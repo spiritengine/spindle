@@ -15,6 +15,7 @@ import asyncio
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import threading
@@ -50,8 +51,8 @@ async def health_check(request: Request) -> JSONResponse:
 # Storage directory
 SPINDLE_DIR = Path.home() / ".spindle" / "spools"
 
-# Concurrency limit
-MAX_CONCURRENT = 5
+# Concurrency limit (configurable via env var)
+MAX_CONCURRENT = int(os.environ.get("SPINDLE_MAX_CONCURRENT", "5"))
 
 # Poll interval for monitoring detached processes
 MONITOR_POLL_INTERVAL = 2  # seconds
@@ -501,7 +502,12 @@ def _spin_sync(
         return f"Error: Max {MAX_CONCURRENT} concurrent spools. Wait for some to complete."
 
     spool_id = str(uuid.uuid4())[:8]
-    cwd = working_dir or os.getcwd()
+
+    # Require working_dir - os.getcwd() returns MCP server dir, not caller's project
+    if not working_dir:
+        return "Error: working_dir required. Pass the project directory."
+
+    cwd = working_dir
 
     # Resolve permission to allowed_tools and check for auto-shard
     resolved_tools, auto_shard = _resolve_permission(permission, allowed_tools)
@@ -518,20 +524,38 @@ def _spin_sync(
         else:
             return f"Error: Failed to create SHARD worktree. Check git repo status."
 
-    cmd = ['claude', '-p', prompt, '--output-format', 'json']
+    claude_cmd = ['claude', '-p', prompt, '--output-format', 'json']
 
     # Auto-accept edits for non-interactive execution
     # Use acceptEdits for careful mode, bypassPermissions for full/shard
     if permission in ('full', 'shard') or (permission and '+shard' in permission):
-        cmd.extend(['--permission-mode', 'bypassPermissions'])
+        claude_cmd.extend(['--permission-mode', 'bypassPermissions'])
     else:
-        cmd.extend(['--permission-mode', 'acceptEdits'])
+        claude_cmd.extend(['--permission-mode', 'acceptEdits'])
 
     if system_prompt:
-        cmd.extend(['--system-prompt', system_prompt])
+        claude_cmd.extend(['--system-prompt', system_prompt])
 
     if resolved_tools:
-        cmd.extend(['--allowedTools', resolved_tools])
+        claude_cmd.extend(['--allowedTools', resolved_tools])
+
+    # Wrap in bwrap sandbox for shards - worktree writable, rest read-only
+    if shard_info and shutil.which('bwrap'):
+        home = str(Path.home())
+        cmd = [
+            'bwrap',
+            '--ro-bind', '/', '/',                    # Root read-only
+            '--bind', cwd, cwd,                       # Worktree writable
+            '--bind', '/tmp', '/tmp',                 # Tmp writable
+            '--bind', f'{home}/.claude', f'{home}/.claude',         # Claude config
+            '--bind', f'{home}/.anthropic', f'{home}/.anthropic',   # API keys
+            '--bind', f'{home}/.spindle', f'{home}/.spindle',       # Spindle state
+            '--dev', '/dev',
+            '--proc', '/proc',
+            '--chdir', cwd,
+        ] + claude_cmd
+    else:
+        cmd = claude_cmd
 
     # Parse tags
     tag_list = [t.strip() for t in tags.split(',')] if tags else []
