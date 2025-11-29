@@ -1,0 +1,15 @@
+[
+  {
+    "agent_id": "cc-session-20251129",
+    "name": "Quartermaster",
+    "agent_type": null,
+    "description": null,
+    "registered_at": "2025-11-29T11:21:28.279895",
+    "capabilities": [],
+    "status": "active",
+    "metadata": {
+      "registered_via": "direct",
+      "ignited_at": "2025-11-29T11:21:28.277434"
+    }
+  }
+]

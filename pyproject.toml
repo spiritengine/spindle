@@ -8,4 +8,7 @@ dependencies = [
 ]
 
 [project.scripts]
-spindle = "spindle:mcp.run"
+spindle = "spindle:main"
+
+[tool.setuptools]
+packages = ["spindle"]

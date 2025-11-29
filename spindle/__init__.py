@@ -1605,17 +1605,86 @@ async def spindle_reload() -> str:
     return "Restarting via systemd..." if is_active else "Starting via systemd..."
 
 
-if __name__ == "__main__":
+def main():
     import sys
     import argparse
     import traceback
     import atexit
 
     parser = argparse.ArgumentParser(description="Spindle MCP server")
-    parser.add_argument("--http", action="store_true", help="Run as HTTP server instead of stdio")
-    parser.add_argument("--port", type=int, default=8002, help="HTTP port (default: 8002)")
-    parser.add_argument("--host", default="127.0.0.1", help="HTTP host (default: 127.0.0.1)")
+    subparsers = parser.add_subparsers(dest="command")
+
+    # serve command (default)
+    serve_parser = subparsers.add_parser("serve", help="Run the MCP server")
+    serve_parser.add_argument("--http", action="store_true", help="Run as HTTP server instead of stdio")
+    serve_parser.add_argument("--port", type=int, default=8002, help="HTTP port (default: 8002)")
+    serve_parser.add_argument("--host", default="127.0.0.1", help="HTTP host (default: 127.0.0.1)")
+
+    # start command - start via systemd or background
+    start_parser = subparsers.add_parser("start", help="Start spindle (via systemd if available)")
+
+    # reload command - restart spindle
+    reload_parser = subparsers.add_parser("reload", help="Reload spindle to pick up code changes")
+
+    # status command
+    status_parser = subparsers.add_parser("status", help="Check spindle status")
+
+    # Legacy flags for backward compat
+    parser.add_argument("--http", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--port", type=int, default=8002, help=argparse.SUPPRESS)
+    parser.add_argument("--host", default="127.0.0.1", help=argparse.SUPPRESS)
+
     args = parser.parse_args()
+
+    # Handle subcommands
+    if args.command == "start":
+        # Check if systemd service exists
+        result = subprocess.run(
+            ['systemctl', '--user', 'list-unit-files', 'spindle.service'],
+            capture_output=True, text=True
+        )
+        if 'spindle.service' in result.stdout:
+            subprocess.run(['systemctl', '--user', 'start', 'spindle'])
+            print("Started via systemd")
+        else:
+            # Start in background
+            subprocess.Popen(
+                [sys.executable, __file__, 'serve', '--http'],
+                start_new_session=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            print("Started in background (no systemd service found)")
+        sys.exit(0)
+
+    elif args.command == "reload":
+        # Check if systemd service exists
+        result = subprocess.run(
+            ['systemctl', '--user', 'list-unit-files', 'spindle.service'],
+            capture_output=True, text=True
+        )
+        if 'spindle.service' in result.stdout:
+            subprocess.run(['systemctl', '--user', 'restart', 'spindle'])
+            print("Restarted via systemd")
+        else:
+            print("No systemd service. Kill and run: spindle start")
+        sys.exit(0)
+
+    elif args.command == "status":
+        result = subprocess.run(
+            ['curl', '-s', 'http://127.0.0.1:8002/health'],
+            capture_output=True, text=True
+        )
+        if result.returncode == 0:
+            print(result.stdout)
+        else:
+            print("Not running")
+        sys.exit(0)
+
+    # Default to serve if no command or using legacy --http flag
+    if args.command is None and not args.http:
+        parser.print_help()
+        sys.exit(0)
 
     log_path = Path.home() / ".spindle" / "spindle.log"
 
@@ -1659,3 +1728,7 @@ if __name__ == "__main__":
     else:
         mcp.run()
     log("FINISHED mcp.run()")
+
+
+if __name__ == "__main__":
+    main()

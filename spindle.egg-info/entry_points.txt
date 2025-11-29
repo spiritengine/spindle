@@ -1,2 +1,2 @@
 [console_scripts]
-spindle = spindle:mcp.run
+spindle = spindle:main

@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__spindle__spools",
+      "Bash(SKEIN_AGENT_ID=cc-session-20251129 skein close:*)",
+      "Bash(python3:*)",
+      "Bash(xargs:*)",
+      "mcp__spindle__spin",
+      "mcp__spindle__unspool"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
