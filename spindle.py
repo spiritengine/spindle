@@ -37,6 +37,214 @@ MAX_CONCURRENT = 5
 # Poll interval for monitoring detached processes
 MONITOR_POLL_INTERVAL = 2  # seconds
 
+# Permission profiles for tool restrictions
+# These map to Claude Code's --allowedTools flag
+# Profiles ending with "+shard" auto-enable shard isolation
+PERMISSION_PROFILES = {
+    "readonly": "Read,Grep,Glob,Bash(ls:*),Bash(cat:*),Bash(head:*),Bash(tail:*),Bash(git status:*),Bash(git log:*),Bash(git diff:*)",
+    "careful": "Read,Write,Edit,Grep,Glob,Bash(git:*),Bash(make:*),Bash(pytest:*),Bash(python:*),Bash(npm:*)",
+    "full": None,  # None means no restrictions
+    # Shard variants - same permissions but auto-enable worktree isolation
+    "shard": None,  # Full permissions + shard isolation (common combo)
+    "careful+shard": "Read,Write,Edit,Grep,Glob,Bash(git:*),Bash(make:*),Bash(pytest:*),Bash(python:*),Bash(npm:*)",
+}
+
+# Cache for SKEIN availability check
+_skein_available: Optional[bool] = None
+
+
+def _has_skein() -> bool:
+    """
+    Check if SKEIN is available in the current project.
+    Result is cached for performance.
+    """
+    global _skein_available
+    if _skein_available is not None:
+        return _skein_available
+
+    # Check if skein command exists and we're in a git repo
+    try:
+        result = subprocess.run(
+            ['skein', '--version'],
+            capture_output=True,
+            timeout=5
+        )
+        if result.returncode == 0:
+            # Also check if we're in a git repo (SKEIN requires git)
+            git_check = subprocess.run(
+                ['git', 'rev-parse', '--git-dir'],
+                capture_output=True,
+                timeout=5
+            )
+            _skein_available = git_check.returncode == 0
+        else:
+            _skein_available = False
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        _skein_available = False
+
+    return _skein_available
+
+
+def _resolve_permission(permission: Optional[str], allowed_tools: Optional[str]) -> tuple[Optional[str], bool]:
+    """
+    Resolve permission profile to allowed_tools string and shard flag.
+
+    Args:
+        permission: Permission profile name ("readonly", "careful", "full", "shard", etc.) or None
+        allowed_tools: Explicit allowed_tools override (takes precedence)
+
+    Returns:
+        Tuple of (allowed_tools string or None, should_use_shard bool)
+    """
+    # Explicit allowed_tools takes precedence (no auto-shard)
+    if allowed_tools:
+        return allowed_tools, False
+
+    # If no permission specified, use "careful" as default
+    if not permission:
+        permission = "careful"
+
+    # Check if this is a shard profile
+    use_shard = permission == "shard" or permission.endswith("+shard")
+
+    # Look up profile
+    if permission in PERMISSION_PROFILES:
+        return PERMISSION_PROFILES[permission], use_shard
+
+    # Unknown profile - use careful, no shard
+    return PERMISSION_PROFILES["careful"], False
+
+
+def _spawn_shard(agent_id: str, working_dir: str) -> Optional[Dict[str, str]]:
+    """
+    Create an isolated git worktree (SHARD) for the agent.
+
+    Uses SKEIN if available, falls back to plain git worktree.
+
+    Args:
+        agent_id: Identifier for the shard (used in worktree name)
+        working_dir: Base directory for the worktree
+
+    Returns:
+        Dict with shard info if successful, None if failed
+        Keys: worktree_path, branch_name, shard_id
+    """
+    if _has_skein():
+        # Use SKEIN's shard spawn command
+        try:
+            result = subprocess.run(
+                [
+                    'skein', 'shard', 'spawn',
+                    '--agent', agent_id,
+                    '--description', f'Spindle spool for {agent_id}'
+                ],
+                capture_output=True,
+                text=True,
+                cwd=working_dir,
+                timeout=30
+            )
+            if result.returncode == 0:
+                # Parse output to get worktree path
+                # Output format: "✓ Spawned SHARD: ..."
+                for line in result.stdout.splitlines():
+                    if 'Worktree:' in line:
+                        worktree_path = line.split('Worktree:')[1].strip()
+                        # Extract other info
+                        branch_name = None
+                        shard_id = None
+                        for l in result.stdout.splitlines():
+                            if 'Branch:' in l:
+                                branch_name = l.split('Branch:')[1].strip()
+                            if 'Spawned SHARD:' in l:
+                                shard_id = l.split('Spawned SHARD:')[1].strip()
+                        return {
+                            'worktree_path': worktree_path,
+                            'branch_name': branch_name or f'shard-{agent_id}',
+                            'shard_id': shard_id or agent_id,
+                        }
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            pass
+
+    # Fallback: plain git worktree
+    try:
+        # Create worktrees directory if needed
+        worktrees_dir = Path(working_dir) / 'worktrees'
+        worktrees_dir.mkdir(exist_ok=True)
+
+        # Generate unique worktree name
+        date_str = datetime.now().strftime('%Y%m%d-%H%M%S')
+        worktree_name = f'{agent_id}-{date_str}'
+        worktree_path = worktrees_dir / worktree_name
+        branch_name = f'shard-{worktree_name}'
+
+        # Create git worktree with new branch
+        result = subprocess.run(
+            ['git', 'worktree', 'add', str(worktree_path), '-b', branch_name],
+            capture_output=True,
+            text=True,
+            cwd=working_dir,
+            timeout=30
+        )
+        if result.returncode == 0:
+            return {
+                'worktree_path': str(worktree_path),
+                'branch_name': branch_name,
+                'shard_id': worktree_name,
+            }
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        pass
+
+    return None
+
+
+def _cleanup_shard(shard_info: Dict[str, str], working_dir: str, keep_branch: bool = False) -> bool:
+    """
+    Clean up a SHARD worktree.
+
+    Args:
+        shard_info: Dict with worktree_path, branch_name
+        working_dir: Base directory
+        keep_branch: If True, don't delete the branch
+
+    Returns:
+        True if successful
+    """
+    worktree_path = shard_info.get('worktree_path')
+    branch_name = shard_info.get('branch_name')
+
+    if not worktree_path:
+        return False
+
+    try:
+        # Remove worktree
+        subprocess.run(
+            ['git', 'worktree', 'remove', '--force', worktree_path],
+            capture_output=True,
+            cwd=working_dir,
+            timeout=30
+        )
+
+        # Optionally delete branch
+        if not keep_branch and branch_name:
+            subprocess.run(
+                ['git', 'branch', '-D', branch_name],
+                capture_output=True,
+                cwd=working_dir,
+                timeout=10
+            )
+
+        # Prune worktree references
+        subprocess.run(
+            ['git', 'worktree', 'prune'],
+            capture_output=True,
+            cwd=working_dir,
+            timeout=10
+        )
+
+        return True
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return False
+
 
 def _get_spool_path(spool_id: str) -> Path:
     """Get path to spool JSON file."""
@@ -262,9 +470,12 @@ _recover_orphans()
 @mcp.tool()
 async def spin(
     prompt: str,
+    permission: Optional[str] = None,
+    shard: bool = False,
     system_prompt: Optional[str] = None,
     working_dir: Optional[str] = None,
     allowed_tools: Optional[str] = None,
+    tags: Optional[str] = None,
 ) -> str:
     """
     Spawn a Claude Code agent to handle a task. Returns immediately with spool_id.
@@ -273,16 +484,21 @@ async def spin(
 
     Args:
         prompt: The task/question for the agent
+        permission: Permission profile - "readonly", "careful" (default), "full",
+                    "shard" (full + isolation), or "careful+shard"
+        shard: Run in isolated git worktree (SKEIN-aware with graceful fallback)
         system_prompt: Optional system prompt to configure behavior
         working_dir: Directory for the agent to work in (defaults to current)
-        allowed_tools: Restrict tools (e.g. "Read,Write,Bash(git:*)")
+        allowed_tools: Override permission profile with explicit tool list
+        tags: Comma-separated tags for organizing spools (e.g. "batch-1,triage")
 
     Returns:
         spool_id to check result later
 
     Example:
         spool_id = spin("Research the Python GIL")
-        # ... do other work ...
+        spool_id = spin("Fix the bug", permission="shard")  # full access + isolation
+        spool_id = spin("Careful work", permission="careful+shard")
         result = unspool(spool_id)
     """
     # Check concurrency limit
@@ -290,16 +506,33 @@ async def spin(
         return f"Error: Max {MAX_CONCURRENT} concurrent spools. Wait for some to complete."
 
     spool_id = str(uuid.uuid4())[:8]
+    cwd = working_dir or os.getcwd()
+
+    # Resolve permission to allowed_tools and check for auto-shard
+    resolved_tools, auto_shard = _resolve_permission(permission, allowed_tools)
+
+    # Use shard if explicitly requested OR if permission profile enables it
+    use_shard = shard or auto_shard
+
+    # Handle shard creation
+    shard_info = None
+    if use_shard:
+        shard_info = _spawn_shard(spool_id, cwd)
+        if shard_info:
+            cwd = shard_info['worktree_path']
+        else:
+            return f"Error: Failed to create SHARD worktree. Check git repo status."
 
     cmd = ['claude', '-p', prompt, '--output-format', 'json']
 
     if system_prompt:
         cmd.extend(['--system-prompt', system_prompt])
 
-    if allowed_tools:
-        cmd.extend(['--allowedTools', allowed_tools])
+    if resolved_tools:
+        cmd.extend(['--allowedTools', resolved_tools])
 
-    cwd = working_dir or os.getcwd()
+    # Parse tags
+    tag_list = [t.strip() for t in tags.split(',')] if tags else []
 
     # Create spool record
     spool = {
@@ -309,8 +542,11 @@ async def spin(
         'result': None,
         'session_id': None,
         'working_dir': cwd,
-        'allowed_tools': allowed_tools,
+        'allowed_tools': resolved_tools,
+        'permission': permission or 'careful',
         'system_prompt': system_prompt,
+        'tags': tag_list,
+        'shard': shard_info,
         'created_at': datetime.now().isoformat(),
         'completed_at': None,
         'pid': None,
@@ -807,9 +1043,12 @@ async def spool_retry(spool_id: str) -> str:
     # Re-spin with same parameters
     return await spin(
         prompt=spool.get('prompt', ''),
+        permission=spool.get('permission'),
+        shard=bool(spool.get('shard')),
         system_prompt=spool.get('system_prompt'),
         working_dir=spool.get('working_dir'),
         allowed_tools=spool.get('allowed_tools'),
+        tags=','.join(spool.get('tags', [])) if spool.get('tags') else None,
     )
 
 
@@ -924,6 +1163,232 @@ async def spool_export(
     path.write_text(content)
 
     return f"Exported {len(spools_to_export)} spools to {path}"
+
+
+@mcp.tool()
+async def shard_status(spool_id: str) -> str:
+    """
+    Get the status of a shard associated with a spool.
+
+    Args:
+        spool_id: The spool_id that has a shard
+
+    Returns:
+        JSON with shard info (worktree path, branch, git status)
+
+    Example:
+        shard_status("abc123")  # show shard details
+    """
+    spool = _read_spool(spool_id)
+
+    if not spool:
+        return f"Error: Unknown spool_id '{spool_id}'"
+
+    shard_info = spool.get('shard')
+    if not shard_info:
+        return f"Spool {spool_id} has no shard (was not run with shard=True)"
+
+    worktree_path = shard_info.get('worktree_path')
+    if not worktree_path or not Path(worktree_path).exists():
+        return json.dumps({
+            'spool_id': spool_id,
+            'shard': shard_info,
+            'exists': False,
+            'message': 'Worktree no longer exists'
+        }, indent=2)
+
+    # Get git status in the shard
+    status_info = {
+        'spool_id': spool_id,
+        'shard': shard_info,
+        'exists': True,
+        'spool_status': spool.get('status'),
+    }
+
+    try:
+        # Get git status
+        result = subprocess.run(
+            ['git', 'status', '--porcelain'],
+            capture_output=True,
+            text=True,
+            cwd=worktree_path,
+            timeout=10
+        )
+        if result.returncode == 0:
+            status_info['git_changes'] = result.stdout.strip().split('\n') if result.stdout.strip() else []
+
+        # Get commit count vs master
+        result = subprocess.run(
+            ['git', 'rev-list', '--count', 'master..HEAD'],
+            capture_output=True,
+            text=True,
+            cwd=worktree_path,
+            timeout=10
+        )
+        if result.returncode == 0:
+            status_info['commits_ahead'] = int(result.stdout.strip())
+
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError, ValueError):
+        status_info['git_error'] = 'Failed to get git status'
+
+    return json.dumps(status_info, indent=2)
+
+
+@mcp.tool()
+async def shard_merge(spool_id: str, keep_branch: bool = False) -> str:
+    """
+    Merge a shard's changes back to master and clean up the worktree.
+
+    The spool must be complete (not running). Changes are merged to master
+    using a merge commit.
+
+    Args:
+        spool_id: The spool_id with a shard to merge
+        keep_branch: Keep the branch after merge (default: delete)
+
+    Returns:
+        Success or error message
+
+    Example:
+        shard_merge("abc123")  # merge and cleanup
+    """
+    spool = _read_spool(spool_id)
+
+    if not spool:
+        return f"Error: Unknown spool_id '{spool_id}'"
+
+    if spool.get('status') == 'running':
+        return f"Error: Spool {spool_id} is still running. Wait for completion."
+
+    shard_info = spool.get('shard')
+    if not shard_info:
+        return f"Error: Spool {spool_id} has no shard"
+
+    worktree_path = shard_info.get('worktree_path')
+    branch_name = shard_info.get('branch_name')
+
+    if not worktree_path or not Path(worktree_path).exists():
+        return f"Error: Worktree no longer exists: {worktree_path}"
+
+    # Find the main repo path
+    main_repo = Path(worktree_path).parent.parent  # worktrees/name -> repo
+
+    try:
+        # Check for uncommitted changes
+        result = subprocess.run(
+            ['git', 'status', '--porcelain'],
+            capture_output=True,
+            text=True,
+            cwd=worktree_path,
+            timeout=10
+        )
+        if result.stdout.strip():
+            return f"Error: Shard has uncommitted changes. Commit or discard them first."
+
+        # Merge branch to master from main repo
+        result = subprocess.run(
+            ['git', 'merge', branch_name, '--no-ff', '-m', f'Merge shard {spool_id}: {spool.get("prompt", "")[:50]}'],
+            capture_output=True,
+            text=True,
+            cwd=str(main_repo),
+            timeout=30
+        )
+        if result.returncode != 0:
+            return f"Error: Merge failed: {result.stderr}"
+
+        # Cleanup shard
+        _cleanup_shard(shard_info, str(main_repo), keep_branch=keep_branch)
+
+        # Update spool record
+        spool['shard']['merged'] = True
+        spool['shard']['merged_at'] = datetime.now().isoformat()
+        _write_spool(spool_id, spool)
+
+        return f"Successfully merged shard {spool_id} to master"
+
+    except subprocess.TimeoutExpired:
+        return "Error: Git operation timed out"
+    except (FileNotFoundError, OSError) as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+async def shard_abandon(spool_id: str, keep_branch: bool = False) -> str:
+    """
+    Abandon a shard, removing the worktree without merging.
+
+    Use this when a shard's work is no longer needed.
+
+    Args:
+        spool_id: The spool_id with a shard to abandon
+        keep_branch: Keep the branch for later (default: delete)
+
+    Returns:
+        Success or error message
+
+    Example:
+        shard_abandon("abc123")  # discard shard
+    """
+    spool = _read_spool(spool_id)
+
+    if not spool:
+        return f"Error: Unknown spool_id '{spool_id}'"
+
+    shard_info = spool.get('shard')
+    if not shard_info:
+        return f"Error: Spool {spool_id} has no shard"
+
+    worktree_path = shard_info.get('worktree_path')
+
+    if not worktree_path:
+        return f"Error: No worktree path in shard info"
+
+    # Find the main repo path
+    main_repo = Path(worktree_path).parent.parent
+
+    # If spool is running, kill it first
+    if spool.get('status') == 'running':
+        pid = spool.get('pid')
+        if pid:
+            try:
+                os.killpg(pid, signal.SIGTERM)
+            except (ProcessLookupError, OSError):
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except (ProcessLookupError, OSError):
+                    pass
+
+        spool['status'] = 'error'
+        spool['error'] = 'Shard abandoned'
+        spool['completed_at'] = datetime.now().isoformat()
+
+    # Cleanup shard
+    success = _cleanup_shard(shard_info, str(main_repo), keep_branch=keep_branch)
+
+    if success:
+        spool['shard']['abandoned'] = True
+        spool['shard']['abandoned_at'] = datetime.now().isoformat()
+        _write_spool(spool_id, spool)
+        return f"Abandoned shard {spool_id}" + (" (branch kept)" if keep_branch else "")
+    else:
+        return f"Warning: Shard cleanup may have been incomplete for {spool_id}"
+
+
+@mcp.tool()
+async def spindle_reload() -> str:
+    """
+    Signal spindle to reload (requires wrapper script).
+
+    Write a signal file that the wrapper script watches for.
+    The wrapper will restart spindle with fresh code.
+
+    Returns:
+        Status message
+    """
+    signal_file = Path.home() / ".spindle" / "reload_signal"
+    signal_file.parent.mkdir(parents=True, exist_ok=True)
+    signal_file.write_text(datetime.now().isoformat())
+    return "Reload signal sent. If running with wrapper, spindle will restart."
 
 
 if __name__ == "__main__":
