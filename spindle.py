@@ -137,6 +137,9 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
     """
     Check if a spool's process has finished and finalize it.
     Returns True if the spool was finalized, False if still running.
+
+    Note: claude CLI doesn't exit immediately after writing output, so we also
+    check if stdout contains a complete JSON result even if PID is alive.
     """
     spool = _read_spool(spool_id)
     if not spool or spool.get('status') != 'running':
@@ -146,10 +149,26 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
     if not pid:
         return False  # No PID yet, still starting
 
-    if _is_pid_alive(pid):
-        return False  # Still running
+    stdout_path = _get_output_path(spool_id)
+    stderr_path = _get_stderr_path(spool_id)
 
-    # Process finished - read output and finalize
+    # Check if stdout has complete JSON result (claude may not exit promptly)
+    stdout_complete = False
+    if stdout_path.exists():
+        try:
+            content = stdout_path.read_text()
+            if content.strip():
+                data = json.loads(content)
+                if 'result' in data or 'error' in data:
+                    stdout_complete = True
+        except (IOError, json.JSONDecodeError):
+            pass
+
+    # If PID alive and no complete output yet, still running
+    if _is_pid_alive(pid) and not stdout_complete:
+        return False
+
+    # Process finished or output complete - finalize
     stdout_path = _get_output_path(spool_id)
     stderr_path = _get_stderr_path(spool_id)
 
