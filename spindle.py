@@ -467,40 +467,16 @@ _cleanup_old_spools()
 _recover_orphans()
 
 
-@mcp.tool()
-async def spin(
+def _spin_sync(
     prompt: str,
-    permission: Optional[str] = None,
-    shard: bool = False,
-    system_prompt: Optional[str] = None,
-    working_dir: Optional[str] = None,
-    allowed_tools: Optional[str] = None,
-    tags: Optional[str] = None,
+    permission: Optional[str],
+    shard: bool,
+    system_prompt: Optional[str],
+    working_dir: Optional[str],
+    allowed_tools: Optional[str],
+    tags: Optional[str],
 ) -> str:
-    """
-    Spawn a Claude Code agent to handle a task. Returns immediately with spool_id.
-
-    The agent runs in background. Use unspool(spool_id) to get the result.
-
-    Args:
-        prompt: The task/question for the agent
-        permission: Permission profile - "readonly", "careful" (default), "full",
-                    "shard" (full + isolation), or "careful+shard"
-        shard: Run in isolated git worktree (SKEIN-aware with graceful fallback)
-        system_prompt: Optional system prompt to configure behavior
-        working_dir: Directory for the agent to work in (defaults to current)
-        allowed_tools: Override permission profile with explicit tool list
-        tags: Comma-separated tags for organizing spools (e.g. "batch-1,triage")
-
-    Returns:
-        spool_id to check result later
-
-    Example:
-        spool_id = spin("Research the Python GIL")
-        spool_id = spin("Fix the bug", permission="shard")  # full access + isolation
-        spool_id = spin("Careful work", permission="careful+shard")
-        result = unspool(spool_id)
-    """
+    """Synchronous implementation of spin - runs in thread pool."""
     # Check concurrency limit
     if _count_running() >= MAX_CONCURRENT:
         return f"Error: Max {MAX_CONCURRENT} concurrent spools. Wait for some to complete."
@@ -578,30 +554,56 @@ async def spin(
 
 
 @mcp.tool()
-async def unspool(spool_id: str) -> str:
+async def spin(
+    prompt: str,
+    permission: Optional[str] = None,
+    shard: bool = False,
+    system_prompt: Optional[str] = None,
+    working_dir: Optional[str] = None,
+    allowed_tools: Optional[str] = None,
+    tags: Optional[str] = None,
+) -> str:
     """
-    Get the result of a background spin task.
+    Spawn a Claude Code agent to handle a task. Returns immediately with spool_id.
+
+    The agent runs in background. Use unspool(spool_id) to get the result.
 
     Args:
-        spool_id: The spool_id returned by spin()
+        prompt: The task/question for the agent
+        permission: Permission profile - "readonly", "careful" (default), "full",
+                    "shard" (full + isolation), or "careful+shard"
+        shard: Run in isolated git worktree (SKEIN-aware with graceful fallback)
+        system_prompt: Optional system prompt to configure behavior
+        working_dir: Directory for the agent to work in (defaults to current)
+        allowed_tools: Override permission profile with explicit tool list
+        tags: Comma-separated tags for organizing spools (e.g. "batch-1,triage")
 
     Returns:
-        Result if complete, status if still running, error if failed
+        spool_id to check result later
+
+    Example:
+        spool_id = spin("Research the Python GIL")
+        spool_id = spin("Fix the bug", permission="shard")  # full access + isolation
+        spool_id = spin("Careful work", permission="careful+shard")
+        result = unspool(spool_id)
     """
-    # First check if we need to finalize
+    import asyncio
+    return await asyncio.to_thread(
+        _spin_sync, prompt, permission, shard, system_prompt,
+        working_dir, allowed_tools, tags
+    )
+
+
+def _unspool_sync(spool_id: str) -> str:
+    """Synchronous implementation of unspool."""
     _check_and_finalize_spool(spool_id)
-
     spool = _read_spool(spool_id)
-
     if not spool:
         return f"Error: Unknown spool_id '{spool_id}'"
-
     status = spool.get('status')
-
     if status == 'pending':
         return f"Spool {spool_id} pending (not yet started)"
     elif status == 'running':
-        # Double-check if process is still alive
         pid = spool.get('pid')
         if pid and not _is_pid_alive(pid):
             _check_and_finalize_spool(spool_id)
@@ -613,8 +615,32 @@ async def unspool(spool_id: str) -> str:
         return f"Spool {spool_id} still running: {spool.get('prompt', '')[:50]}..."
     elif status == 'complete':
         return spool.get('result', 'No result')
-    else:  # error
+    else:
         return f"Spool {spool_id} failed: {spool.get('error', 'Unknown error')}"
+
+
+@mcp.tool()
+async def unspool(spool_id: str) -> str:
+    """
+    Get the result of a background spin task.
+    """
+    import asyncio
+    return await asyncio.to_thread(_unspool_sync, spool_id)
+
+
+def _spools_sync() -> str:
+    """Synchronous implementation of spools."""
+    _recover_orphans()
+    all_spools = _list_spools()
+    return json.dumps({
+        spool['id']: {
+            'status': spool.get('status'),
+            'prompt': spool.get('prompt', '')[:100],
+            'created_at': spool.get('created_at'),
+            'session_id': spool.get('session_id'),
+        }
+        for spool in all_spools
+    }, indent=2)
 
 
 @mcp.tool()
@@ -625,20 +651,8 @@ async def spools() -> str:
     Returns:
         JSON object with spool statuses
     """
-    # Check for any finished spools first
-    _recover_orphans()
-
-    all_spools = _list_spools()
-
-    return json.dumps({
-        spool['id']: {
-            'status': spool.get('status'),
-            'prompt': spool.get('prompt', '')[:100],
-            'created_at': spool.get('created_at'),
-            'session_id': spool.get('session_id'),
-        }
-        for spool in all_spools
-    }, indent=2)
+    import asyncio
+    return await asyncio.to_thread(_spools_sync)
 
 
 @mcp.tool()
@@ -1172,20 +1186,8 @@ async def spool_export(
     return f"Exported {len(spools_to_export)} spools to {path}"
 
 
-@mcp.tool()
-async def shard_status(spool_id: str) -> str:
-    """
-    Get the status of a shard associated with a spool.
-
-    Args:
-        spool_id: The spool_id that has a shard
-
-    Returns:
-        JSON with shard info (worktree path, branch, git status)
-
-    Example:
-        shard_status("abc123")  # show shard details
-    """
+def _shard_status_sync(spool_id: str) -> str:
+    """Synchronous implementation of shard_status."""
     spool = _read_spool(spool_id)
 
     if not spool:
@@ -1204,7 +1206,6 @@ async def shard_status(spool_id: str) -> str:
             'message': 'Worktree no longer exists'
         }, indent=2)
 
-    # Get git status in the shard
     status_info = {
         'spool_id': spool_id,
         'shard': shard_info,
@@ -1213,24 +1214,16 @@ async def shard_status(spool_id: str) -> str:
     }
 
     try:
-        # Get git status
         result = subprocess.run(
             ['git', 'status', '--porcelain'],
-            capture_output=True,
-            text=True,
-            cwd=worktree_path,
-            timeout=10
+            capture_output=True, text=True, cwd=worktree_path, timeout=10
         )
         if result.returncode == 0:
             status_info['git_changes'] = result.stdout.strip().split('\n') if result.stdout.strip() else []
 
-        # Get commit count vs master
         result = subprocess.run(
             ['git', 'rev-list', '--count', 'master..HEAD'],
-            capture_output=True,
-            text=True,
-            cwd=worktree_path,
-            timeout=10
+            capture_output=True, text=True, cwd=worktree_path, timeout=10
         )
         if result.returncode == 0:
             status_info['commits_ahead'] = int(result.stdout.strip())
@@ -1239,6 +1232,24 @@ async def shard_status(spool_id: str) -> str:
         status_info['git_error'] = 'Failed to get git status'
 
     return json.dumps(status_info, indent=2)
+
+
+@mcp.tool()
+async def shard_status(spool_id: str) -> str:
+    """
+    Get the status of a shard associated with a spool.
+
+    Args:
+        spool_id: The spool_id that has a shard
+
+    Returns:
+        JSON with shard info (worktree path, branch, git status)
+
+    Example:
+        shard_status("abc123")  # show shard details
+    """
+    import asyncio
+    return await asyncio.to_thread(_shard_status_sync, spool_id)
 
 
 @mcp.tool()
@@ -1409,15 +1420,40 @@ async def spindle_reload() -> str:
 if __name__ == "__main__":
     import sys
     import traceback
+    import atexit
 
-    # Log uncaught exceptions to file
+    log_path = Path.home() / ".spindle" / "spindle.log"
+
+    def log(msg: str):
+        with open(log_path, "a") as f:
+            f.write(f"{datetime.now().isoformat()} {msg}\n")
+
+    # Log startup
+    log(f"STARTUP pid={os.getpid()}")
+
+    # Log uncaught exceptions
     def exception_handler(exc_type, exc_value, exc_tb):
-        with open(Path.home() / ".spindle" / "crash.log", "a") as f:
-            f.write(f"\n{'='*60}\n")
-            f.write(f"Crash at {datetime.now().isoformat()}\n")
+        log(f"EXCEPTION {exc_type.__name__}: {exc_value}")
+        with open(log_path, "a") as f:
             traceback.print_exception(exc_type, exc_value, exc_tb, file=f)
         sys.__excepthook__(exc_type, exc_value, exc_tb)
 
     sys.excepthook = exception_handler
 
+    # Log signals
+    def signal_handler(signum, frame):
+        log(f"SIGNAL received: {signum} ({signal.Signals(signum).name})")
+        sys.exit(128 + signum)
+
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(sig, signal_handler)
+
+    # Log exit
+    def exit_handler():
+        log("EXIT")
+
+    atexit.register(exit_handler)
+
+    log("STARTING mcp.run()")
     mcp.run()
+    log("FINISHED mcp.run()")
