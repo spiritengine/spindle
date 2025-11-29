@@ -1407,4 +1407,17 @@ async def spindle_reload() -> str:
 
 
 if __name__ == "__main__":
+    import sys
+    import traceback
+
+    # Log uncaught exceptions to file
+    def exception_handler(exc_type, exc_value, exc_tb):
+        with open(Path.home() / ".spindle" / "crash.log", "a") as f:
+            f.write(f"\n{'='*60}\n")
+            f.write(f"Crash at {datetime.now().isoformat()}\n")
+            traceback.print_exception(exc_type, exc_value, exc_tb, file=f)
+        sys.__excepthook__(exc_type, exc_value, exc_tb)
+
+    sys.excepthook = exception_handler
+
     mcp.run()
