@@ -314,7 +314,6 @@ async def spin(
         'created_at': datetime.now().isoformat(),
         'completed_at': None,
         'pid': None,
-        'cost': None,
         'error': None,
     }
 
@@ -784,6 +783,147 @@ async def spool_grep(pattern: str) -> str:
         return f"No results matching pattern '{pattern}'"
 
     return json.dumps(matches, indent=2)
+
+
+@mcp.tool()
+async def spool_retry(spool_id: str) -> str:
+    """
+    Re-run a spool with the same parameters.
+
+    Args:
+        spool_id: The spool_id to retry
+
+    Returns:
+        New spool_id for the retried task
+
+    Example:
+        new_id = spool_retry("abc123")  # retry failed spool
+    """
+    spool = _read_spool(spool_id)
+
+    if not spool:
+        return f"Error: Unknown spool_id '{spool_id}'"
+
+    # Re-spin with same parameters
+    return await spin(
+        prompt=spool.get('prompt', ''),
+        system_prompt=spool.get('system_prompt'),
+        working_dir=spool.get('working_dir'),
+        allowed_tools=spool.get('allowed_tools'),
+    )
+
+
+@mcp.tool()
+async def spool_stats() -> str:
+    """
+    Get summary statistics for all spools.
+
+    Returns:
+        JSON with counts by status and time range
+
+    Example:
+        stats = spool_stats()  # {"total": 25, "by_status": {"complete": 10, "error": 2}, ...}
+    """
+    all_spools = _list_spools()
+
+    stats = {
+        'total': len(all_spools),
+        'by_status': {},
+        'oldest': None,
+        'newest': None,
+    }
+
+    for spool in all_spools:
+        # Count by status
+        status = spool.get('status', 'unknown')
+        stats['by_status'][status] = stats['by_status'].get(status, 0) + 1
+
+        # Track time range
+        created = spool.get('created_at')
+        if created:
+            if not stats['oldest'] or created < stats['oldest']:
+                stats['oldest'] = created
+            if not stats['newest'] or created > stats['newest']:
+                stats['newest'] = created
+
+    return json.dumps(stats, indent=2)
+
+
+@mcp.tool()
+async def spool_export(
+    spool_ids: str,
+    format: str = "json",
+    output_path: Optional[str] = None,
+) -> str:
+    """
+    Export spool results to a file.
+
+    Args:
+        spool_ids: Comma-separated spool IDs, or "all" for all spools
+        format: Output format - "json" or "md" (markdown)
+        output_path: File path to write (default: ~/.spindle/export.{format})
+
+    Returns:
+        Path to exported file
+
+    Example:
+        spool_export("abc123,def456", format="md")
+        spool_export("all", format="json", output_path="/tmp/results.json")
+    """
+    # Get spools to export
+    if spool_ids.strip().lower() == "all":
+        spools_to_export = _list_spools()
+    else:
+        ids = [s.strip() for s in spool_ids.split(',')]
+        spools_to_export = []
+        for sid in ids:
+            spool = _read_spool(sid)
+            if spool:
+                spools_to_export.append(spool)
+            else:
+                return f"Error: Unknown spool_id '{sid}'"
+
+    if not spools_to_export:
+        return "No spools to export"
+
+    # Sort by created_at
+    spools_to_export.sort(key=lambda s: s.get('created_at', ''))
+
+    # Generate output
+    if format == "md":
+        lines = ["# Spool Export", "", f"Generated: {datetime.now().isoformat()}", ""]
+        for spool in spools_to_export:
+            lines.append(f"## {spool.get('id')}")
+            lines.append(f"**Status:** {spool.get('status')}")
+            lines.append(f"**Created:** {spool.get('created_at')}")
+            lines.append("")
+            lines.append("### Prompt")
+            lines.append(f"```\n{spool.get('prompt', '')}\n```")
+            lines.append("")
+            lines.append("### Result")
+            result = spool.get('result', '')
+            if isinstance(result, dict):
+                result = json.dumps(result, indent=2)
+            lines.append(f"```\n{result}\n```")
+            lines.append("")
+            lines.append("---")
+            lines.append("")
+        content = '\n'.join(lines)
+        ext = "md"
+    else:
+        content = json.dumps(spools_to_export, indent=2)
+        ext = "json"
+
+    # Write file
+    if output_path:
+        path = Path(output_path)
+    else:
+        path = SPINDLE_DIR / f"export.{ext}"
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content)
+
+    return f"Exported {len(spools_to_export)} spools to {path}"
 
 
 if __name__ == "__main__":
