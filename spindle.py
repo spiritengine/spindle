@@ -1357,6 +1357,14 @@ async def shard_merge(spool_id: str, keep_branch: bool = False, caller_cwd: str 
             main_repo = wt_path.parent.parent
             return f"Error: Cannot delete worktree - your working directory is inside it. Run `cd {main_repo}` first."
 
+    # Check if any running spool has working_dir inside this worktree
+    wt_path = Path(worktree_path).resolve()
+    for other in _list_spools():
+        if other.get('status') == 'running' and other.get('id') != spool_id:
+            other_wd = other.get('working_dir', '')
+            if other_wd and Path(other_wd).resolve() == wt_path:
+                return f"Error: Spool {other['id']} is still running in this worktree. Wait for it to complete or use spin_drop() first."
+
     # Find the main repo path
     main_repo = Path(worktree_path).parent.parent  # worktrees/name -> repo
 
@@ -1440,6 +1448,14 @@ async def shard_abandon(spool_id: str, keep_branch: bool = False, caller_cwd: st
         if wt_path.exists() and (caller_path == wt_path or wt_path in caller_path.parents):
             main_repo = wt_path.parent.parent
             return f"Error: Cannot delete worktree - your working directory is inside it. Run `cd {main_repo}` first."
+
+    # Check if any OTHER running spool has working_dir inside this worktree
+    wt_path = Path(worktree_path).resolve()
+    for other in _list_spools():
+        if other.get('status') == 'running' and other.get('id') != spool_id:
+            other_wd = other.get('working_dir', '')
+            if other_wd and Path(other_wd).resolve() == wt_path:
+                return f"Error: Spool {other['id']} is still running in this worktree. Wait for it to complete or use spin_drop() first."
 
     # Find the main repo path
     main_repo = Path(worktree_path).parent.parent
