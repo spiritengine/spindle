@@ -14,6 +14,7 @@ A background thread monitors completion by polling the PID.
 import asyncio
 import json
 import os
+import re
 import signal
 import subprocess
 import threading
@@ -582,6 +583,207 @@ async def spin_drop(spool_id: str) -> str:
         stderr_path.unlink()
 
     return f"Dropped spool {spool_id}"
+
+
+@mcp.tool()
+async def spool_search(
+    query: str,
+    field: str = "both",
+) -> str:
+    """
+    Search spool prompts and/or results for a string.
+
+    Args:
+        query: The search string (case-insensitive)
+        field: Where to search - "prompt", "result", or "both" (default)
+
+    Returns:
+        Matching spool IDs with context snippets
+
+    Example:
+        spool_search("triage")              # search both
+        spool_search("human review", field="result")  # results only
+    """
+    all_spools = _list_spools()
+    matches = []
+    query_lower = query.lower()
+
+    for spool in all_spools:
+        spool_id = spool.get('id', 'unknown')
+        prompt = spool.get('prompt', '') or ''
+        result = spool.get('result', '') or ''
+
+        # Convert result to string if it's a dict
+        if isinstance(result, dict):
+            result = json.dumps(result)
+
+        prompt_match = query_lower in prompt.lower() if field in ('prompt', 'both') else False
+        result_match = query_lower in result.lower() if field in ('result', 'both') else False
+
+        if prompt_match or result_match:
+            match_info = {
+                'id': spool_id,
+                'status': spool.get('status'),
+                'created_at': spool.get('created_at'),
+            }
+
+            # Add context snippets
+            if prompt_match:
+                idx = prompt.lower().find(query_lower)
+                start = max(0, idx - 30)
+                end = min(len(prompt), idx + len(query) + 30)
+                match_info['prompt_match'] = f"...{prompt[start:end]}..."
+
+            if result_match:
+                idx = result.lower().find(query_lower)
+                start = max(0, idx - 50)
+                end = min(len(result), idx + len(query) + 50)
+                match_info['result_match'] = f"...{result[start:end]}..."
+
+            matches.append(match_info)
+
+    if not matches:
+        return f"No spools found matching '{query}' in {field}"
+
+    return json.dumps(matches, indent=2)
+
+
+@mcp.tool()
+async def spool_results(
+    status: str = "complete",
+    since: Optional[str] = None,
+    limit: int = 10,
+) -> str:
+    """
+    Bulk fetch spool results with filtering.
+
+    Args:
+        status: Filter by status - "complete", "error", "running", or "all" (default: complete)
+        since: Time filter - "1h", "6h", "1d", "7d" (default: no filter)
+        limit: Max results to return (default: 10)
+
+    Returns:
+        List of spool results matching filters
+
+    Example:
+        spool_results()                      # last 10 completed
+        spool_results(status="error")        # failed spools
+        spool_results(since="1h")            # last hour
+    """
+    all_spools = _list_spools()
+    now = datetime.now()
+
+    # Parse since filter
+    since_cutoff = None
+    if since:
+        since_map = {
+            '1h': timedelta(hours=1),
+            '6h': timedelta(hours=6),
+            '12h': timedelta(hours=12),
+            '1d': timedelta(days=1),
+            '7d': timedelta(days=7),
+        }
+        delta = since_map.get(since)
+        if delta:
+            since_cutoff = now - delta
+        else:
+            return f"Invalid since value '{since}'. Use: 1h, 6h, 12h, 1d, 7d"
+
+    # Filter spools
+    filtered = []
+    for spool in all_spools:
+        # Status filter
+        if status != "all" and spool.get('status') != status:
+            continue
+
+        # Time filter
+        if since_cutoff:
+            created_str = spool.get('created_at')
+            if created_str:
+                try:
+                    created = datetime.fromisoformat(created_str)
+                    if created < since_cutoff:
+                        continue
+                except ValueError:
+                    continue
+
+        filtered.append(spool)
+
+    # Sort by created_at descending
+    filtered.sort(key=lambda s: s.get('created_at', ''), reverse=True)
+
+    # Apply limit
+    filtered = filtered[:limit]
+
+    # Format output
+    results = []
+    for spool in filtered:
+        result_text = spool.get('result', '')
+        if isinstance(result_text, dict):
+            result_text = json.dumps(result_text)
+
+        results.append({
+            'id': spool.get('id'),
+            'status': spool.get('status'),
+            'prompt': spool.get('prompt', '')[:100],
+            'result': result_text[:500] if result_text else None,
+            'created_at': spool.get('created_at'),
+            'session_id': spool.get('session_id'),
+        })
+
+    if not results:
+        return f"No spools found with status='{status}'" + (f" since {since}" if since else "")
+
+    return json.dumps(results, indent=2)
+
+
+@mcp.tool()
+async def spool_grep(pattern: str) -> str:
+    """
+    Regex search through all spool results.
+
+    Args:
+        pattern: Regular expression pattern to search for
+
+    Returns:
+        Matching spool IDs with matched text
+
+    Example:
+        spool_grep("friction-[0-9]+-[a-z]+")    # find friction IDs in results
+        spool_grep("error|failed|exception")    # find error-related text
+    """
+    try:
+        regex = re.compile(pattern, re.IGNORECASE)
+    except re.error as e:
+        return f"Invalid regex pattern: {e}"
+
+    all_spools = _list_spools()
+    matches = []
+
+    for spool in all_spools:
+        spool_id = spool.get('id', 'unknown')
+        result = spool.get('result', '') or ''
+
+        # Convert result to string if it's a dict
+        if isinstance(result, dict):
+            result = json.dumps(result)
+
+        found = regex.findall(result)
+        if found:
+            # Get unique matches and limit to first 10
+            unique_matches = list(dict.fromkeys(found))[:10]
+            matches.append({
+                'id': spool_id,
+                'status': spool.get('status'),
+                'prompt': spool.get('prompt', '')[:80],
+                'matches': unique_matches,
+                'match_count': len(found),
+            })
+
+    if not matches:
+        return f"No results matching pattern '{pattern}'"
+
+    return json.dumps(matches, indent=2)
 
 
 if __name__ == "__main__":
