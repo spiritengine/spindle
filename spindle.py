@@ -1384,18 +1384,26 @@ async def shard_abandon(spool_id: str, keep_branch: bool = False) -> str:
 @mcp.tool()
 async def spindle_reload() -> str:
     """
-    Signal spindle to reload (requires wrapper script).
+    Restart spindle to pick up code changes.
 
-    Write a signal file that the wrapper script watches for.
-    The wrapper will restart spindle with fresh code.
+    This exits the spindle process. Claude Code will automatically restart it,
+    picking up any code changes.
 
     Returns:
-        Status message
+        Status message (though you may not see it due to restart)
     """
-    signal_file = Path.home() / ".spindle" / "reload_signal"
-    signal_file.parent.mkdir(parents=True, exist_ok=True)
-    signal_file.write_text(datetime.now().isoformat())
-    return "Reload signal sent. If running with wrapper, spindle will restart."
+    import sys
+    import os
+
+    # Schedule exit after returning response
+    def delayed_exit():
+        time.sleep(0.5)  # Give time for response to be sent
+        os._exit(0)
+
+    exit_thread = threading.Thread(target=delayed_exit, daemon=True)
+    exit_thread.start()
+
+    return "Spindle restarting... Claude Code will reconnect automatically."
 
 
 if __name__ == "__main__":
