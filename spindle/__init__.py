@@ -1409,6 +1409,9 @@ async def shard_merge(spool_id: str, keep_branch: bool = False, caller_cwd: str 
     Example:
         shard_merge("abc123")  # merge and cleanup
     """
+    if not caller_cwd:
+        return "Error: caller_cwd required. Pass your current working directory to prevent deleting a worktree you're inside of."
+
     spool = _read_spool(spool_id)
 
     if not spool:
@@ -1505,6 +1508,9 @@ async def shard_abandon(spool_id: str, keep_branch: bool = False, caller_cwd: st
     Example:
         shard_abandon("abc123")  # discard shard
     """
+    if not caller_cwd:
+        return "Error: caller_cwd required. Pass your current working directory to prevent deleting a worktree you're inside of."
+
     spool = _read_spool(spool_id)
 
     if not spool:
