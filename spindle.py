@@ -1431,8 +1431,15 @@ async def spindle_reload() -> str:
 
 if __name__ == "__main__":
     import sys
+    import argparse
     import traceback
     import atexit
+
+    parser = argparse.ArgumentParser(description="Spindle MCP server")
+    parser.add_argument("--http", action="store_true", help="Run as HTTP server instead of stdio")
+    parser.add_argument("--port", type=int, default=8002, help="HTTP port (default: 8002)")
+    parser.add_argument("--host", default="127.0.0.1", help="HTTP host (default: 127.0.0.1)")
+    args = parser.parse_args()
 
     log_path = Path.home() / ".spindle" / "spindle.log"
 
@@ -1440,8 +1447,12 @@ if __name__ == "__main__":
         with open(log_path, "a") as f:
             f.write(f"{datetime.now().isoformat()} {msg}\n")
 
+    # Ensure spindle directory exists
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
     # Log startup
-    log(f"STARTUP pid={os.getpid()}")
+    mode = f"HTTP {args.host}:{args.port}" if args.http else "stdio"
+    log(f"STARTUP pid={os.getpid()} mode={mode}")
 
     # Log uncaught exceptions
     def exception_handler(exc_type, exc_value, exc_tb):
@@ -1467,5 +1478,8 @@ if __name__ == "__main__":
     atexit.register(exit_handler)
 
     log("STARTING mcp.run()")
-    mcp.run()
+    if args.http:
+        mcp.run(transport="streamable-http", host=args.host, port=args.port)
+    else:
+        mcp.run()
     log("FINISHED mcp.run()")
