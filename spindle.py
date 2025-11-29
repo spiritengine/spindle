@@ -1571,24 +1571,38 @@ async def spindle_reload() -> str:
     """
     Restart spindle to pick up code changes.
 
-    This exits the spindle process. Claude Code will automatically restart it,
-    picking up any code changes.
+    Uses systemctl --user restart spindle. Requires spindle systemd service.
 
     Returns:
-        Status message (though you may not see it due to restart)
+        Status message
     """
-    import sys
-    import os
+    # Check if systemd service exists (even if not running)
+    result = subprocess.run(
+        ['systemctl', '--user', 'list-unit-files', 'spindle.service'],
+        capture_output=True,
+        text=True
+    )
 
-    # Schedule exit after returning response
-    def delayed_exit():
+    if 'spindle.service' not in result.stdout:
+        return "Error: spindle.service not found. Restart manually."
+
+    # Check if currently active
+    is_active = subprocess.run(
+        ['systemctl', '--user', 'is-active', 'spindle'],
+        capture_output=True
+    ).returncode == 0
+
+    def delayed_restart():
         time.sleep(0.5)  # Give time for response to be sent
-        os._exit(0)
+        if is_active:
+            subprocess.run(['systemctl', '--user', 'restart', 'spindle'])
+        else:
+            subprocess.run(['systemctl', '--user', 'start', 'spindle'])
 
-    exit_thread = threading.Thread(target=delayed_exit, daemon=True)
-    exit_thread.start()
+    restart_thread = threading.Thread(target=delayed_restart, daemon=True)
+    restart_thread.start()
 
-    return "Spindle restarting... Claude Code will reconnect automatically."
+    return "Restarting via systemd..." if is_active else "Starting via systemd..."
 
 
 if __name__ == "__main__":
