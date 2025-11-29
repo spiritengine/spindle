@@ -1311,7 +1311,7 @@ async def shard_status(spool_id: str) -> str:
 
 
 @mcp.tool()
-async def shard_merge(spool_id: str, keep_branch: bool = False) -> str:
+async def shard_merge(spool_id: str, keep_branch: bool = False, caller_cwd: str | None = None) -> str:
     """
     Merge a shard's changes back to master and clean up the worktree.
 
@@ -1321,6 +1321,9 @@ async def shard_merge(spool_id: str, keep_branch: bool = False) -> str:
     Args:
         spool_id: The spool_id with a shard to merge
         keep_branch: Keep the branch after merge (default: delete)
+        caller_cwd: Optional current working directory of the caller. If provided
+            and the cwd is inside the worktree, the operation will be refused to
+            prevent breaking the caller's shell.
 
     Returns:
         Success or error message
@@ -1345,6 +1348,14 @@ async def shard_merge(spool_id: str, keep_branch: bool = False) -> str:
 
     if not worktree_path or not Path(worktree_path).exists():
         return f"Error: Worktree no longer exists: {worktree_path}"
+
+    # Check if caller's cwd is inside the worktree (would break their shell)
+    if caller_cwd:
+        caller_path = Path(caller_cwd).resolve()
+        wt_path = Path(worktree_path).resolve()
+        if caller_path == wt_path or wt_path in caller_path.parents:
+            main_repo = wt_path.parent.parent
+            return f"Error: Cannot delete worktree - your working directory is inside it. Run `cd {main_repo}` first."
 
     # Find the main repo path
     main_repo = Path(worktree_path).parent.parent  # worktrees/name -> repo
@@ -1389,7 +1400,7 @@ async def shard_merge(spool_id: str, keep_branch: bool = False) -> str:
 
 
 @mcp.tool()
-async def shard_abandon(spool_id: str, keep_branch: bool = False) -> str:
+async def shard_abandon(spool_id: str, keep_branch: bool = False, caller_cwd: str | None = None) -> str:
     """
     Abandon a shard, removing the worktree without merging.
 
@@ -1398,6 +1409,9 @@ async def shard_abandon(spool_id: str, keep_branch: bool = False) -> str:
     Args:
         spool_id: The spool_id with a shard to abandon
         keep_branch: Keep the branch for later (default: delete)
+        caller_cwd: Optional current working directory of the caller. If provided
+            and the cwd is inside the worktree, the operation will be refused to
+            prevent breaking the caller's shell.
 
     Returns:
         Success or error message
@@ -1418,6 +1432,14 @@ async def shard_abandon(spool_id: str, keep_branch: bool = False) -> str:
 
     if not worktree_path:
         return f"Error: No worktree path in shard info"
+
+    # Check if caller's cwd is inside the worktree (would break their shell)
+    if caller_cwd:
+        caller_path = Path(caller_cwd).resolve()
+        wt_path = Path(worktree_path).resolve()
+        if wt_path.exists() and (caller_path == wt_path or wt_path in caller_path.parents):
+            main_repo = wt_path.parent.parent
+            return f"Error: Cannot delete worktree - your working directory is inside it. Run `cd {main_repo}` first."
 
     # Find the main repo path
     main_repo = Path(worktree_path).parent.parent
