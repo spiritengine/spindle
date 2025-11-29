@@ -525,6 +525,13 @@ async def spin(
 
     cmd = ['claude', '-p', prompt, '--output-format', 'json']
 
+    # Auto-accept edits for non-interactive execution
+    # Use acceptEdits for careful mode, bypassPermissions for full/shard
+    if permission in ('full', 'shard') or (permission and '+shard' in permission):
+        cmd.extend(['--permission-mode', 'bypassPermissions'])
+    else:
+        cmd.extend(['--permission-mode', 'acceptEdits'])
+
     if system_prompt:
         cmd.extend(['--system-prompt', system_prompt])
 
