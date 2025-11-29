@@ -547,13 +547,16 @@ def _spin_sync(
             '--ro-bind', '/', '/',                    # Root read-only
             '--bind', cwd, cwd,                       # Worktree writable
             '--bind', '/tmp', '/tmp',                 # Tmp writable
-            '--bind', f'{home}/.claude', f'{home}/.claude',         # Claude config
-            '--bind', f'{home}/.anthropic', f'{home}/.anthropic',   # API keys
-            '--bind', f'{home}/.spindle', f'{home}/.spindle',       # Spindle state
             '--dev', '/dev',
             '--proc', '/proc',
             '--chdir', cwd,
-        ] + claude_cmd
+        ]
+        # Conditionally bind config dirs if they exist
+        for config_dir in ['.claude', '.anthropic', '.spindle', '.config']:
+            path = f'{home}/{config_dir}'
+            if Path(path).exists():
+                cmd.extend(['--bind', path, path])
+        cmd.extend(claude_cmd)
     else:
         cmd = claude_cmd
 
