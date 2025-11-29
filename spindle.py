@@ -588,10 +588,22 @@ async def spin(
         result = unspool(spool_id)
     """
     import asyncio
-    return await asyncio.to_thread(
-        _spin_sync, prompt, permission, shard, system_prompt,
-        working_dir, allowed_tools, tags
-    )
+    import sys
+    # Debug: log entry/exit
+    with open(Path.home() / ".spindle" / "debug.log", "a") as f:
+        f.write(f"{datetime.now().isoformat()} SPIN_ENTER prompt={prompt[:30]}...\n")
+    try:
+        result = await asyncio.to_thread(
+            _spin_sync, prompt, permission, shard, system_prompt,
+            working_dir, allowed_tools, tags
+        )
+        with open(Path.home() / ".spindle" / "debug.log", "a") as f:
+            f.write(f"{datetime.now().isoformat()} SPIN_EXIT result={result}\n")
+        return result
+    except Exception as e:
+        with open(Path.home() / ".spindle" / "debug.log", "a") as f:
+            f.write(f"{datetime.now().isoformat()} SPIN_ERROR {e}\n")
+        raise
 
 
 def _unspool_sync(spool_id: str) -> str:
