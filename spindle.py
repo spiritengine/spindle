@@ -25,8 +25,27 @@ from pathlib import Path
 from typing import Optional, Dict, Any
 
 from fastmcp import FastMCP
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
-mcp = FastMCP("spindle")
+mcp = FastMCP("spindle", stateless_http=True)
+
+# Track server start time for uptime calculation
+_server_start_time = datetime.now()
+
+
+@mcp.custom_route("/health", methods=["GET"])
+async def health_check(request: Request) -> JSONResponse:
+    """Health check endpoint for monitoring and systemd watchdog."""
+    uptime_seconds = (datetime.now() - _server_start_time).total_seconds()
+    running_count = _count_running()
+
+    return JSONResponse({
+        "status": "healthy",
+        "uptime_seconds": int(uptime_seconds),
+        "running_spools": running_count,
+        "max_concurrent": MAX_CONCURRENT,
+    })
 
 # Storage directory
 SPINDLE_DIR = Path.home() / ".spindle" / "spools"
