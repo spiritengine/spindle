@@ -184,21 +184,31 @@ Spools persist to `~/.spindle/spools/{spool_id}.json`:
 }
 ```
 
-## Development: Hot Reload
+## CLI Commands
 
-For development, use the wrapper script to enable hot reload:
-
-```json
-{
-  "mcpServers": {
-    "spindle": {
-      "command": "/path/to/spindle/spindle-wrapper.sh"
-    }
-  }
-}
+```bash
+spindle start   # Start via systemd (or background if no service)
+spindle reload  # Restart via systemd to pick up code changes
+spindle status  # Check if running (hits /health endpoint)
+spindle serve --http  # Run MCP server directly (what systemd calls)
 ```
 
-Then after making code changes, call `spindle_reload()` and the server restarts with fresh code - no need to restart Claude Code.
+### systemd Service
+
+For production, use the systemd service:
+
+```bash
+# Install service (copy to ~/.config/systemd/user/spindle.service)
+systemctl --user daemon-reload
+systemctl --user enable spindle
+systemctl --user start spindle
+```
+
+Then `spindle reload` works to restart after code changes.
+
+### Hot Reload (MCP tool)
+
+From within Claude Code, call `spindle_reload()` to restart the server and pick up code changes.
 
 ## Limits
 
