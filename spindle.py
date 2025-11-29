@@ -6,12 +6,18 @@ Lets CC agents spawn other CC agents, all using Max subscription credits.
 Async by default - spin returns immediately, check results later.
 
 Storage: ~/.spindle/spools/{spool_id}.json
+
+Subprocess handling: Uses detached processes that survive MCP reconnects.
+A background thread monitors completion by polling the PID.
 """
 
 import asyncio
 import json
 import os
 import signal
+import subprocess
+import threading
+import time
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -24,16 +30,26 @@ mcp = FastMCP("spindle")
 # Storage directory
 SPINDLE_DIR = Path.home() / ".spindle" / "spools"
 
-# In-memory tracking of background asyncio tasks (not persisted)
-_background_tasks: Dict[str, asyncio.Task] = {}
-
 # Concurrency limit
 MAX_CONCURRENT = 5
+
+# Poll interval for monitoring detached processes
+MONITOR_POLL_INTERVAL = 2  # seconds
 
 
 def _get_spool_path(spool_id: str) -> Path:
     """Get path to spool JSON file."""
     return SPINDLE_DIR / f"{spool_id}.json"
+
+
+def _get_output_path(spool_id: str) -> Path:
+    """Get path to stdout file for a spool."""
+    return SPINDLE_DIR / f"{spool_id}.stdout"
+
+
+def _get_stderr_path(spool_id: str) -> Path:
+    """Get path to stderr file for a spool."""
+    return SPINDLE_DIR / f"{spool_id}.stderr"
 
 
 def _write_spool(spool_id: str, data: dict) -> None:
@@ -54,8 +70,11 @@ def _read_spool(spool_id: str) -> Optional[dict]:
     if not path.exists():
         return None
 
-    with open(path) as f:
-        return json.load(f)
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, IOError):
+        return None
 
 
 def _list_spools() -> list[dict]:
@@ -99,91 +118,125 @@ def _cleanup_old_spools() -> None:
             with open(path) as f:
                 data = json.load(f)
 
+            spool_id = data.get('id', path.stem)
             created = datetime.fromisoformat(data.get('created_at', ''))
             if created < cutoff:
                 path.unlink()
+                # Also clean up output files
+                stdout_path = _get_output_path(spool_id)
+                stderr_path = _get_stderr_path(spool_id)
+                if stdout_path.exists():
+                    stdout_path.unlink()
+                if stderr_path.exists():
+                    stderr_path.unlink()
         except Exception:
             pass
 
 
-def _recover_orphans() -> None:
-    """Mark spools as error if their process died."""
-    for spool in _list_spools():
-        if spool.get('status') != 'running':
-            continue
+def _check_and_finalize_spool(spool_id: str) -> bool:
+    """
+    Check if a spool's process has finished and finalize it.
+    Returns True if the spool was finalized, False if still running.
+    """
+    spool = _read_spool(spool_id)
+    if not spool or spool.get('status') != 'running':
+        return True  # Already done
 
-        pid = spool.get('pid')
-        if pid and not _is_pid_alive(pid):
+    pid = spool.get('pid')
+    if not pid:
+        return False  # No PID yet, still starting
+
+    if _is_pid_alive(pid):
+        return False  # Still running
+
+    # Process finished - read output and finalize
+    stdout_path = _get_output_path(spool_id)
+    stderr_path = _get_stderr_path(spool_id)
+
+    stdout = ""
+    stderr = ""
+
+    if stdout_path.exists():
+        try:
+            stdout = stdout_path.read_text()
+        except IOError:
+            pass
+
+    if stderr_path.exists():
+        try:
+            stderr = stderr_path.read_text()
+        except IOError:
+            pass
+
+    # Parse result
+    try:
+        data = json.loads(stdout)
+        spool['result'] = data.get('result', stdout)
+        spool['session_id'] = data.get('session_id')
+        spool['cost'] = data.get('cost')
+        spool['status'] = 'complete'
+    except json.JSONDecodeError:
+        if stdout.strip():
+            spool['result'] = stdout
+            spool['status'] = 'complete'
+        elif stderr.strip():
             spool['status'] = 'error'
-            spool['error'] = 'Process died unexpectedly (orphaned on server restart)'
-            spool['completed_at'] = datetime.now().isoformat()
-            _write_spool(spool['id'], spool)
+            spool['error'] = stderr[:500]
+        else:
+            spool['status'] = 'error'
+            spool['error'] = 'Process exited with no output'
+
+    spool['completed_at'] = datetime.now().isoformat()
+    _write_spool(spool_id, spool)
+
+    # Clean up output files
+    if stdout_path.exists():
+        stdout_path.unlink()
+    if stderr_path.exists():
+        stderr_path.unlink()
+
+    return True
+
+
+def _recover_orphans() -> None:
+    """Check all running spools and finalize any that have completed."""
+    for spool in _list_spools():
+        if spool.get('status') == 'running':
+            _check_and_finalize_spool(spool['id'])
+
+
+def _monitor_spool(spool_id: str) -> None:
+    """Background thread that monitors a spool until completion."""
+    while True:
+        if _check_and_finalize_spool(spool_id):
+            break
+        time.sleep(MONITOR_POLL_INTERVAL)
+
+
+def _spawn_detached(spool_id: str, cmd: list, cwd: str) -> int:
+    """
+    Spawn a detached process that survives parent death.
+    Returns the PID.
+    """
+    stdout_path = _get_output_path(spool_id)
+    stderr_path = _get_stderr_path(spool_id)
+
+    with open(stdout_path, 'w') as stdout_file, open(stderr_path, 'w') as stderr_file:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=stdout_file,
+            stderr=stderr_file,
+            cwd=cwd,
+            env=os.environ.copy(),
+            start_new_session=True,  # Detach from parent
+        )
+
+    return proc.pid
 
 
 # Run cleanup and recovery on module load
 _cleanup_old_spools()
 _recover_orphans()
-
-
-async def _run_claude(spool_id: str, cmd: list, cwd: str):
-    """Background task that runs claude and stores result."""
-    spool = _read_spool(spool_id)
-    if not spool:
-        return
-
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=cwd,
-            env=os.environ.copy()
-        )
-
-        # Store PID immediately
-        spool['pid'] = proc.pid
-        _write_spool(spool_id, spool)
-
-        stdout, stderr = await proc.communicate()
-
-        spool = _read_spool(spool_id)  # Re-read in case of updates
-        if not spool:
-            return
-
-        if proc.returncode != 0:
-            spool['status'] = 'error'
-            spool['error'] = f"Exit {proc.returncode}: {stderr.decode()[:500]}"
-        else:
-            try:
-                data = json.loads(stdout.decode())
-                spool['result'] = data.get('result', stdout.decode())
-                spool['session_id'] = data.get('session_id')
-                spool['cost'] = data.get('cost')
-            except json.JSONDecodeError:
-                spool['result'] = stdout.decode()
-            spool['status'] = 'complete'
-
-        spool['completed_at'] = datetime.now().isoformat()
-        _write_spool(spool_id, spool)
-
-    except asyncio.CancelledError:
-        spool = _read_spool(spool_id)
-        if spool:
-            spool['status'] = 'error'
-            spool['error'] = 'Spool was cancelled'
-            spool['completed_at'] = datetime.now().isoformat()
-            _write_spool(spool_id, spool)
-        raise
-    except Exception as e:
-        spool = _read_spool(spool_id)
-        if spool:
-            spool['status'] = 'error'
-            spool['error'] = str(e)
-            spool['completed_at'] = datetime.now().isoformat()
-            _write_spool(spool_id, spool)
-    finally:
-        # Clean up background task reference
-        _background_tasks.pop(spool_id, None)
 
 
 @mcp.tool()
@@ -247,13 +300,17 @@ async def spin(
 
     _write_spool(spool_id, spool)
 
-    # Update status to running
+    # Spawn detached process
+    pid = _spawn_detached(spool_id, cmd, cwd)
+
+    # Update spool with PID and status
+    spool['pid'] = pid
     spool['status'] = 'running'
     _write_spool(spool_id, spool)
 
-    # Fire and forget - run in background
-    bg_task = asyncio.create_task(_run_claude(spool_id, cmd, cwd))
-    _background_tasks[spool_id] = bg_task
+    # Start background monitor thread (daemon so it won't block shutdown)
+    monitor = threading.Thread(target=_monitor_spool, args=(spool_id,), daemon=True)
+    monitor.start()
 
     return spool_id
 
@@ -269,6 +326,9 @@ async def unspool(spool_id: str) -> str:
     Returns:
         Result if complete, status if still running, error if failed
     """
+    # First check if we need to finalize
+    _check_and_finalize_spool(spool_id)
+
     spool = _read_spool(spool_id)
 
     if not spool:
@@ -279,6 +339,15 @@ async def unspool(spool_id: str) -> str:
     if status == 'pending':
         return f"Spool {spool_id} pending (not yet started)"
     elif status == 'running':
+        # Double-check if process is still alive
+        pid = spool.get('pid')
+        if pid and not _is_pid_alive(pid):
+            _check_and_finalize_spool(spool_id)
+            spool = _read_spool(spool_id)
+            if spool.get('status') == 'complete':
+                return spool.get('result', 'No result')
+            elif spool.get('status') == 'error':
+                return f"Spool {spool_id} failed: {spool.get('error', 'Unknown error')}"
         return f"Spool {spool_id} still running: {spool.get('prompt', '')[:50]}..."
     elif status == 'complete':
         return spool.get('result', 'No result')
@@ -294,6 +363,9 @@ async def spools() -> str:
     Returns:
         JSON object with spool statuses
     """
+    # Check for any finished spools first
+    _recover_orphans()
+
     all_spools = _list_spools()
 
     return json.dumps({
@@ -339,7 +411,7 @@ async def respin(
 
     spool = {
         'id': spool_id,
-        'status': 'running',
+        'status': 'pending',
         'prompt': f"Continue {session_id}: {prompt}",
         'result': None,
         'session_id': session_id,
@@ -355,8 +427,16 @@ async def respin(
 
     _write_spool(spool_id, spool)
 
-    bg_task = asyncio.create_task(_run_claude(spool_id, cmd, cwd))
-    _background_tasks[spool_id] = bg_task
+    # Spawn detached process
+    pid = _spawn_detached(spool_id, cmd, cwd)
+
+    spool['pid'] = pid
+    spool['status'] = 'running'
+    _write_spool(spool_id, spool)
+
+    # Start background monitor
+    monitor = threading.Thread(target=_monitor_spool, args=(spool_id,), daemon=True)
+    monitor.start()
 
     return spool_id
 
@@ -386,6 +466,7 @@ async def spin_wait(
         # Return as soon as any completes
         while True:
             for spool_id in ids:
+                _check_and_finalize_spool(spool_id)
                 spool = _read_spool(spool_id)
                 if not spool:
                     return f"Error: Unknown spool_id '{spool_id}'"
@@ -407,6 +488,7 @@ async def spin_wait(
 
         while pending:
             for spool_id in list(pending):
+                _check_and_finalize_spool(spool_id)
                 spool = _read_spool(spool_id)
                 if not spool:
                     return f"Error: Unknown spool_id '{spool_id}'"
@@ -454,24 +536,31 @@ async def spin_drop(spool_id: str) -> str:
     if not pid:
         return f"Spool {spool_id} has no PID recorded yet"
 
-    # Cancel the asyncio task if we have a reference
-    bg_task = _background_tasks.get(spool_id)
-    if bg_task:
-        bg_task.cancel()
-
-    # Kill the process
+    # Kill the process group (since we used start_new_session)
     try:
-        os.kill(pid, signal.SIGTERM)
+        os.killpg(pid, signal.SIGTERM)
     except ProcessLookupError:
         pass  # Already dead
-    except OSError as e:
-        return f"Error killing process: {e}"
+    except OSError:
+        # Try killing just the process
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except (ProcessLookupError, OSError):
+            pass
 
     # Update spool status
     spool['status'] = 'error'
     spool['error'] = 'Cancelled by user'
     spool['completed_at'] = datetime.now().isoformat()
     _write_spool(spool_id, spool)
+
+    # Clean up output files
+    stdout_path = _get_output_path(spool_id)
+    stderr_path = _get_stderr_path(spool_id)
+    if stdout_path.exists():
+        stdout_path.unlink()
+    if stderr_path.exists():
+        stderr_path.unlink()
 
     return f"Dropped spool {spool_id}"
 

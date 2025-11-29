@@ -1,0 +1,6 @@
+Metadata-Version: 2.4
+Name: spindle
+Version: 1.0.0
+Summary: MCP server for Claude Code to Claude Code delegation
+Requires-Python: >=3.10
+Requires-Dist: fastmcp>=2.0.0

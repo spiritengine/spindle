@@ -1,0 +1,9 @@
+README.md
+pyproject.toml
+spindle.py
+spindle.egg-info/PKG-INFO
+spindle.egg-info/SOURCES.txt
+spindle.egg-info/dependency_links.txt
+spindle.egg-info/entry_points.txt
+spindle.egg-info/requires.txt
+spindle.egg-info/top_level.txt
