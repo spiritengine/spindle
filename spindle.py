@@ -456,6 +456,29 @@ def _recover_orphans() -> None:
 def _monitor_spool(spool_id: str) -> None:
     """Background thread that monitors a spool until completion."""
     while True:
+        # Check for timeout
+        spool = _read_spool(spool_id)
+        if spool and spool.get('timeout'):
+            created = datetime.fromisoformat(spool['created_at'])
+            elapsed = (datetime.now() - created).total_seconds()
+            if elapsed > spool['timeout']:
+                # Kill the process
+                pid = spool.get('pid')
+                if pid and _is_pid_alive(pid):
+                    try:
+                        os.kill(pid, signal.SIGTERM)
+                        time.sleep(0.5)
+                        if _is_pid_alive(pid):
+                            os.kill(pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                # Mark as timeout
+                spool['status'] = 'timeout'
+                spool['error'] = f'Timeout after {spool["timeout"]}s'
+                spool['completed_at'] = datetime.now().isoformat()
+                _write_spool(spool_id, spool)
+                break
+
         if _check_and_finalize_spool(spool_id):
             break
         time.sleep(MONITOR_POLL_INTERVAL)
@@ -495,6 +518,8 @@ def _spin_sync(
     working_dir: Optional[str],
     allowed_tools: Optional[str],
     tags: Optional[str],
+    model: Optional[str],
+    timeout: Optional[int],
 ) -> str:
     """Synchronous implementation of spin - runs in thread pool."""
     # Check concurrency limit
@@ -525,6 +550,9 @@ def _spin_sync(
             return f"Error: Failed to create SHARD worktree. Check git repo status."
 
     claude_cmd = ['claude', '-p', prompt, '--output-format', 'json']
+
+    if model:
+        claude_cmd.extend(['--model', model])
 
     # Auto-accept edits for non-interactive execution
     # Use acceptEdits for careful mode, bypassPermissions for full/shard
@@ -576,6 +604,8 @@ def _spin_sync(
         'system_prompt': system_prompt,
         'tags': tag_list,
         'shard': shard_info,
+        'model': model,
+        'timeout': timeout,
         'created_at': datetime.now().isoformat(),
         'completed_at': None,
         'pid': None,
@@ -608,6 +638,8 @@ async def spin(
     working_dir: Optional[str] = None,
     allowed_tools: Optional[str] = None,
     tags: Optional[str] = None,
+    model: Optional[str] = None,
+    timeout: Optional[int] = None,
 ) -> str:
     """
     Spawn a Claude Code agent to handle a task. Returns immediately with spool_id.
@@ -623,6 +655,8 @@ async def spin(
         working_dir: Directory for the agent to work in (defaults to current)
         allowed_tools: Override permission profile with explicit tool list
         tags: Comma-separated tags for organizing spools (e.g. "batch-1,triage")
+        model: Model to use - "haiku", "sonnet", or "opus" (default: inherit)
+        timeout: Kill spool after this many seconds (default: no timeout)
 
     Returns:
         spool_id to check result later
@@ -631,6 +665,7 @@ async def spin(
         spool_id = spin("Research the Python GIL")
         spool_id = spin("Fix the bug", permission="shard")  # full access + isolation
         spool_id = spin("Careful work", permission="careful+shard")
+        spool_id = spin("Quick task", model="haiku", timeout=60)
         result = unspool(spool_id)
     """
     import asyncio
@@ -641,7 +676,7 @@ async def spin(
     try:
         result = await asyncio.to_thread(
             _spin_sync, prompt, permission, shard, system_prompt,
-            working_dir, allowed_tools, tags
+            working_dir, allowed_tools, tags, model, timeout
         )
         with open(Path.home() / ".spindle" / "debug.log", "a") as f:
             f.write(f"{datetime.now().isoformat()} SPIN_EXIT result={result}\n")
@@ -1098,6 +1133,49 @@ async def spool_grep(pattern: str) -> str:
         return f"No results matching pattern '{pattern}'"
 
     return json.dumps(matches, indent=2)
+
+
+@mcp.tool()
+async def spool_peek(spool_id: str, lines: int = 50) -> str:
+    """
+    See partial output of a running spool.
+
+    Useful for debugging stuck spools or monitoring progress.
+
+    Args:
+        spool_id: The spool_id to peek at
+        lines: Number of lines to return from the end (default: 50)
+
+    Returns:
+        Last N lines of stdout, or error if spool not found
+
+    Example:
+        spool_peek("abc123")          # see last 50 lines
+        spool_peek("abc123", lines=100)  # see last 100 lines
+    """
+    spool = _read_spool(spool_id)
+    if not spool:
+        return f"Error: Unknown spool_id '{spool_id}'"
+
+    stdout_path = _get_output_path(spool_id)
+    if not stdout_path.exists():
+        return f"No output yet for spool {spool_id}"
+
+    try:
+        with open(stdout_path, 'r') as f:
+            all_lines = f.readlines()
+
+        if not all_lines:
+            return f"Output file exists but is empty for spool {spool_id}"
+
+        # Get last N lines
+        tail = all_lines[-lines:] if len(all_lines) > lines else all_lines
+        status = spool.get('status', 'unknown')
+
+        header = f"[spool {spool_id} - {status} - {len(all_lines)} total lines, showing last {len(tail)}]\n"
+        return header + ''.join(tail)
+    except Exception as e:
+        return f"Error reading output: {e}"
 
 
 @mcp.tool()
