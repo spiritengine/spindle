@@ -62,11 +62,11 @@ MONITOR_POLL_INTERVAL = 2  # seconds
 # Profiles ending with "+shard" auto-enable shard isolation
 PERMISSION_PROFILES = {
     "readonly": "Read,Grep,Glob,Bash(ls:*),Bash(cat:*),Bash(head:*),Bash(tail:*),Bash(git status:*),Bash(git log:*),Bash(git diff:*)",
-    "careful": "Read,Write,Edit,Grep,Glob,Bash(git:*),Bash(make:*),Bash(pytest:*),Bash(python:*),Bash(npm:*),Bash(skein:*)",
+    "careful": "Read,Write,Edit,Grep,Glob,Bash(git:*),Bash(make:*),Bash(pytest:*),Bash(python:*),Bash(npm:*),Bash(skein:*),Bash(muster:*)",
     "full": None,  # None means no restrictions
     # Shard variants - same permissions but auto-enable worktree isolation
     "shard": None,  # Full permissions + shard isolation (common combo)
-    "careful+shard": "Read,Write,Edit,Grep,Glob,Bash(git:*),Bash(make:*),Bash(pytest:*),Bash(python:*),Bash(npm:*),Bash(skein:*)",
+    "careful+shard": "Read,Write,Edit,Grep,Glob,Bash(git:*),Bash(make:*),Bash(pytest:*),Bash(python:*),Bash(npm:*),Bash(skein:*),Bash(muster:*)",
 }
 
 # Cache for SKEIN availability check
@@ -668,23 +668,10 @@ async def spin(
         spool_id = spin("Quick task", model="haiku", timeout=60)
         result = unspool(spool_id)
     """
-    import asyncio
-    import sys
-    # Debug: log entry/exit
-    with open(Path.home() / ".spindle" / "debug.log", "a") as f:
-        f.write(f"{datetime.now().isoformat()} SPIN_ENTER prompt={prompt[:30]}...\n")
-    try:
-        result = await asyncio.to_thread(
-            _spin_sync, prompt, permission, shard, system_prompt,
-            working_dir, allowed_tools, tags, model, timeout
-        )
-        with open(Path.home() / ".spindle" / "debug.log", "a") as f:
-            f.write(f"{datetime.now().isoformat()} SPIN_EXIT result={result}\n")
-        return result
-    except Exception as e:
-        with open(Path.home() / ".spindle" / "debug.log", "a") as f:
-            f.write(f"{datetime.now().isoformat()} SPIN_ERROR {e}\n")
-        raise
+    return await asyncio.to_thread(
+        _spin_sync, prompt, permission, shard, system_prompt,
+        working_dir, allowed_tools, tags, model, timeout
+    )
 
 
 def _unspool_sync(spool_id: str) -> str:

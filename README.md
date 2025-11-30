@@ -1,6 +1,26 @@
 # Spindle
 
-MCP server for Claude Code to Claude Code delegation. Fire-and-forget async work using Max subscription credits.
+<!-- Uncomment when published:
+[![PyPI version](https://badge.fury.io/py/spindle.svg)](https://badge.fury.io/py/spindle)
+[![CI](https://github.com/OWNER/spindle/actions/workflows/ci.yml/badge.svg)](https://github.com/OWNER/spindle/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+-->
+
+MCP server for Claude Code to Claude Code delegation. Spawn background agents that run asynchronously, with optional git worktree isolation for safe parallel work.
+
+## Features
+
+- **Async agent spawning** - Fire-and-forget pattern with spool IDs
+- **Permission profiles** - Control what tools child agents can use (readonly, careful, full)
+- **Shard isolation** - Run agents in isolated git worktrees to prevent conflicts
+- **Session continuity** - Resume conversations with child agents
+- **Rich querying** - Search, filter, and export spool results
+
+## Requirements
+
+- Python 3.10+
+- [Claude CLI](https://docs.anthropic.com/en/docs/claude-code) installed and authenticated
+- Git (for shard/worktree functionality)
 
 ## Install
 
@@ -210,8 +230,35 @@ Then `spindle reload` works to restart after code changes.
 
 From within Claude Code, call `spindle_reload()` to restart the server and pick up code changes.
 
+## Configuration
+
+Environment variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SPINDLE_MAX_CONCURRENT` | `5` | Maximum concurrent spools |
+
+Storage location: `~/.spindle/spools/`
+
+## How It Works
+
+1. **spin()** spawns a detached `claude` CLI process with the given prompt
+2. The process runs in background, writing output to temporary files
+3. A monitor thread polls for completion
+4. **unspool()** returns the result once complete (non-blocking check)
+5. Spool metadata persists to JSON files, surviving server restarts
+
+For shards:
+1. A git worktree is created with a new branch
+2. The agent runs inside that worktree
+3. After completion, merge back with `shard_merge()` or discard with `shard_abandon()`
+
 ## Limits
 
-- Max 5 concurrent spools
+- Max 5 concurrent spools (configurable via `SPINDLE_MAX_CONCURRENT`)
 - 24h auto-cleanup of old spools
 - Orphaned spools (dead process) marked as error on restart
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and guidelines.
