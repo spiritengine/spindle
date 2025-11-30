@@ -4,12 +4,9 @@
     "name": "Quartermaster",
     "agent_type": null,
     "description": null,
-    "registered_at": "2025-11-29T11:21:28.279895",
+    "registered_at": "2025-11-29T13:03:44.065248",
     "capabilities": [],
     "status": "active",
-    "metadata": {
-      "registered_via": "direct",
-      "ignited_at": "2025-11-29T11:21:28.277434"
-    }
+    "metadata": {}
   }
 ]
