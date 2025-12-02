@@ -1636,11 +1636,18 @@ If status is `incomplete` and work is worth continuing, create a brief for the r
 
 Be honest about confidence - low confidence is fine, it just means human review needed."""
 
-    return await spin(
-        prompt=prompt,
-        permission="careful",  # Needs to run git, skein commands
-        working_dir=worktree_path,
-        skeinless=True,  # Triage agent doesn't need SKEIN lifecycle
+    return await asyncio.to_thread(
+        _spin_sync,
+        prompt,
+        "careful",  # permission - needs git, skein commands
+        False,      # shard
+        None,       # system_prompt
+        worktree_path,  # working_dir
+        None,       # allowed_tools
+        "triage",   # tags
+        None,       # model
+        None,       # timeout
+        True,       # skeinless
     )
 
 
