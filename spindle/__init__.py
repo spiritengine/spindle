@@ -520,6 +520,7 @@ def _spin_sync(
     tags: Optional[str],
     model: Optional[str],
     timeout: Optional[int],
+    skeinless: bool,
 ) -> str:
     """Synchronous implementation of spin - runs in thread pool."""
     # Check concurrency limit
@@ -549,7 +550,25 @@ def _spin_sync(
         else:
             return f"Error: Failed to create SHARD worktree. Check git repo status."
 
-    claude_cmd = ['claude', '-p', prompt, '--output-format', 'json']
+    # Inject SKEIN context for shard agents (unless skeinless=True)
+    effective_prompt = prompt
+    if _has_skein() and shard_info and not skeinless:
+        # Prepend SKEIN ignition instructions to the prompt
+        skein_preamble = f"""You are working in an isolated SHARD worktree.
+
+Before starting work, orient yourself with SKEIN:
+1. Run: skein ignite --message "{prompt[:100]}..."
+2. Then: skein ready --name "spool-{spool_id}"
+
+After completing work, retire properly:
+1. Run: skein torch
+2. Then: skein complete
+
+Your task:
+"""
+        effective_prompt = skein_preamble + prompt
+
+    claude_cmd = ['claude', '-p', effective_prompt, '--output-format', 'json']
 
     if model:
         claude_cmd.extend(['--model', model])
@@ -640,6 +659,7 @@ async def spin(
     tags: Optional[str] = None,
     model: Optional[str] = None,
     timeout: Optional[int] = None,
+    skeinless: bool = False,
 ) -> str:
     """
     Spawn a Claude Code agent to handle a task. Returns immediately with spool_id.
@@ -657,6 +677,7 @@ async def spin(
         tags: Comma-separated tags for organizing spools (e.g. "batch-1,triage")
         model: Model to use - "haiku", "sonnet", or "opus" (default: inherit)
         timeout: Kill spool after this many seconds (default: no timeout)
+        skeinless: Skip SKEIN context injection for shard agents (default: False)
 
     Returns:
         spool_id to check result later
@@ -670,7 +691,7 @@ async def spin(
     """
     return await asyncio.to_thread(
         _spin_sync, prompt, permission, shard, system_prompt,
-        working_dir, allowed_tools, tags, model, timeout
+        working_dir, allowed_tools, tags, model, timeout, skeinless
     )
 
 
@@ -1557,6 +1578,161 @@ async def shard_abandon(spool_id: str, keep_branch: bool = False, caller_cwd: st
         return f"Abandoned shard {spool_id}" + (" (branch kept)" if keep_branch else "")
     else:
         return f"Warning: Shard cleanup may have been incomplete for {spool_id}"
+
+
+def _gather_shard_git_state(spool_id: str) -> Optional[Dict[str, Any]]:
+    """
+    Gather git state from a shard for triage assessment.
+
+    Returns dict with:
+        - commits: list of commit messages on the shard branch
+        - diff_stat: summary of changes (files changed, insertions, deletions)
+        - uncommitted: any uncommitted changes
+        - branch_name: the shard's branch name
+    """
+    spool = _read_spool(spool_id)
+    if not spool:
+        return None
+
+    shard_info = spool.get('shard')
+    if not shard_info:
+        return None
+
+    worktree_path = shard_info.get('worktree_path')
+    branch_name = shard_info.get('branch_name')
+
+    if not worktree_path or not Path(worktree_path).exists():
+        return None
+
+    state = {
+        'spool_id': spool_id,
+        'branch_name': branch_name,
+        'worktree_path': worktree_path,
+        'prompt': spool.get('prompt', ''),
+        'commits': [],
+        'diff_stat': '',
+        'uncommitted': [],
+    }
+
+    try:
+        # Get commits on branch (compared to master)
+        result = subprocess.run(
+            ['git', 'log', '--oneline', 'master..HEAD'],
+            capture_output=True, text=True, cwd=worktree_path, timeout=10
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            state['commits'] = result.stdout.strip().split('\n')
+
+        # Get diff stat
+        result = subprocess.run(
+            ['git', 'diff', '--stat', 'master..HEAD'],
+            capture_output=True, text=True, cwd=worktree_path, timeout=10
+        )
+        if result.returncode == 0:
+            state['diff_stat'] = result.stdout.strip()
+
+        # Get uncommitted changes
+        result = subprocess.run(
+            ['git', 'status', '--porcelain'],
+            capture_output=True, text=True, cwd=worktree_path, timeout=10
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            state['uncommitted'] = result.stdout.strip().split('\n')
+
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        pass
+
+    return state
+
+
+@mcp.tool()
+async def spool_triage(spool_id: str) -> str:
+    """
+    Triage a completed shard spool - assess its git state and get a recommendation.
+
+    Gathers git state from the shard (commits, diff, uncommitted changes) and
+    spins a readonly haiku agent to assess whether the work should be merged,
+    needs review, or should be abandoned.
+
+    Args:
+        spool_id: The spool_id with a shard to triage
+
+    Returns:
+        Triage assessment with recommendation
+
+    Example:
+        spool_triage("abc123")  # get triage report for shard
+    """
+    spool = _read_spool(spool_id)
+
+    if not spool:
+        return f"Error: Unknown spool_id '{spool_id}'"
+
+    if spool.get('status') == 'running':
+        return f"Error: Spool {spool_id} is still running. Wait for completion before triage."
+
+    shard_info = spool.get('shard')
+    if not shard_info:
+        return f"Error: Spool {spool_id} has no shard. Triage only works on shard spools."
+
+    # Gather git state
+    git_state = _gather_shard_git_state(spool_id)
+    if not git_state:
+        return f"Error: Could not gather git state for spool {spool_id}"
+
+    # Format state for triage prompt
+    state_summary = f"""## Shard Triage Request
+
+**Spool ID:** {spool_id}
+**Original Task:** {git_state['prompt'][:500]}
+
+### Git State
+
+**Branch:** {git_state['branch_name']}
+**Commits:** {len(git_state['commits'])}
+"""
+
+    if git_state['commits']:
+        state_summary += "\n**Commit log:**\n"
+        for commit in git_state['commits'][:10]:  # Limit to 10
+            state_summary += f"  - {commit}\n"
+
+    if git_state['diff_stat']:
+        state_summary += f"\n**Diff summary:**\n```\n{git_state['diff_stat'][:1000]}\n```\n"
+
+    if git_state['uncommitted']:
+        state_summary += f"\n**Uncommitted changes:** {len(git_state['uncommitted'])} files\n"
+        for change in git_state['uncommitted'][:5]:
+            state_summary += f"  - {change}\n"
+
+    # Spin a haiku agent to assess
+    triage_prompt = f"""{state_summary}
+
+## Your Task
+
+Assess this shard's work and provide a triage recommendation:
+
+1. **Summary**: Brief summary of what was done
+2. **Quality**: Assessment of the work (complete/partial/broken)
+3. **Recommendation**: One of:
+   - MERGE: Ready to merge, work looks good
+   - REVIEW: Needs human review before merge
+   - ABANDON: Work should be discarded
+
+Be concise. Focus on actionable assessment."""
+
+    # Spin readonly haiku to do the triage
+    triage_spool_id = await spin(
+        prompt=triage_prompt,
+        permission="readonly",
+        model="haiku",
+        working_dir=git_state['worktree_path'],
+        timeout=120,
+        skeinless=True,  # Don't inject SKEIN context for triage
+        tags="triage",
+    )
+
+    return f"Triage started: spool_id={triage_spool_id}\n\nUse unspool('{triage_spool_id}') to get the assessment."
 
 
 @mcp.tool()
