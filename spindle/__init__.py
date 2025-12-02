@@ -52,7 +52,7 @@ async def health_check(request: Request) -> JSONResponse:
 SPINDLE_DIR = Path.home() / ".spindle" / "spools"
 
 # Concurrency limit (configurable via env var)
-MAX_CONCURRENT = int(os.environ.get("SPINDLE_MAX_CONCURRENT", "5"))
+MAX_CONCURRENT = int(os.environ.get("SPINDLE_MAX_CONCURRENT", "15"))
 
 # Poll interval for monitoring detached processes
 MONITOR_POLL_INTERVAL = 2  # seconds
