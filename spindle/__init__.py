@@ -1581,7 +1581,7 @@ async def shard_abandon(spool_id: str, keep_branch: bool = False, caller_cwd: st
 
 
 @mcp.tool()
-async def spool_triage(worktree_path: str) -> str:
+async def triage(worktree_path: str) -> str:
     """
     Assess orphan worktree and create tender with recommendation.
 
