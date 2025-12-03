@@ -560,13 +560,28 @@ Before starting work, orient yourself with SKEIN:
 1. Run: skein ignite --message "{prompt[:100]}..."
 2. Then: skein ready --name "spool-{spool_id}"
 
-After completing work, retire properly:
-1. Run: skein torch
-2. Then: skein complete
+After completing work:
+1. Commit your changes: git add -A && git commit -m "Your commit message"
+2. Run: skein torch
+3. Then: skein complete
+
+IMPORTANT: You MUST commit your changes before retiring. The shard cannot be merged without commits.
 
 Your task:
 """
         effective_prompt = skein_preamble + prompt
+    elif shard_info:
+        # Non-SKEIN shard - still need commit instructions
+        shard_preamble = """You are working in an isolated SHARD worktree.
+
+After completing work, commit your changes:
+  git add -A && git commit -m "Your commit message"
+
+IMPORTANT: You MUST commit your changes. The shard cannot be merged without commits.
+
+Your task:
+"""
+        effective_prompt = shard_preamble + prompt
 
     claude_cmd = ['claude', '-p', effective_prompt, '--output-format', 'json']
 
@@ -598,6 +613,16 @@ Your task:
             '--proc', '/proc',
             '--chdir', cwd,
         ]
+        # Make the git worktree metadata writable (needed for commits)
+        # Worktrees store their index/HEAD in main repo's .git/worktrees/<name>/
+        git_file = Path(cwd) / '.git'
+        if git_file.exists() and git_file.is_file():
+            # .git is a file pointing to the real git dir
+            git_content = git_file.read_text().strip()
+            if git_content.startswith('gitdir:'):
+                git_worktree_dir = git_content.split('gitdir:')[1].strip()
+                if Path(git_worktree_dir).exists():
+                    cmd.extend(['--bind', git_worktree_dir, git_worktree_dir])
         # Conditionally bind config dirs if they exist
         for config_dir in ['.claude', '.anthropic', '.spindle', '.config']:
             path = f'{home}/{config_dir}'
