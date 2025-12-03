@@ -1242,6 +1242,280 @@ async def spool_retry(spool_id: str) -> str:
     )
 
 
+def _get_shard_commit_status(spool: dict) -> Optional[str]:
+    """
+    Determine commit status for a shard spool.
+
+    Returns:
+        - None: No shard
+        - "merged": Already merged
+        - "has_commit": Has commits on branch
+        - "uncommitted": Has uncommitted changes
+        - "conflict": Would have merge conflicts
+        - "no_worktree": Worktree doesn't exist
+    """
+    shard_info = spool.get('shard')
+    if not shard_info:
+        return None
+
+    # Check if already merged
+    if shard_info.get('merged'):
+        return "merged"
+
+    worktree_path = shard_info.get('worktree_path')
+    if not worktree_path or not Path(worktree_path).exists():
+        return "no_worktree"
+
+    try:
+        # Check for uncommitted changes
+        result = subprocess.run(
+            ['git', 'status', '--porcelain'],
+            capture_output=True, text=True, cwd=worktree_path, timeout=10
+        )
+        has_uncommitted = bool(result.stdout.strip()) if result.returncode == 0 else False
+
+        # Check for commits ahead of master
+        result = subprocess.run(
+            ['git', 'rev-list', '--count', 'master..HEAD'],
+            capture_output=True, text=True, cwd=worktree_path, timeout=10
+        )
+        commits_ahead = int(result.stdout.strip()) if result.returncode == 0 else 0
+
+        if has_uncommitted:
+            return "uncommitted"
+
+        if commits_ahead == 0:
+            return "no_changes"
+
+        # Check for potential merge conflicts
+        main_repo = Path(worktree_path).parent.parent
+        branch_name = shard_info.get('branch_name')
+        if branch_name:
+            result = subprocess.run(
+                ['git', 'merge-tree', '--write-tree', 'master', branch_name],
+                capture_output=True, text=True, cwd=str(main_repo), timeout=10
+            )
+            # Non-zero exit means conflicts
+            if result.returncode != 0:
+                return "conflict"
+
+        return "has_commit"
+
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError, ValueError):
+        return "unknown"
+
+
+def _get_shard_change_stats(spool: dict) -> Optional[dict]:
+    """
+    Get stats about changes in a shard.
+
+    Returns dict with files_changed, insertions, deletions or None.
+    """
+    shard_info = spool.get('shard')
+    if not shard_info:
+        return None
+
+    worktree_path = shard_info.get('worktree_path')
+    if not worktree_path or not Path(worktree_path).exists():
+        return None
+
+    try:
+        result = subprocess.run(
+            ['git', 'diff', '--stat', '--stat-width=1000', 'master...HEAD'],
+            capture_output=True, text=True, cwd=worktree_path, timeout=10
+        )
+        if result.returncode != 0:
+            return None
+
+        # Parse the summary line: " X files changed, Y insertions(+), Z deletions(-)"
+        lines = result.stdout.strip().split('\n')
+        if not lines:
+            return None
+
+        summary = lines[-1]
+        stats = {'files_changed': 0, 'insertions': 0, 'deletions': 0}
+
+        files_match = re.search(r'(\d+) files? changed', summary)
+        ins_match = re.search(r'(\d+) insertions?\(\+\)', summary)
+        del_match = re.search(r'(\d+) deletions?\(-\)', summary)
+
+        if files_match:
+            stats['files_changed'] = int(files_match.group(1))
+        if ins_match:
+            stats['insertions'] = int(ins_match.group(1))
+        if del_match:
+            stats['deletions'] = int(del_match.group(1))
+
+        return stats
+
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError, ValueError):
+        return None
+
+
+def _spool_dashboard_sync() -> str:
+    """Synchronous implementation of spool_dashboard."""
+    _recover_orphans()
+    all_spools = _list_spools()
+    now = datetime.now()
+    hour_ago = now - timedelta(hours=1)
+
+    # Count by status
+    running = []
+    complete_last_hour = []
+    errors = []
+
+    for spool in all_spools:
+        status = spool.get('status')
+        if status == 'running':
+            running.append(spool)
+        elif status == 'error':
+            errors.append(spool)
+        elif status == 'complete':
+            completed_at = spool.get('completed_at')
+            if completed_at:
+                try:
+                    completed_dt = datetime.fromisoformat(completed_at)
+                    if completed_dt >= hour_ago:
+                        complete_last_hour.append(spool)
+                except ValueError:
+                    pass
+
+    # Build recent completions list (last hour, sorted by completion time)
+    recent = []
+    for spool in sorted(complete_last_hour, key=lambda s: s.get('completed_at', ''), reverse=True)[:10]:
+        spool_id = spool.get('id')
+        completed_at = spool.get('completed_at')
+
+        # Calculate age
+        age_str = "unknown"
+        if completed_at:
+            try:
+                completed_dt = datetime.fromisoformat(completed_at)
+                age_mins = int((now - completed_dt).total_seconds() / 60)
+                age_str = f"{age_mins}m ago"
+            except ValueError:
+                pass
+
+        # Get task name (first 60 chars of prompt)
+        prompt = spool.get('prompt', '')[:60]
+        if len(spool.get('prompt', '')) > 60:
+            prompt += "..."
+
+        commit_status = _get_shard_commit_status(spool)
+
+        recent.append({
+            'spool_id': spool_id,
+            'task': prompt,
+            'status': 'complete',
+            'age': age_str,
+            'commit_status': commit_status,
+        })
+
+    # Needing attention: shards with uncommitted changes or large changesets
+    needing_attention = []
+    for spool in all_spools:
+        if spool.get('status') != 'complete':
+            continue
+
+        shard_info = spool.get('shard')
+        if not shard_info:
+            continue
+
+        commit_status = _get_shard_commit_status(spool)
+        needs_attention = False
+        reason = None
+
+        if commit_status == 'uncommitted':
+            needs_attention = True
+            reason = "uncommitted changes"
+        elif commit_status == 'conflict':
+            needs_attention = True
+            reason = "merge conflict"
+
+        # Check for large changes
+        if commit_status == 'has_commit':
+            stats = _get_shard_change_stats(spool)
+            if stats:
+                total_changes = stats.get('insertions', 0) + stats.get('deletions', 0)
+                if total_changes > 500 or stats.get('files_changed', 0) > 10:
+                    needs_attention = True
+                    reason = f"large changeset ({stats['files_changed']} files, +{stats['insertions']}/-{stats['deletions']})"
+
+        if needs_attention:
+            needing_attention.append({
+                'spool_id': spool.get('id'),
+                'task': spool.get('prompt', '')[:60],
+                'commit_status': commit_status,
+                'reason': reason,
+                'worktree': shard_info.get('worktree_path'),
+            })
+
+    # Also add errors from last hour as needing attention
+    for spool in errors:
+        created_at = spool.get('created_at')
+        if created_at:
+            try:
+                created_dt = datetime.fromisoformat(created_at)
+                if created_dt >= hour_ago:
+                    needing_attention.append({
+                        'spool_id': spool.get('id'),
+                        'task': spool.get('prompt', '')[:60],
+                        'commit_status': None,
+                        'reason': f"error: {spool.get('error', 'unknown')[:50]}",
+                    })
+            except ValueError:
+                pass
+
+    dashboard = {
+        'summary': {
+            'running': len(running),
+            'complete_last_hour': len(complete_last_hour),
+            'errors': len(errors),
+            'total_spools': len(all_spools),
+        },
+        'running': [
+            {
+                'spool_id': s.get('id'),
+                'task': s.get('prompt', '')[:60],
+                'started': s.get('created_at'),
+            }
+            for s in running
+        ],
+        'recent_completions': recent,
+        'needing_attention': needing_attention,
+    }
+
+    return json.dumps(dashboard, indent=2)
+
+
+@mcp.tool()
+async def spool_dashboard() -> str:
+    """
+    Single-view dashboard of spool status for QMs.
+
+    Shows:
+    - Summary counts: running, complete (last hour), errors
+    - Currently running spools with task and start time
+    - Recent completions with spool_id, task, age, commit status
+    - Items needing attention: uncommitted changes, large changesets, conflicts
+
+    Commit status values:
+    - uncommitted: Has uncommitted changes in worktree
+    - has_commit: Has commits ready for merge
+    - merged: Already merged to master
+    - conflict: Would have merge conflicts
+    - no_worktree: Worktree no longer exists
+    - None: Not a shard spool
+
+    Returns:
+        JSON dashboard with summary, running, recent_completions, needing_attention
+
+    Example:
+        dashboard = spool_dashboard()  # Get full status overview
+    """
+    return await asyncio.to_thread(_spool_dashboard_sync)
+
+
 @mcp.tool()
 async def spool_stats() -> str:
     """
