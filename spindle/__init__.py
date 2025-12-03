@@ -1930,6 +1930,8 @@ Assess the work in this worktree and create a tender.
 2. Run `git diff --stat master` to see scope of changes
 3. Run `git status` to see uncommitted work
 4. Read key files if needed to understand intent
+5. If there are uncommitted changes worth keeping, commit them:
+   `git add -A && git commit -m "Triage: <description of changes>"`
 
 ### Then tender with your assessment:
 
@@ -1940,7 +1942,7 @@ skein shard tender {worktree_name} --status <status> --confidence <1-10> --summa
 **Status options:**
 - `complete` - Work is done, ready for merge consideration
 - `incomplete` - Partial work, may be salvageable
-- `abandoned` - Nothing useful, recommend discard
+- `abandoned` - Nothing useful, recommend discard (still tender it for the record)
 
 **Confidence scale (merge risk):**
 - 10: Safe, additive, isolated (auto-merge candidate)
@@ -1948,9 +1950,9 @@ skein shard tender {worktree_name} --status <status> --confidence <1-10> --summa
 - 4-6: Moderate changes, needs review
 - 1-3: Big refactor, critical path, risky
 
-If status is `incomplete` and work is worth continuing, create a brief for the remaining work.
+Always tender something - even abandoned work should be tendered with a note explaining why.
 
-Be honest about confidence - low confidence is fine, it just means human review needed."""
+If status is `incomplete` and work is worth continuing, create a brief for the remaining work."""
 
     return await asyncio.to_thread(
         _spin_sync,
