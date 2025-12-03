@@ -217,6 +217,91 @@ def _spawn_shard(agent_id: str, working_dir: str) -> Optional[Dict[str, str]]:
     return None
 
 
+def _close_tender_folios(worktree_name: str) -> Optional[str]:
+    """
+    Close any tender folios associated with a worktree after successful merge.
+
+    Queries SKEIN for tender folios with matching worktree_name in metadata,
+    then closes them by creating a status thread.
+
+    Args:
+        worktree_name: The worktree name to match in tender metadata
+
+    Returns:
+        Message about closed folios, or None if SKEIN unavailable/no matches
+    """
+    if not _has_skein():
+        return None
+
+    try:
+        import urllib.request
+        import urllib.error
+
+        # Query SKEIN for tender folios
+        skein_url = os.environ.get('SKEIN_URL', 'http://localhost:8001')
+        agent_id = os.environ.get('SKEIN_AGENT_ID', 'spindle')
+
+        # Get all tender folios
+        req = urllib.request.Request(
+            f"{skein_url}/folios?type=tender",
+            headers={'X-Agent-ID': agent_id}
+        )
+
+        with urllib.request.urlopen(req, timeout=10) as response:
+            folios = json.loads(response.read().decode())
+
+        # Find tenders with matching worktree_name in metadata
+        closed_folios = []
+        for folio in folios:
+            metadata = folio.get('metadata', {})
+            if isinstance(metadata, str):
+                try:
+                    metadata = json.loads(metadata)
+                except json.JSONDecodeError:
+                    continue
+
+            if metadata.get('worktree_name') == worktree_name:
+                folio_id = folio.get('folio_id')
+                if not folio_id:
+                    continue
+
+                # Check if already closed
+                status = folio.get('status', 'open')
+                if status == 'closed':
+                    continue
+
+                # Close the folio by creating a status thread
+                close_data = json.dumps({
+                    "from_id": folio_id,
+                    "to_id": folio_id,
+                    "type": "status",
+                    "content": "closed"
+                }).encode()
+
+                close_req = urllib.request.Request(
+                    f"{skein_url}/threads",
+                    data=close_data,
+                    headers={
+                        'X-Agent-ID': agent_id,
+                        'Content-Type': 'application/json'
+                    },
+                    method='POST'
+                )
+
+                try:
+                    urllib.request.urlopen(close_req, timeout=10)
+                    closed_folios.append(folio_id)
+                except urllib.error.URLError:
+                    pass  # Ignore individual close failures
+
+        if closed_folios:
+            return f"Closed tender(s): {', '.join(closed_folios)}"
+        return None
+
+    except (urllib.error.URLError, OSError, json.JSONDecodeError):
+        return None  # SKEIN not available or error, continue silently
+
+
 def _cleanup_shard(shard_info: Dict[str, str], working_dir: str, keep_branch: bool = False) -> bool:
     """
     Clean up a SHARD worktree.
@@ -1804,7 +1889,14 @@ async def shard_merge(spool_id: str, keep_branch: bool = False, caller_cwd: str 
         spool['shard']['merged_at'] = datetime.now().isoformat()
         _write_spool(spool_id, spool)
 
-        return f"Successfully merged shard {spool_id} to master"
+        # Auto-close any tender folios for this worktree
+        worktree_name = shard_info.get('shard_id') or Path(worktree_path).name
+        tender_result = _close_tender_folios(worktree_name)
+
+        msg = f"Successfully merged shard {spool_id} to master"
+        if tender_result:
+            msg += f". {tender_result}"
+        return msg
 
     except subprocess.TimeoutExpired:
         return "Error: Git operation timed out"
