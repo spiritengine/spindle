@@ -554,6 +554,7 @@ def _spin_sync(
     effective_prompt = prompt
     if _has_skein() and shard_info and not skeinless:
         # Prepend SKEIN ignition instructions to the prompt
+        worktree_name = shard_info.get('shard_id', spool_id)
         skein_preamble = f"""You are working in an isolated SHARD worktree.
 
 Before starting work, orient yourself with SKEIN:
@@ -561,11 +562,10 @@ Before starting work, orient yourself with SKEIN:
 2. Then: skein ready --name "spool-{spool_id}"
 
 After completing work:
-1. Commit your changes: git add -A && git commit -m "Your commit message"
-2. Run: skein torch
-3. Then: skein complete
-
-IMPORTANT: You MUST commit your changes before retiring. The shard cannot be merged without commits.
+1. Commit: git add -A && git commit -m "Your commit message"
+2. Tender: skein shard tender {worktree_name} --summary "What you did" --confidence N
+   (confidence 1-10: 10=safe/isolated, 5=needs review, 1=risky)
+3. Retire: skein torch && skein complete
 
 Your task:
 """
@@ -574,10 +574,8 @@ Your task:
         # Non-SKEIN shard - still need commit instructions
         shard_preamble = """You are working in an isolated SHARD worktree.
 
-After completing work, commit your changes:
-  git add -A && git commit -m "Your commit message"
-
-IMPORTANT: You MUST commit your changes. The shard cannot be merged without commits.
+After completing work:
+1. Commit: git add -A && git commit -m "Your commit message"
 
 Your task:
 """
