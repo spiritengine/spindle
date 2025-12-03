@@ -11,14 +11,14 @@
   },
   {
     "agent_id": "cc-session-20251201",
-    "name": "spool-dashboard",
+    "name": "Shard Commit Investigation",
     "agent_type": null,
     "description": null,
-    "registered_at": "2025-12-01T17:53:09.520732",
+    "registered_at": "2025-12-01T18:12:10.992717",
     "capabilities": [],
     "status": "active",
     "metadata": {
-      "torched_at": "2025-12-01T17:53:09.518317",
+      "torched_at": "2025-12-01T18:12:10.990891",
       "work_summary": {
         "issues": 0,
         "findings": 0,

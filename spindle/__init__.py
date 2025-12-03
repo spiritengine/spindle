@@ -613,16 +613,31 @@ Your task:
             '--proc', '/proc',
             '--chdir', cwd,
         ]
-        # Make the git worktree metadata writable (needed for commits)
-        # Worktrees store their index/HEAD in main repo's .git/worktrees/<name>/
+        # Make git writable for commits in worktrees
+        # Worktrees need:
+        #   .git/worktrees/<name>/ - index, HEAD, logs
+        #   .git/objects/ - store new blobs, trees, commits
+        #   .git/refs/heads/ - update branch pointers
         git_file = Path(cwd) / '.git'
         if git_file.exists() and git_file.is_file():
-            # .git is a file pointing to the real git dir
             git_content = git_file.read_text().strip()
             if git_content.startswith('gitdir:'):
                 git_worktree_dir = git_content.split('gitdir:')[1].strip()
                 if Path(git_worktree_dir).exists():
+                    # Worktree metadata (index, HEAD)
                     cmd.extend(['--bind', git_worktree_dir, git_worktree_dir])
+                    # Main .git directory for objects and refs
+                    # gitdir is like: /path/to/repo/.git/worktrees/<name>
+                    main_git = Path(git_worktree_dir).parent.parent
+                    if main_git.exists() and main_git.name == '.git':
+                        # Objects - for storing commits (append-only)
+                        objects_dir = main_git / 'objects'
+                        if objects_dir.exists():
+                            cmd.extend(['--bind', str(objects_dir), str(objects_dir)])
+                        # Refs/heads - for branch pointers (not remotes/tags)
+                        refs_heads = main_git / 'refs' / 'heads'
+                        if refs_heads.exists():
+                            cmd.extend(['--bind', str(refs_heads), str(refs_heads)])
         # Conditionally bind config dirs if they exist
         for config_dir in ['.claude', '.anthropic', '.spindle', '.config']:
             path = f'{home}/{config_dir}'
