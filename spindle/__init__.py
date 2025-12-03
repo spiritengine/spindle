@@ -638,6 +638,10 @@ Your task:
                         refs_heads = main_git / 'refs' / 'heads'
                         if refs_heads.exists():
                             cmd.extend(['--bind', str(refs_heads), str(refs_heads)])
+                        # Logs/refs/heads - for reflogs
+                        logs_refs_heads = main_git / 'logs' / 'refs' / 'heads'
+                        if logs_refs_heads.exists():
+                            cmd.extend(['--bind', str(logs_refs_heads), str(logs_refs_heads)])
         # Conditionally bind config dirs if they exist
         for config_dir in ['.claude', '.anthropic', '.spindle', '.config']:
             path = f'{home}/{config_dir}'
