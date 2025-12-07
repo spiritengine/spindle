@@ -366,6 +366,11 @@ def _get_stderr_path(spool_id: str) -> Path:
     return SPINDLE_DIR / f"{spool_id}.stderr"
 
 
+def _get_transcript_path(spool_id: str) -> Path:
+    """Get path to transcript file for a spool."""
+    return SPINDLE_DIR / "transcripts" / f"{spool_id}.txt"
+
+
 def _write_spool(spool_id: str, data: dict) -> None:
     """Atomically write spool data to disk."""
     SPINDLE_DIR.mkdir(parents=True, exist_ok=True)
@@ -404,6 +409,14 @@ def _list_spools() -> list[dict]:
         except Exception:
             pass
     return spools
+
+
+def _find_spool_by_session(session_id: str) -> Optional[dict]:
+    """Find a spool by its session_id."""
+    for spool in _list_spools():
+        if spool.get('session_id') == session_id:
+            return spool
+    return None
 
 
 def _count_running() -> int:
@@ -522,6 +535,16 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
     spool['completed_at'] = datetime.now().isoformat()
     _write_spool(spool_id, spool)
 
+    # Save transcript for future respin if session_id exists
+    # This preserves conversation context even after CC cleans up sessions
+    if spool.get('session_id') and stdout:
+        transcript_path = _get_transcript_path(spool_id)
+        transcript_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            transcript_path.write_text(stdout)
+        except IOError:
+            pass  # Non-critical, continue
+
     # Clean up output files
     if stdout_path.exists():
         stdout_path.unlink()
@@ -536,6 +559,65 @@ def _recover_orphans() -> None:
     for spool in _list_spools():
         if spool.get('status') == 'running':
             _check_and_finalize_spool(spool['id'])
+
+
+def _handle_expired_session(spool_id: str, spool: dict) -> bool:
+    """
+    Handle expired session by retrying with transcript injection.
+
+    Returns True if successfully retried, False otherwise.
+    """
+    # Find original spool with this session_id
+    original_spool = _find_spool_by_session(spool['session_id'])
+    if not original_spool:
+        return False
+
+    # Check for transcript
+    transcript_path = _get_transcript_path(original_spool['id'])
+    if not transcript_path.exists():
+        return False
+
+    # Kill the failing process
+    pid = spool.get('pid')
+    if pid and _is_pid_alive(pid):
+        try:
+            os.kill(pid, signal.SIGTERM)
+            time.sleep(0.2)
+            if _is_pid_alive(pid):
+                os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, OSError):
+            pass
+
+    # Read transcript
+    try:
+        transcript = transcript_path.read_text()
+    except IOError:
+        return False
+
+    # Build new prompt with transcript context
+    context_prompt = f"""Previous conversation transcript:
+
+{transcript}
+
+---
+
+Continue from above. New message: {spool['prompt'].split(': ', 1)[-1]}"""
+
+    # Spawn new process without --resume flag, with transcript as context
+    cmd = ['claude', '-p', context_prompt, '--output-format', 'json']
+
+    try:
+        new_pid = _spawn_detached(spool_id, cmd, spool['working_dir'])
+
+        # Update spool with new PID and mark as using transcript fallback
+        spool['pid'] = new_pid
+        spool['used_transcript_fallback'] = True
+        spool['transcript_injected_at'] = datetime.now().isoformat()
+        _write_spool(spool_id, spool)
+
+        return True
+    except Exception:
+        return False
 
 
 def _monitor_spool(spool_id: str) -> None:
@@ -563,6 +645,19 @@ def _monitor_spool(spool_id: str) -> None:
                 spool['completed_at'] = datetime.now().isoformat()
                 _write_spool(spool_id, spool)
                 break
+
+        # For respin spools, check for "session not found" error early
+        if spool and spool.get('session_id') and spool.get('status') == 'running':
+            stderr_path = _get_stderr_path(spool_id)
+            if stderr_path.exists():
+                try:
+                    stderr_content = stderr_path.read_text()
+                    if 'No conversation found with session ID' in stderr_content:
+                        # Session expired - try transcript fallback
+                        if _handle_expired_session(spool_id, spool):
+                            break  # Successfully retried with transcript
+                except IOError:
+                    pass
 
         if _check_and_finalize_spool(spool_id):
             break
@@ -883,28 +978,16 @@ async def spools() -> str:
     return await asyncio.to_thread(_spools_sync)
 
 
-@mcp.tool()
-async def respin(
-    session_id: str,
-    prompt: str,
-) -> str:
-    """
-    Continue an existing Claude Code session with a new message.
-    Returns immediately with spool_id.
-
-    Args:
-        session_id: The session ID to continue
-        prompt: The follow-up message/task
-
-    Returns:
-        spool_id to check result later
-    """
+def _respin_sync(session_id: str, prompt: str) -> str:
+    """Synchronous implementation of respin."""
     # Check concurrency limit
     if _count_running() >= MAX_CONCURRENT:
         return f"Error: Max {MAX_CONCURRENT} concurrent spools. Wait for some to complete."
 
     spool_id = str(uuid.uuid4())[:8]
 
+    # Try to resume with session_id first
+    # If that fails (session expired), fall back to transcript injection
     cmd = [
         'claude', '-p', prompt,
         '--resume', session_id,
@@ -912,6 +995,13 @@ async def respin(
     ]
 
     cwd = os.getcwd()
+
+    # Check if we have a transcript for this session
+    original_spool = _find_spool_by_session(session_id)
+    transcript_available = False
+    if original_spool:
+        transcript_path = _get_transcript_path(original_spool['id'])
+        transcript_available = transcript_path.exists()
 
     spool = {
         'id': spool_id,
@@ -922,6 +1012,7 @@ async def respin(
         'working_dir': cwd,
         'allowed_tools': None,
         'system_prompt': None,
+        'transcript_fallback_available': transcript_available,
         'created_at': datetime.now().isoformat(),
         'completed_at': None,
         'pid': None,
@@ -943,6 +1034,28 @@ async def respin(
     monitor.start()
 
     return spool_id
+
+
+@mcp.tool()
+async def respin(
+    session_id: str,
+    prompt: str,
+) -> str:
+    """
+    Continue an existing Claude Code session with a new message.
+    Returns immediately with spool_id.
+
+    If the session has expired on Claude's end, automatically falls back
+    to transcript injection to recreate context.
+
+    Args:
+        session_id: The session ID to continue
+        prompt: The follow-up message/task
+
+    Returns:
+        spool_id to check result later
+    """
+    return await asyncio.to_thread(_respin_sync, session_id, prompt)
 
 
 @mcp.tool()
@@ -2059,6 +2172,42 @@ If status is `incomplete` and work is worth continuing, create a brief for the r
         None,       # timeout
         True,       # skeinless
     )
+
+
+@mcp.tool()
+async def spool_info(spool_id: str) -> str:
+    """
+    Get detailed information about a spool for debugging.
+
+    Shows complete spool metadata including session_id, transcript availability,
+    working_dir, timestamps, and other internal state.
+
+    Args:
+        spool_id: The spool_id to inspect
+
+    Returns:
+        JSON with full spool details
+
+    Example:
+        spool_info("abc123")  # Get complete spool info
+    """
+    spool = _read_spool(spool_id)
+    if not spool:
+        return f"Error: Unknown spool_id '{spool_id}'"
+
+    # Add transcript availability info
+    if spool.get('session_id'):
+        original_spool = _find_spool_by_session(spool['session_id'])
+        if original_spool:
+            transcript_path = _get_transcript_path(original_spool['id'])
+            spool['_transcript_available'] = transcript_path.exists()
+            if transcript_path.exists():
+                try:
+                    spool['_transcript_size'] = len(transcript_path.read_text())
+                except IOError:
+                    spool['_transcript_size'] = 'error'
+
+    return json.dumps(spool, indent=2)
 
 
 @mcp.tool()
