@@ -41,12 +41,15 @@ async def health_check(request: Request) -> JSONResponse:
     uptime_seconds = (datetime.now() - _server_start_time).total_seconds()
     running_count = _count_running()
 
-    return JSONResponse({
-        "status": "healthy",
-        "uptime_seconds": int(uptime_seconds),
-        "running_spools": running_count,
-        "max_concurrent": MAX_CONCURRENT,
-    })
+    return JSONResponse(
+        {
+            "status": "healthy",
+            "uptime_seconds": int(uptime_seconds),
+            "running_spools": running_count,
+            "max_concurrent": MAX_CONCURRENT,
+        }
+    )
+
 
 # Storage directory
 SPINDLE_DIR = Path.home() / ".spindle" / "spools"
@@ -77,29 +80,21 @@ def _has_skein() -> bool:
     """
     Check if SKEIN is available in the current project.
     Result is cached for performance.
+
+    Uses 'skein health' which checks git repo, .skein/ dir, and server.
     """
     global _skein_available
     if _skein_available is not None:
         return _skein_available
 
-    # Check if skein command exists and we're in a git repo
     try:
-        result = subprocess.run(
-            ['skein', '--version'],
-            capture_output=True,
-            timeout=5
-        )
+        result = subprocess.run(["skein", "health", "--json"], capture_output=True, text=True, timeout=10)
         if result.returncode == 0:
-            # Also check if we're in a git repo (SKEIN requires git)
-            git_check = subprocess.run(
-                ['git', 'rev-parse', '--git-dir'],
-                capture_output=True,
-                timeout=5
-            )
-            _skein_available = git_check.returncode == 0
+            data = json.loads(result.stdout)
+            _skein_available = data.get("healthy", False)
         else:
             _skein_available = False
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError, json.JSONDecodeError):
         _skein_available = False
 
     return _skein_available
@@ -153,34 +148,30 @@ def _spawn_shard(agent_id: str, working_dir: str) -> Optional[Dict[str, str]]:
         # Use SKEIN's shard spawn command
         try:
             result = subprocess.run(
-                [
-                    'skein', 'shard', 'spawn',
-                    '--agent', agent_id,
-                    '--description', f'Spindle spool for {agent_id}'
-                ],
+                ["skein", "shard", "spawn", "--agent", agent_id, "--description", f"Spindle spool for {agent_id}"],
                 capture_output=True,
                 text=True,
                 cwd=working_dir,
-                timeout=30
+                timeout=30,
             )
             if result.returncode == 0:
                 # Parse output to get worktree path
                 # Output format: "✓ Spawned SHARD: ..."
                 for line in result.stdout.splitlines():
-                    if 'Worktree:' in line:
-                        worktree_path = line.split('Worktree:')[1].strip()
+                    if "Worktree:" in line:
+                        worktree_path = line.split("Worktree:")[1].strip()
                         # Extract other info
                         branch_name = None
                         shard_id = None
                         for l in result.stdout.splitlines():
-                            if 'Branch:' in l:
-                                branch_name = l.split('Branch:')[1].strip()
-                            if 'Spawned SHARD:' in l:
-                                shard_id = l.split('Spawned SHARD:')[1].strip()
+                            if "Branch:" in l:
+                                branch_name = l.split("Branch:")[1].strip()
+                            if "Spawned SHARD:" in l:
+                                shard_id = l.split("Spawned SHARD:")[1].strip()
                         return {
-                            'worktree_path': worktree_path,
-                            'branch_name': branch_name or f'shard-{agent_id}',
-                            'shard_id': shard_id or agent_id,
+                            "worktree_path": worktree_path,
+                            "branch_name": branch_name or f"shard-{agent_id}",
+                            "shard_id": shard_id or agent_id,
                         }
         except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
             pass
@@ -188,28 +179,28 @@ def _spawn_shard(agent_id: str, working_dir: str) -> Optional[Dict[str, str]]:
     # Fallback: plain git worktree
     try:
         # Create worktrees directory if needed
-        worktrees_dir = Path(working_dir) / 'worktrees'
+        worktrees_dir = Path(working_dir) / "worktrees"
         worktrees_dir.mkdir(exist_ok=True)
 
         # Generate unique worktree name
-        date_str = datetime.now().strftime('%Y%m%d-%H%M%S')
-        worktree_name = f'{agent_id}-{date_str}'
+        date_str = datetime.now().strftime("%Y%m%d-%H%M%S")
+        worktree_name = f"{agent_id}-{date_str}"
         worktree_path = worktrees_dir / worktree_name
-        branch_name = f'shard-{worktree_name}'
+        branch_name = f"shard-{worktree_name}"
 
         # Create git worktree with new branch
         result = subprocess.run(
-            ['git', 'worktree', 'add', str(worktree_path), '-b', branch_name],
+            ["git", "worktree", "add", str(worktree_path), "-b", branch_name],
             capture_output=True,
             text=True,
             cwd=working_dir,
-            timeout=30
+            timeout=30,
         )
         if result.returncode == 0:
             return {
-                'worktree_path': str(worktree_path),
-                'branch_name': branch_name,
-                'shard_id': worktree_name,
+                "worktree_path": str(worktree_path),
+                "branch_name": branch_name,
+                "shard_id": worktree_name,
             }
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
         pass
@@ -238,14 +229,11 @@ def _close_tender_folios(worktree_name: str) -> Optional[str]:
         import urllib.error
 
         # Query SKEIN for tender folios
-        skein_url = os.environ.get('SKEIN_URL', 'http://localhost:8001')
-        agent_id = os.environ.get('SKEIN_AGENT_ID', 'spindle')
+        skein_url = os.environ.get("SKEIN_URL", "http://localhost:8001")
+        agent_id = os.environ.get("SKEIN_AGENT_ID", "spindle")
 
         # Get all tender folios
-        req = urllib.request.Request(
-            f"{skein_url}/folios?type=tender",
-            headers={'X-Agent-ID': agent_id}
-        )
+        req = urllib.request.Request(f"{skein_url}/folios?type=tender", headers={"X-Agent-ID": agent_id})
 
         with urllib.request.urlopen(req, timeout=10) as response:
             folios = json.loads(response.read().decode())
@@ -253,39 +241,33 @@ def _close_tender_folios(worktree_name: str) -> Optional[str]:
         # Find tenders with matching worktree_name in metadata
         closed_folios = []
         for folio in folios:
-            metadata = folio.get('metadata', {})
+            metadata = folio.get("metadata", {})
             if isinstance(metadata, str):
                 try:
                     metadata = json.loads(metadata)
                 except json.JSONDecodeError:
                     continue
 
-            if metadata.get('worktree_name') == worktree_name:
-                folio_id = folio.get('folio_id')
+            if metadata.get("worktree_name") == worktree_name:
+                folio_id = folio.get("folio_id")
                 if not folio_id:
                     continue
 
                 # Check if already closed
-                status = folio.get('status', 'open')
-                if status == 'closed':
+                status = folio.get("status", "open")
+                if status == "closed":
                     continue
 
                 # Close the folio by creating a status thread
-                close_data = json.dumps({
-                    "from_id": folio_id,
-                    "to_id": folio_id,
-                    "type": "status",
-                    "content": "closed"
-                }).encode()
+                close_data = json.dumps(
+                    {"from_id": folio_id, "to_id": folio_id, "type": "status", "content": "closed"}
+                ).encode()
 
                 close_req = urllib.request.Request(
                     f"{skein_url}/threads",
                     data=close_data,
-                    headers={
-                        'X-Agent-ID': agent_id,
-                        'Content-Type': 'application/json'
-                    },
-                    method='POST'
+                    headers={"X-Agent-ID": agent_id, "Content-Type": "application/json"},
+                    method="POST",
                 )
 
                 try:
@@ -314,8 +296,8 @@ def _cleanup_shard(shard_info: Dict[str, str], working_dir: str, keep_branch: bo
     Returns:
         True if successful
     """
-    worktree_path = shard_info.get('worktree_path')
-    branch_name = shard_info.get('branch_name')
+    worktree_path = shard_info.get("worktree_path")
+    branch_name = shard_info.get("branch_name")
 
     if not worktree_path:
         return False
@@ -323,28 +305,15 @@ def _cleanup_shard(shard_info: Dict[str, str], working_dir: str, keep_branch: bo
     try:
         # Remove worktree
         subprocess.run(
-            ['git', 'worktree', 'remove', '--force', worktree_path],
-            capture_output=True,
-            cwd=working_dir,
-            timeout=30
+            ["git", "worktree", "remove", "--force", worktree_path], capture_output=True, cwd=working_dir, timeout=30
         )
 
         # Optionally delete branch
         if not keep_branch and branch_name:
-            subprocess.run(
-                ['git', 'branch', '-D', branch_name],
-                capture_output=True,
-                cwd=working_dir,
-                timeout=10
-            )
+            subprocess.run(["git", "branch", "-D", branch_name], capture_output=True, cwd=working_dir, timeout=10)
 
         # Prune worktree references
-        subprocess.run(
-            ['git', 'worktree', 'prune'],
-            capture_output=True,
-            cwd=working_dir,
-            timeout=10
-        )
+        subprocess.run(["git", "worktree", "prune"], capture_output=True, cwd=working_dir, timeout=10)
 
         return True
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
@@ -375,9 +344,9 @@ def _write_spool(spool_id: str, data: dict) -> None:
     """Atomically write spool data to disk."""
     SPINDLE_DIR.mkdir(parents=True, exist_ok=True)
     path = _get_spool_path(spool_id)
-    tmp_path = path.with_suffix('.tmp')
+    tmp_path = path.with_suffix(".tmp")
 
-    with open(tmp_path, 'w') as f:
+    with open(tmp_path, "w") as f:
         json.dump(data, f, indent=2)
 
     os.rename(tmp_path, path)
@@ -414,14 +383,14 @@ def _list_spools() -> list[dict]:
 def _find_spool_by_session(session_id: str) -> Optional[dict]:
     """Find a spool by its session_id."""
     for spool in _list_spools():
-        if spool.get('session_id') == session_id:
+        if spool.get("session_id") == session_id:
             return spool
     return None
 
 
 def _count_running() -> int:
     """Count currently running spools."""
-    return sum(1 for s in _list_spools() if s.get('status') == 'running')
+    return sum(1 for s in _list_spools() if s.get("status") == "running")
 
 
 def _is_pid_alive(pid: int) -> bool:
@@ -445,8 +414,8 @@ def _cleanup_old_spools() -> None:
             with open(path) as f:
                 data = json.load(f)
 
-            spool_id = data.get('id', path.stem)
-            created = datetime.fromisoformat(data.get('created_at', ''))
+            spool_id = data.get("id", path.stem)
+            created = datetime.fromisoformat(data.get("created_at", ""))
             if created < cutoff:
                 path.unlink()
                 # Also clean up output files
@@ -469,10 +438,10 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
     check if stdout contains a complete JSON result even if PID is alive.
     """
     spool = _read_spool(spool_id)
-    if not spool or spool.get('status') != 'running':
+    if not spool or spool.get("status") != "running":
         return True  # Already done
 
-    pid = spool.get('pid')
+    pid = spool.get("pid")
     if not pid:
         return False  # No PID yet, still starting
 
@@ -486,7 +455,7 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
             content = stdout_path.read_text()
             if content.strip():
                 data = json.loads(content)
-                if 'result' in data or 'error' in data:
+                if "result" in data or "error" in data:
                     stdout_complete = True
         except (IOError, json.JSONDecodeError):
             pass
@@ -517,27 +486,27 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
     # Parse result
     try:
         data = json.loads(stdout)
-        spool['result'] = data.get('result', stdout)
-        spool['session_id'] = data.get('session_id')
-        spool['cost'] = data.get('cost')
-        spool['status'] = 'complete'
+        spool["result"] = data.get("result", stdout)
+        spool["session_id"] = data.get("session_id")
+        spool["cost"] = data.get("cost")
+        spool["status"] = "complete"
     except json.JSONDecodeError:
         if stdout.strip():
-            spool['result'] = stdout
-            spool['status'] = 'complete'
+            spool["result"] = stdout
+            spool["status"] = "complete"
         elif stderr.strip():
-            spool['status'] = 'error'
-            spool['error'] = stderr[:500]
+            spool["status"] = "error"
+            spool["error"] = stderr[:500]
         else:
-            spool['status'] = 'error'
-            spool['error'] = 'Process exited with no output'
+            spool["status"] = "error"
+            spool["error"] = "Process exited with no output"
 
-    spool['completed_at'] = datetime.now().isoformat()
+    spool["completed_at"] = datetime.now().isoformat()
     _write_spool(spool_id, spool)
 
     # Save transcript for future respin if session_id exists
     # This preserves conversation context even after CC cleans up sessions
-    if spool.get('session_id') and stdout:
+    if spool.get("session_id") and stdout:
         transcript_path = _get_transcript_path(spool_id)
         transcript_path.parent.mkdir(parents=True, exist_ok=True)
         try:
@@ -557,8 +526,8 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
 def _recover_orphans() -> None:
     """Check all running spools and finalize any that have completed."""
     for spool in _list_spools():
-        if spool.get('status') == 'running':
-            _check_and_finalize_spool(spool['id'])
+        if spool.get("status") == "running":
+            _check_and_finalize_spool(spool["id"])
 
 
 def _handle_expired_session(spool_id: str, spool: dict) -> bool:
@@ -568,17 +537,17 @@ def _handle_expired_session(spool_id: str, spool: dict) -> bool:
     Returns True if successfully retried, False otherwise.
     """
     # Find original spool with this session_id
-    original_spool = _find_spool_by_session(spool['session_id'])
+    original_spool = _find_spool_by_session(spool["session_id"])
     if not original_spool:
         return False
 
     # Check for transcript
-    transcript_path = _get_transcript_path(original_spool['id'])
+    transcript_path = _get_transcript_path(original_spool["id"])
     if not transcript_path.exists():
         return False
 
     # Kill the failing process
-    pid = spool.get('pid')
+    pid = spool.get("pid")
     if pid and _is_pid_alive(pid):
         try:
             os.kill(pid, signal.SIGTERM)
@@ -604,15 +573,15 @@ def _handle_expired_session(spool_id: str, spool: dict) -> bool:
 Continue from above. New message: {spool['prompt'].split(': ', 1)[-1]}"""
 
     # Spawn new process without --resume flag, with transcript as context
-    cmd = ['claude', '-p', context_prompt, '--output-format', 'json']
+    cmd = ["claude", "-p", context_prompt, "--output-format", "json"]
 
     try:
-        new_pid = _spawn_detached(spool_id, cmd, spool['working_dir'])
+        new_pid = _spawn_detached(spool_id, cmd, spool["working_dir"])
 
         # Update spool with new PID and mark as using transcript fallback
-        spool['pid'] = new_pid
-        spool['used_transcript_fallback'] = True
-        spool['transcript_injected_at'] = datetime.now().isoformat()
+        spool["pid"] = new_pid
+        spool["used_transcript_fallback"] = True
+        spool["transcript_injected_at"] = datetime.now().isoformat()
         _write_spool(spool_id, spool)
 
         return True
@@ -625,12 +594,12 @@ def _monitor_spool(spool_id: str) -> None:
     while True:
         # Check for timeout
         spool = _read_spool(spool_id)
-        if spool and spool.get('timeout'):
-            created = datetime.fromisoformat(spool['created_at'])
+        if spool and spool.get("timeout"):
+            created = datetime.fromisoformat(spool["created_at"])
             elapsed = (datetime.now() - created).total_seconds()
-            if elapsed > spool['timeout']:
+            if elapsed > spool["timeout"]:
                 # Kill the process
-                pid = spool.get('pid')
+                pid = spool.get("pid")
                 if pid and _is_pid_alive(pid):
                     try:
                         os.kill(pid, signal.SIGTERM)
@@ -640,19 +609,19 @@ def _monitor_spool(spool_id: str) -> None:
                     except ProcessLookupError:
                         pass
                 # Mark as timeout
-                spool['status'] = 'timeout'
-                spool['error'] = f'Timeout after {spool["timeout"]}s'
-                spool['completed_at'] = datetime.now().isoformat()
+                spool["status"] = "timeout"
+                spool["error"] = f'Timeout after {spool["timeout"]}s'
+                spool["completed_at"] = datetime.now().isoformat()
                 _write_spool(spool_id, spool)
                 break
 
         # For respin spools, check for "session not found" error early
-        if spool and spool.get('session_id') and spool.get('status') == 'running':
+        if spool and spool.get("session_id") and spool.get("status") == "running":
             stderr_path = _get_stderr_path(spool_id)
             if stderr_path.exists():
                 try:
                     stderr_content = stderr_path.read_text()
-                    if 'No conversation found with session ID' in stderr_content:
+                    if "No conversation found with session ID" in stderr_content:
                         # Session expired - try transcript fallback
                         if _handle_expired_session(spool_id, spool):
                             break  # Successfully retried with transcript
@@ -672,7 +641,7 @@ def _spawn_detached(spool_id: str, cmd: list, cwd: str) -> int:
     stdout_path = _get_output_path(spool_id)
     stderr_path = _get_stderr_path(spool_id)
 
-    with open(stdout_path, 'w') as stdout_file, open(stderr_path, 'w') as stderr_file:
+    with open(stdout_path, "w") as stdout_file, open(stderr_path, "w") as stderr_file:
         proc = subprocess.Popen(
             cmd,
             stdout=stdout_file,
@@ -726,7 +695,7 @@ def _spin_sync(
     if use_shard:
         shard_info = _spawn_shard(spool_id, cwd)
         if shard_info:
-            cwd = shard_info['worktree_path']
+            cwd = shard_info["worktree_path"]
         else:
             return f"Error: Failed to create SHARD worktree. Check git repo status."
 
@@ -734,7 +703,7 @@ def _spin_sync(
     effective_prompt = prompt
     if _has_skein() and shard_info and not skeinless:
         # Prepend SKEIN ignition instructions to the prompt
-        worktree_name = shard_info.get('shard_id', spool_id)
+        worktree_name = shard_info.get("shard_id", spool_id)
         skein_preamble = f"""You are working in an isolated SHARD worktree.
 
 Before starting work, orient yourself with SKEIN:
@@ -761,96 +730,105 @@ Your task:
 """
         effective_prompt = shard_preamble + prompt
 
-    claude_cmd = ['claude', '-p', effective_prompt, '--output-format', 'json']
+    claude_cmd = ["claude", "-p", effective_prompt, "--output-format", "json"]
 
     if model:
-        claude_cmd.extend(['--model', model])
+        claude_cmd.extend(["--model", model])
 
     # Auto-accept edits for non-interactive execution
     # Use acceptEdits for careful mode, bypassPermissions for full/shard
-    if permission in ('full', 'shard') or (permission and '+shard' in permission):
-        claude_cmd.extend(['--permission-mode', 'bypassPermissions'])
+    if permission in ("full", "shard") or (permission and "+shard" in permission):
+        claude_cmd.extend(["--permission-mode", "bypassPermissions"])
     else:
-        claude_cmd.extend(['--permission-mode', 'acceptEdits'])
+        claude_cmd.extend(["--permission-mode", "acceptEdits"])
 
     if system_prompt:
-        claude_cmd.extend(['--system-prompt', system_prompt])
+        claude_cmd.extend(["--system-prompt", system_prompt])
 
     if resolved_tools:
-        claude_cmd.extend(['--allowedTools', resolved_tools])
+        claude_cmd.extend(["--allowedTools", resolved_tools])
 
     # Wrap in bwrap sandbox for shards - worktree writable, rest read-only
-    if shard_info and shutil.which('bwrap'):
+    if shard_info and shutil.which("bwrap"):
         home = str(Path.home())
         cmd = [
-            'bwrap',
-            '--ro-bind', '/', '/',                    # Root read-only
-            '--bind', cwd, cwd,                       # Worktree writable
-            '--bind', '/tmp', '/tmp',                 # Tmp writable
-            '--dev', '/dev',
-            '--proc', '/proc',
-            '--chdir', cwd,
+            "bwrap",
+            "--ro-bind",
+            "/",
+            "/",  # Root read-only
+            "--bind",
+            cwd,
+            cwd,  # Worktree writable
+            "--bind",
+            "/tmp",
+            "/tmp",  # Tmp writable
+            "--dev",
+            "/dev",
+            "--proc",
+            "/proc",
+            "--chdir",
+            cwd,
         ]
         # Make git writable for commits in worktrees
         # Worktrees need:
         #   .git/worktrees/<name>/ - index, HEAD, logs
         #   .git/objects/ - store new blobs, trees, commits
         #   .git/refs/heads/ - update branch pointers
-        git_file = Path(cwd) / '.git'
+        git_file = Path(cwd) / ".git"
         if git_file.exists() and git_file.is_file():
             git_content = git_file.read_text().strip()
-            if git_content.startswith('gitdir:'):
-                git_worktree_dir = git_content.split('gitdir:')[1].strip()
+            if git_content.startswith("gitdir:"):
+                git_worktree_dir = git_content.split("gitdir:")[1].strip()
                 if Path(git_worktree_dir).exists():
                     # Worktree metadata (index, HEAD)
-                    cmd.extend(['--bind', git_worktree_dir, git_worktree_dir])
+                    cmd.extend(["--bind", git_worktree_dir, git_worktree_dir])
                     # Main .git directory for objects and refs
                     # gitdir is like: /path/to/repo/.git/worktrees/<name>
                     main_git = Path(git_worktree_dir).parent.parent
-                    if main_git.exists() and main_git.name == '.git':
+                    if main_git.exists() and main_git.name == ".git":
                         # Objects - for storing commits (append-only)
-                        objects_dir = main_git / 'objects'
+                        objects_dir = main_git / "objects"
                         if objects_dir.exists():
-                            cmd.extend(['--bind', str(objects_dir), str(objects_dir)])
+                            cmd.extend(["--bind", str(objects_dir), str(objects_dir)])
                         # Refs/heads - for branch pointers (not remotes/tags)
-                        refs_heads = main_git / 'refs' / 'heads'
+                        refs_heads = main_git / "refs" / "heads"
                         if refs_heads.exists():
-                            cmd.extend(['--bind', str(refs_heads), str(refs_heads)])
+                            cmd.extend(["--bind", str(refs_heads), str(refs_heads)])
                         # Logs/refs/heads - for reflogs
-                        logs_refs_heads = main_git / 'logs' / 'refs' / 'heads'
+                        logs_refs_heads = main_git / "logs" / "refs" / "heads"
                         if logs_refs_heads.exists():
-                            cmd.extend(['--bind', str(logs_refs_heads), str(logs_refs_heads)])
-        # Conditionally bind config dirs if they exist
-        for config_dir in ['.claude', '.anthropic', '.spindle', '.config']:
-            path = f'{home}/{config_dir}'
+                            cmd.extend(["--bind", str(logs_refs_heads), str(logs_refs_heads)])
+        # Conditionally bind config dirs/files if they exist
+        for config_item in [".claude", ".claude.json", ".anthropic", ".spindle", ".config"]:
+            path = f"{home}/{config_item}"
             if Path(path).exists():
-                cmd.extend(['--bind', path, path])
+                cmd.extend(["--bind", path, path])
         cmd.extend(claude_cmd)
     else:
         cmd = claude_cmd
 
     # Parse tags
-    tag_list = [t.strip() for t in tags.split(',')] if tags else []
+    tag_list = [t.strip() for t in tags.split(",")] if tags else []
 
     # Create spool record
     spool = {
-        'id': spool_id,
-        'status': 'pending',
-        'prompt': prompt,
-        'result': None,
-        'session_id': None,
-        'working_dir': cwd,
-        'allowed_tools': resolved_tools,
-        'permission': permission or 'careful',
-        'system_prompt': system_prompt,
-        'tags': tag_list,
-        'shard': shard_info,
-        'model': model,
-        'timeout': timeout,
-        'created_at': datetime.now().isoformat(),
-        'completed_at': None,
-        'pid': None,
-        'error': None,
+        "id": spool_id,
+        "status": "pending",
+        "prompt": prompt,
+        "result": None,
+        "session_id": None,
+        "working_dir": cwd,
+        "allowed_tools": resolved_tools,
+        "permission": permission or "careful",
+        "system_prompt": system_prompt,
+        "tags": tag_list,
+        "shard": shard_info,
+        "model": model,
+        "timeout": timeout,
+        "created_at": datetime.now().isoformat(),
+        "completed_at": None,
+        "pid": None,
+        "error": None,
     }
 
     _write_spool(spool_id, spool)
@@ -859,8 +837,8 @@ Your task:
     pid = _spawn_detached(spool_id, cmd, cwd)
 
     # Update spool with PID and status
-    spool['pid'] = pid
-    spool['status'] = 'running'
+    spool["pid"] = pid
+    spool["status"] = "running"
     _write_spool(spool_id, spool)
 
     # Start background monitor thread (daemon so it won't block shutdown)
@@ -912,8 +890,17 @@ async def spin(
         result = unspool(spool_id)
     """
     return await asyncio.to_thread(
-        _spin_sync, prompt, permission, shard, system_prompt,
-        working_dir, allowed_tools, tags, model, timeout, skeinless
+        _spin_sync,
+        prompt,
+        permission,
+        shard,
+        system_prompt,
+        working_dir,
+        allowed_tools,
+        tags,
+        model,
+        timeout,
+        skeinless,
     )
 
 
@@ -923,21 +910,21 @@ def _unspool_sync(spool_id: str) -> str:
     spool = _read_spool(spool_id)
     if not spool:
         return f"Error: Unknown spool_id '{spool_id}'"
-    status = spool.get('status')
-    if status == 'pending':
+    status = spool.get("status")
+    if status == "pending":
         return f"Spool {spool_id} pending (not yet started)"
-    elif status == 'running':
-        pid = spool.get('pid')
+    elif status == "running":
+        pid = spool.get("pid")
         if pid and not _is_pid_alive(pid):
             _check_and_finalize_spool(spool_id)
             spool = _read_spool(spool_id)
-            if spool.get('status') == 'complete':
-                return spool.get('result', 'No result')
-            elif spool.get('status') == 'error':
+            if spool.get("status") == "complete":
+                return spool.get("result", "No result")
+            elif spool.get("status") == "error":
                 return f"Spool {spool_id} failed: {spool.get('error', 'Unknown error')}"
         return f"Spool {spool_id} still running: {spool.get('prompt', '')[:50]}..."
-    elif status == 'complete':
-        return spool.get('result', 'No result')
+    elif status == "complete":
+        return spool.get("result", "No result")
     else:
         return f"Spool {spool_id} failed: {spool.get('error', 'Unknown error')}"
 
@@ -948,6 +935,7 @@ async def unspool(spool_id: str) -> str:
     Get the result of a background spin task.
     """
     import asyncio
+
     return await asyncio.to_thread(_unspool_sync, spool_id)
 
 
@@ -955,15 +943,18 @@ def _spools_sync() -> str:
     """Synchronous implementation of spools."""
     _recover_orphans()
     all_spools = _list_spools()
-    return json.dumps({
-        spool['id']: {
-            'status': spool.get('status'),
-            'prompt': spool.get('prompt', '')[:100],
-            'created_at': spool.get('created_at'),
-            'session_id': spool.get('session_id'),
-        }
-        for spool in all_spools
-    }, indent=2)
+    return json.dumps(
+        {
+            spool["id"]: {
+                "status": spool.get("status"),
+                "prompt": spool.get("prompt", "")[:100],
+                "created_at": spool.get("created_at"),
+                "session_id": spool.get("session_id"),
+            }
+            for spool in all_spools
+        },
+        indent=2,
+    )
 
 
 @mcp.tool()
@@ -975,6 +966,7 @@ async def spools() -> str:
         JSON object with spool statuses
     """
     import asyncio
+
     return await asyncio.to_thread(_spools_sync)
 
 
@@ -988,11 +980,7 @@ def _respin_sync(session_id: str, prompt: str) -> str:
 
     # Try to resume with session_id first
     # If that fails (session expired), fall back to transcript injection
-    cmd = [
-        'claude', '-p', prompt,
-        '--resume', session_id,
-        '--output-format', 'json'
-    ]
+    cmd = ["claude", "-p", prompt, "--resume", session_id, "--output-format", "json"]
 
     cwd = os.getcwd()
 
@@ -1000,24 +988,24 @@ def _respin_sync(session_id: str, prompt: str) -> str:
     original_spool = _find_spool_by_session(session_id)
     transcript_available = False
     if original_spool:
-        transcript_path = _get_transcript_path(original_spool['id'])
+        transcript_path = _get_transcript_path(original_spool["id"])
         transcript_available = transcript_path.exists()
 
     spool = {
-        'id': spool_id,
-        'status': 'pending',
-        'prompt': f"Continue {session_id}: {prompt}",
-        'result': None,
-        'session_id': session_id,
-        'working_dir': cwd,
-        'allowed_tools': None,
-        'system_prompt': None,
-        'transcript_fallback_available': transcript_available,
-        'created_at': datetime.now().isoformat(),
-        'completed_at': None,
-        'pid': None,
-        'cost': None,
-        'error': None,
+        "id": spool_id,
+        "status": "pending",
+        "prompt": f"Continue {session_id}: {prompt}",
+        "result": None,
+        "session_id": session_id,
+        "working_dir": cwd,
+        "allowed_tools": None,
+        "system_prompt": None,
+        "transcript_fallback_available": transcript_available,
+        "created_at": datetime.now().isoformat(),
+        "completed_at": None,
+        "pid": None,
+        "cost": None,
+        "error": None,
     }
 
     _write_spool(spool_id, spool)
@@ -1025,8 +1013,8 @@ def _respin_sync(session_id: str, prompt: str) -> str:
     # Spawn detached process
     pid = _spawn_detached(spool_id, cmd, cwd)
 
-    spool['pid'] = pid
-    spool['status'] = 'running'
+    spool["pid"] = pid
+    spool["status"] = "running"
     _write_spool(spool_id, spool)
 
     # Start background monitor
@@ -1075,7 +1063,7 @@ async def spin_wait(
     Returns:
         Results from completed spools
     """
-    ids = [s.strip() for s in spool_ids.split(',')]
+    ids = [s.strip() for s in spool_ids.split(",")]
     start_time = datetime.now()
     poll_interval = 3  # seconds
 
@@ -1087,9 +1075,9 @@ async def spin_wait(
                 spool = _read_spool(spool_id)
                 if not spool:
                     return f"Error: Unknown spool_id '{spool_id}'"
-                if spool.get('status') == 'complete':
-                    return spool.get('result', 'No result')
-                elif spool.get('status') == 'error':
+                if spool.get("status") == "complete":
+                    return spool.get("result", "No result")
+                elif spool.get("status") == "error":
                     return f"Error: {spool.get('error')}"
 
             if timeout:
@@ -1109,10 +1097,10 @@ async def spin_wait(
                 spool = _read_spool(spool_id)
                 if not spool:
                     return f"Error: Unknown spool_id '{spool_id}'"
-                if spool.get('status') == 'complete':
-                    results[spool_id] = spool.get('result', 'No result')
+                if spool.get("status") == "complete":
+                    results[spool_id] = spool.get("result", "No result")
                     pending.remove(spool_id)
-                elif spool.get('status') == 'error':
+                elif spool.get("status") == "error":
                     results[spool_id] = f"Error: {spool.get('error')}"
                     pending.remove(spool_id)
 
@@ -1145,10 +1133,10 @@ async def spin_drop(spool_id: str) -> str:
     if not spool:
         return f"Error: Unknown spool_id '{spool_id}'"
 
-    if spool.get('status') != 'running':
+    if spool.get("status") != "running":
         return f"Spool {spool_id} is not running (status: {spool.get('status')})"
 
-    pid = spool.get('pid')
+    pid = spool.get("pid")
 
     if not pid:
         return f"Spool {spool_id} has no PID recorded yet"
@@ -1166,9 +1154,9 @@ async def spin_drop(spool_id: str) -> str:
             pass
 
     # Update spool status
-    spool['status'] = 'error'
-    spool['error'] = 'Cancelled by user'
-    spool['completed_at'] = datetime.now().isoformat()
+    spool["status"] = "error"
+    spool["error"] = "Cancelled by user"
+    spool["completed_at"] = datetime.now().isoformat()
     _write_spool(spool_id, spool)
 
     # Clean up output files
@@ -1206,22 +1194,22 @@ async def spool_search(
     query_lower = query.lower()
 
     for spool in all_spools:
-        spool_id = spool.get('id', 'unknown')
-        prompt = spool.get('prompt', '') or ''
-        result = spool.get('result', '') or ''
+        spool_id = spool.get("id", "unknown")
+        prompt = spool.get("prompt", "") or ""
+        result = spool.get("result", "") or ""
 
         # Convert result to string if it's a dict
         if isinstance(result, dict):
             result = json.dumps(result)
 
-        prompt_match = query_lower in prompt.lower() if field in ('prompt', 'both') else False
-        result_match = query_lower in result.lower() if field in ('result', 'both') else False
+        prompt_match = query_lower in prompt.lower() if field in ("prompt", "both") else False
+        result_match = query_lower in result.lower() if field in ("result", "both") else False
 
         if prompt_match or result_match:
             match_info = {
-                'id': spool_id,
-                'status': spool.get('status'),
-                'created_at': spool.get('created_at'),
+                "id": spool_id,
+                "status": spool.get("status"),
+                "created_at": spool.get("created_at"),
             }
 
             # Add context snippets
@@ -1229,13 +1217,13 @@ async def spool_search(
                 idx = prompt.lower().find(query_lower)
                 start = max(0, idx - 30)
                 end = min(len(prompt), idx + len(query) + 30)
-                match_info['prompt_match'] = f"...{prompt[start:end]}..."
+                match_info["prompt_match"] = f"...{prompt[start:end]}..."
 
             if result_match:
                 idx = result.lower().find(query_lower)
                 start = max(0, idx - 50)
                 end = min(len(result), idx + len(query) + 50)
-                match_info['result_match'] = f"...{result[start:end]}..."
+                match_info["result_match"] = f"...{result[start:end]}..."
 
             matches.append(match_info)
 
@@ -1274,11 +1262,11 @@ async def spool_results(
     since_cutoff = None
     if since:
         since_map = {
-            '1h': timedelta(hours=1),
-            '6h': timedelta(hours=6),
-            '12h': timedelta(hours=12),
-            '1d': timedelta(days=1),
-            '7d': timedelta(days=7),
+            "1h": timedelta(hours=1),
+            "6h": timedelta(hours=6),
+            "12h": timedelta(hours=12),
+            "1d": timedelta(days=1),
+            "7d": timedelta(days=7),
         }
         delta = since_map.get(since)
         if delta:
@@ -1290,12 +1278,12 @@ async def spool_results(
     filtered = []
     for spool in all_spools:
         # Status filter
-        if status != "all" and spool.get('status') != status:
+        if status != "all" and spool.get("status") != status:
             continue
 
         # Time filter
         if since_cutoff:
-            created_str = spool.get('created_at')
+            created_str = spool.get("created_at")
             if created_str:
                 try:
                     created = datetime.fromisoformat(created_str)
@@ -1307,7 +1295,7 @@ async def spool_results(
         filtered.append(spool)
 
     # Sort by created_at descending
-    filtered.sort(key=lambda s: s.get('created_at', ''), reverse=True)
+    filtered.sort(key=lambda s: s.get("created_at", ""), reverse=True)
 
     # Apply limit
     filtered = filtered[:limit]
@@ -1315,18 +1303,20 @@ async def spool_results(
     # Format output
     results = []
     for spool in filtered:
-        result_text = spool.get('result', '')
+        result_text = spool.get("result", "")
         if isinstance(result_text, dict):
             result_text = json.dumps(result_text)
 
-        results.append({
-            'id': spool.get('id'),
-            'status': spool.get('status'),
-            'prompt': spool.get('prompt', '')[:100],
-            'result': result_text[:500] if result_text else None,
-            'created_at': spool.get('created_at'),
-            'session_id': spool.get('session_id'),
-        })
+        results.append(
+            {
+                "id": spool.get("id"),
+                "status": spool.get("status"),
+                "prompt": spool.get("prompt", "")[:100],
+                "result": result_text[:500] if result_text else None,
+                "created_at": spool.get("created_at"),
+                "session_id": spool.get("session_id"),
+            }
+        )
 
     if not results:
         return f"No spools found with status='{status}'" + (f" since {since}" if since else "")
@@ -1358,8 +1348,8 @@ async def spool_grep(pattern: str) -> str:
     matches = []
 
     for spool in all_spools:
-        spool_id = spool.get('id', 'unknown')
-        result = spool.get('result', '') or ''
+        spool_id = spool.get("id", "unknown")
+        result = spool.get("result", "") or ""
 
         # Convert result to string if it's a dict
         if isinstance(result, dict):
@@ -1369,13 +1359,15 @@ async def spool_grep(pattern: str) -> str:
         if found:
             # Get unique matches and limit to first 10
             unique_matches = list(dict.fromkeys(found))[:10]
-            matches.append({
-                'id': spool_id,
-                'status': spool.get('status'),
-                'prompt': spool.get('prompt', '')[:80],
-                'matches': unique_matches,
-                'match_count': len(found),
-            })
+            matches.append(
+                {
+                    "id": spool_id,
+                    "status": spool.get("status"),
+                    "prompt": spool.get("prompt", "")[:80],
+                    "matches": unique_matches,
+                    "match_count": len(found),
+                }
+            )
 
     if not matches:
         return f"No results matching pattern '{pattern}'"
@@ -1410,7 +1402,7 @@ async def spool_peek(spool_id: str, lines: int = 50) -> str:
         return f"No output yet for spool {spool_id}"
 
     try:
-        with open(stdout_path, 'r') as f:
+        with open(stdout_path, "r") as f:
             all_lines = f.readlines()
 
         if not all_lines:
@@ -1418,10 +1410,10 @@ async def spool_peek(spool_id: str, lines: int = 50) -> str:
 
         # Get last N lines
         tail = all_lines[-lines:] if len(all_lines) > lines else all_lines
-        status = spool.get('status', 'unknown')
+        status = spool.get("status", "unknown")
 
         header = f"[spool {spool_id} - {status} - {len(all_lines)} total lines, showing last {len(tail)}]\n"
-        return header + ''.join(tail)
+        return header + "".join(tail)
     except Exception as e:
         return f"Error reading output: {e}"
 
@@ -1447,13 +1439,13 @@ async def spool_retry(spool_id: str) -> str:
 
     # Re-spin with same parameters
     return await spin(
-        prompt=spool.get('prompt', ''),
-        permission=spool.get('permission'),
-        shard=bool(spool.get('shard')),
-        system_prompt=spool.get('system_prompt'),
-        working_dir=spool.get('working_dir'),
-        allowed_tools=spool.get('allowed_tools'),
-        tags=','.join(spool.get('tags', [])) if spool.get('tags') else None,
+        prompt=spool.get("prompt", ""),
+        permission=spool.get("permission"),
+        shard=bool(spool.get("shard")),
+        system_prompt=spool.get("system_prompt"),
+        working_dir=spool.get("working_dir"),
+        allowed_tools=spool.get("allowed_tools"),
+        tags=",".join(spool.get("tags", [])) if spool.get("tags") else None,
     )
 
 
@@ -1469,30 +1461,32 @@ def _get_shard_commit_status(spool: dict) -> Optional[str]:
         - "conflict": Would have merge conflicts
         - "no_worktree": Worktree doesn't exist
     """
-    shard_info = spool.get('shard')
+    shard_info = spool.get("shard")
     if not shard_info:
         return None
 
     # Check if already merged
-    if shard_info.get('merged'):
+    if shard_info.get("merged"):
         return "merged"
 
-    worktree_path = shard_info.get('worktree_path')
+    worktree_path = shard_info.get("worktree_path")
     if not worktree_path or not Path(worktree_path).exists():
         return "no_worktree"
 
     try:
         # Check for uncommitted changes
         result = subprocess.run(
-            ['git', 'status', '--porcelain'],
-            capture_output=True, text=True, cwd=worktree_path, timeout=10
+            ["git", "status", "--porcelain"], capture_output=True, text=True, cwd=worktree_path, timeout=10
         )
         has_uncommitted = bool(result.stdout.strip()) if result.returncode == 0 else False
 
         # Check for commits ahead of master
         result = subprocess.run(
-            ['git', 'rev-list', '--count', 'master..HEAD'],
-            capture_output=True, text=True, cwd=worktree_path, timeout=10
+            ["git", "rev-list", "--count", "master..HEAD"],
+            capture_output=True,
+            text=True,
+            cwd=worktree_path,
+            timeout=10,
         )
         commits_ahead = int(result.stdout.strip()) if result.returncode == 0 else 0
 
@@ -1504,11 +1498,14 @@ def _get_shard_commit_status(spool: dict) -> Optional[str]:
 
         # Check for potential merge conflicts
         main_repo = Path(worktree_path).parent.parent
-        branch_name = shard_info.get('branch_name')
+        branch_name = shard_info.get("branch_name")
         if branch_name:
             result = subprocess.run(
-                ['git', 'merge-tree', '--write-tree', 'master', branch_name],
-                capture_output=True, text=True, cwd=str(main_repo), timeout=10
+                ["git", "merge-tree", "--write-tree", "master", branch_name],
+                capture_output=True,
+                text=True,
+                cwd=str(main_repo),
+                timeout=10,
             )
             # Non-zero exit means conflicts
             if result.returncode != 0:
@@ -1526,40 +1523,43 @@ def _get_shard_change_stats(spool: dict) -> Optional[dict]:
 
     Returns dict with files_changed, insertions, deletions or None.
     """
-    shard_info = spool.get('shard')
+    shard_info = spool.get("shard")
     if not shard_info:
         return None
 
-    worktree_path = shard_info.get('worktree_path')
+    worktree_path = shard_info.get("worktree_path")
     if not worktree_path or not Path(worktree_path).exists():
         return None
 
     try:
         result = subprocess.run(
-            ['git', 'diff', '--stat', '--stat-width=1000', 'master...HEAD'],
-            capture_output=True, text=True, cwd=worktree_path, timeout=10
+            ["git", "diff", "--stat", "--stat-width=1000", "master...HEAD"],
+            capture_output=True,
+            text=True,
+            cwd=worktree_path,
+            timeout=10,
         )
         if result.returncode != 0:
             return None
 
         # Parse the summary line: " X files changed, Y insertions(+), Z deletions(-)"
-        lines = result.stdout.strip().split('\n')
+        lines = result.stdout.strip().split("\n")
         if not lines:
             return None
 
         summary = lines[-1]
-        stats = {'files_changed': 0, 'insertions': 0, 'deletions': 0}
+        stats = {"files_changed": 0, "insertions": 0, "deletions": 0}
 
-        files_match = re.search(r'(\d+) files? changed', summary)
-        ins_match = re.search(r'(\d+) insertions?\(\+\)', summary)
-        del_match = re.search(r'(\d+) deletions?\(-\)', summary)
+        files_match = re.search(r"(\d+) files? changed", summary)
+        ins_match = re.search(r"(\d+) insertions?\(\+\)", summary)
+        del_match = re.search(r"(\d+) deletions?\(-\)", summary)
 
         if files_match:
-            stats['files_changed'] = int(files_match.group(1))
+            stats["files_changed"] = int(files_match.group(1))
         if ins_match:
-            stats['insertions'] = int(ins_match.group(1))
+            stats["insertions"] = int(ins_match.group(1))
         if del_match:
-            stats['deletions'] = int(del_match.group(1))
+            stats["deletions"] = int(del_match.group(1))
 
         return stats
 
@@ -1580,13 +1580,13 @@ def _spool_dashboard_sync() -> str:
     errors = []
 
     for spool in all_spools:
-        status = spool.get('status')
-        if status == 'running':
+        status = spool.get("status")
+        if status == "running":
             running.append(spool)
-        elif status == 'error':
+        elif status == "error":
             errors.append(spool)
-        elif status == 'complete':
-            completed_at = spool.get('completed_at')
+        elif status == "complete":
+            completed_at = spool.get("completed_at")
             if completed_at:
                 try:
                     completed_dt = datetime.fromisoformat(completed_at)
@@ -1597,9 +1597,9 @@ def _spool_dashboard_sync() -> str:
 
     # Build recent completions list (last hour, sorted by completion time)
     recent = []
-    for spool in sorted(complete_last_hour, key=lambda s: s.get('completed_at', ''), reverse=True)[:10]:
-        spool_id = spool.get('id')
-        completed_at = spool.get('completed_at')
+    for spool in sorted(complete_last_hour, key=lambda s: s.get("completed_at", ""), reverse=True)[:10]:
+        spool_id = spool.get("id")
+        completed_at = spool.get("completed_at")
 
         # Calculate age
         age_str = "unknown"
@@ -1612,27 +1612,29 @@ def _spool_dashboard_sync() -> str:
                 pass
 
         # Get task name (first 60 chars of prompt)
-        prompt = spool.get('prompt', '')[:60]
-        if len(spool.get('prompt', '')) > 60:
+        prompt = spool.get("prompt", "")[:60]
+        if len(spool.get("prompt", "")) > 60:
             prompt += "..."
 
         commit_status = _get_shard_commit_status(spool)
 
-        recent.append({
-            'spool_id': spool_id,
-            'task': prompt,
-            'status': 'complete',
-            'age': age_str,
-            'commit_status': commit_status,
-        })
+        recent.append(
+            {
+                "spool_id": spool_id,
+                "task": prompt,
+                "status": "complete",
+                "age": age_str,
+                "commit_status": commit_status,
+            }
+        )
 
     # Needing attention: shards with uncommitted changes or large changesets
     needing_attention = []
     for spool in all_spools:
-        if spool.get('status') != 'complete':
+        if spool.get("status") != "complete":
             continue
 
-        shard_info = spool.get('shard')
+        shard_info = spool.get("shard")
         if not shard_info:
             continue
 
@@ -1640,64 +1642,68 @@ def _spool_dashboard_sync() -> str:
         needs_attention = False
         reason = None
 
-        if commit_status == 'uncommitted':
+        if commit_status == "uncommitted":
             needs_attention = True
             reason = "uncommitted changes"
-        elif commit_status == 'conflict':
+        elif commit_status == "conflict":
             needs_attention = True
             reason = "merge conflict"
 
         # Check for large changes
-        if commit_status == 'has_commit':
+        if commit_status == "has_commit":
             stats = _get_shard_change_stats(spool)
             if stats:
-                total_changes = stats.get('insertions', 0) + stats.get('deletions', 0)
-                if total_changes > 500 or stats.get('files_changed', 0) > 10:
+                total_changes = stats.get("insertions", 0) + stats.get("deletions", 0)
+                if total_changes > 500 or stats.get("files_changed", 0) > 10:
                     needs_attention = True
                     reason = f"large changeset ({stats['files_changed']} files, +{stats['insertions']}/-{stats['deletions']})"
 
         if needs_attention:
-            needing_attention.append({
-                'spool_id': spool.get('id'),
-                'task': spool.get('prompt', '')[:60],
-                'commit_status': commit_status,
-                'reason': reason,
-                'worktree': shard_info.get('worktree_path'),
-            })
+            needing_attention.append(
+                {
+                    "spool_id": spool.get("id"),
+                    "task": spool.get("prompt", "")[:60],
+                    "commit_status": commit_status,
+                    "reason": reason,
+                    "worktree": shard_info.get("worktree_path"),
+                }
+            )
 
     # Also add errors from last hour as needing attention
     for spool in errors:
-        created_at = spool.get('created_at')
+        created_at = spool.get("created_at")
         if created_at:
             try:
                 created_dt = datetime.fromisoformat(created_at)
                 if created_dt >= hour_ago:
-                    needing_attention.append({
-                        'spool_id': spool.get('id'),
-                        'task': spool.get('prompt', '')[:60],
-                        'commit_status': None,
-                        'reason': f"error: {spool.get('error', 'unknown')[:50]}",
-                    })
+                    needing_attention.append(
+                        {
+                            "spool_id": spool.get("id"),
+                            "task": spool.get("prompt", "")[:60],
+                            "commit_status": None,
+                            "reason": f"error: {spool.get('error', 'unknown')[:50]}",
+                        }
+                    )
             except ValueError:
                 pass
 
     dashboard = {
-        'summary': {
-            'running': len(running),
-            'complete_last_hour': len(complete_last_hour),
-            'errors': len(errors),
-            'total_spools': len(all_spools),
+        "summary": {
+            "running": len(running),
+            "complete_last_hour": len(complete_last_hour),
+            "errors": len(errors),
+            "total_spools": len(all_spools),
         },
-        'running': [
+        "running": [
             {
-                'spool_id': s.get('id'),
-                'task': s.get('prompt', '')[:60],
-                'started': s.get('created_at'),
+                "spool_id": s.get("id"),
+                "task": s.get("prompt", "")[:60],
+                "started": s.get("created_at"),
             }
             for s in running
         ],
-        'recent_completions': recent,
-        'needing_attention': needing_attention,
+        "recent_completions": recent,
+        "needing_attention": needing_attention,
     }
 
     return json.dumps(dashboard, indent=2)
@@ -1745,24 +1751,24 @@ async def spool_stats() -> str:
     all_spools = _list_spools()
 
     stats = {
-        'total': len(all_spools),
-        'by_status': {},
-        'oldest': None,
-        'newest': None,
+        "total": len(all_spools),
+        "by_status": {},
+        "oldest": None,
+        "newest": None,
     }
 
     for spool in all_spools:
         # Count by status
-        status = spool.get('status', 'unknown')
-        stats['by_status'][status] = stats['by_status'].get(status, 0) + 1
+        status = spool.get("status", "unknown")
+        stats["by_status"][status] = stats["by_status"].get(status, 0) + 1
 
         # Track time range
-        created = spool.get('created_at')
+        created = spool.get("created_at")
         if created:
-            if not stats['oldest'] or created < stats['oldest']:
-                stats['oldest'] = created
-            if not stats['newest'] or created > stats['newest']:
-                stats['newest'] = created
+            if not stats["oldest"] or created < stats["oldest"]:
+                stats["oldest"] = created
+            if not stats["newest"] or created > stats["newest"]:
+                stats["newest"] = created
 
     return json.dumps(stats, indent=2)
 
@@ -1792,7 +1798,7 @@ async def spool_export(
     if spool_ids.strip().lower() == "all":
         spools_to_export = _list_spools()
     else:
-        ids = [s.strip() for s in spool_ids.split(',')]
+        ids = [s.strip() for s in spool_ids.split(",")]
         spools_to_export = []
         for sid in ids:
             spool = _read_spool(sid)
@@ -1805,7 +1811,7 @@ async def spool_export(
         return "No spools to export"
 
     # Sort by created_at
-    spools_to_export.sort(key=lambda s: s.get('created_at', ''))
+    spools_to_export.sort(key=lambda s: s.get("created_at", ""))
 
     # Generate output
     if format == "md":
@@ -1819,14 +1825,14 @@ async def spool_export(
             lines.append(f"```\n{spool.get('prompt', '')}\n```")
             lines.append("")
             lines.append("### Result")
-            result = spool.get('result', '')
+            result = spool.get("result", "")
             if isinstance(result, dict):
                 result = json.dumps(result, indent=2)
             lines.append(f"```\n{result}\n```")
             lines.append("")
             lines.append("---")
             lines.append("")
-        content = '\n'.join(lines)
+        content = "\n".join(lines)
         ext = "md"
     else:
         content = json.dumps(spools_to_export, indent=2)
@@ -1851,43 +1857,43 @@ def _shard_status_sync(spool_id: str) -> str:
     if not spool:
         return f"Error: Unknown spool_id '{spool_id}'"
 
-    shard_info = spool.get('shard')
+    shard_info = spool.get("shard")
     if not shard_info:
         return f"Spool {spool_id} has no shard (was not run with shard=True)"
 
-    worktree_path = shard_info.get('worktree_path')
+    worktree_path = shard_info.get("worktree_path")
     if not worktree_path or not Path(worktree_path).exists():
-        return json.dumps({
-            'spool_id': spool_id,
-            'shard': shard_info,
-            'exists': False,
-            'message': 'Worktree no longer exists'
-        }, indent=2)
+        return json.dumps(
+            {"spool_id": spool_id, "shard": shard_info, "exists": False, "message": "Worktree no longer exists"},
+            indent=2,
+        )
 
     status_info = {
-        'spool_id': spool_id,
-        'shard': shard_info,
-        'exists': True,
-        'spool_status': spool.get('status'),
+        "spool_id": spool_id,
+        "shard": shard_info,
+        "exists": True,
+        "spool_status": spool.get("status"),
     }
 
     try:
         result = subprocess.run(
-            ['git', 'status', '--porcelain'],
-            capture_output=True, text=True, cwd=worktree_path, timeout=10
+            ["git", "status", "--porcelain"], capture_output=True, text=True, cwd=worktree_path, timeout=10
         )
         if result.returncode == 0:
-            status_info['git_changes'] = result.stdout.strip().split('\n') if result.stdout.strip() else []
+            status_info["git_changes"] = result.stdout.strip().split("\n") if result.stdout.strip() else []
 
         result = subprocess.run(
-            ['git', 'rev-list', '--count', 'master..HEAD'],
-            capture_output=True, text=True, cwd=worktree_path, timeout=10
+            ["git", "rev-list", "--count", "master..HEAD"],
+            capture_output=True,
+            text=True,
+            cwd=worktree_path,
+            timeout=10,
         )
         if result.returncode == 0:
-            status_info['commits_ahead'] = int(result.stdout.strip())
+            status_info["commits_ahead"] = int(result.stdout.strip())
 
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError, ValueError):
-        status_info['git_error'] = 'Failed to get git status'
+        status_info["git_error"] = "Failed to get git status"
 
     return json.dumps(status_info, indent=2)
 
@@ -1907,6 +1913,7 @@ async def shard_status(spool_id: str) -> str:
         shard_status("abc123")  # show shard details
     """
     import asyncio
+
     return await asyncio.to_thread(_shard_status_sync, spool_id)
 
 
@@ -1939,15 +1946,15 @@ async def shard_merge(spool_id: str, keep_branch: bool = False, caller_cwd: str 
     if not spool:
         return f"Error: Unknown spool_id '{spool_id}'"
 
-    if spool.get('status') == 'running':
+    if spool.get("status") == "running":
         return f"Error: Spool {spool_id} is still running. Wait for completion."
 
-    shard_info = spool.get('shard')
+    shard_info = spool.get("shard")
     if not shard_info:
         return f"Error: Spool {spool_id} has no shard"
 
-    worktree_path = shard_info.get('worktree_path')
-    branch_name = shard_info.get('branch_name')
+    worktree_path = shard_info.get("worktree_path")
+    branch_name = shard_info.get("branch_name")
 
     if not worktree_path or not Path(worktree_path).exists():
         return f"Error: Worktree no longer exists: {worktree_path}"
@@ -1963,8 +1970,8 @@ async def shard_merge(spool_id: str, keep_branch: bool = False, caller_cwd: str 
     # Check if any running spool has working_dir inside this worktree
     wt_path = Path(worktree_path).resolve()
     for other in _list_spools():
-        if other.get('status') == 'running' and other.get('id') != spool_id:
-            other_wd = other.get('working_dir', '')
+        if other.get("status") == "running" and other.get("id") != spool_id:
+            other_wd = other.get("working_dir", "")
             if other_wd and Path(other_wd).resolve() == wt_path:
                 return f"Error: Spool {other['id']} is still running in this worktree. Wait for it to complete or use spin_drop() first."
 
@@ -1974,22 +1981,18 @@ async def shard_merge(spool_id: str, keep_branch: bool = False, caller_cwd: str 
     try:
         # Check for uncommitted changes
         result = subprocess.run(
-            ['git', 'status', '--porcelain'],
-            capture_output=True,
-            text=True,
-            cwd=worktree_path,
-            timeout=10
+            ["git", "status", "--porcelain"], capture_output=True, text=True, cwd=worktree_path, timeout=10
         )
         if result.stdout.strip():
             return f"Error: Shard has uncommitted changes. Commit or discard them first."
 
         # Merge branch to master from main repo
         result = subprocess.run(
-            ['git', 'merge', branch_name, '--no-ff', '-m', f'Merge shard {spool_id}: {spool.get("prompt", "")[:50]}'],
+            ["git", "merge", branch_name, "--no-ff", "-m", f'Merge shard {spool_id}: {spool.get("prompt", "")[:50]}'],
             capture_output=True,
             text=True,
             cwd=str(main_repo),
-            timeout=30
+            timeout=30,
         )
         if result.returncode != 0:
             return f"Error: Merge failed: {result.stderr}"
@@ -1998,12 +2001,12 @@ async def shard_merge(spool_id: str, keep_branch: bool = False, caller_cwd: str 
         _cleanup_shard(shard_info, str(main_repo), keep_branch=keep_branch)
 
         # Update spool record
-        spool['shard']['merged'] = True
-        spool['shard']['merged_at'] = datetime.now().isoformat()
+        spool["shard"]["merged"] = True
+        spool["shard"]["merged_at"] = datetime.now().isoformat()
         _write_spool(spool_id, spool)
 
         # Auto-close any tender folios for this worktree
-        worktree_name = shard_info.get('shard_id') or Path(worktree_path).name
+        worktree_name = shard_info.get("shard_id") or Path(worktree_path).name
         tender_result = _close_tender_folios(worktree_name)
 
         msg = f"Successfully merged shard {spool_id} to master"
@@ -2045,11 +2048,11 @@ async def shard_abandon(spool_id: str, keep_branch: bool = False, caller_cwd: st
     if not spool:
         return f"Error: Unknown spool_id '{spool_id}'"
 
-    shard_info = spool.get('shard')
+    shard_info = spool.get("shard")
     if not shard_info:
         return f"Error: Spool {spool_id} has no shard"
 
-    worktree_path = shard_info.get('worktree_path')
+    worktree_path = shard_info.get("worktree_path")
 
     if not worktree_path:
         return f"Error: No worktree path in shard info"
@@ -2065,8 +2068,8 @@ async def shard_abandon(spool_id: str, keep_branch: bool = False, caller_cwd: st
     # Check if any OTHER running spool has working_dir inside this worktree
     wt_path = Path(worktree_path).resolve()
     for other in _list_spools():
-        if other.get('status') == 'running' and other.get('id') != spool_id:
-            other_wd = other.get('working_dir', '')
+        if other.get("status") == "running" and other.get("id") != spool_id:
+            other_wd = other.get("working_dir", "")
             if other_wd and Path(other_wd).resolve() == wt_path:
                 return f"Error: Spool {other['id']} is still running in this worktree. Wait for it to complete or use spin_drop() first."
 
@@ -2074,8 +2077,8 @@ async def shard_abandon(spool_id: str, keep_branch: bool = False, caller_cwd: st
     main_repo = Path(worktree_path).parent.parent
 
     # If spool is running, kill it first
-    if spool.get('status') == 'running':
-        pid = spool.get('pid')
+    if spool.get("status") == "running":
+        pid = spool.get("pid")
         if pid:
             try:
                 os.killpg(pid, signal.SIGTERM)
@@ -2085,16 +2088,16 @@ async def shard_abandon(spool_id: str, keep_branch: bool = False, caller_cwd: st
                 except (ProcessLookupError, OSError):
                     pass
 
-        spool['status'] = 'error'
-        spool['error'] = 'Shard abandoned'
-        spool['completed_at'] = datetime.now().isoformat()
+        spool["status"] = "error"
+        spool["error"] = "Shard abandoned"
+        spool["completed_at"] = datetime.now().isoformat()
 
     # Cleanup shard
     success = _cleanup_shard(shard_info, str(main_repo), keep_branch=keep_branch)
 
     if success:
-        spool['shard']['abandoned'] = True
-        spool['shard']['abandoned_at'] = datetime.now().isoformat()
+        spool["shard"]["abandoned"] = True
+        spool["shard"]["abandoned_at"] = datetime.now().isoformat()
         _write_spool(spool_id, spool)
         return f"Abandoned shard {spool_id}" + (" (branch kept)" if keep_branch else "")
     else:
@@ -2163,14 +2166,14 @@ If status is `incomplete` and work is worth continuing, create a brief for the r
         _spin_sync,
         prompt,
         "careful",  # permission - needs git, skein commands
-        False,      # shard
-        None,       # system_prompt
+        False,  # shard
+        None,  # system_prompt
         worktree_path,  # working_dir
-        None,       # allowed_tools
-        "triage",   # tags
-        None,       # model
-        None,       # timeout
-        True,       # skeinless
+        None,  # allowed_tools
+        "triage",  # tags
+        None,  # model
+        None,  # timeout
+        True,  # skeinless
     )
 
 
@@ -2196,16 +2199,16 @@ async def spool_info(spool_id: str) -> str:
         return f"Error: Unknown spool_id '{spool_id}'"
 
     # Add transcript availability info
-    if spool.get('session_id'):
-        original_spool = _find_spool_by_session(spool['session_id'])
+    if spool.get("session_id"):
+        original_spool = _find_spool_by_session(spool["session_id"])
         if original_spool:
-            transcript_path = _get_transcript_path(original_spool['id'])
-            spool['_transcript_available'] = transcript_path.exists()
+            transcript_path = _get_transcript_path(original_spool["id"])
+            spool["_transcript_available"] = transcript_path.exists()
             if transcript_path.exists():
                 try:
-                    spool['_transcript_size'] = len(transcript_path.read_text())
+                    spool["_transcript_size"] = len(transcript_path.read_text())
                 except IOError:
-                    spool['_transcript_size'] = 'error'
+                    spool["_transcript_size"] = "error"
 
     return json.dumps(spool, indent=2)
 
@@ -2222,26 +2225,21 @@ async def spindle_reload() -> str:
     """
     # Check if systemd service exists (even if not running)
     result = subprocess.run(
-        ['systemctl', '--user', 'list-unit-files', 'spindle.service'],
-        capture_output=True,
-        text=True
+        ["systemctl", "--user", "list-unit-files", "spindle.service"], capture_output=True, text=True
     )
 
-    if 'spindle.service' not in result.stdout:
+    if "spindle.service" not in result.stdout:
         return "Error: spindle.service not found. Restart manually."
 
     # Check if currently active
-    is_active = subprocess.run(
-        ['systemctl', '--user', 'is-active', 'spindle'],
-        capture_output=True
-    ).returncode == 0
+    is_active = subprocess.run(["systemctl", "--user", "is-active", "spindle"], capture_output=True).returncode == 0
 
     def delayed_restart():
         time.sleep(0.5)  # Give time for response to be sent
         if is_active:
-            subprocess.run(['systemctl', '--user', 'restart', 'spindle'])
+            subprocess.run(["systemctl", "--user", "restart", "spindle"])
         else:
-            subprocess.run(['systemctl', '--user', 'start', 'spindle'])
+            subprocess.run(["systemctl", "--user", "start", "spindle"])
 
     restart_thread = threading.Thread(target=delayed_restart, daemon=True)
     restart_thread.start()
@@ -2284,16 +2282,15 @@ def main():
     if args.command == "start":
         # Check if systemd service exists
         result = subprocess.run(
-            ['systemctl', '--user', 'list-unit-files', 'spindle.service'],
-            capture_output=True, text=True
+            ["systemctl", "--user", "list-unit-files", "spindle.service"], capture_output=True, text=True
         )
-        if 'spindle.service' in result.stdout:
-            subprocess.run(['systemctl', '--user', 'start', 'spindle'])
+        if "spindle.service" in result.stdout:
+            subprocess.run(["systemctl", "--user", "start", "spindle"])
             print("Started via systemd")
         else:
             # Start in background
             subprocess.Popen(
-                [sys.executable, __file__, 'serve', '--http'],
+                [sys.executable, __file__, "serve", "--http"],
                 start_new_session=True,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -2304,21 +2301,17 @@ def main():
     elif args.command == "reload":
         # Check if systemd service exists
         result = subprocess.run(
-            ['systemctl', '--user', 'list-unit-files', 'spindle.service'],
-            capture_output=True, text=True
+            ["systemctl", "--user", "list-unit-files", "spindle.service"], capture_output=True, text=True
         )
-        if 'spindle.service' in result.stdout:
-            subprocess.run(['systemctl', '--user', 'restart', 'spindle'])
+        if "spindle.service" in result.stdout:
+            subprocess.run(["systemctl", "--user", "restart", "spindle"])
             print("Restarted via systemd")
         else:
             print("No systemd service. Kill and run: spindle start")
         sys.exit(0)
 
     elif args.command == "status":
-        result = subprocess.run(
-            ['curl', '-s', 'http://127.0.0.1:8002/health'],
-            capture_output=True, text=True
-        )
+        result = subprocess.run(["curl", "-s", "http://127.0.0.1:8002/health"], capture_output=True, text=True)
         if result.returncode == 0:
             print(result.stdout)
         else:

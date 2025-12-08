@@ -125,6 +125,7 @@ class TestProcessUtils:
     def test_is_pid_alive_current_process(self):
         """Current process PID should be alive."""
         import os
+
         assert _is_pid_alive(os.getpid()) is True
 
     def test_is_pid_alive_nonexistent(self):

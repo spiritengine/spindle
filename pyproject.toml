@@ -4,7 +4,7 @@ version = "1.0.0"
 description = "MCP server for Claude Code to Claude Code delegation"
 readme = "README.md"
 requires-python = ">=3.10"
-# license = {text = "MIT"}  # Uncomment after adding LICENSE file
+license = {text = "MIT"}
 keywords = ["mcp", "claude", "claude-code", "agent", "delegation", "ai"]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -25,19 +25,24 @@ dependencies = [
 dev = [
     "pytest>=7.0",
     "pytest-asyncio>=0.21",
+    "black>=24.0",
     "ruff>=0.1.0",
 ]
 
 [project.urls]
-# Homepage = "https://github.com/OWNER/spindle"
-# Repository = "https://github.com/OWNER/spindle"
-# Issues = "https://github.com/OWNER/spindle/issues"
+Homepage = "https://github.com/smythp/spindle"
+Repository = "https://github.com/smythp/spindle"
+Issues = "https://github.com/smythp/spindle/issues"
 
 [project.scripts]
 spindle = "spindle:main"
 
 [tool.setuptools]
 packages = ["spindle"]
+
+[tool.black]
+line-length = 120
+target-version = ["py310"]
 
 [tool.ruff]
 line-length = 120

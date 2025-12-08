@@ -1,31 +1,30 @@
 # Contributing to Spindle
 
-Thanks for your interest in contributing to Spindle!
-
 ## Development Setup
 
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/OWNER/spindle.git
-   cd spindle
-   ```
+```bash
+# Clone the repo
+git clone https://github.com/smythp/spindle.git
+cd spindle
 
-2. Create a virtual environment:
-   ```bash
-   python -m venv .venv
-   source .venv/bin/activate  # On Windows: .venv\Scripts\activate
-   ```
+# Install with dev dependencies
+pip install -e ".[dev]"
+```
 
-3. Install in development mode with dev dependencies:
-   ```bash
-   pip install -e ".[dev]"
-   ```
+## Code Style
 
-## Requirements
+We use black for formatting and ruff for linting:
 
-- Python 3.10+
-- Claude CLI (`claude`) installed and configured
-- Git (for shard/worktree functionality)
+```bash
+# Format code
+black spindle/ tests/
+
+# Lint
+ruff check spindle/ tests/
+
+# Fix auto-fixable lint issues
+ruff check --fix spindle/ tests/
+```
 
 ## Running Tests
 
@@ -33,43 +32,21 @@ Thanks for your interest in contributing to Spindle!
 pytest
 ```
 
-## Code Style
-
-We use [ruff](https://github.com/astral-sh/ruff) for linting:
-
-```bash
-ruff check .
-ruff format .  # If you want to auto-format
-```
-
 ## Making Changes
 
 1. Create a branch for your changes
 2. Make your changes
-3. Run tests and linting
-4. Submit a pull request
+3. Run `black` and `ruff check`
+4. Run `pytest`
+5. Submit a PR
 
-## Pull Request Guidelines
+## Code Structure
 
-- Keep PRs focused on a single change
-- Include tests for new functionality
-- Update documentation if needed
-- Ensure all tests pass
+- `spindle/__init__.py` - Main MCP server implementation
+- `tests/` - Test suite
 
-## Architecture Overview
+## Key Concepts
 
-Spindle is an MCP (Model Context Protocol) server that enables Claude Code to spawn child Claude Code agents:
-
-- **Spool**: A background task/agent instance. Has an ID, status, prompt, and result.
-- **Shard**: An isolated git worktree for a spool to work in safely.
-- **Storage**: Spools persist to `~/.spindle/spools/{id}.json`
-
-Key components:
-- `spin()` - Spawn a new agent
-- `unspool()` - Get result from an agent
-- `shard_*` - Manage isolated git worktrees
-- `spool_*` - Search, filter, export spool data
-
-## Questions?
-
-Open an issue for questions or discussion.
+- **Spool** - A background task/agent. Has an ID, status, prompt, and result.
+- **Shard** - An isolated git worktree for safe parallel work.
+- **Permission profile** - Controls what tools a spawned agent can use.

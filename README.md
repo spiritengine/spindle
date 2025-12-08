@@ -2,7 +2,7 @@
 
 <!-- Uncomment when published:
 [![PyPI version](https://badge.fury.io/py/spindle.svg)](https://badge.fury.io/py/spindle)
-[![CI](https://github.com/OWNER/spindle/actions/workflows/ci.yml/badge.svg)](https://github.com/OWNER/spindle/actions/workflows/ci.yml)
+[![CI](https://github.com/smythp/spindle/actions/workflows/ci.yml/badge.svg)](https://github.com/smythp/spindle/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 -->
 
@@ -236,7 +236,7 @@ Environment variables:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `SPINDLE_MAX_CONCURRENT` | `5` | Maximum concurrent spools |
+| `SPINDLE_MAX_CONCURRENT` | `15` | Maximum concurrent spools |
 
 Storage location: `~/.spindle/spools/`
 
@@ -255,10 +255,14 @@ For shards:
 
 ## Limits
 
-- Max 5 concurrent spools (configurable via `SPINDLE_MAX_CONCURRENT`)
+- Max 15 concurrent spools (configurable via `SPINDLE_MAX_CONCURRENT`)
 - 24h auto-cleanup of old spools
 - Orphaned spools (dead process) marked as error on restart
 
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and guidelines.
+
+## License
+
+MIT - see [LICENSE](LICENSE).
