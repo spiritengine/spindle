@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Spindle launchd service for macOS
+
+  This file is for reference. Use `spindle install-service` to install
+  automatically with the correct paths for your system.
+
+  Manual installation:
+    cp examples/com.spindle.server.plist ~/Library/LaunchAgents/
+    # Edit the spindle path if not in /usr/local/bin
+    launchctl load ~/Library/LaunchAgents/com.spindle.server.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.spindle.server</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/spindle</string>
+        <string>serve</string>
+        <string>--http</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/Users/YOURUSERNAME/.spindle/spindle.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/YOURUSERNAME/.spindle/spindle.log</string>
+</dict>
+</plist>

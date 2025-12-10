@@ -110,9 +110,9 @@ Shards create a git worktree + branch. If SKEIN is available, uses `skein shard 
 
 ```
 # Spawn multiple agents
-id1 = spin("Research competitor A")
-id2 = spin("Research competitor B")
-id3 = spin("Research competitor C")
+id1 = spin("Find all TODO comments")
+id2 = spin("List unused imports")
+id3 = spin("Check for type errors")
 
 # Gather: block until all complete, get all results
 results = spin_wait("id1,id2,id3", mode="gather")
@@ -233,24 +233,44 @@ Spools persist to `~/.spindle/spools/{spool_id}.json`:
 ## CLI Commands
 
 ```bash
-spindle start   # Start via systemd (or background if no service)
-spindle reload  # Restart via systemd to pick up code changes
-spindle status  # Check if running (hits /health endpoint)
-spindle serve --http  # Run MCP server directly (what systemd calls)
+spindle install-service  # Install background service (Linux/macOS)
+spindle start            # Start via systemd (or background if no service)
+spindle reload           # Restart via systemd to pick up code changes
+spindle status           # Check if running (hits /health endpoint)
+spindle serve --http     # Run MCP server directly
 ```
 
-### systemd Service
+### Background Service
 
-For production, use the systemd service:
+For persistent background operation:
 
 ```bash
-# Install service (copy to ~/.config/systemd/user/spindle.service)
-systemctl --user daemon-reload
-systemctl --user enable spindle
-systemctl --user start spindle
+# Install and enable the service (Linux or macOS)
+spindle install-service
+
+# Start it
+spindle start
 ```
 
-Then `spindle reload` works to restart after code changes.
+**Linux**: Writes a systemd user service to `~/.config/systemd/user/spindle.service`
+
+**macOS**: Writes a launchd plist to `~/Library/LaunchAgents/com.spindle.server.plist` and loads it immediately
+
+Use `--force` to overwrite an existing service file. Then `spindle reload` restarts the service to pick up code changes.
+
+### Windows
+
+On Windows, run spindle manually:
+
+```bash
+spindle serve --http
+```
+
+Or use [NSSM](https://nssm.cc/) to create a Windows service.
+
+### WSL
+
+In WSL2 with systemd enabled, `spindle install-service` works like native Linux. If systemd isn't enabled, you'll get instructions to enable it or run manually.
 
 ### Hot Reload (MCP tool)
 

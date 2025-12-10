@@ -1,0 +1,25 @@
+# Spindle systemd user service
+#
+# This file is for reference. Use `spindle install-service` to install
+# automatically with the correct paths for your system.
+#
+# Manual installation:
+#   cp examples/spindle.service ~/.config/systemd/user/spindle.service
+#   # Edit ExecStart path if spindle is not in ~/.local/bin
+#   systemctl --user daemon-reload
+#   systemctl --user enable spindle
+#   systemctl --user start spindle
+
+[Unit]
+Description=Spindle MCP Server
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/spindle serve --http
+Restart=on-failure
+RestartSec=5
+Environment=PATH=%h/.local/bin:/usr/bin
+
+[Install]
+WantedBy=default.target
