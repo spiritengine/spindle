@@ -208,7 +208,37 @@ def _spawn_shard(agent_id: str, working_dir: str) -> Optional[Dict[str, str]]:
     return None
 
 
-def _close_tender_folios(worktree_name: str) -> Optional[str]:
+def _get_skein_project_id(working_dir: Optional[str] = None) -> Optional[str]:
+    """
+    Get SKEIN project ID from environment or project config.
+
+    Checks SKEIN_PROJECT env var first, then looks for .skein/config.json
+    in the working directory or its parents.
+
+    Returns:
+        Project ID string or None if not found
+    """
+    # Check environment first
+    project_id = os.environ.get("SKEIN_PROJECT")
+    if project_id:
+        return project_id
+
+    # Look for .skein/config.json in working_dir or parents
+    search_dir = Path(working_dir) if working_dir else Path.cwd()
+    for parent in [search_dir] + list(search_dir.parents):
+        config_path = parent / ".skein" / "config.json"
+        if config_path.exists():
+            try:
+                with open(config_path) as f:
+                    config = json.load(f)
+                    return config.get("project_id")
+            except (IOError, json.JSONDecodeError):
+                continue
+
+    return None
+
+
+def _close_tender_folios(worktree_name: str, working_dir: Optional[str] = None) -> Optional[str]:
     """
     Close any tender folios associated with a worktree after successful merge.
 
@@ -217,6 +247,7 @@ def _close_tender_folios(worktree_name: str) -> Optional[str]:
 
     Args:
         worktree_name: The worktree name to match in tender metadata
+        working_dir: Working directory to search for SKEIN config (for project ID)
 
     Returns:
         Message about closed folios, or None if SKEIN unavailable/no matches
@@ -231,9 +262,22 @@ def _close_tender_folios(worktree_name: str) -> Optional[str]:
         # Query SKEIN for tender folios
         skein_url = os.environ.get("SKEIN_URL", "http://localhost:8001")
         agent_id = os.environ.get("SKEIN_AGENT_ID", "spindle")
+        project_id = _get_skein_project_id(working_dir)
 
-        # Get all tender folios
-        req = urllib.request.Request(f"{skein_url}/folios?type=tender", headers={"X-Agent-ID": agent_id})
+        if not project_id:
+            return None  # Can't query without project ID
+
+        # Build headers with required project ID
+        headers = {
+            "X-Agent-ID": agent_id,
+            "X-Project-Id": project_id,
+        }
+
+        # Get all tender folios (note: /skein prefix required)
+        req = urllib.request.Request(
+            f"{skein_url}/skein/folios?type=tender",
+            headers=headers
+        )
 
         with urllib.request.urlopen(req, timeout=10) as response:
             folios = json.loads(response.read().decode())
@@ -264,9 +308,9 @@ def _close_tender_folios(worktree_name: str) -> Optional[str]:
                 ).encode()
 
                 close_req = urllib.request.Request(
-                    f"{skein_url}/threads",
+                    f"{skein_url}/skein/threads",
                     data=close_data,
-                    headers={"X-Agent-ID": agent_id, "Content-Type": "application/json"},
+                    headers={**headers, "Content-Type": "application/json"},
                     method="POST",
                 )
 
@@ -2007,7 +2051,7 @@ async def shard_merge(spool_id: str, keep_branch: bool = False, caller_cwd: str 
 
         # Auto-close any tender folios for this worktree
         worktree_name = shard_info.get("shard_id") or Path(worktree_path).name
-        tender_result = _close_tender_folios(worktree_name)
+        tender_result = _close_tender_folios(worktree_name, str(main_repo))
 
         msg = f"Successfully merged shard {spool_id} to master"
         if tender_result:
