@@ -843,7 +843,7 @@ Your task:
                         if logs_refs_heads.exists():
                             cmd.extend(["--bind", str(logs_refs_heads), str(logs_refs_heads)])
         # Conditionally bind config dirs/files if they exist
-        for config_item in [".claude", ".claude.json", ".anthropic", ".spindle", ".config"]:
+        for config_item in [".claude", ".claude.json", ".anthropic", ".spindle", ".config", ".cache"]:
             path = f"{home}/{config_item}"
             if Path(path).exists():
                 cmd.extend(["--bind", path, path])
