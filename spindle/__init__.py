@@ -1544,16 +1544,27 @@ def _get_shard_commit_status(spool: dict) -> Optional[str]:
         main_repo = Path(worktree_path).parent.parent
         branch_name = shard_info.get("branch_name")
         if branch_name:
+            # Find merge base first
             result = subprocess.run(
-                ["git", "merge-tree", "--write-tree", "master", branch_name],
+                ["git", "merge-base", "master", branch_name],
                 capture_output=True,
                 text=True,
                 cwd=str(main_repo),
                 timeout=10,
             )
-            # Non-zero exit means conflicts
-            if result.returncode != 0:
-                return "conflict"
+            if result.returncode == 0:
+                merge_base = result.stdout.strip()
+                # Use 3-way merge-tree with explicit base (old-style merge-tree)
+                result = subprocess.run(
+                    ["git", "merge-tree", merge_base, "master", branch_name],
+                    capture_output=True,
+                    text=True,
+                    cwd=str(main_repo),
+                    timeout=10,
+                )
+                # Check for conflict markers in output
+                if "<<<<<<" in result.stdout or "+<<<<<<" in result.stdout:
+                    return "conflict"
 
         return "has_commit"
 
