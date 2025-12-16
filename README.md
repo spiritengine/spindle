@@ -11,10 +11,12 @@ MCP server for Claude Code to Claude Code delegation. Spawn background agents th
 ## Features
 
 - **Async agent spawning** - Fire-and-forget pattern with spool IDs
+- **Optional blocking with gather/yield** - Wait for all results at once, or stream them as agents complete. Alternatively, agent can continue other work, spins are nonblocking by default
 - **Permission profiles** - Control what tools child agents can use (readonly, careful, full)
-- **Shard isolation** - Run agents in isolated git worktrees to prevent conflicts
-- **Session continuity** - Resume conversations with child agents
-- **Rich querying** - Search, filter, and export spool results
+- **Shard isolation** - Run agents in sandboxed git worktrees to prevent conflicts
+- **Model selection** - Route tasks to haiku, sonnet, or opus per-agent
+- **Session continuity** - Resume conversations with child agents (auto-recovers expired sessions)
+- **Rich querying** - Search, filter, peek at running output, export results
 
 ## Requirements
 
@@ -25,7 +27,7 @@ MCP server for Claude Code to Claude Code delegation. Spawn background agents th
 ## Install
 
 ```bash
-pip install -e .
+pip install spindle-mcp
 ```
 
 Add to Claude Code's MCP config (`~/.claude.json`):
@@ -107,15 +109,35 @@ Shards create a git worktree + branch. If SKEIN is available, uses `skein shard 
 ### Wait for completion
 
 ```
-# Spawn multiple
-id1 = spin("Task 1")
-id2 = spin("Task 2")
+# Spawn multiple agents
+id1 = spin("Find all TODO comments")
+id2 = spin("List unused imports")
+id3 = spin("Check for type errors")
 
-# Wait for all (gather mode)
-results = spin_wait("id1,id2", mode="gather")
+# Gather: block until all complete, get all results
+results = spin_wait("id1,id2,id3", mode="gather")
 
-# Or get first to complete (yield mode)
-first = spin_wait("id1,id2", mode="yield")
+# Yield: return as each completes
+# Great when results are independent - process each as it lands
+result = spin_wait("id1,id2,id3", mode="yield")  # Returns first to finish
+
+# With timeout
+results = spin_wait("id1,id2", mode="gather", timeout=300)
+```
+
+Yield mode keeps you responsive instead of blocking on the slowest agent.
+
+### Model selection and timeouts
+
+```
+# Route quick tasks to haiku (fast, cheap)
+spin("Summarize this file", model="haiku")
+
+# Complex work to opus
+spin("Design the new architecture", model="opus")
+
+# Auto-kill if it takes too long
+spin("Should be quick", timeout=60)
 ```
 
 ### Continue a session
@@ -127,6 +149,8 @@ result = unspool(spool_id)  # includes session_id
 # Continue that conversation
 new_id = respin(session_id, "Follow up question")
 ```
+
+If the session has expired on Claude's end, respin automatically falls back to transcript injection to recreate context.
 
 ### Cancel running work
 
@@ -173,6 +197,8 @@ spool_export("all", format="md")
 | `spool_results(status?, since?, limit?)` | Bulk fetch with filters |
 | `spool_grep(pattern)` | Regex search results |
 | `spool_retry(spool_id)` | Re-run with same params |
+| `spool_peek(spool_id, lines?)` | See partial output while running |
+| `spool_dashboard()` | Overview of running/complete/needs-attention |
 | `spool_stats()` | Get summary statistics |
 | `spool_export(spool_ids, format?, output_path?)` | Export to file |
 | `shard_status(spool_id)` | Check shard worktree status |
@@ -207,24 +233,44 @@ Spools persist to `~/.spindle/spools/{spool_id}.json`:
 ## CLI Commands
 
 ```bash
-spindle start   # Start via systemd (or background if no service)
-spindle reload  # Restart via systemd to pick up code changes
-spindle status  # Check if running (hits /health endpoint)
-spindle serve --http  # Run MCP server directly (what systemd calls)
+spindle install-service  # Install background service (Linux/macOS)
+spindle start            # Start via systemd (or background if no service)
+spindle reload           # Restart via systemd to pick up code changes
+spindle status           # Check if running (hits /health endpoint)
+spindle serve --http     # Run MCP server directly
 ```
 
-### systemd Service
+### Background Service
 
-For production, use the systemd service:
+For persistent background operation:
 
 ```bash
-# Install service (copy to ~/.config/systemd/user/spindle.service)
-systemctl --user daemon-reload
-systemctl --user enable spindle
-systemctl --user start spindle
+# Install and enable the service (Linux or macOS)
+spindle install-service
+
+# Start it
+spindle start
 ```
 
-Then `spindle reload` works to restart after code changes.
+**Linux**: Writes a systemd user service to `~/.config/systemd/user/spindle.service`
+
+**macOS**: Writes a launchd plist to `~/Library/LaunchAgents/com.spindle.server.plist` and loads it immediately
+
+Use `--force` to overwrite an existing service file. Then `spindle reload` restarts the service to pick up code changes.
+
+### Windows
+
+On Windows, run spindle manually:
+
+```bash
+spindle serve --http
+```
+
+Or use [NSSM](https://nssm.cc/) to create a Windows service.
+
+### WSL
+
+In WSL2 with systemd enabled, `spindle install-service` works like native Linux. If systemd isn't enabled, you'll get instructions to enable it or run manually.
 
 ### Hot Reload (MCP tool)
 

@@ -1,10 +1,10 @@
 [project]
-name = "spindle"
-version = "1.0.0"
+name = "spindle-mcp"
+version = "1.0.1"
 description = "MCP server for Claude Code to Claude Code delegation"
 readme = "README.md"
 requires-python = ">=3.10"
-license = {text = "MIT"}
+license = "MIT"
 keywords = ["mcp", "claude", "claude-code", "agent", "delegation", "ai"]
 classifiers = [
     "Development Status :: 4 - Beta",

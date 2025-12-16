@@ -62,7 +62,7 @@ Preparing Spindle for open-source release.
 - [ ] Add type hints throughout (partially present)
 - [ ] Add docstrings to all public functions
 - [ ] Consider adding a CHANGELOG.md
-- [ ] Add example systemd service file to repo
+- [x] Add example systemd service file to repo + `spindle install-service` command
 
 ### Configuration
 - [x] SPINDLE_DIR is `~/.spindle/spools` (sensible default)

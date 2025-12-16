@@ -799,7 +799,7 @@ Your task:
                         if logs_refs_heads.exists():
                             cmd.extend(["--bind", str(logs_refs_heads), str(logs_refs_heads)])
         # Conditionally bind config dirs/files if they exist
-        for config_item in [".claude", ".claude.json", ".anthropic", ".spindle", ".config"]:
+        for config_item in [".claude", ".claude.json", ".anthropic", ".spindle", ".config", ".cache"]:
             path = f"{home}/{config_item}"
             if Path(path).exists():
                 cmd.extend(["--bind", path, path])
@@ -2282,6 +2282,14 @@ def main():
     # status command
     status_parser = subparsers.add_parser("status", help="Check spindle status")
 
+    # install-service command
+    install_service_parser = subparsers.add_parser(
+        "install-service", help="Install systemd user service"
+    )
+    install_service_parser.add_argument(
+        "--force", action="store_true", help="Overwrite existing service file"
+    )
+
     # Legacy flags for backward compat
     parser.add_argument("--http", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--port", type=int, default=8002, help=argparse.SUPPRESS)
@@ -2327,6 +2335,150 @@ def main():
             print(result.stdout)
         else:
             print("Not running")
+        sys.exit(0)
+
+    elif args.command == "install-service":
+        import shutil
+        import platform
+
+        system = platform.system()
+
+        # Find spindle executable path
+        spindle_path = shutil.which("spindle")
+        if not spindle_path:
+            if system == "Darwin":
+                # Common locations on macOS
+                for p in ["/usr/local/bin/spindle", "/opt/homebrew/bin/spindle"]:
+                    if Path(p).exists():
+                        spindle_path = p
+                        break
+                if not spindle_path:
+                    spindle_path = "/usr/local/bin/spindle"
+            else:
+                spindle_path = str(Path.home() / ".local" / "bin" / "spindle")
+
+        if system == "Linux":
+            # Check if systemd is actually running (important for WSL)
+            systemd_check = subprocess.run(
+                ["systemctl", "--user", "status"], capture_output=True, text=True
+            )
+            if systemd_check.returncode != 0 and "Failed to connect" in systemd_check.stderr:
+                # Detect WSL
+                is_wsl = False
+                try:
+                    with open("/proc/version", "r") as f:
+                        if "microsoft" in f.read().lower():
+                            is_wsl = True
+                except:
+                    pass
+
+                if is_wsl:
+                    print("WSL detected but systemd is not running.")
+                    print("\nTo enable systemd in WSL2, add to /etc/wsl.conf:")
+                    print("  [boot]")
+                    print("  systemd=true")
+                    print("\nThen restart WSL: wsl --shutdown")
+                    print("\nOr run spindle manually: spindle serve --http")
+                else:
+                    print("systemd user session not available.")
+                    print("Run spindle manually: spindle serve --http")
+                sys.exit(1)
+
+            service_content = f"""\
+[Unit]
+Description=Spindle MCP Server
+After=network.target
+
+[Service]
+Type=simple
+ExecStart={spindle_path} serve --http
+Restart=on-failure
+RestartSec=5
+Environment=PATH=%h/.local/bin:/usr/bin
+
+[Install]
+WantedBy=default.target
+"""
+            service_dir = Path.home() / ".config" / "systemd" / "user"
+            service_file = service_dir / "spindle.service"
+
+            if service_file.exists() and not args.force:
+                print(f"Service file already exists: {service_file}")
+                print("Use --force to overwrite")
+                sys.exit(1)
+
+            service_dir.mkdir(parents=True, exist_ok=True)
+            service_file.write_text(service_content)
+            print(f"Wrote {service_file}")
+
+            subprocess.run(["systemctl", "--user", "daemon-reload"])
+            print("Reloaded systemd")
+
+            subprocess.run(["systemctl", "--user", "enable", "spindle"])
+            print("Enabled spindle service")
+
+            print("\nTo start now: spindle start")
+            print("To check status: spindle status")
+
+        elif system == "Darwin":
+            plist_content = f"""\
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.spindle.server</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{spindle_path}</string>
+        <string>serve</string>
+        <string>--http</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>{Path.home()}/.spindle/spindle.log</string>
+    <key>StandardErrorPath</key>
+    <string>{Path.home()}/.spindle/spindle.log</string>
+</dict>
+</plist>
+"""
+            launch_agents = Path.home() / "Library" / "LaunchAgents"
+            plist_file = launch_agents / "com.spindle.server.plist"
+
+            if plist_file.exists() and not args.force:
+                print(f"Plist already exists: {plist_file}")
+                print("Use --force to overwrite")
+                sys.exit(1)
+
+            # Unload if already loaded
+            if plist_file.exists():
+                subprocess.run(["launchctl", "unload", str(plist_file)], capture_output=True)
+
+            launch_agents.mkdir(parents=True, exist_ok=True)
+            plist_file.write_text(plist_content)
+            print(f"Wrote {plist_file}")
+
+            # Ensure log directory exists
+            (Path.home() / ".spindle").mkdir(parents=True, exist_ok=True)
+
+            # Load the service
+            subprocess.run(["launchctl", "load", str(plist_file)])
+            print("Loaded launchd service")
+
+            print("\nService is now running.")
+            print("To check status: spindle status")
+            print("To stop: launchctl unload ~/Library/LaunchAgents/com.spindle.server.plist")
+
+        else:
+            print(f"Service installation not supported on {system}.")
+            print("Run spindle manually:")
+            print("  spindle serve --http")
+            print("\nOn Windows, consider using NSSM to create a service.")
+            sys.exit(1)
+
         sys.exit(0)
 
     # Default to serve if no command or using legacy --http flag
