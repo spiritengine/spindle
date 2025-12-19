@@ -127,6 +127,22 @@ results = spin_wait("id1,id2", mode="gather", timeout=300)
 
 Yield mode keeps you responsive instead of blocking on the slowest agent.
 
+### Time-based waiting
+
+Wait for a duration instead of waiting on spools:
+
+```
+# Wait for 90 minutes
+spin_wait(time="90m")
+
+# Other formats
+spin_wait(time="30s")    # 30 seconds
+spin_wait(time="2h")     # 2 hours
+spin_wait(time="06:00")  # Until 6 AM (handles next-day wraparound)
+```
+
+Useful for periodic check-in loops (e.g., QM/dancing partner patterns).
+
 ### Model selection and timeouts
 
 ```
@@ -190,7 +206,7 @@ spool_export("all", format="md")
 | `spin(prompt, permission?, shard?, system_prompt?, working_dir?, allowed_tools?, tags?)` | Spawn agent, return spool_id |
 | `unspool(spool_id)` | Get result (non-blocking) |
 | `spools()` | List all spools |
-| `spin_wait(spool_ids, mode?, timeout?)` | Block until done |
+| `spin_wait(spool_ids?, mode?, timeout?, time?)` | Block until spools complete, or wait for duration |
 | `respin(session_id, prompt)` | Continue session |
 | `spin_drop(spool_id)` | Cancel by killing process |
 | `spool_search(query, field?)` | Search prompts/results |
