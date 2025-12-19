@@ -402,6 +402,57 @@ def _is_pid_alive(pid: int) -> bool:
         return False
 
 
+def _parse_duration(time_str: str) -> Optional[int]:
+    """
+    Parse a duration string into seconds.
+
+    Supported formats:
+    - "30s" - 30 seconds
+    - "90m" - 90 minutes
+    - "2h" - 2 hours
+    - "06:00" or "14:30" - absolute time (wait until that time today/tomorrow)
+
+    Returns:
+        Number of seconds to wait, or None if invalid format
+    """
+    if not time_str:
+        return None
+
+    time_str = time_str.strip()
+
+    # Try relative duration formats: 30s, 90m, 2h
+    match = re.match(r'^(\d+(?:\.\d+)?)\s*([smh])$', time_str.lower())
+    if match:
+        value = float(match.group(1))
+        unit = match.group(2)
+        if unit == 's':
+            return int(value)
+        elif unit == 'm':
+            return int(value * 60)
+        elif unit == 'h':
+            return int(value * 3600)
+
+    # Try absolute time format: HH:MM
+    match = re.match(r'^(\d{1,2}):(\d{2})$', time_str)
+    if match:
+        target_hour = int(match.group(1))
+        target_minute = int(match.group(2))
+
+        if target_hour < 0 or target_hour > 23 or target_minute < 0 or target_minute > 59:
+            return None
+
+        now = datetime.now()
+        target = now.replace(hour=target_hour, minute=target_minute, second=0, microsecond=0)
+
+        # If target time is in the past, assume tomorrow
+        if target <= now:
+            target += timedelta(days=1)
+
+        return int((target - now).total_seconds())
+
+    return None
+
+
 def _cleanup_old_spools() -> None:
     """Remove spool files older than 24 hours."""
     if not SPINDLE_DIR.exists():
@@ -1048,9 +1099,10 @@ async def respin(
 
 @mcp.tool()
 async def spin_wait(
-    spool_ids: str,
+    spool_ids: Optional[str] = None,
     mode: str = "gather",
     timeout: Optional[int] = None,
+    time: Optional[str] = None,
 ) -> str:
     """
     Block until spools complete.
@@ -1059,10 +1111,61 @@ async def spin_wait(
         spool_ids: Comma-separated spool IDs to wait for
         mode: 'gather' (wait for all) or 'yield' (return first completed)
         timeout: Optional timeout in seconds
+        time: Duration to wait (when no spool_ids provided).
+              Formats: "90m" (minutes), "2h" (hours), "30s" (seconds),
+              or "06:00" (absolute time, wait until then)
 
     Returns:
-        Results from completed spools
+        Results from completed spools, or wait status if using time parameter
+
+    Examples:
+        spin_wait("abc123,def456")  # Wait for spools
+        spin_wait(time="90m")       # Sleep for 90 minutes
+        spin_wait(time="2h")        # Sleep for 2 hours
+        spin_wait(time="06:00")     # Wait until 6 AM
     """
+    # Time-based waiting mode (no spool_ids)
+    if time and not spool_ids:
+        duration_seconds = _parse_duration(time)
+        if duration_seconds is None:
+            return f"Error: Invalid time format '{time}'. Use: 30s, 90m, 2h, or HH:MM"
+
+        start_time = datetime.now()
+        target_time = start_time + timedelta(seconds=duration_seconds)
+
+        # Sleep in chunks to allow interruption
+        chunk_size = 5  # seconds
+        elapsed = 0
+
+        try:
+            while elapsed < duration_seconds:
+                remaining = duration_seconds - elapsed
+                sleep_time = min(chunk_size, remaining)
+                await asyncio.sleep(sleep_time)
+                elapsed = int((datetime.now() - start_time).total_seconds())
+        except asyncio.CancelledError:
+            # Handle Ctrl+C gracefully
+            elapsed = int((datetime.now() - start_time).total_seconds())
+            return json.dumps({
+                "waited": time,
+                "elapsed_seconds": elapsed,
+                "interrupted": True,
+                "started_at": start_time.isoformat(),
+                "ended_at": datetime.now().isoformat(),
+            }, indent=2)
+
+        return json.dumps({
+            "waited": time,
+            "elapsed_seconds": elapsed,
+            "interrupted": False,
+            "started_at": start_time.isoformat(),
+            "ended_at": datetime.now().isoformat(),
+        }, indent=2)
+
+    # Must have spool_ids for spool-waiting mode
+    if not spool_ids:
+        return "Error: Provide spool_ids to wait for spools, or time to wait for a duration"
+
     ids = [s.strip() for s in spool_ids.split(",")]
     start_time = datetime.now()
     poll_interval = 3  # seconds
