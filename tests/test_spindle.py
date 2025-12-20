@@ -15,6 +15,7 @@ from spindle import (
     _write_spool,
     _read_spool,
     _is_pid_alive,
+    _parse_duration,
     PERMISSION_PROFILES,
 )
 
@@ -202,3 +203,46 @@ class TestPermissionProfileContents:
         assert "Bash(pytest:*)" in careful
         assert "Bash(python:*)" in careful
         assert "Bash(npm:*)" in careful
+
+
+class TestParseDuration:
+    """Test duration parsing for spin_sleep."""
+
+    def test_parse_seconds(self):
+        """Parse seconds format."""
+        assert _parse_duration("30s") == 30
+        assert _parse_duration("1s") == 1
+
+    def test_parse_minutes(self):
+        """Parse minutes format."""
+        assert _parse_duration("90m") == 90 * 60
+        assert _parse_duration("1m") == 60
+
+    def test_parse_hours(self):
+        """Parse hours format."""
+        assert _parse_duration("2h") == 2 * 3600
+        assert _parse_duration("1h") == 3600
+
+    def test_parse_with_whitespace(self):
+        """Handle whitespace in duration strings."""
+        assert _parse_duration(" 30s ") == 30
+        assert _parse_duration("  5m  ") == 5 * 60
+
+    def test_parse_invalid_returns_none(self):
+        """Invalid formats should return None."""
+        assert _parse_duration("invalid") is None
+        assert _parse_duration("30x") is None
+        assert _parse_duration("") is None
+        assert _parse_duration("abc") is None
+
+    def test_parse_absolute_time(self):
+        """Parse absolute time format (HH:MM)."""
+        # Just verify it returns a positive integer
+        result = _parse_duration("06:00")
+        assert result is not None
+        assert result > 0
+
+    def test_parse_invalid_absolute_time(self):
+        """Invalid absolute times should return None."""
+        assert _parse_duration("25:00") is None
+        assert _parse_duration("12:60") is None
