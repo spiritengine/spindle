@@ -1221,6 +1221,64 @@ async def spin_wait(
 
 
 @mcp.tool()
+async def spin_sleep(duration: str) -> str:
+    """
+    Sleep for a specified duration.
+
+    A simpler interface for timed waiting when you don't need to wait on spools.
+
+    Args:
+        duration: How long to sleep.
+            Formats: "90m" (minutes), "2h" (hours), "30s" (seconds),
+            or "06:00" (absolute time, wait until then)
+
+    Returns:
+        JSON with wait details (elapsed time, timestamps)
+
+    Example:
+        spin_sleep("90m")       # Sleep for 90 minutes
+        spin_sleep("2h")        # Sleep for 2 hours
+        spin_sleep("30s")       # Sleep for 30 seconds
+        spin_sleep("06:00")     # Wait until 6 AM
+    """
+    duration_seconds = _parse_duration(duration)
+    if duration_seconds is None:
+        return f"Error: Invalid duration format '{duration}'. Use: 30s, 90m, 2h, or HH:MM"
+
+    start_time = datetime.now()
+    target_time = start_time + timedelta(seconds=duration_seconds)
+
+    # Sleep in chunks to allow interruption
+    chunk_size = 5  # seconds
+    elapsed = 0
+
+    try:
+        while elapsed < duration_seconds:
+            remaining = duration_seconds - elapsed
+            sleep_time = min(chunk_size, remaining)
+            await asyncio.sleep(sleep_time)
+            elapsed = int((datetime.now() - start_time).total_seconds())
+    except asyncio.CancelledError:
+        # Handle Ctrl+C gracefully
+        elapsed = int((datetime.now() - start_time).total_seconds())
+        return json.dumps({
+            "duration": duration,
+            "elapsed_seconds": elapsed,
+            "interrupted": True,
+            "started_at": start_time.isoformat(),
+            "ended_at": datetime.now().isoformat(),
+        }, indent=2)
+
+    return json.dumps({
+        "duration": duration,
+        "elapsed_seconds": elapsed,
+        "interrupted": False,
+        "started_at": start_time.isoformat(),
+        "ended_at": datetime.now().isoformat(),
+    }, indent=2)
+
+
+@mcp.tool()
 async def spin_drop(spool_id: str) -> str:
     """
     Cancel a running spool by killing its process.

@@ -129,16 +129,20 @@ Yield mode keeps you responsive instead of blocking on the slowest agent.
 
 ### Time-based waiting
 
-Wait for a duration instead of waiting on spools:
+Simple timed waiting with `spin_sleep`:
 
 ```
-# Wait for 90 minutes
-spin_wait(time="90m")
+spin_sleep("90m")       # Sleep for 90 minutes
+spin_sleep("2h")        # Sleep for 2 hours
+spin_sleep("30s")       # Sleep for 30 seconds
+spin_sleep("06:00")     # Wait until 6 AM
+```
 
-# Other formats
-spin_wait(time="30s")    # 30 seconds
-spin_wait(time="2h")     # 2 hours
-spin_wait(time="06:00")  # Until 6 AM (handles next-day wraparound)
+Or use `spin_wait` with the `time` parameter:
+
+```
+spin_wait(time="90m")
+spin_wait(time="06:00")  # Handles next-day wraparound
 ```
 
 Useful for periodic check-in loops (e.g., QM/dancing partner patterns).
@@ -207,6 +211,7 @@ spool_export("all", format="md")
 | `unspool(spool_id)` | Get result (non-blocking) |
 | `spools()` | List all spools |
 | `spin_wait(spool_ids?, mode?, timeout?, time?)` | Block until spools complete, or wait for duration |
+| `spin_sleep(duration)` | Sleep for a duration (90m, 2h, 30s, HH:MM) |
 | `respin(session_id, prompt)` | Continue session |
 | `spin_drop(spool_id)` | Cancel by killing process |
 | `spool_search(query, field?)` | Search prompts/results |
