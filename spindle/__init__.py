@@ -72,32 +72,45 @@ PERMISSION_PROFILES = {
     "careful+shard": "Read,Write,Edit,Grep,Glob,Bash(git:*),Bash(make:*),Bash(pytest:*),Bash(python:*),Bash(npm:*),Bash(skein:*),Bash(muster:*)",
 }
 
-# Cache for SKEIN availability check
-_skein_available: Optional[bool] = None
+# Cache for SKEIN availability check (per-directory)
+_skein_available: Dict[str, bool] = {}
 
 
-def _has_skein() -> bool:
+def _has_skein(working_dir: str) -> bool:
     """
-    Check if SKEIN is available in the current project.
-    Result is cached for performance.
+    Check if SKEIN is available for the given project directory.
+    Results are cached per-directory for performance.
 
     Uses 'skein health' which checks git repo, .skein/ dir, and server.
+
+    Args:
+        working_dir: The directory to check for SKEIN availability
     """
     global _skein_available
-    if _skein_available is not None:
-        return _skein_available
+
+    # Normalize the path for consistent cache keys
+    cache_key = str(Path(working_dir).resolve())
+
+    if cache_key in _skein_available:
+        return _skein_available[cache_key]
 
     try:
-        result = subprocess.run(["skein", "health", "--json"], capture_output=True, text=True, timeout=10)
+        result = subprocess.run(
+            ["skein", "health", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            cwd=working_dir,
+        )
         if result.returncode == 0:
             data = json.loads(result.stdout)
-            _skein_available = data.get("healthy", False)
+            _skein_available[cache_key] = data.get("healthy", False)
         else:
-            _skein_available = False
+            _skein_available[cache_key] = False
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError, json.JSONDecodeError):
-        _skein_available = False
+        _skein_available[cache_key] = False
 
-    return _skein_available
+    return _skein_available[cache_key]
 
 
 def _resolve_permission(permission: Optional[str], allowed_tools: Optional[str]) -> tuple[Optional[str], bool]:
@@ -144,7 +157,7 @@ def _spawn_shard(agent_id: str, working_dir: str) -> Optional[Dict[str, str]]:
         Dict with shard info if successful, None if failed
         Keys: worktree_path, branch_name, shard_id
     """
-    if _has_skein():
+    if _has_skein(working_dir):
         # Use SKEIN's shard spawn command
         try:
             result = subprocess.run(
@@ -208,7 +221,7 @@ def _spawn_shard(agent_id: str, working_dir: str) -> Optional[Dict[str, str]]:
     return None
 
 
-def _close_tender_folios(worktree_name: str) -> Optional[str]:
+def _close_tender_folios(worktree_name: str, working_dir: str) -> Optional[str]:
     """
     Close any tender folios associated with a worktree after successful merge.
 
@@ -217,11 +230,12 @@ def _close_tender_folios(worktree_name: str) -> Optional[str]:
 
     Args:
         worktree_name: The worktree name to match in tender metadata
+        working_dir: The directory to check for SKEIN availability
 
     Returns:
         Message about closed folios, or None if SKEIN unavailable/no matches
     """
-    if not _has_skein():
+    if not _has_skein(working_dir):
         return None
 
     try:
@@ -752,7 +766,7 @@ def _spin_sync(
 
     # Inject SKEIN context for shard agents (unless skeinless=True)
     effective_prompt = prompt
-    if _has_skein() and shard_info and not skeinless:
+    if _has_skein(working_dir) and shard_info and not skeinless:
         # Prepend SKEIN ignition instructions to the prompt
         worktree_name = shard_info.get("shard_id", spool_id)
         skein_preamble = f"""You are working in an isolated SHARD worktree.
@@ -2179,7 +2193,7 @@ async def shard_merge(spool_id: str, keep_branch: bool = False, caller_cwd: str 
 
         # Auto-close any tender folios for this worktree
         worktree_name = shard_info.get("shard_id") or Path(worktree_path).name
-        tender_result = _close_tender_folios(worktree_name)
+        tender_result = _close_tender_folios(worktree_name, str(main_repo))
 
         msg = f"Successfully merged shard {spool_id} to master"
         if tender_result:
