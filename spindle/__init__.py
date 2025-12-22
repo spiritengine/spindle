@@ -1612,15 +1612,22 @@ async def spool_retry(spool_id: str) -> str:
     if not spool:
         return f"Error: Unknown spool_id '{spool_id}'"
 
-    # Re-spin with same parameters
-    return await spin(
-        prompt=spool.get("prompt", ""),
-        permission=spool.get("permission"),
-        shard=bool(spool.get("shard")),
-        system_prompt=spool.get("system_prompt"),
-        working_dir=spool.get("working_dir"),
-        allowed_tools=spool.get("allowed_tools"),
-        tags=",".join(spool.get("tags", [])) if spool.get("tags") else None,
+    # Re-spin with same parameters using asyncio.to_thread pattern
+    tags = spool.get("tags")
+    tags_str = ",".join(tags) if tags else None
+
+    return await asyncio.to_thread(
+        _spin_sync,
+        spool.get("prompt", ""),  # prompt
+        spool.get("permission"),  # permission
+        bool(spool.get("shard")),  # shard
+        spool.get("system_prompt"),  # system_prompt
+        spool.get("working_dir"),  # working_dir
+        spool.get("allowed_tools"),  # allowed_tools
+        tags_str,  # tags
+        spool.get("model"),  # model
+        spool.get("timeout"),  # timeout
+        False,  # skeinless
     )
 
 
