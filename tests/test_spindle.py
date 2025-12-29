@@ -23,6 +23,7 @@ from spindle import (
     _spool_lock,
     _check_and_finalize_spool,
     _get_output_path,
+    _cleanup_shard,
     PERMISSION_PROFILES,
     SPINDLE_DIR,
     _try_reserve_slot_and_create,
@@ -519,3 +520,106 @@ class TestConcurrencyLimit:
 
             count = _count_running()
             assert count == 3  # 2 running + 1 pending
+
+
+class TestShardCleanup:
+    """Test shard cleanup returncode checking and logging."""
+
+    @patch('spindle.subprocess.run')
+    @patch('spindle.logger')
+    def test_cleanup_shard_logs_worktree_removal_failure(self, mock_logger, mock_run):
+        """Failed worktree removal should be logged and return False."""
+        # Mock subprocess to return error for worktree removal
+        mock_result = MagicMock()
+        mock_result.returncode = 1
+        mock_result.stderr = "fatal: worktree not found"
+        mock_run.return_value = mock_result
+
+        shard_info = {
+            "worktree_path": "/tmp/test-worktree",
+            "branch_name": "test-branch"
+        }
+
+        success = _cleanup_shard(shard_info, "/tmp/repo", spool_id="test123")
+
+        assert success is False
+        mock_logger.error.assert_called_once()
+        error_msg = mock_logger.error.call_args[0][0]
+        assert "Failed to remove worktree" in error_msg
+        assert "/tmp/test-worktree" in error_msg
+        assert "test123" in error_msg
+        assert "fatal: worktree not found" in error_msg
+
+    @patch('spindle.subprocess.run')
+    @patch('spindle.logger')
+    def test_cleanup_shard_logs_branch_deletion_failure(self, mock_logger, mock_run):
+        """Failed branch deletion should be logged but not fail cleanup."""
+        # Mock subprocess: worktree removal succeeds, branch deletion fails
+        def mock_run_side_effect(*args, **kwargs):
+            result = MagicMock()
+            cmd = args[0]
+            if "worktree" in cmd and "remove" in cmd:
+                result.returncode = 0
+                result.stderr = ""
+            elif "branch" in cmd and "-D" in cmd:
+                result.returncode = 1
+                result.stderr = "error: branch 'test-branch' not found"
+            elif "worktree" in cmd and "prune" in cmd:
+                result.returncode = 0
+                result.stderr = ""
+            return result
+
+        mock_run.side_effect = mock_run_side_effect
+
+        shard_info = {
+            "worktree_path": "/tmp/test-worktree",
+            "branch_name": "test-branch"
+        }
+
+        success = _cleanup_shard(shard_info, "/tmp/repo", spool_id="test123")
+
+        # Should still succeed since worktree removal worked
+        assert success is True
+        # But should log warning about branch deletion
+        mock_logger.warning.assert_called()
+        warning_msg = mock_logger.warning.call_args_list[0][0][0]
+        assert "Failed to delete branch" in warning_msg
+        assert "test-branch" in warning_msg
+        assert "test123" in warning_msg
+
+    @patch('spindle.subprocess.run')
+    @patch('spindle.logger')
+    def test_cleanup_shard_logs_timeout(self, mock_logger, mock_run):
+        """Timeout during cleanup should be logged."""
+        import subprocess as sp
+        mock_run.side_effect = sp.TimeoutExpired("git", 30)
+
+        shard_info = {
+            "worktree_path": "/tmp/test-worktree",
+            "branch_name": "test-branch"
+        }
+
+        success = _cleanup_shard(shard_info, "/tmp/repo", spool_id="test123")
+
+        assert success is False
+        mock_logger.error.assert_called_once()
+        error_msg = mock_logger.error.call_args[0][0]
+        assert "Timeout during shard cleanup" in error_msg
+        assert "/tmp/test-worktree" in error_msg
+        assert "test123" in error_msg
+
+    @patch('spindle.subprocess.run')
+    def test_cleanup_shard_works_without_spool_id(self, mock_run):
+        """Cleanup should work without spool_id for logging."""
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_run.return_value = mock_result
+
+        shard_info = {
+            "worktree_path": "/tmp/test-worktree",
+            "branch_name": "test-branch"
+        }
+
+        # Should not raise exception even without spool_id
+        success = _cleanup_shard(shard_info, "/tmp/repo")
+        assert success is True
