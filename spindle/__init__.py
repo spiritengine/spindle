@@ -533,6 +533,12 @@ def _parse_duration(time_str: str) -> Optional[int]:
 
     Returns:
         Number of seconds to wait, or None if invalid format
+
+    Validation:
+        - Minimum: 1 second
+        - Maximum: 24 hours (86400 seconds)
+        - Rejects negative values
+        - Rejects zero
     """
     if not time_str:
         return None
@@ -544,12 +550,22 @@ def _parse_duration(time_str: str) -> Optional[int]:
     if match:
         value = float(match.group(1))
         unit = match.group(2)
+
+        # Calculate seconds
         if unit == 's':
-            return int(value)
+            seconds = int(value)
         elif unit == 'm':
-            return int(value * 60)
+            seconds = int(value * 60)
         elif unit == 'h':
-            return int(value * 3600)
+            seconds = int(value * 3600)
+        else:
+            return None
+
+        # Validate range: minimum 1 second, maximum 24 hours
+        if seconds < 1 or seconds > 86400:
+            return None
+
+        return seconds
 
     # Try absolute time format: HH:MM
     match = re.match(r'^(\d{1,2}):(\d{2})$', time_str)
@@ -567,7 +583,13 @@ def _parse_duration(time_str: str) -> Optional[int]:
         if target <= now:
             target += timedelta(days=1)
 
-        return int((target - now).total_seconds())
+        seconds = int((target - now).total_seconds())
+
+        # Validate range: minimum 1 second, maximum 24 hours
+        if seconds < 1 or seconds > 86400:
+            return None
+
+        return seconds
 
     return None
 
