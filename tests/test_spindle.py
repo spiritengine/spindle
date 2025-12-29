@@ -261,6 +261,34 @@ class TestParseDuration:
         assert _parse_duration("25:00") is None
         assert _parse_duration("12:60") is None
 
+    def test_parse_rejects_negative_values(self):
+        """Negative values should be rejected (regex won't match, but test for completeness)."""
+        # The regex pattern doesn't allow negative values, so these return None
+        assert _parse_duration("-5s") is None
+        assert _parse_duration("-10m") is None
+        assert _parse_duration("-1h") is None
+
+    def test_parse_rejects_zero(self):
+        """Zero duration should be rejected."""
+        assert _parse_duration("0s") is None
+        assert _parse_duration("0m") is None
+        assert _parse_duration("0h") is None
+
+    def test_parse_rejects_overflow(self):
+        """Values exceeding 24 hours should be rejected."""
+        # 24 hours = 86400 seconds
+        assert _parse_duration("86401s") is None  # 1 second over
+        assert _parse_duration("1441m") is None   # 1 minute over 24h
+        assert _parse_duration("25h") is None     # 1 hour over
+        assert _parse_duration("999999s") is None # Large overflow
+
+    def test_parse_accepts_boundary_values(self):
+        """Values at the boundaries should work correctly."""
+        assert _parse_duration("1s") == 1         # Minimum
+        assert _parse_duration("86400s") == 86400 # Maximum (24 hours)
+        assert _parse_duration("1440m") == 86400  # 24 hours in minutes
+        assert _parse_duration("24h") == 86400    # 24 hours
+
 
 class TestSpoolLocking:
     """Test file locking for spool operations."""
