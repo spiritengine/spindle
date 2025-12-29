@@ -6,24 +6,26 @@ This harness allows Spindle to delegate tasks to OpenAI's Codex CLI, providing a
 
 ## Features
 
-- **Async execution**: `codex_spin` returns immediately with a spool_id
-- **Session continuity**: `codex_respin` allows continuing conversations
-- **Result retrieval**: `codex_unspool` fetches results when complete
-- **Unified spool management**: Codex spools integrate with existing Spindle infrastructure
+- **Transparent API**: Use regular `spin()`, `unspool()`, and `respin()` with `harness="codex"`
+- **Async execution**: `spin` returns immediately with a spool_id
+- **Session continuity**: `respin` allows continuing conversations (auto-detects harness)
+- **Result retrieval**: `unspool` fetches results when complete (auto-detects harness)
+- **Unified spool management**: Codex spools integrate seamlessly with Claude Code spools
 - **Automatic tagging**: All Codex spools are tagged with "codex" for easy filtering
 
 ## API
 
-### codex_spin
+### spin (with harness="codex")
 
 Spawn a Codex CLI agent to handle a task. Returns immediately with spool_id.
 
 ```python
-spool_id = codex_spin(
+spool_id = spin(
     prompt="Write a function to parse CSV files",
     working_dir="/path/to/project",
     model="gpt-5-codex",  # Optional, defaults to configured model
-    sandbox="workspace-write",  # Optional: read-only, workspace-write, danger-full-access
+    harness="codex",  # Use Codex instead of Claude Code
+    permission="full",  # Mapped to sandbox policy
     timeout=300,  # Optional, seconds
     tags="csv,utils"  # Optional, comma-separated tags
 )
@@ -32,40 +34,44 @@ spool_id = codex_spin(
 **Parameters:**
 - `prompt` (required): The task/question for the Codex agent
 - `working_dir` (required): Directory for the agent to work in
+- `harness` (required): Set to "codex" to use Codex CLI
 - `model` (optional): Model to use (e.g., "gpt-5-codex")
-- `sandbox` (optional): Sandbox policy - "read-only", "workspace-write", or "danger-full-access"
+- `permission` (optional): Mapped to Codex sandbox policy:
+  - `"readonly"` → `"read-only"`
+  - `"full"` or `"shard"` → `"danger-full-access"`
+  - Other → `"workspace-write"`
 - `timeout` (optional): Kill spool after this many seconds
 - `tags` (optional): Comma-separated tags for organizing spools
 
 **Returns:** spool_id (string) with "codex-" prefix
 
-### codex_unspool
+### unspool (auto-detects harness)
 
-Get the result of a background Codex spin task.
+Get the result of a background spin task. Automatically detects whether the spool uses Claude Code or Codex.
 
 ```python
-result = codex_unspool(spool_id)
+result = unspool(spool_id)
 ```
 
 **Parameters:**
-- `spool_id` (required): The spool_id from codex_spin
+- `spool_id` (required): The spool_id from spin
 
 **Returns:** Result string or status message
 
-### codex_respin
+### respin (auto-detects harness)
 
-Continue an existing Codex session with a new message.
+Continue an existing session with a new message. Automatically detects whether the session uses Claude Code or Codex.
 
 ```python
-spool_id = codex_respin(
+spool_id = respin(
     session_id="abc-123-def",
     prompt="Now add tests for that function"
 )
-result = codex_unspool(spool_id)
+result = unspool(spool_id)
 ```
 
 **Parameters:**
-- `session_id` (required): The Codex session ID to continue
+- `session_id` (required): The session ID to continue
 - `prompt` (required): The follow-up message/task
 
 **Returns:** spool_id (string) for the continuation
@@ -120,37 +126,38 @@ Codex spools:
 
 ```python
 # Start a task
-spool_id = codex_spin(
+spool_id = spin(
     prompt="Create a Python function to validate email addresses using regex",
-    working_dir="/home/user/myproject"
+    working_dir="/home/user/myproject",
+    harness="codex"
 )
 
-# Check status
-result = codex_unspool(spool_id)
+# Check status (auto-detects harness)
+result = unspool(spool_id)
 # Returns: "Spool codex-abc123 still running..." or actual result
 
 # When complete, extract session_id from result if needed for continuation
 # (Session ID is in the JSON output from Codex CLI)
 
-# Continue the conversation
+# Continue the conversation (auto-detects harness)
 session_id = "extracted-from-previous-result"
-spool_id2 = codex_respin(
+spool_id2 = respin(
     session_id=session_id,
     prompt="Add unit tests for that email validator"
 )
 
-result2 = codex_unspool(spool_id2)
+result2 = unspool(spool_id2)
 ```
 
 ## Differences from Claude Code Harness
 
-| Feature | Claude Code (`spin`) | Codex CLI (`codex_spin`) |
+| Feature | Claude Code (`harness="claude-code"`) | Codex CLI (`harness="codex"`) |
 |---------|---------------------|-------------------------|
 | Command | `claude exec` | `codex exec` |
 | Spool prefix | 8-char UUID | `codex-` + 8-char UUID |
 | Shard support | Full (via `permission="shard"`) | Not yet implemented |
 | SKEIN integration | Full | Not yet implemented |
-| Permission modes | careful, readonly, full, shard | sandbox policies (read-only, workspace-write, danger-full-access) |
+| Permission modes | careful, readonly, full, shard | Mapped to sandbox policies (read-only, workspace-write, danger-full-access) |
 | Model selection | sonnet, opus, haiku | gpt-5-codex, gpt-5 |
 | Session resume | `--resume` flag | `codex resume` command |
 
@@ -176,15 +183,16 @@ To test the Codex harness:
 2. Use the MCP tools via a client:
    ```python
    # Via MCP client
-   result = await call_tool("codex_spin", {
+   result = await call_tool("spin", {
        "prompt": "Write hello world in Python",
-       "working_dir": "/tmp/test"
+       "working_dir": "/tmp/test",
+       "harness": "codex"
    })
    ```
 
-3. Check spool status:
+3. Check spool status (auto-detects harness):
    ```python
-   result = await call_tool("codex_unspool", {
+   result = await call_tool("unspool", {
        "spool_id": "codex-abc12345"
    })
    ```

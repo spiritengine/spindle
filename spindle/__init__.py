@@ -1100,6 +1100,7 @@ Your task:
         "completed_at": None,
         "pid": None,
         "error": None,
+        "harness": "claude-code",
     }
 
     _write_spool(spool_id, spool)
@@ -1131,9 +1132,10 @@ async def spin(
     model: Optional[str] = None,
     timeout: Optional[int] = None,
     skeinless: bool = False,
+    harness: Optional[str] = None,
 ) -> str:
     """
-    Spawn a Claude Code agent to handle a task. Returns immediately with spool_id.
+    Spawn an agent to handle a task. Returns immediately with spool_id.
 
     The agent runs in background. Use unspool(spool_id) to get the result.
 
@@ -1149,6 +1151,7 @@ async def spin(
         model: Model to use - "haiku", "sonnet", or "opus" (default: inherit)
         timeout: Kill spool after this many seconds (default: no timeout)
         skeinless: Skip SKEIN context injection for shard agents (default: False)
+        harness: Which harness to use - "claude-code" (default) or "codex"
 
     Returns:
         spool_id to check result later
@@ -1158,46 +1161,81 @@ async def spin(
         spool_id = spin("Fix the bug", permission="shard")  # full access + isolation
         spool_id = spin("Careful work", permission="careful+shard")
         spool_id = spin("Quick task", model="haiku", timeout=60)
+        spool_id = spin("Write a parser", harness="codex")  # Use Codex instead
         result = unspool(spool_id)
     """
-    return await asyncio.to_thread(
-        _spin_sync,
-        prompt,
-        permission,
-        shard,
-        system_prompt,
-        working_dir,
-        allowed_tools,
-        tags,
-        model,
-        timeout,
-        skeinless,
-    )
+    # Route to appropriate harness
+    if harness == "codex":
+        # Map Claude Code parameters to Codex parameters
+        sandbox = None
+        if permission == "readonly":
+            sandbox = "read-only"
+        elif permission in ("full", "shard"):
+            sandbox = "danger-full-access"
+        else:
+            sandbox = "workspace-write"
+
+        return await asyncio.to_thread(
+            _codex_spin_sync,
+            prompt,
+            working_dir,
+            model,
+            sandbox,
+            timeout,
+            tags,
+        )
+    else:
+        # Default to Claude Code harness
+        return await asyncio.to_thread(
+            _spin_sync,
+            prompt,
+            permission,
+            shard,
+            system_prompt,
+            working_dir,
+            allowed_tools,
+            tags,
+            model,
+            timeout,
+            skeinless,
+        )
 
 
 def _unspool_sync(spool_id: str) -> str:
-    """Synchronous implementation of unspool."""
-    _check_and_finalize_spool(spool_id)
+    """Synchronous implementation of unspool - auto-detects harness."""
+    # Auto-detect harness from spool metadata
     spool = _read_spool(spool_id)
     if not spool:
         return f"Error: Unknown spool_id '{spool_id}'"
-    status = spool.get("status")
-    if status == "pending":
-        return f"Spool {spool_id} pending (not yet started)"
-    elif status == "running":
-        pid = spool.get("pid")
-        if pid and not _is_pid_alive(pid):
-            _check_and_finalize_spool(spool_id)
-            spool = _read_spool(spool_id)
-            if spool.get("status") == "complete":
-                return spool.get("result", "No result")
-            elif spool.get("status") == "error":
-                return f"Spool {spool_id} failed: {spool.get('error', 'Unknown error')}"
-        return f"Spool {spool_id} still running: {spool.get('prompt', '')[:50]}..."
-    elif status == "complete":
-        return spool.get("result", "No result")
+
+    harness = spool.get("harness", "claude-code")
+
+    # Route to appropriate harness implementation
+    if harness == "codex":
+        return _codex_unspool_sync(spool_id)
     else:
-        return f"Spool {spool_id} failed: {spool.get('error', 'Unknown error')}"
+        # Claude Code harness (default)
+        _check_and_finalize_spool(spool_id)
+        spool = _read_spool(spool_id)
+        if not spool:
+            return f"Error: Unknown spool_id '{spool_id}'"
+        status = spool.get("status")
+        if status == "pending":
+            return f"Spool {spool_id} pending (not yet started)"
+        elif status == "running":
+            pid = spool.get("pid")
+            if pid and not _is_pid_alive(pid):
+                _check_and_finalize_spool(spool_id)
+                spool = _read_spool(spool_id)
+                if spool.get("status") == "complete":
+                    return spool.get("result", "No result")
+                elif spool.get("status") == "error":
+                    return f"Spool {spool_id} failed: {spool.get('error', 'Unknown error')}"
+            return f"Spool {spool_id} still running: {spool.get('prompt', '')[:50]}..."
+        elif status == "complete":
+            return spool.get("result", "No result")
+        else:
+            return f"Spool {spool_id} failed: {spool.get('error', 'Unknown error')}"
 
 
 @mcp.tool()
@@ -1242,61 +1280,73 @@ async def spools() -> str:
 
 
 def _respin_sync(session_id: str, prompt: str) -> str:
-    """Synchronous implementation of respin."""
-    # Generate spool ID first
-    spool_id = str(uuid.uuid4())[:8]
-
-    # Atomically check concurrency limit and create initial spool entry
-    success, error_msg = _try_reserve_slot_and_create(spool_id, initial_status="pending")
-    if not success:
-        return error_msg
-
-    # Slot reserved via spool creation - continue with setup
-
-    # Try to resume with session_id first
-    # If that fails (session expired), fall back to transcript injection
-    cmd = ["claude", "-p", prompt, "--resume", session_id, "--output-format", "json"]
-
-    cwd = os.getcwd()
-
-    # Check if we have a transcript for this session
+    """Synchronous implementation of respin - auto-detects harness."""
+    # Find the original spool to detect harness
     original_spool = _find_spool_by_session(session_id)
-    transcript_available = False
-    if original_spool:
-        transcript_path = _get_transcript_path(original_spool["id"])
-        transcript_available = transcript_path.exists()
+    if not original_spool:
+        return f"Error: No spool found for session_id '{session_id}'"
 
-    spool = {
-        "id": spool_id,
-        "status": "pending",
-        "prompt": f"Continue {session_id}: {prompt}",
-        "result": None,
-        "session_id": session_id,
-        "working_dir": cwd,
-        "allowed_tools": None,
-        "system_prompt": None,
-        "transcript_fallback_available": transcript_available,
-        "created_at": datetime.now().isoformat(),
-        "completed_at": None,
-        "pid": None,
-        "cost": None,
-        "error": None,
-    }
+    harness = original_spool.get("harness", "claude-code")
 
-    _write_spool(spool_id, spool)
+    # Route to appropriate harness implementation
+    if harness == "codex":
+        return _codex_respin_sync(session_id, prompt)
+    else:
+        # Claude Code harness (default)
+        # Generate spool ID first
+        spool_id = str(uuid.uuid4())[:8]
 
-    # Spawn detached process
-    pid = _spawn_detached(spool_id, cmd, cwd)
+        # Atomically check concurrency limit and create initial spool entry
+        success, error_msg = _try_reserve_slot_and_create(spool_id, initial_status="pending")
+        if not success:
+            return error_msg
 
-    spool["pid"] = pid
-    spool["status"] = "running"
-    _write_spool(spool_id, spool)
+        # Slot reserved via spool creation - continue with setup
 
-    # Start background monitor
-    monitor = threading.Thread(target=_monitor_spool, args=(spool_id,), daemon=True)
-    monitor.start()
+        # Try to resume with session_id first
+        # If that fails (session expired), fall back to transcript injection
+        cmd = ["claude", "-p", prompt, "--resume", session_id, "--output-format", "json"]
 
-    return spool_id
+        cwd = os.getcwd()
+
+        # Check if we have a transcript for this session
+        transcript_available = False
+        if original_spool:
+            transcript_path = _get_transcript_path(original_spool["id"])
+            transcript_available = transcript_path.exists()
+
+        spool = {
+            "id": spool_id,
+            "status": "pending",
+            "prompt": f"Continue {session_id}: {prompt}",
+            "result": None,
+            "session_id": session_id,
+            "working_dir": cwd,
+            "allowed_tools": None,
+            "system_prompt": None,
+            "transcript_fallback_available": transcript_available,
+            "created_at": datetime.now().isoformat(),
+            "completed_at": None,
+            "pid": None,
+            "cost": None,
+            "error": None,
+            "harness": "claude-code",
+        }
+
+        _write_spool(spool_id, spool)
+
+        # Spawn detached process
+        pid = _spawn_detached(spool_id, cmd, cwd)
+
+        spool["pid"] = pid
+        spool["status"] = "running"
+        _write_spool(spool_id, spool)
+
+        # Start background monitor
+        monitor = threading.Thread(target=_monitor_spool, args=(spool_id,), daemon=True)
+        monitor.start()
+
+        return spool_id
 
 
 @mcp.tool()
@@ -2692,57 +2742,12 @@ def _codex_spin_sync(
     return spool_id
 
 
-@mcp.tool()
-async def codex_spin(
-    prompt: str,
-    working_dir: Optional[str] = None,
-    model: Optional[str] = None,
-    sandbox: Optional[str] = None,
-    timeout: Optional[int] = None,
-    tags: Optional[str] = None,
-) -> str:
-    """
-    Spawn a Codex CLI agent to handle a task. Returns immediately with spool_id.
-
-    The agent runs in background. Use codex_unspool(spool_id) to get the result.
-
-    Args:
-        prompt: The task/question for the Codex agent
-        working_dir: Directory for the agent to work in (defaults to current)
-        model: Model to use - e.g. "gpt-5-codex" (default: configured default)
-        sandbox: Sandbox policy - "read-only", "workspace-write", "danger-full-access"
-        timeout: Kill spool after this many seconds (default: no timeout)
-        tags: Comma-separated tags for organizing spools (e.g. "batch-1,codex")
-
-    Returns:
-        spool_id to check result later
-
-    Example:
-        spool_id = codex_spin("Write a function to parse CSV files", working_dir="/path/to/project")
-        spool_id = codex_spin("Fix the bug in auth.py", model="gpt-5-codex", sandbox="workspace-write")
-        result = codex_unspool(spool_id)
-    """
-    return await asyncio.to_thread(
-        _codex_spin_sync,
-        prompt,
-        working_dir,
-        model,
-        sandbox,
-        timeout,
-        tags,
-    )
-
-
 def _codex_unspool_sync(spool_id: str) -> str:
     """Synchronous implementation of codex_unspool."""
     _check_and_finalize_spool(spool_id)
     spool = _read_spool(spool_id)
     if not spool:
         return f"Error: Unknown spool_id '{spool_id}'"
-
-    # Verify this is a codex spool
-    if spool.get("harness") != "codex":
-        return f"Error: spool_id '{spool_id}' is not a Codex spool"
 
     status = spool.get("status")
     if status == "pending":
@@ -2761,20 +2766,6 @@ def _codex_unspool_sync(spool_id: str) -> str:
         return spool.get("result", "No result")
     else:
         return f"Spool {spool_id} failed: {spool.get('error', 'Unknown error')}"
-
-
-@mcp.tool()
-async def codex_unspool(spool_id: str) -> str:
-    """
-    Get the result of a background Codex spin task.
-
-    Args:
-        spool_id: The spool_id from codex_spin
-
-    Returns:
-        Result or status message
-    """
-    return await asyncio.to_thread(_codex_unspool_sync, spool_id)
 
 
 def _codex_respin_sync(session_id: str, prompt: str) -> str:
@@ -2829,26 +2820,6 @@ def _codex_respin_sync(session_id: str, prompt: str) -> str:
     monitor.start()
 
     return spool_id
-
-
-@mcp.tool()
-async def codex_respin(session_id: str, prompt: str) -> str:
-    """
-    Continue an existing Codex session with a new message.
-    Returns immediately with spool_id.
-
-    Args:
-        session_id: The Codex session ID to continue
-        prompt: The follow-up message/task
-
-    Returns:
-        spool_id to check result later
-
-    Example:
-        spool_id = codex_respin("abc-123-def", "Now add tests for that function")
-        result = codex_unspool(spool_id)
-    """
-    return await asyncio.to_thread(_codex_respin_sync, session_id, prompt)
 
 
 @mcp.tool()

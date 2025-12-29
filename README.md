@@ -210,18 +210,19 @@ Spindle also supports OpenAI's Codex CLI as an alternative harness. This allows 
 ### Basic Usage
 
 ```
-# Spawn a Codex agent
-spool_id = codex_spin(
+# Spawn a Codex agent using the harness parameter
+spool_id = spin(
     prompt="Write a CSV parser function",
     working_dir="/path/to/project",
-    model="gpt-5-codex"
+    model="gpt-5-codex",
+    harness="codex"
 )
 
-# Check result
-result = codex_unspool(spool_id)
+# Check result (works transparently with any harness)
+result = unspool(spool_id)
 
-# Continue the conversation
-spool_id2 = codex_respin(session_id, "Add tests for that parser")
+# Continue the conversation (auto-detects harness)
+spool_id2 = respin(session_id, "Add tests for that parser")
 ```
 
 ### Requirements
@@ -242,21 +243,13 @@ See [CODEX_HARNESS.md](CODEX_HARNESS.md) for full documentation.
 
 ## API
 
-### Claude Code Harness
+### Unified API (works with both harnesses)
 
 | Tool | Purpose |
 |------|---------|
-| `spin(prompt, permission?, shard?, system_prompt?, working_dir?, allowed_tools?, tags?)` | Spawn Claude Code agent, return spool_id |
-| `unspool(spool_id)` | Get result (non-blocking) |
-| `respin(session_id, prompt)` | Continue Claude Code session |
-
-### Codex CLI Harness
-
-| Tool | Purpose |
-|------|---------|
-| `codex_spin(prompt, working_dir, model?, sandbox?, timeout?, tags?)` | Spawn Codex agent, return spool_id |
-| `codex_unspool(spool_id)` | Get Codex result (non-blocking) |
-| `codex_respin(session_id, prompt)` | Continue Codex session |
+| `spin(prompt, permission?, shard?, system_prompt?, working_dir?, allowed_tools?, tags?, harness?)` | Spawn agent (Claude Code or Codex), return spool_id |
+| `unspool(spool_id)` | Get result (auto-detects harness, non-blocking) |
+| `respin(session_id, prompt)` | Continue session (auto-detects harness) |
 
 ### Spool Management (works with both harnesses)
 
