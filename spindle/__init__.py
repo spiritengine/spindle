@@ -14,6 +14,7 @@ A background thread monitors completion by polling the PID.
 import asyncio
 import fcntl
 import json
+import logging
 import os
 import re
 import shutil
@@ -32,6 +33,9 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 mcp = FastMCP("spindle", stateless_http=True)
+
+# Set up logging
+logger = logging.getLogger(__name__)
 
 # Track server start time for uptime calculation
 _server_start_time = datetime.now()
@@ -300,7 +304,7 @@ def _close_tender_folios(worktree_name: str, working_dir: str) -> Optional[str]:
         return None  # SKEIN not available or error, continue silently
 
 
-def _cleanup_shard(shard_info: Dict[str, str], working_dir: str, keep_branch: bool = False) -> bool:
+def _cleanup_shard(shard_info: Dict[str, str], working_dir: str, keep_branch: bool = False, spool_id: Optional[str] = None) -> bool:
     """
     Clean up a SHARD worktree.
 
@@ -308,6 +312,7 @@ def _cleanup_shard(shard_info: Dict[str, str], working_dir: str, keep_branch: bo
         shard_info: Dict with worktree_path, branch_name
         working_dir: Base directory
         keep_branch: If True, don't delete the branch
+        spool_id: Optional spool ID for better error logging
 
     Returns:
         True if successful
@@ -320,19 +325,68 @@ def _cleanup_shard(shard_info: Dict[str, str], working_dir: str, keep_branch: bo
 
     try:
         # Remove worktree
-        subprocess.run(
-            ["git", "worktree", "remove", "--force", worktree_path], capture_output=True, cwd=working_dir, timeout=30
+        result = subprocess.run(
+            ["git", "worktree", "remove", "--force", worktree_path],
+            capture_output=True,
+            text=True,
+            cwd=working_dir,
+            timeout=30
         )
+        if result.returncode != 0:
+            logger.error(
+                f"Failed to remove worktree {worktree_path}" +
+                (f" for spool {spool_id}" if spool_id else "") +
+                f": {result.stderr.strip()}"
+            )
+            return False
 
         # Optionally delete branch
         if not keep_branch and branch_name:
-            subprocess.run(["git", "branch", "-D", branch_name], capture_output=True, cwd=working_dir, timeout=10)
+            result = subprocess.run(
+                ["git", "branch", "-D", branch_name],
+                capture_output=True,
+                text=True,
+                cwd=working_dir,
+                timeout=10
+            )
+            if result.returncode != 0:
+                logger.warning(
+                    f"Failed to delete branch {branch_name}" +
+                    (f" for spool {spool_id}" if spool_id else "") +
+                    f": {result.stderr.strip()}"
+                )
+                # Don't return False here - worktree removal succeeded
 
         # Prune worktree references
-        subprocess.run(["git", "worktree", "prune"], capture_output=True, cwd=working_dir, timeout=10)
+        result = subprocess.run(
+            ["git", "worktree", "prune"],
+            capture_output=True,
+            text=True,
+            cwd=working_dir,
+            timeout=10
+        )
+        if result.returncode != 0:
+            logger.warning(
+                f"Failed to prune worktree references" +
+                (f" for spool {spool_id}" if spool_id else "") +
+                f": {result.stderr.strip()}"
+            )
+            # Don't return False here - worktree removal succeeded
 
         return True
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+    except subprocess.TimeoutExpired as e:
+        logger.error(
+            f"Timeout during shard cleanup for worktree {worktree_path}" +
+            (f" (spool {spool_id})" if spool_id else "") +
+            f": {e}"
+        )
+        return False
+    except (FileNotFoundError, OSError) as e:
+        logger.error(
+            f"Error during shard cleanup for worktree {worktree_path}" +
+            (f" (spool {spool_id})" if spool_id else "") +
+            f": {e}"
+        )
         return False
 
 
@@ -2323,7 +2377,7 @@ async def shard_merge(spool_id: str, keep_branch: bool = False, caller_cwd: str 
             return f"Error: Merge failed: {result.stderr}"
 
         # Cleanup shard
-        _cleanup_shard(shard_info, str(main_repo), keep_branch=keep_branch)
+        _cleanup_shard(shard_info, str(main_repo), keep_branch=keep_branch, spool_id=spool_id)
 
         # Update spool record
         spool["shard"]["merged"] = True
@@ -2418,7 +2472,7 @@ async def shard_abandon(spool_id: str, keep_branch: bool = False, caller_cwd: st
         spool["completed_at"] = datetime.now().isoformat()
 
     # Cleanup shard
-    success = _cleanup_shard(shard_info, str(main_repo), keep_branch=keep_branch)
+    success = _cleanup_shard(shard_info, str(main_repo), keep_branch=keep_branch, spool_id=spool_id)
 
     if success:
         spool["shard"]["abandoned"] = True
