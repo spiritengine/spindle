@@ -22,9 +22,10 @@ import subprocess
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Generator
 
 from fastmcp import FastMCP
 from starlette.requests import Request
@@ -380,6 +381,52 @@ def _read_spool(spool_id: str) -> Optional[dict]:
         return None
 
 
+def _get_lock_path(spool_id: str) -> Path:
+    """Get path to lock file for a spool."""
+    return SPINDLE_DIR / f"{spool_id}.lock"
+
+
+@contextmanager
+def _spool_lock(spool_id: str, blocking: bool = True) -> Generator[bool, None, None]:
+    """
+    Acquire exclusive lock on a spool for atomic operations.
+
+    Uses fcntl advisory locking. The lock is held for the duration of the
+    context manager and automatically released on exit.
+
+    Args:
+        spool_id: The spool to lock
+        blocking: If True, wait for lock. If False, fail immediately if locked.
+
+    Yields:
+        True if lock acquired, False if non-blocking and lock unavailable.
+    """
+    SPINDLE_DIR.mkdir(parents=True, exist_ok=True)
+    lock_path = _get_lock_path(spool_id)
+
+    lock_fd = None
+    acquired = False
+    try:
+        lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR)
+        try:
+            if blocking:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+                acquired = True
+            else:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+        except BlockingIOError:
+            # Non-blocking mode and lock not available
+            acquired = False
+
+        yield acquired
+    finally:
+        if lock_fd is not None:
+            if acquired:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+
+
 def _list_spools() -> list[dict]:
     """List all spool files."""
     if not SPINDLE_DIR.exists():
@@ -540,14 +587,21 @@ def _cleanup_old_spools() -> None:
             spool_id = data.get("id", path.stem)
             created = datetime.fromisoformat(data.get("created_at", ""))
             if created < cutoff:
-                path.unlink()
-                # Also clean up output files
-                stdout_path = _get_output_path(spool_id)
-                stderr_path = _get_stderr_path(spool_id)
-                if stdout_path.exists():
-                    stdout_path.unlink()
-                if stderr_path.exists():
-                    stderr_path.unlink()
+                # Use lock to prevent race with finalization
+                with _spool_lock(spool_id, blocking=False) as acquired:
+                    if not acquired:
+                        continue  # Skip if locked
+                    path.unlink()
+                    # Also clean up output, lock, and transcript files
+                    stdout_path = _get_output_path(spool_id)
+                    stderr_path = _get_stderr_path(spool_id)
+                    lock_path = _get_lock_path(spool_id)
+                    if stdout_path.exists():
+                        stdout_path.unlink()
+                    if stderr_path.exists():
+                        stderr_path.unlink()
+                    if lock_path.exists():
+                        lock_path.unlink()
         except Exception:
             pass
 
@@ -559,91 +613,102 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
 
     Note: claude CLI doesn't exit immediately after writing output, so we also
     check if stdout contains a complete JSON result even if PID is alive.
+
+    Uses file locking to prevent TOCTOU race conditions when multiple processes
+    attempt to finalize the same spool concurrently.
     """
-    spool = _read_spool(spool_id)
-    if not spool or spool.get("status") != "running":
-        return True  # Already done
+    # Use non-blocking lock first for quick check without waiting
+    with _spool_lock(spool_id, blocking=False) as acquired:
+        if not acquired:
+            # Another process is finalizing this spool, treat as "still running"
+            # The other process will complete finalization
+            return False
 
-    pid = spool.get("pid")
-    if not pid:
-        return False  # No PID yet, still starting
+        spool = _read_spool(spool_id)
+        if not spool or spool.get("status") != "running":
+            return True  # Already done
 
-    stdout_path = _get_output_path(spool_id)
-    stderr_path = _get_stderr_path(spool_id)
+        pid = spool.get("pid")
+        if not pid:
+            return False  # No PID yet, still starting
 
-    # Check if stdout has complete JSON result (claude may not exit promptly)
-    stdout_complete = False
-    if stdout_path.exists():
+        stdout_path = _get_output_path(spool_id)
+        stderr_path = _get_stderr_path(spool_id)
+
+        # Check if stdout has complete JSON result (claude may not exit promptly)
+        stdout_complete = False
+        if stdout_path.exists():
+            try:
+                content = stdout_path.read_text()
+                if content.strip():
+                    data = json.loads(content)
+                    if "result" in data or "error" in data:
+                        stdout_complete = True
+            except (IOError, json.JSONDecodeError):
+                pass
+
+        # If PID alive and no complete output yet, still running
+        if _is_pid_alive(pid) and not stdout_complete:
+            return False
+
+        # Process finished or output complete - finalize
+        # Re-read paths (they're the same but clearer for the finalization section)
+        stdout_path = _get_output_path(spool_id)
+        stderr_path = _get_stderr_path(spool_id)
+
+        stdout = ""
+        stderr = ""
+
+        if stdout_path.exists():
+            try:
+                stdout = stdout_path.read_text()
+            except IOError:
+                pass
+
+        if stderr_path.exists():
+            try:
+                stderr = stderr_path.read_text()
+            except IOError:
+                pass
+
+        # Parse result
         try:
-            content = stdout_path.read_text()
-            if content.strip():
-                data = json.loads(content)
-                if "result" in data or "error" in data:
-                    stdout_complete = True
-        except (IOError, json.JSONDecodeError):
-            pass
-
-    # If PID alive and no complete output yet, still running
-    if _is_pid_alive(pid) and not stdout_complete:
-        return False
-
-    # Process finished or output complete - finalize
-    stdout_path = _get_output_path(spool_id)
-    stderr_path = _get_stderr_path(spool_id)
-
-    stdout = ""
-    stderr = ""
-
-    if stdout_path.exists():
-        try:
-            stdout = stdout_path.read_text()
-        except IOError:
-            pass
-
-    if stderr_path.exists():
-        try:
-            stderr = stderr_path.read_text()
-        except IOError:
-            pass
-
-    # Parse result
-    try:
-        data = json.loads(stdout)
-        spool["result"] = data.get("result", stdout)
-        spool["session_id"] = data.get("session_id")
-        spool["cost"] = data.get("cost")
-        spool["status"] = "complete"
-    except json.JSONDecodeError:
-        if stdout.strip():
-            spool["result"] = stdout
+            data = json.loads(stdout)
+            spool["result"] = data.get("result", stdout)
+            spool["session_id"] = data.get("session_id")
+            spool["cost"] = data.get("cost")
             spool["status"] = "complete"
-        elif stderr.strip():
-            spool["status"] = "error"
-            spool["error"] = stderr[:500]
-        else:
-            spool["status"] = "error"
-            spool["error"] = "Process exited with no output"
+        except json.JSONDecodeError:
+            if stdout.strip():
+                spool["result"] = stdout
+                spool["status"] = "complete"
+            elif stderr.strip():
+                spool["status"] = "error"
+                spool["error"] = stderr[:500]
+            else:
+                spool["status"] = "error"
+                spool["error"] = "Process exited with no output"
 
-    spool["completed_at"] = datetime.now().isoformat()
-    _write_spool(spool_id, spool)
+        spool["completed_at"] = datetime.now().isoformat()
+        _write_spool(spool_id, spool)
 
-    # Save transcript for future respin if session_id exists
-    # This preserves conversation context even after CC cleans up sessions
-    if spool.get("session_id") and stdout:
-        transcript_path = _get_transcript_path(spool_id)
-        transcript_path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            transcript_path.write_text(stdout)
-        except IOError:
-            pass  # Non-critical, continue
+        # Save transcript for future respin if session_id exists
+        # This preserves conversation context even after CC cleans up sessions
+        if spool.get("session_id") and stdout:
+            transcript_path = _get_transcript_path(spool_id)
+            transcript_path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                transcript_path.write_text(stdout)
+            except IOError:
+                pass  # Non-critical, continue
 
-    # Clean up output files
-    if stdout_path.exists():
-        stdout_path.unlink()
-    if stderr_path.exists():
-        stderr_path.unlink()
+        # Clean up output files
+        if stdout_path.exists():
+            stdout_path.unlink()
+        if stderr_path.exists():
+            stderr_path.unlink()
 
-    return True
+        return True
 
 
 def _recover_orphans() -> None:
