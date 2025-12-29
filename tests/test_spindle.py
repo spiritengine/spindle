@@ -4,6 +4,7 @@ import json
 import multiprocessing
 import os
 import tempfile
+import threading
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -24,6 +25,11 @@ from spindle import (
     _get_output_path,
     PERMISSION_PROFILES,
     SPINDLE_DIR,
+    _try_reserve_slot_and_create,
+    _count_running,
+    _list_spools,
+    PERMISSION_PROFILES,
+    MAX_CONCURRENT,
 )
 
 
@@ -389,3 +395,127 @@ class TestConcurrentFinalization:
 
             # Now without lock, it should work (though may error since no output)
             # The key is it doesn't block or corrupt
+class TestConcurrencyLimit:
+    """Test that concurrency limit is enforced atomically."""
+
+    def test_try_reserve_slot_basic(self, tmp_path):
+        """Basic slot reservation should work when under limit."""
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            # Mock _count_running to return 0
+            with patch("spindle._count_running", return_value=0):
+                success, error = _try_reserve_slot_and_create("test123")
+                assert success is True
+                assert error is None
+                # Verify spool was created
+                spool_file = tmp_path / "test123.json"
+                assert spool_file.exists()
+
+    def test_try_reserve_slot_at_limit(self, tmp_path):
+        """Should reject when at max concurrent limit."""
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            # Mock _count_running to return MAX_CONCURRENT
+            with patch("spindle._count_running", return_value=MAX_CONCURRENT):
+                success, error = _try_reserve_slot_and_create("test123")
+                assert success is False
+                assert "Max" in error
+                assert str(MAX_CONCURRENT) in error
+                # Verify no spool was created
+                spool_file = tmp_path / "test123.json"
+                assert not spool_file.exists()
+
+    def test_concurrent_reservation_respects_limit(self, tmp_path):
+        """
+        Regression test for TOCTOU race condition (brief-20251229-79ly).
+
+        Simulates 20 threads trying to reserve slots concurrently.
+        Only MAX_CONCURRENT should succeed, rest should be rejected.
+
+        This tests that the file locking in _try_reserve_slot_and_create() prevents
+        the race between check and spawn that allowed exceeding the limit.
+        """
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            # Create some mock running spools to start near the limit
+            initial_running = MAX_CONCURRENT - 5
+            for i in range(initial_running):
+                spool = {
+                    "id": f"initial{i}",
+                    "status": "running",
+                    "created_at": datetime.now().isoformat(),
+                }
+                _write_spool(f"initial{i}", spool)
+
+            # Track results from concurrent attempts
+            results = {"success": [], "failure": []}
+            results_lock = threading.Lock()
+
+            def attempt_reservation(thread_id):
+                """Attempt to reserve a slot and record the result."""
+                spool_id = f"thread{thread_id}"
+                success, error = _try_reserve_slot_and_create(spool_id, initial_status="running")
+
+                with results_lock:
+                    if success:
+                        results["success"].append(thread_id)
+                    else:
+                        results["failure"].append(thread_id)
+
+            # Launch 20 concurrent threads trying to reserve slots
+            num_threads = 20
+            threads = []
+            for i in range(num_threads):
+                t = threading.Thread(target=attempt_reservation, args=(i,))
+                threads.append(t)
+
+            # Start all threads at once
+            for t in threads:
+                t.start()
+
+            # Wait for all to complete
+            for t in threads:
+                t.join(timeout=5.0)
+
+            # Verify results
+            success_count = len(results["success"])
+            failure_count = len(results["failure"])
+
+            # All threads should have completed
+            assert success_count + failure_count == num_threads, \
+                f"Expected {num_threads} results, got {success_count + failure_count}"
+
+            # We started with initial_running, so only (MAX_CONCURRENT - initial_running)
+            # new slots should be available
+            max_new_slots = MAX_CONCURRENT - initial_running
+
+            assert success_count == max_new_slots, \
+                f"Expected exactly {max_new_slots} successful reservations, got {success_count}"
+
+            # The rest should have been rejected
+            expected_failures = num_threads - max_new_slots
+            assert failure_count == expected_failures, \
+                f"Expected {expected_failures} rejections, got {failure_count}"
+
+            # Verify we never exceeded the limit by checking total running
+            all_spools = _list_spools()
+            running_count = sum(1 for s in all_spools if s.get("status") == "running")
+            assert running_count == MAX_CONCURRENT, \
+                f"Expected exactly {MAX_CONCURRENT} running spools, got {running_count}"
+
+    def test_lock_file_created(self, tmp_path):
+        """Lock file should be created during reservation."""
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle._count_running", return_value=0):
+                _try_reserve_slot_and_create("test123")
+                lock_file = tmp_path / ".concurrency.lock"
+                assert lock_file.exists()
+
+    def test_count_running_includes_pending(self, tmp_path):
+        """_count_running should count both running and pending spools."""
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            # Create mix of running and pending spools
+            _write_spool("running1", {"id": "running1", "status": "running"})
+            _write_spool("running2", {"id": "running2", "status": "running"})
+            _write_spool("pending1", {"id": "pending1", "status": "pending"})
+            _write_spool("completed1", {"id": "completed1", "status": "completed"})
+
+            count = _count_running()
+            assert count == 3  # 2 running + 1 pending

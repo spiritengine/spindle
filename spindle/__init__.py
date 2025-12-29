@@ -451,8 +451,65 @@ def _find_spool_by_session(session_id: str) -> Optional[dict]:
 
 
 def _count_running() -> int:
-    """Count currently running spools."""
-    return sum(1 for s in _list_spools() if s.get("status") == "running")
+    """
+    Count currently running spools.
+
+    Includes both "running" and "pending" spools, since pending spools
+    represent reserved slots that will become running shortly.
+    This prevents TOCTOU race in concurrency limit enforcement.
+    """
+    return sum(
+        1 for s in _list_spools()
+        if s.get("status") in ("running", "pending")
+    )
+
+
+def _try_reserve_slot_and_create(spool_id: str, initial_status: str = "pending") -> tuple[bool, Optional[str]]:
+    """
+    Atomically check if we can spawn a new spool and create the initial spool file.
+
+    This function holds a file lock during both the check AND the spool creation
+    to prevent TOCTOU race conditions.
+
+    Args:
+        spool_id: The ID for the new spool
+        initial_status: Initial status for the spool (default: "pending")
+
+    Returns:
+        (success, error_message): success is True if slot reserved and spool created,
+                                  False if limit exceeded.
+
+    Uses file locking to prevent TOCTOU race between check and spawn.
+    The lock is held during both the check and the initial spool creation.
+    """
+    lock_file = SPINDLE_DIR / ".concurrency.lock"
+    SPINDLE_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Open lock file (creates if needed)
+    with open(lock_file, "a") as f:
+        # Acquire exclusive lock - blocks if another thread holds it
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+
+        try:
+            # Now we have exclusive access - check the limit
+            running_count = _count_running()
+            if running_count >= MAX_CONCURRENT:
+                return False, f"Error: Max {MAX_CONCURRENT} concurrent spools. Wait for some to complete."
+
+            # Slot available - create the spool immediately while holding the lock
+            # This ensures the slot is claimed atomically
+            spool = {
+                "id": spool_id,
+                "status": initial_status,
+                "created_at": datetime.now().isoformat(),
+            }
+            _write_spool(spool_id, spool)
+
+            return True, None
+        finally:
+            # Release lock - happens automatically when context exits
+            # but explicit unlock is clearer
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
 
 def _is_pid_alive(pid: int) -> bool:
@@ -803,15 +860,20 @@ def _spin_sync(
     skeinless: bool,
 ) -> str:
     """Synchronous implementation of spin - runs in thread pool."""
-    # Check concurrency limit
-    if _count_running() >= MAX_CONCURRENT:
-        return f"Error: Max {MAX_CONCURRENT} concurrent spools. Wait for some to complete."
-
-    spool_id = str(uuid.uuid4())[:8]
-
     # Require working_dir - os.getcwd() returns MCP server dir, not caller's project
     if not working_dir:
         return "Error: working_dir required. Pass the project directory."
+
+    # Generate spool ID first
+    spool_id = str(uuid.uuid4())[:8]
+
+    # Atomically check concurrency limit and create initial spool entry
+    # This reserves the slot by creating a spool that counts toward the limit
+    success, error_msg = _try_reserve_slot_and_create(spool_id, initial_status="pending")
+    if not success:
+        return error_msg
+
+    # Slot reserved via spool creation - continue with setup
 
     cwd = working_dir
 
@@ -1103,11 +1165,15 @@ async def spools() -> str:
 
 def _respin_sync(session_id: str, prompt: str) -> str:
     """Synchronous implementation of respin."""
-    # Check concurrency limit
-    if _count_running() >= MAX_CONCURRENT:
-        return f"Error: Max {MAX_CONCURRENT} concurrent spools. Wait for some to complete."
-
+    # Generate spool ID first
     spool_id = str(uuid.uuid4())[:8]
+
+    # Atomically check concurrency limit and create initial spool entry
+    success, error_msg = _try_reserve_slot_and_create(spool_id, initial_status="pending")
+    if not success:
+        return error_msg
+
+    # Slot reserved via spool creation - continue with setup
 
     # Try to resume with session_id first
     # If that fails (session expired), fall back to transcript injection
