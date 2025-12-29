@@ -1,7 +1,10 @@
 """Tests for Spindle MCP server."""
 
 import json
+import multiprocessing
+import os
 import tempfile
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch, MagicMock
@@ -16,7 +19,11 @@ from spindle import (
     _read_spool,
     _is_pid_alive,
     _parse_duration,
+    _spool_lock,
+    _check_and_finalize_spool,
+    _get_output_path,
     PERMISSION_PROFILES,
+    SPINDLE_DIR,
 )
 
 
@@ -246,3 +253,139 @@ class TestParseDuration:
         """Invalid absolute times should return None."""
         assert _parse_duration("25:00") is None
         assert _parse_duration("12:60") is None
+
+
+class TestSpoolLocking:
+    """Test file locking for spool operations."""
+
+    def test_lock_acquire_release(self, tmp_path):
+        """Lock should be acquired and released properly."""
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with _spool_lock("test123", blocking=True) as acquired:
+                assert acquired is True
+                # Lock file should exist
+                lock_path = tmp_path / "test123.lock"
+                assert lock_path.exists()
+
+    def test_nonblocking_lock_fails_when_held(self, tmp_path):
+        """Non-blocking lock should fail when lock is held."""
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            # Hold the lock
+            with _spool_lock("test123", blocking=True) as first:
+                assert first is True
+                # Try to get another non-blocking lock
+                with _spool_lock("test123", blocking=False) as second:
+                    assert second is False
+
+    def test_different_spools_independent_locks(self, tmp_path):
+        """Locks on different spools should be independent."""
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with _spool_lock("spool1", blocking=True) as first:
+                assert first is True
+                with _spool_lock("spool2", blocking=True) as second:
+                    assert second is True
+
+
+def _finalize_worker(tmp_path_str: str, spool_id: str, result_queue):
+    """Worker function for concurrent finalization test."""
+    import spindle
+    tmp_path = Path(tmp_path_str)
+
+    # Patch SPINDLE_DIR in this process
+    with patch.object(spindle, 'SPINDLE_DIR', tmp_path):
+        result = _check_and_finalize_spool(spool_id)
+        result_queue.put(result)
+
+
+class TestConcurrentFinalization:
+    """Test concurrent spool finalization with locking."""
+
+    def test_concurrent_finalize_no_corruption(self, tmp_path):
+        """Two processes finalizing same spool should not corrupt data."""
+        spool_id = "concurrent_test"
+
+        # Create a spool in running state with a dead PID
+        spool = {
+            "id": spool_id,
+            "status": "running",
+            "prompt": "Test",
+            "pid": 999999999,  # Non-existent PID
+            "created_at": datetime.now().isoformat(),
+        }
+        # Write directly to tmp_path
+        (tmp_path).mkdir(parents=True, exist_ok=True)
+        spool_path = tmp_path / f"{spool_id}.json"
+        with open(spool_path, "w") as f:
+            json.dump(spool, f)
+
+        # Create stdout output file so it can finalize
+        stdout_path = tmp_path / f"{spool_id}.stdout"
+        stdout_path.write_text(json.dumps({"result": "test result"}))
+
+        # Spawn two processes to finalize concurrently
+        result_queue = multiprocessing.Queue()
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            p1 = multiprocessing.Process(
+                target=_finalize_worker,
+                args=(str(tmp_path), spool_id, result_queue)
+            )
+            p2 = multiprocessing.Process(
+                target=_finalize_worker,
+                args=(str(tmp_path), spool_id, result_queue)
+            )
+
+            p1.start()
+            p2.start()
+
+            p1.join(timeout=5)
+            p2.join(timeout=5)
+
+        # Collect results
+        results = []
+        while not result_queue.empty():
+            results.append(result_queue.get())
+
+        assert len(results) == 2
+
+        # One should return True (finalized), one should return False (lock not acquired)
+        # OR both return True if one completes before the other starts
+        # The key is: no crash, no corruption
+        assert all(r in [True, False] for r in results)
+
+        # Verify spool was finalized properly (status should be complete)
+        with open(spool_path) as f:
+            final_spool = json.load(f)
+        assert final_spool["status"] == "complete"
+        assert final_spool.get("result") == "test result"
+
+    def test_finalize_returns_false_when_locked(self, tmp_path):
+        """Finalize should return False if another process holds the lock."""
+        import spindle
+
+        spool_id = "lock_test"
+
+        # Create a running spool
+        spool = {
+            "id": spool_id,
+            "status": "running",
+            "prompt": "Test",
+            "pid": 999999999,
+            "created_at": datetime.now().isoformat(),
+        }
+        (tmp_path).mkdir(parents=True, exist_ok=True)
+        spool_path = tmp_path / f"{spool_id}.json"
+        with open(spool_path, "w") as f:
+            json.dump(spool, f)
+
+        with patch.object(spindle, 'SPINDLE_DIR', tmp_path):
+            # Hold the lock
+            with _spool_lock(spool_id, blocking=True) as acquired:
+                assert acquired is True
+
+                # Try to finalize - should return False immediately
+                result = _check_and_finalize_spool(spool_id)
+                assert result is False
+
+            # Now without lock, it should work (though may error since no output)
+            # The key is it doesn't block or corrupt
