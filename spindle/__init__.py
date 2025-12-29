@@ -2616,6 +2616,241 @@ async def spool_info(spool_id: str) -> str:
     return json.dumps(spool, indent=2)
 
 
+# ============================================================================
+# CODEX CLI HARNESS
+# ============================================================================
+
+
+def _codex_spin_sync(
+    prompt: str,
+    working_dir: Optional[str],
+    model: Optional[str],
+    sandbox: Optional[str],
+    timeout: Optional[int],
+    tags: Optional[str],
+) -> str:
+    """Synchronous implementation of codex_spin - runs Codex CLI in background."""
+    # Require working_dir
+    if not working_dir:
+        return "Error: working_dir required. Pass the project directory."
+
+    # Generate spool ID
+    spool_id = "codex-" + str(uuid.uuid4())[:8]
+
+    # Atomically check concurrency limit and create initial spool entry
+    success, error_msg = _try_reserve_slot_and_create(spool_id, initial_status="pending")
+    if not success:
+        return error_msg
+
+    # Build codex exec command
+    # Use --json for structured output, --full-auto for non-interactive execution
+    codex_cmd = ["codex", "exec", "--json", "--full-auto", prompt]
+
+    if model:
+        codex_cmd.extend(["--model", model])
+
+    if sandbox:
+        codex_cmd.extend(["--sandbox", sandbox])
+
+    # Parse tags
+    tag_list = [t.strip() for t in tags.split(",")] if tags else []
+    tag_list.append("codex")  # Auto-tag as codex spool
+
+    # Create spool record
+    spool = {
+        "id": spool_id,
+        "status": "pending",
+        "prompt": prompt,
+        "result": None,
+        "session_id": None,  # Will be extracted from output
+        "working_dir": working_dir,
+        "model": model or "default",
+        "sandbox": sandbox or "workspace-write",
+        "tags": tag_list,
+        "timeout": timeout,
+        "created_at": datetime.now().isoformat(),
+        "completed_at": None,
+        "pid": None,
+        "error": None,
+        "harness": "codex",  # Mark as codex harness
+    }
+
+    _write_spool(spool_id, spool)
+
+    # Spawn detached process
+    pid = _spawn_detached(spool_id, codex_cmd, working_dir)
+
+    # Update spool with PID and status
+    spool["pid"] = pid
+    spool["status"] = "running"
+    _write_spool(spool_id, spool)
+
+    # Start background monitor thread
+    monitor = threading.Thread(target=_monitor_spool, args=(spool_id,), daemon=True)
+    monitor.start()
+
+    return spool_id
+
+
+@mcp.tool()
+async def codex_spin(
+    prompt: str,
+    working_dir: Optional[str] = None,
+    model: Optional[str] = None,
+    sandbox: Optional[str] = None,
+    timeout: Optional[int] = None,
+    tags: Optional[str] = None,
+) -> str:
+    """
+    Spawn a Codex CLI agent to handle a task. Returns immediately with spool_id.
+
+    The agent runs in background. Use codex_unspool(spool_id) to get the result.
+
+    Args:
+        prompt: The task/question for the Codex agent
+        working_dir: Directory for the agent to work in (defaults to current)
+        model: Model to use - e.g. "gpt-5-codex" (default: configured default)
+        sandbox: Sandbox policy - "read-only", "workspace-write", "danger-full-access"
+        timeout: Kill spool after this many seconds (default: no timeout)
+        tags: Comma-separated tags for organizing spools (e.g. "batch-1,codex")
+
+    Returns:
+        spool_id to check result later
+
+    Example:
+        spool_id = codex_spin("Write a function to parse CSV files", working_dir="/path/to/project")
+        spool_id = codex_spin("Fix the bug in auth.py", model="gpt-5-codex", sandbox="workspace-write")
+        result = codex_unspool(spool_id)
+    """
+    return await asyncio.to_thread(
+        _codex_spin_sync,
+        prompt,
+        working_dir,
+        model,
+        sandbox,
+        timeout,
+        tags,
+    )
+
+
+def _codex_unspool_sync(spool_id: str) -> str:
+    """Synchronous implementation of codex_unspool."""
+    _check_and_finalize_spool(spool_id)
+    spool = _read_spool(spool_id)
+    if not spool:
+        return f"Error: Unknown spool_id '{spool_id}'"
+
+    # Verify this is a codex spool
+    if spool.get("harness") != "codex":
+        return f"Error: spool_id '{spool_id}' is not a Codex spool"
+
+    status = spool.get("status")
+    if status == "pending":
+        return f"Spool {spool_id} pending (not yet started)"
+    elif status == "running":
+        pid = spool.get("pid")
+        if pid and not _is_pid_alive(pid):
+            _check_and_finalize_spool(spool_id)
+            spool = _read_spool(spool_id)
+            if spool.get("status") == "complete":
+                return spool.get("result", "No result")
+            elif spool.get("status") == "error":
+                return f"Spool {spool_id} failed: {spool.get('error', 'Unknown error')}"
+        return f"Spool {spool_id} still running: {spool.get('prompt', '')[:50]}..."
+    elif status == "complete":
+        return spool.get("result", "No result")
+    else:
+        return f"Spool {spool_id} failed: {spool.get('error', 'Unknown error')}"
+
+
+@mcp.tool()
+async def codex_unspool(spool_id: str) -> str:
+    """
+    Get the result of a background Codex spin task.
+
+    Args:
+        spool_id: The spool_id from codex_spin
+
+    Returns:
+        Result or status message
+    """
+    return await asyncio.to_thread(_codex_unspool_sync, spool_id)
+
+
+def _codex_respin_sync(session_id: str, prompt: str) -> str:
+    """Synchronous implementation of codex_respin - continue a Codex session."""
+    # Generate spool ID
+    spool_id = "codex-" + str(uuid.uuid4())[:8]
+
+    # Atomically check concurrency limit and create initial spool entry
+    success, error_msg = _try_reserve_slot_and_create(spool_id, initial_status="pending")
+    if not success:
+        return error_msg
+
+    # Build codex resume command
+    # Use --json for structured output, --full-auto for non-interactive
+    codex_cmd = ["codex", "resume", session_id, "--json", "--full-auto"]
+
+    # The prompt is passed as additional argument to resume
+    codex_cmd.append(prompt)
+
+    # Get working_dir from original spool if possible
+    original_spool = _find_spool_by_session(session_id)
+    working_dir = original_spool.get("working_dir") if original_spool else os.getcwd()
+
+    # Create spool record
+    spool = {
+        "id": spool_id,
+        "status": "pending",
+        "prompt": f"Continue {session_id}: {prompt}",
+        "result": None,
+        "session_id": session_id,
+        "working_dir": working_dir,
+        "tags": ["codex", "respin"],
+        "created_at": datetime.now().isoformat(),
+        "completed_at": None,
+        "pid": None,
+        "error": None,
+        "harness": "codex",
+    }
+
+    _write_spool(spool_id, spool)
+
+    # Spawn detached process
+    pid = _spawn_detached(spool_id, codex_cmd, working_dir)
+
+    # Update spool with PID and status
+    spool["pid"] = pid
+    spool["status"] = "running"
+    _write_spool(spool_id, spool)
+
+    # Start background monitor
+    monitor = threading.Thread(target=_monitor_spool, args=(spool_id,), daemon=True)
+    monitor.start()
+
+    return spool_id
+
+
+@mcp.tool()
+async def codex_respin(session_id: str, prompt: str) -> str:
+    """
+    Continue an existing Codex session with a new message.
+    Returns immediately with spool_id.
+
+    Args:
+        session_id: The Codex session ID to continue
+        prompt: The follow-up message/task
+
+    Returns:
+        spool_id to check result later
+
+    Example:
+        spool_id = codex_respin("abc-123-def", "Now add tests for that function")
+        result = codex_unspool(spool_id)
+    """
+    return await asyncio.to_thread(_codex_respin_sync, session_id, prompt)
+
+
 @mcp.tool()
 async def spindle_reload() -> str:
     """

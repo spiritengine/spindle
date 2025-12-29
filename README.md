@@ -203,16 +203,68 @@ spool_stats()
 spool_export("all", format="md")
 ```
 
+## Codex CLI Harness (Beta)
+
+Spindle also supports OpenAI's Codex CLI as an alternative harness. This allows delegating tasks to GPT-5 Codex models.
+
+### Basic Usage
+
+```
+# Spawn a Codex agent
+spool_id = codex_spin(
+    prompt="Write a CSV parser function",
+    working_dir="/path/to/project",
+    model="gpt-5-codex"
+)
+
+# Check result
+result = codex_unspool(spool_id)
+
+# Continue the conversation
+spool_id2 = codex_respin(session_id, "Add tests for that parser")
+```
+
+### Requirements
+
+- [Codex CLI](https://developers.openai.com/codex/cli/) installed (`npm i -g @openai/codex`)
+- ChatGPT Plus/Pro/Enterprise subscription
+- Codex CLI authenticated
+
+### Differences from Claude Code
+
+- Uses OpenAI's GPT-5 Codex models instead of Claude
+- Sandbox policies instead of permission profiles
+- Spool IDs prefixed with `codex-`
+- Automatically tagged with "codex" for filtering
+- Shares the same concurrency limit (15 total spools)
+
+See [CODEX_HARNESS.md](CODEX_HARNESS.md) for full documentation.
+
 ## API
+
+### Claude Code Harness
 
 | Tool | Purpose |
 |------|---------|
-| `spin(prompt, permission?, shard?, system_prompt?, working_dir?, allowed_tools?, tags?)` | Spawn agent, return spool_id |
+| `spin(prompt, permission?, shard?, system_prompt?, working_dir?, allowed_tools?, tags?)` | Spawn Claude Code agent, return spool_id |
 | `unspool(spool_id)` | Get result (non-blocking) |
+| `respin(session_id, prompt)` | Continue Claude Code session |
+
+### Codex CLI Harness
+
+| Tool | Purpose |
+|------|---------|
+| `codex_spin(prompt, working_dir, model?, sandbox?, timeout?, tags?)` | Spawn Codex agent, return spool_id |
+| `codex_unspool(spool_id)` | Get Codex result (non-blocking) |
+| `codex_respin(session_id, prompt)` | Continue Codex session |
+
+### Spool Management (works with both harnesses)
+
+| Tool | Purpose |
+|------|---------|
 | `spools()` | List all spools |
 | `spin_wait(spool_ids?, mode?, timeout?, time?)` | Block until spools complete, or wait for duration |
 | `spin_sleep(duration)` | Sleep for a duration (90m, 2h, 30s, HH:MM) |
-| `respin(session_id, prompt)` | Continue session |
 | `spin_drop(spool_id)` | Cancel by killing process |
 | `spool_search(query, field?)` | Search prompts/results |
 | `spool_results(status?, since?, limit?)` | Bulk fetch with filters |
