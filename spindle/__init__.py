@@ -201,9 +201,11 @@ def _spawn_shard(agent_id: str, working_dir: str) -> Optional[Dict[str, str]]:
         worktrees_dir = Path(working_dir) / "worktrees"
         worktrees_dir.mkdir(exist_ok=True)
 
-        # Generate unique worktree name
-        date_str = datetime.now().strftime("%Y%m%d-%H%M%S")
-        worktree_name = f"{agent_id}-{date_str}"
+        # Generate unique worktree name with microseconds to prevent collisions
+        now = datetime.now()
+        date_str = now.strftime("%Y%m%d-%H%M%S")
+        microseconds = now.strftime("%f")[:6]  # Get all 6 digits of microseconds
+        worktree_name = f"{agent_id}-{date_str}-{microseconds}"
         worktree_path = worktrees_dir / worktree_name
         branch_name = f"shard-{worktree_name}"
 

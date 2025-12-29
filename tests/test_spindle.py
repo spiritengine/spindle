@@ -3,6 +3,7 @@
 import json
 import multiprocessing
 import os
+import subprocess
 import tempfile
 import threading
 import time
@@ -31,6 +32,7 @@ from spindle import (
     _list_spools,
     PERMISSION_PROFILES,
     MAX_CONCURRENT,
+    _spawn_shard,
 )
 
 
@@ -651,3 +653,54 @@ class TestShardCleanup:
         # Should not raise exception even without spool_id
         success = _cleanup_shard(shard_info, "/tmp/repo")
         assert success is True
+class TestWorktreeNameUniqueness:
+    """Test that worktree names are unique even when created rapidly."""
+
+    def test_rapid_shard_creation_unique_names(self, tmp_path):
+        """
+        Regression test for brief-20251229-3agj.
+
+        Worktree names should include microseconds to prevent collisions
+        when multiple shards are created in the same second.
+        """
+        # Create a mock git repo
+        git_dir = tmp_path / "test_repo"
+        git_dir.mkdir()
+
+        # Initialize git repo
+        subprocess.run(["git", "init"], cwd=git_dir, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=git_dir, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "Test User"], cwd=git_dir, capture_output=True)
+
+        # Create initial commit
+        test_file = git_dir / "test.txt"
+        test_file.write_text("test")
+        subprocess.run(["git", "add", "."], cwd=git_dir, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "Initial commit"], cwd=git_dir, capture_output=True)
+
+        # Create two shards rapidly (without SKEIN, using plain git worktree)
+        # Mock _has_skein to return False so we use the plain git path
+        with patch("spindle._has_skein", return_value=False):
+            shard1 = _spawn_shard("test-agent-1", str(git_dir))
+            shard2 = _spawn_shard("test-agent-2", str(git_dir))
+
+        # Both should succeed
+        assert shard1 is not None, "First shard creation failed"
+        assert shard2 is not None, "Second shard creation failed"
+
+        # Worktree names should be different
+        shard1_id = shard1["shard_id"]
+        shard2_id = shard2["shard_id"]
+        assert shard1_id != shard2_id, f"Shard IDs collided: {shard1_id} == {shard2_id}"
+
+        # Branch names should also be different
+        assert shard1["branch_name"] != shard2["branch_name"], \
+            f"Branch names collided: {shard1['branch_name']} == {shard2['branch_name']}"
+
+        # Verify both worktrees exist
+        assert Path(shard1["worktree_path"]).exists(), f"Worktree 1 doesn't exist: {shard1['worktree_path']}"
+        assert Path(shard2["worktree_path"]).exists(), f"Worktree 2 doesn't exist: {shard2['worktree_path']}"
+
+        # Cleanup - remove worktrees
+        subprocess.run(["git", "worktree", "remove", shard1["worktree_path"]], cwd=git_dir, capture_output=True)
+        subprocess.run(["git", "worktree", "remove", shard2["worktree_path"]], cwd=git_dir, capture_output=True)
