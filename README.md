@@ -203,43 +203,69 @@ spool_stats()
 spool_export("all", format="md")
 ```
 
-## Codex CLI Harness (Beta)
+## Multi-Harness Support
 
-Spindle also supports OpenAI's Codex CLI as an alternative harness. This allows delegating tasks to GPT-5 Codex models.
+Spindle supports multiple AI agent harnesses, allowing you to choose the best tool for each task.
+
+### Available Harnesses
+
+**Claude Code** (default) - Anthropic's Claude models via claude CLI
+- Superior code understanding and reasoning
+- Best for complex refactoring, architecture decisions
+- Slower startup (~3-4 minutes to first response)
+- Use `harness="claude-code"` or omit harness parameter
+
+**Codex CLI** - OpenAI's GPT-5 Codex models via codex CLI
+- Extremely fast startup (~10 seconds to first response)
+- Good for quick edits, simple tasks, prototyping
+- Requires ChatGPT Plus/Pro/Enterprise
+- Use `harness="codex"`
 
 ### Basic Usage
 
-```
-# Spawn a Codex agent using the harness parameter
+```python
+# Claude Code (default) - best for complex work
+spool_id = spin("Refactor the auth module to use dependency injection")
+
+# Codex CLI - fast for simple tasks
 spool_id = spin(
-    prompt="Write a CSV parser function",
-    working_dir="/path/to/project",
-    model="gpt-5-codex",
-    harness="codex"
+    prompt="Add error handling to this function",
+    harness="codex",
+    working_dir="/path/to/project"
 )
 
-# Check result (works transparently with any harness)
-result = unspool(spool_id)
-
-# Continue the conversation (auto-detects harness)
-spool_id2 = respin(session_id, "Add tests for that parser")
+# All harnesses use the same API
+result = unspool(spool_id)  # Auto-detects harness
+respin(session_id, "Follow up")  # Auto-detects harness
 ```
+
+### Choosing a Harness
+
+**Use Claude Code when:**
+- Task requires deep reasoning or architecture decisions
+- Working on complex refactoring across multiple files
+- Need thorough code review or analysis
+- Time isn't critical (can wait 3-4 minutes)
+
+**Use Codex when:**
+- Need quick edits or simple implementations
+- Prototyping or exploring ideas rapidly
+- Running many parallel tasks (faster = more throughput)
+- Time is critical (10 second startup vs 3-4 minutes)
 
 ### Requirements
 
+**Claude Code:**
+- [Claude CLI](https://docs.anthropic.com/en/docs/claude-code) installed and authenticated
+- Anthropic API key or Claude subscription
+
+**Codex CLI:**
 - [Codex CLI](https://developers.openai.com/codex/cli/) installed (`npm i -g @openai/codex`)
 - ChatGPT Plus/Pro/Enterprise subscription
 - Codex CLI authenticated
+- Linux kernel 5.13+ for sandbox support (automatically bypassed on older kernels)
 
-### Differences from Claude Code
-
-- Uses OpenAI's GPT-5 Codex models instead of Claude
-- Sandbox policies instead of permission profiles
-- Spool IDs prefixed with `codex-`
-- Automatically tagged with "codex" for filtering
-- Shares the same concurrency limit (15 total spools)
-
-See [CODEX_HARNESS.md](CODEX_HARNESS.md) for full documentation.
+See [docs/MULTI_HARNESS_GUIDE.md](docs/MULTI_HARNESS_GUIDE.md) and [docs/CODEX_SETUP.md](docs/CODEX_SETUP.md) for detailed documentation.
 
 ## API
 
@@ -247,9 +273,21 @@ See [CODEX_HARNESS.md](CODEX_HARNESS.md) for full documentation.
 
 | Tool | Purpose |
 |------|---------|
-| `spin(prompt, permission?, shard?, system_prompt?, working_dir?, allowed_tools?, tags?, harness?)` | Spawn agent (Claude Code or Codex), return spool_id |
+| `spin(prompt, permission?, shard?, system_prompt?, working_dir?, allowed_tools?, tags?, model?, timeout?, harness?)` | Spawn agent (Claude Code or Codex), return spool_id |
 | `unspool(spool_id)` | Get result (auto-detects harness, non-blocking) |
 | `respin(session_id, prompt)` | Continue session (auto-detects harness) |
+
+**spin() parameters:**
+- `prompt` (required): The task for the agent
+- `harness` (optional): "claude-code" (default) or "codex"
+- `working_dir` (optional for Claude, required for Codex): Project directory
+- `permission` (optional): "readonly", "careful" (default), "full", "shard", "careful+shard"
+- `model` (optional): Model to use ("sonnet", "opus", "haiku" for Claude; "gpt-5-codex" for Codex)
+- `timeout` (optional): Auto-kill after N seconds
+- `tags` (optional): Comma-separated tags for organization
+- `shard` (optional): Create isolated git worktree (can also use `permission="shard"`)
+- `system_prompt` (optional): Custom system prompt for Claude Code
+- `allowed_tools` (optional): Override permission profile with explicit tool list
 
 ### Spool Management (works with both harnesses)
 
