@@ -2989,6 +2989,27 @@ def main():
         "--force", action="store_true", help="Overwrite existing service file"
     )
 
+    # spin command - spawn an agent
+    spin_parser = subparsers.add_parser("spin", help="Spawn an agent to handle a task")
+    spin_parser.add_argument("prompt", help="The task/question for the agent")
+    spin_parser.add_argument("--permission", "-p", choices=["readonly", "careful", "full", "shard", "careful+shard"],
+                             help="Permission profile (default: careful)")
+    spin_parser.add_argument("--shard", "-s", action="store_true", help="Run in isolated git worktree")
+    spin_parser.add_argument("--system-prompt", help="Optional system prompt")
+    spin_parser.add_argument("--working-dir", "-d", help="Directory for the agent (default: current)")
+    spin_parser.add_argument("--allowed-tools", help="Override permission profile with explicit tool list")
+    spin_parser.add_argument("--tags", help="Comma-separated tags for organizing spools")
+    spin_parser.add_argument("--model", "-m", choices=["haiku", "sonnet", "opus"], help="Model to use")
+    spin_parser.add_argument("--timeout", "-t", type=int, help="Kill spool after N seconds")
+    spin_parser.add_argument("--skeinless", action="store_true", help="Skip SKEIN context injection for shard agents")
+
+    # unspool command - get result
+    unspool_parser = subparsers.add_parser("unspool", help="Get the result of a background spin task")
+    unspool_parser.add_argument("spool_id", help="The spool ID to get output from")
+
+    # spools command - list all
+    spools_parser = subparsers.add_parser("spools", help="List all spools (running and completed)")
+
     # Legacy flags for backward compat
     parser.add_argument("--http", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--port", type=int, default=8002, help=argparse.SUPPRESS)
@@ -3034,6 +3055,46 @@ def main():
             print(result.stdout)
         else:
             print("Not running")
+        sys.exit(0)
+
+    elif args.command == "spin":
+        working_dir = args.working_dir or os.getcwd()
+        result = _spin_sync(
+            prompt=args.prompt,
+            permission=args.permission,
+            shard=args.shard,
+            system_prompt=args.system_prompt,
+            working_dir=working_dir,
+            allowed_tools=args.allowed_tools,
+            tags=args.tags,
+            model=args.model,
+            timeout=args.timeout,
+            skeinless=args.skeinless,
+        )
+        # Output as JSON for machine parsing
+        if result.startswith("Error:"):
+            print(json.dumps({"error": result}))
+            sys.exit(1)
+        else:
+            # Result is spool_id
+            print(json.dumps({"spool_id": result}))
+        sys.exit(0)
+
+    elif args.command == "unspool":
+        result = _unspool_sync(args.spool_id)
+        # Try to parse as JSON if the spool result is JSON
+        try:
+            parsed = json.loads(result)
+            print(json.dumps(parsed, indent=2))
+        except json.JSONDecodeError:
+            # Plain text result - wrap in JSON
+            print(json.dumps({"result": result}))
+        sys.exit(0)
+
+    elif args.command == "spools":
+        result = _spools_sync()
+        # Already returns JSON
+        print(result)
         sys.exit(0)
 
     elif args.command == "install-service":
