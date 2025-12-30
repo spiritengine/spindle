@@ -714,14 +714,28 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
         stderr_path = _get_stderr_path(spool_id)
 
         # Check if stdout has complete JSON result (claude may not exit promptly)
+        # For Codex, check for "turn.completed" event in newline-delimited JSON
         stdout_complete = False
         if stdout_path.exists():
             try:
                 content = stdout_path.read_text()
                 if content.strip():
-                    data = json.loads(content)
-                    if "result" in data or "error" in data:
-                        stdout_complete = True
+                    # Check harness type to determine completion detection method
+                    if spool.get("harness") == "codex":
+                        # Codex uses newline-delimited JSON with "turn.completed" event
+                        for line in content.strip().split('\n'):
+                            try:
+                                event = json.loads(line)
+                                if event.get("type") == "turn.completed":
+                                    stdout_complete = True
+                                    break
+                            except json.JSONDecodeError:
+                                continue
+                    else:
+                        # Claude Code uses single JSON object with "result" or "error"
+                        data = json.loads(content)
+                        if "result" in data or "error" in data:
+                            stdout_complete = True
             except (IOError, json.JSONDecodeError):
                 pass
 
@@ -749,23 +763,62 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
             except IOError:
                 pass
 
-        # Parse result
-        try:
-            data = json.loads(stdout)
-            spool["result"] = data.get("result", stdout)
-            spool["session_id"] = data.get("session_id")
-            spool["cost"] = data.get("cost")
-            spool["status"] = "complete"
-        except json.JSONDecodeError:
-            if stdout.strip():
-                spool["result"] = stdout
+        # Parse result based on harness type
+        if spool.get("harness") == "codex":
+            # Parse Codex newline-delimited JSON format
+            try:
+                if stdout.strip():
+                    # Just store the complete newline-delimited JSON as result
+                    # (Same as the successful codex-321bd642 example)
+                    spool["result"] = stdout
+
+                    # Try to extract session_id from thread.started event
+                    for line in stdout.strip().split('\n'):
+                        try:
+                            event = json.loads(line)
+                            if event.get("type") == "thread.started":
+                                spool["session_id"] = event.get("thread_id")
+                            elif event.get("type") == "turn.completed":
+                                # Extract usage/cost information if available
+                                usage = event.get("usage", {})
+                                if usage:
+                                    spool["cost"] = usage
+                        except json.JSONDecodeError:
+                            continue
+
+                    spool["status"] = "complete"
+                elif stderr.strip():
+                    spool["status"] = "error"
+                    spool["error"] = stderr[:500]
+                else:
+                    spool["status"] = "error"
+                    spool["error"] = "Process exited with no output"
+            except Exception:
+                # Fallback: treat as raw output
+                if stdout.strip():
+                    spool["result"] = stdout
+                    spool["status"] = "complete"
+                else:
+                    spool["status"] = "error"
+                    spool["error"] = "Failed to parse Codex output"
+        else:
+            # Parse Claude Code single JSON object format
+            try:
+                data = json.loads(stdout)
+                spool["result"] = data.get("result", stdout)
+                spool["session_id"] = data.get("session_id")
+                spool["cost"] = data.get("cost")
                 spool["status"] = "complete"
-            elif stderr.strip():
-                spool["status"] = "error"
-                spool["error"] = stderr[:500]
-            else:
-                spool["status"] = "error"
-                spool["error"] = "Process exited with no output"
+            except json.JSONDecodeError:
+                if stdout.strip():
+                    spool["result"] = stdout
+                    spool["status"] = "complete"
+                elif stderr.strip():
+                    spool["status"] = "error"
+                    spool["error"] = stderr[:500]
+                else:
+                    spool["status"] = "error"
+                    spool["error"] = "Process exited with no output"
 
         spool["completed_at"] = datetime.now().isoformat()
         _write_spool(spool_id, spool)
