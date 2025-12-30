@@ -2724,6 +2724,33 @@ async def spool_info(spool_id: str) -> str:
 # ============================================================================
 
 
+def _has_landlock_support() -> bool:
+    """Check if the kernel supports Landlock (5.13+).
+
+    Returns True if Landlock is available, False otherwise.
+    Landlock was added in Linux kernel 5.13.
+    """
+    import platform
+    import re
+
+    # Get kernel version
+    kernel_version = platform.release()
+
+    # Extract major.minor version
+    match = re.match(r'(\d+)\.(\d+)', kernel_version)
+    if match:
+        major, minor = int(match.group(1)), int(match.group(2))
+        # Landlock added in 5.13
+        if major > 5 or (major == 5 and minor >= 13):
+            return True
+
+    # Also check if /sys/kernel/security/landlock exists
+    if os.path.exists('/sys/kernel/security/landlock'):
+        return True
+
+    return False
+
+
 def _codex_spin_sync(
     prompt: str,
     working_dir: Optional[str],
@@ -2746,13 +2773,24 @@ def _codex_spin_sync(
         return error_msg
 
     # Build codex exec command
-    # Use --json for structured output, --full-auto for non-interactive execution
-    codex_cmd = ["codex", "exec", "--json", "--full-auto", prompt]
+    # Check for Landlock support and use appropriate flags
+    has_landlock = _has_landlock_support()
+
+    if has_landlock:
+        # Use --json for structured output, --full-auto for non-interactive execution
+        codex_cmd = ["codex", "exec", "--json", "--full-auto", prompt]
+    else:
+        # Kernel lacks Landlock support - use bypass mode
+        import platform
+        kernel_version = platform.release()
+        print(f"[Spindle] Kernel {kernel_version} lacks Landlock support (needs 5.13+), using bypass mode for Codex")
+        codex_cmd = ["codex", "exec", "--json", "--dangerously-bypass-approvals-and-sandbox", prompt]
 
     if model:
         codex_cmd.extend(["--model", model])
 
-    if sandbox:
+    if sandbox and has_landlock:
+        # Only apply sandbox flag if we have Landlock support
         codex_cmd.extend(["--sandbox", sandbox])
 
     # Parse tags
@@ -2832,8 +2870,18 @@ def _codex_respin_sync(session_id: str, prompt: str) -> str:
         return error_msg
 
     # Build codex resume command
-    # Use --json for structured output, --full-auto for non-interactive
-    codex_cmd = ["codex", "resume", session_id, "--json", "--full-auto"]
+    # Check for Landlock support and use appropriate flags
+    has_landlock = _has_landlock_support()
+
+    if has_landlock:
+        # Use --json for structured output, --full-auto for non-interactive
+        codex_cmd = ["codex", "resume", session_id, "--json", "--full-auto"]
+    else:
+        # Kernel lacks Landlock support - use bypass mode
+        import platform
+        kernel_version = platform.release()
+        print(f"[Spindle] Kernel {kernel_version} lacks Landlock support (needs 5.13+), using bypass mode for Codex")
+        codex_cmd = ["codex", "resume", session_id, "--json", "--dangerously-bypass-approvals-and-sandbox"]
 
     # The prompt is passed as additional argument to resume
     codex_cmd.append(prompt)
