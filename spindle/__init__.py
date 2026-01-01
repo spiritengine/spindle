@@ -895,7 +895,9 @@ Continue from above. New message: {spool['prompt'].split(': ', 1)[-1]}"""
     cmd = ["claude", "-p", context_prompt, "--output-format", "json"]
 
     try:
-        new_pid = _spawn_detached(spool_id, cmd, spool["working_dir"])
+        # Inherit env from spool if available
+        env = spool.get("env")
+        new_pid = _spawn_detached(spool_id, cmd, spool["working_dir"], env)
 
         # Update spool with new PID and mark as using transcript fallback
         spool["pid"] = new_pid
@@ -952,13 +954,24 @@ def _monitor_spool(spool_id: str) -> None:
         time.sleep(MONITOR_POLL_INTERVAL)
 
 
-def _spawn_detached(spool_id: str, cmd: list, cwd: str) -> int:
+def _spawn_detached(spool_id: str, cmd: list, cwd: str, env: Optional[Dict[str, str]] = None) -> int:
     """
     Spawn a detached process that survives parent death.
     Returns the PID.
+
+    Args:
+        spool_id: The spool ID for output files
+        cmd: Command and arguments to execute
+        cwd: Working directory
+        env: Optional dict of environment variables to merge with current environment
     """
     stdout_path = _get_output_path(spool_id)
     stderr_path = _get_stderr_path(spool_id)
+
+    # Start with current environment, then merge in any custom vars
+    process_env = os.environ.copy()
+    if env:
+        process_env.update(env)
 
     with open(stdout_path, "w") as stdout_file, open(stderr_path, "w") as stderr_file:
         proc = subprocess.Popen(
@@ -966,7 +979,7 @@ def _spawn_detached(spool_id: str, cmd: list, cwd: str) -> int:
             stdout=stdout_file,
             stderr=stderr_file,
             cwd=cwd,
-            env=os.environ.copy(),
+            env=process_env,
             start_new_session=True,  # Detach from parent
         )
 
@@ -989,6 +1002,7 @@ def _spin_sync(
     model: Optional[str],
     timeout: Optional[int],
     skeinless: bool,
+    env: Optional[Dict[str, str]],
 ) -> str:
     """Synchronous implementation of spin - runs in thread pool."""
     # Require working_dir - os.getcwd() returns MCP server dir, not caller's project
@@ -1149,6 +1163,7 @@ Your task:
         "shard": shard_info,
         "model": model,
         "timeout": timeout,
+        "env": env,
         "created_at": datetime.now().isoformat(),
         "completed_at": None,
         "pid": None,
@@ -1159,7 +1174,7 @@ Your task:
     _write_spool(spool_id, spool)
 
     # Spawn detached process
-    pid = _spawn_detached(spool_id, cmd, cwd)
+    pid = _spawn_detached(spool_id, cmd, cwd, env)
 
     # Update spool with PID and status
     spool["pid"] = pid
@@ -1186,6 +1201,7 @@ async def spin(
     timeout: Optional[int] = None,
     skeinless: bool = False,
     harness: Optional[str] = None,
+    env: Optional[Dict[str, str]] = None,
 ) -> str:
     """
     Spawn an agent to handle a task. Returns immediately with spool_id.
@@ -1205,6 +1221,7 @@ async def spin(
         timeout: Kill spool after this many seconds (default: no timeout)
         skeinless: Skip SKEIN context injection for shard agents (default: False)
         harness: Which harness to use - "claude-code" (default) or "codex"
+        env: Optional dict of environment variables to set in spawned agent
 
     Returns:
         spool_id to check result later
@@ -1215,6 +1232,7 @@ async def spin(
         spool_id = spin("Careful work", permission="careful+shard")
         spool_id = spin("Quick task", model="haiku", timeout=60)
         spool_id = spin("Write a parser", harness="codex")  # Use Codex instead
+        spool_id = spin("Do something", env={"CC_THINKING_BOOST": "1"})
         result = unspool(spool_id)
     """
     # Route to appropriate harness
@@ -1236,6 +1254,7 @@ async def spin(
             sandbox,
             timeout,
             tags,
+            env,
         )
     else:
         # Default to Claude Code harness
@@ -1251,6 +1270,7 @@ async def spin(
             model,
             timeout,
             skeinless,
+            env,
         )
 
 
@@ -1368,6 +1388,9 @@ def _respin_sync(session_id: str, prompt: str) -> str:
             transcript_path = _get_transcript_path(original_spool["id"])
             transcript_available = transcript_path.exists()
 
+        # Inherit env from original spool
+        env = original_spool.get("env") if original_spool else None
+
         spool = {
             "id": spool_id,
             "status": "pending",
@@ -1378,6 +1401,7 @@ def _respin_sync(session_id: str, prompt: str) -> str:
             "allowed_tools": None,
             "system_prompt": None,
             "transcript_fallback_available": transcript_available,
+            "env": env,
             "created_at": datetime.now().isoformat(),
             "completed_at": None,
             "pid": None,
@@ -1389,7 +1413,7 @@ def _respin_sync(session_id: str, prompt: str) -> str:
         _write_spool(spool_id, spool)
 
         # Spawn detached process
-        pid = _spawn_detached(spool_id, cmd, cwd)
+        pid = _spawn_detached(spool_id, cmd, cwd, env)
 
         spool["pid"] = pid
         spool["status"] = "running"
@@ -2758,6 +2782,7 @@ def _codex_spin_sync(
     sandbox: Optional[str],
     timeout: Optional[int],
     tags: Optional[str],
+    env: Optional[Dict[str, str]],
 ) -> str:
     """Synchronous implementation of codex_spin - runs Codex CLI in background."""
     # Require working_dir
@@ -2809,6 +2834,7 @@ def _codex_spin_sync(
         "sandbox": sandbox or "workspace-write",
         "tags": tag_list,
         "timeout": timeout,
+        "env": env,
         "created_at": datetime.now().isoformat(),
         "completed_at": None,
         "pid": None,
@@ -2819,7 +2845,7 @@ def _codex_spin_sync(
     _write_spool(spool_id, spool)
 
     # Spawn detached process
-    pid = _spawn_detached(spool_id, codex_cmd, working_dir)
+    pid = _spawn_detached(spool_id, codex_cmd, working_dir, env)
 
     # Update spool with PID and status
     spool["pid"] = pid
@@ -2886,9 +2912,10 @@ def _codex_respin_sync(session_id: str, prompt: str) -> str:
     # The prompt is passed as additional argument to resume
     codex_cmd.append(prompt)
 
-    # Get working_dir from original spool if possible
+    # Get working_dir and env from original spool if possible
     original_spool = _find_spool_by_session(session_id)
     working_dir = original_spool.get("working_dir") if original_spool else os.getcwd()
+    env = original_spool.get("env") if original_spool else None
 
     # Create spool record
     spool = {
@@ -2899,6 +2926,7 @@ def _codex_respin_sync(session_id: str, prompt: str) -> str:
         "session_id": session_id,
         "working_dir": working_dir,
         "tags": ["codex", "respin"],
+        "env": env,
         "created_at": datetime.now().isoformat(),
         "completed_at": None,
         "pid": None,
@@ -2909,7 +2937,7 @@ def _codex_respin_sync(session_id: str, prompt: str) -> str:
     _write_spool(spool_id, spool)
 
     # Spawn detached process
-    pid = _spawn_detached(spool_id, codex_cmd, working_dir)
+    pid = _spawn_detached(spool_id, codex_cmd, working_dir, env)
 
     # Update spool with PID and status
     spool["pid"] = pid
