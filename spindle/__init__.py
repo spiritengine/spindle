@@ -32,7 +32,7 @@ from fastmcp import FastMCP
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-mcp = FastMCP("spindle", stateless_http=True)
+mcp = FastMCP("spindle")
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -3098,6 +3098,7 @@ def main():
             model=args.model,
             timeout=args.timeout,
             skeinless=args.skeinless,
+            env=None,
         )
         # Output as JSON for machine parsing
         if result.startswith("Error:"):
@@ -3312,7 +3313,7 @@ WantedBy=default.target
 
     log("STARTING mcp.run()")
     if args.http:
-        mcp.run(transport="streamable-http", host=args.host, port=args.port)
+        mcp.run(transport="streamable-http", host=args.host, port=args.port, stateless_http=True)
     else:
         mcp.run()
     log("FINISHED mcp.run()")
