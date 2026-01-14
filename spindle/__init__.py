@@ -1238,8 +1238,11 @@ async def spin(
         spool_id = spin("Do something", env={"CC_THINKING_BOOST": "1"})
         result = unspool(spool_id)
     """
+    # Normalize harness parameter (case-insensitive)
+    harness_lower = harness.lower() if harness else None
+
     # Route to appropriate harness
-    if harness == "codex":
+    if harness_lower == "codex":
         # Map Claude Code parameters to Codex parameters
         sandbox = None
         if permission == "readonly":
@@ -1259,7 +1262,7 @@ async def spin(
             tags,
             env,
         )
-    elif harness == "gemini":
+    elif harness_lower == "gemini":
         return await asyncio.to_thread(
             _gemini_spin_sync,
             prompt,
@@ -1296,11 +1299,12 @@ def _unspool_sync(spool_id: str) -> str:
         return f"Error: Unknown spool_id '{spool_id}'"
 
     harness = spool.get("harness", "claude-code")
+    harness_lower = harness.lower() if harness else "claude-code"
 
     # Route to appropriate harness implementation
-    if harness == "codex":
+    if harness_lower == "codex":
         return _codex_unspool_sync(spool_id)
-    elif harness == "gemini":
+    elif harness_lower == "gemini":
         return _gemini_unspool_sync(spool_id)
     else:
         # Claude Code harness (default)
@@ -2121,23 +2125,61 @@ async def spool_retry(spool_id: str) -> str:
     if not spool:
         return f"Error: Unknown spool_id '{spool_id}'"
 
-    # Re-spin with same parameters using asyncio.to_thread pattern
+    # Re-spin with same parameters - route to appropriate harness
     tags = spool.get("tags")
     tags_str = ",".join(tags) if tags else None
 
-    return await asyncio.to_thread(
-        _spin_sync,
-        spool.get("prompt", ""),  # prompt
-        spool.get("permission"),  # permission
-        bool(spool.get("shard")),  # shard
-        spool.get("system_prompt"),  # system_prompt
-        spool.get("working_dir"),  # working_dir
-        spool.get("allowed_tools"),  # allowed_tools
-        tags_str,  # tags
-        spool.get("model"),  # model
-        spool.get("timeout"),  # timeout
-        False,  # skeinless
-    )
+    harness = spool.get("harness", "claude-code")
+    harness_lower = harness.lower() if harness else "claude-code"
+
+    if harness_lower == "codex":
+        # Map Claude Code parameters to Codex parameters
+        permission = spool.get("permission")
+        sandbox = None
+        if permission == "readonly":
+            sandbox = "read-only"
+        elif permission in ("full", "shard"):
+            sandbox = "danger-full-access"
+        else:
+            sandbox = "workspace-write"
+
+        return await asyncio.to_thread(
+            _codex_spin_sync,
+            spool.get("prompt", ""),
+            spool.get("working_dir"),
+            spool.get("model"),
+            sandbox,
+            spool.get("timeout"),
+            tags_str,
+            spool.get("env"),
+        )
+    elif harness_lower == "gemini":
+        return await asyncio.to_thread(
+            _gemini_spin_sync,
+            spool.get("prompt", ""),
+            spool.get("working_dir"),
+            spool.get("model"),
+            spool.get("system_prompt"),
+            spool.get("timeout"),
+            tags_str,
+            spool.get("env"),
+        )
+    else:
+        # Default to Claude Code harness
+        return await asyncio.to_thread(
+            _spin_sync,
+            spool.get("prompt", ""),  # prompt
+            spool.get("permission"),  # permission
+            bool(spool.get("shard")),  # shard
+            spool.get("system_prompt"),  # system_prompt
+            spool.get("working_dir"),  # working_dir
+            spool.get("allowed_tools"),  # allowed_tools
+            tags_str,  # tags
+            spool.get("model"),  # model
+            spool.get("timeout"),  # timeout
+            False,  # skeinless
+            spool.get("env"),  # env
+        )
 
 
 def _get_shard_commit_status(spool: dict) -> Optional[str]:
@@ -3130,15 +3172,24 @@ def _codex_respin_sync(session_id: str, prompt: str) -> str:
 # Unlike CLI-based harnesses, this runs a Python subprocess with inline code.
 
 # Default Gemini model
-GEMINI_DEFAULT_MODEL = "gemini-2.0-flash"
+GEMINI_DEFAULT_MODEL = "gemini-2.5-flash"
 
 # Gemini model aliases for convenience
 GEMINI_MODEL_ALIASES = {
-    "flash": "gemini-2.0-flash",
-    "flash-lite": "gemini-2.0-flash-lite",
-    "pro": "gemini-1.5-pro",
+    # Gemini 3 models (latest)
+    "flash": "gemini-3-flash",
+    "pro": "gemini-3-pro",
+    "3-flash": "gemini-3-flash",
+    "3-pro": "gemini-3-pro",
+    "3-flash-preview": "gemini-3-flash-preview",
+    "3-pro-preview": "gemini-3-pro-preview",
+    # Gemini 2.5 models
     "2.5-flash": "gemini-2.5-flash",
+    "2.5-pro": "gemini-2.5-pro",
+    # Gemini 2.0 models
     "2.0-flash": "gemini-2.0-flash",
+    "flash-lite": "gemini-2.0-flash-lite",
+    # Gemini 1.5 models (legacy)
     "1.5-pro": "gemini-1.5-pro",
     "1.5-flash": "gemini-1.5-flash",
 }
