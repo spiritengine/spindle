@@ -1339,6 +1339,162 @@ def _spools_sync() -> str:
     )
 
 
+def _spin_drop_sync(spool_id: str) -> str:
+    """Synchronous implementation of spin_drop."""
+    spool = _read_spool(spool_id)
+
+    if not spool:
+        return f"Error: Unknown spool_id '{spool_id}'"
+
+    if spool.get("status") != "running":
+        return f"Spool {spool_id} is not running (status: {spool.get('status')})"
+
+    pid = spool.get("pid")
+
+    if not pid:
+        return f"Spool {spool_id} has no PID recorded yet"
+
+    # Kill the process group (since we used start_new_session)
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass  # Already dead
+    except OSError:
+        # Try killing just the process
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except (ProcessLookupError, OSError):
+            pass
+
+    # Update spool status
+    spool["status"] = "error"
+    spool["error"] = "Cancelled by user"
+    spool["completed_at"] = datetime.now().isoformat()
+    _write_spool(spool_id, spool)
+
+    # Clean up output files
+    stdout_path = _get_output_path(spool_id)
+    stderr_path = _get_stderr_path(spool_id)
+    if stdout_path.exists():
+        stdout_path.unlink()
+    if stderr_path.exists():
+        stderr_path.unlink()
+
+    return f"Dropped spool {spool_id}"
+
+
+def _spool_peek_sync(spool_id: str, lines: int = 50) -> str:
+    """Synchronous implementation of spool_peek."""
+    spool = _read_spool(spool_id)
+    if not spool:
+        return f"Error: Unknown spool_id '{spool_id}'"
+
+    stdout_path = _get_output_path(spool_id)
+    if not stdout_path.exists():
+        return f"No output yet for spool {spool_id}"
+
+    try:
+        with open(stdout_path, "r") as f:
+            all_lines = f.readlines()
+
+        if not all_lines:
+            return f"Output file exists but is empty for spool {spool_id}"
+
+        # Get last N lines
+        tail = all_lines[-lines:] if len(all_lines) > lines else all_lines
+        status = spool.get("status", "unknown")
+
+        header = f"[spool {spool_id} - {status} - {len(all_lines)} total lines, showing last {len(tail)}]\n"
+        return header + "".join(tail)
+    except Exception as e:
+        return f"Error reading output: {e}"
+
+
+def _spin_wait_sync(
+    spool_ids: Optional[str] = None,
+    mode: str = "gather",
+    timeout: Optional[int] = None,
+    time_param: Optional[str] = None,
+) -> str:
+    """Synchronous implementation of spin_wait."""
+    import time as time_module
+
+    # Time-based waiting mode (no spool_ids)
+    if time_param and not spool_ids:
+        duration_seconds = _parse_duration(time_param)
+        if duration_seconds is None:
+            return f"Error: Invalid time format '{time_param}'. Use: 30s, 90m, 2h, or HH:MM"
+
+        start_time = datetime.now()
+        time_module.sleep(duration_seconds)
+        elapsed = int((datetime.now() - start_time).total_seconds())
+
+        return json.dumps({
+            "waited": time_param,
+            "elapsed_seconds": elapsed,
+            "interrupted": False,
+            "started_at": start_time.isoformat(),
+            "ended_at": datetime.now().isoformat(),
+        }, indent=2)
+
+    # Must have spool_ids for spool-waiting mode
+    if not spool_ids:
+        return "Error: Provide spool_ids to wait for spools, or time to wait for a duration"
+
+    ids = [s.strip() for s in spool_ids.split(",")]
+    start_time = datetime.now()
+    poll_interval = 3  # seconds
+
+    if mode == "yield":
+        # Return as soon as any completes
+        while True:
+            for spool_id in ids:
+                _check_and_finalize_spool(spool_id)
+                spool = _read_spool(spool_id)
+                if not spool:
+                    return f"Error: Unknown spool_id '{spool_id}'"
+                if spool.get("status") == "complete":
+                    return spool.get("result", "No result")
+                elif spool.get("status") == "error":
+                    return f"Error: {spool.get('error')}"
+
+            if timeout:
+                elapsed = (datetime.now() - start_time).total_seconds()
+                if elapsed >= timeout:
+                    return f"Timeout after {timeout}s. Spools still running: {', '.join(ids)}"
+
+            time_module.sleep(poll_interval)
+    else:
+        # gather mode - wait for all
+        results = {}
+        pending = set(ids)
+
+        while pending:
+            for spool_id in list(pending):
+                _check_and_finalize_spool(spool_id)
+                spool = _read_spool(spool_id)
+                if not spool:
+                    return f"Error: Unknown spool_id '{spool_id}'"
+                if spool.get("status") == "complete":
+                    results[spool_id] = spool.get("result", "No result")
+                    pending.remove(spool_id)
+                elif spool.get("status") == "error":
+                    results[spool_id] = f"Error: {spool.get('error')}"
+                    pending.remove(spool_id)
+
+            if not pending:
+                break
+
+            if timeout:
+                elapsed = (datetime.now() - start_time).total_seconds()
+                if elapsed >= timeout:
+                    return f"Timeout after {timeout}s. Still pending: {', '.join(pending)}. Completed: {json.dumps(results)}"
+
+            time_module.sleep(poll_interval)
+
+        return json.dumps(results, indent=2)
+
+
 @mcp.tool()
 async def spools() -> str:
     """
@@ -3030,13 +3186,36 @@ def main():
     spin_parser.add_argument("--model", "-m", choices=["haiku", "sonnet", "opus"], help="Model to use")
     spin_parser.add_argument("--timeout", "-t", type=int, help="Kill spool after N seconds")
     spin_parser.add_argument("--skeinless", action="store_true", help="Skip SKEIN context injection for shard agents")
+    spin_parser.add_argument("--human", action="store_true", help="Human-readable output instead of JSON")
 
     # unspool command - get result
     unspool_parser = subparsers.add_parser("unspool", help="Get the result of a background spin task")
     unspool_parser.add_argument("spool_id", help="The spool ID to get output from")
+    unspool_parser.add_argument("--human", action="store_true", help="Human-readable output instead of JSON")
 
     # spools command - list all
     spools_parser = subparsers.add_parser("spools", help="List all spools (running and completed)")
+    spools_parser.add_argument("--human", action="store_true", help="Human-readable output instead of JSON")
+
+    # wait command - wait for spools to complete
+    wait_parser = subparsers.add_parser("wait", help="Wait for spools to complete")
+    wait_parser.add_argument("spool_ids", nargs="?", help="Comma-separated spool IDs to wait for")
+    wait_parser.add_argument("--mode", "-m", choices=["gather", "yield"], default="gather",
+                            help="Wait mode: gather (all) or yield (first completed)")
+    wait_parser.add_argument("--timeout", "-t", type=int, help="Timeout in seconds")
+    wait_parser.add_argument("--time", help="Duration to wait (e.g., 90m, 2h, 30s, 06:00)")
+    wait_parser.add_argument("--human", action="store_true", help="Human-readable output instead of JSON")
+
+    # drop command - cancel a spool
+    drop_parser = subparsers.add_parser("drop", help="Cancel a running spool")
+    drop_parser.add_argument("spool_id", help="The spool ID to cancel")
+    drop_parser.add_argument("--human", action="store_true", help="Human-readable output instead of JSON")
+
+    # peek command - see partial output
+    peek_parser = subparsers.add_parser("peek", help="See partial output of a running spool")
+    peek_parser.add_argument("spool_id", help="The spool ID to peek at")
+    peek_parser.add_argument("--lines", "-n", type=int, default=50, help="Number of lines to show (default: 50)")
+    peek_parser.add_argument("--human", action="store_true", help="Human-readable output instead of JSON")
 
     # Legacy flags for backward compat
     parser.add_argument("--http", action="store_true", help=argparse.SUPPRESS)
@@ -3100,30 +3279,101 @@ def main():
             skeinless=args.skeinless,
             env=None,
         )
-        # Output as JSON for machine parsing
         if result.startswith("Error:"):
-            print(json.dumps({"error": result}))
+            if args.human:
+                print(f"Error: {result}")
+            else:
+                print(json.dumps({"error": result}))
             sys.exit(1)
         else:
             # Result is spool_id
-            print(json.dumps({"spool_id": result}))
+            if args.human:
+                print(f"Spawned spool: {result}")
+            else:
+                print(json.dumps({"spool_id": result}))
         sys.exit(0)
 
     elif args.command == "unspool":
         result = _unspool_sync(args.spool_id)
-        # Try to parse as JSON if the spool result is JSON
-        try:
-            parsed = json.loads(result)
-            print(json.dumps(parsed, indent=2))
-        except json.JSONDecodeError:
-            # Plain text result - wrap in JSON
-            print(json.dumps({"result": result}))
+        if args.human:
+            # For human output, just print the result directly
+            print(result)
+        else:
+            # Try to parse as JSON if the spool result is JSON
+            try:
+                parsed = json.loads(result)
+                print(json.dumps(parsed, indent=2))
+            except json.JSONDecodeError:
+                # Plain text result - wrap in JSON
+                print(json.dumps({"result": result}))
         sys.exit(0)
 
     elif args.command == "spools":
         result = _spools_sync()
-        # Already returns JSON
-        print(result)
+        if args.human:
+            # Format as human-readable table
+            spools_data = json.loads(result)
+            if not spools_data:
+                print("No spools found")
+            else:
+                print(f"{'ID':<12} {'Status':<10} {'Prompt':<50}")
+                print("-" * 72)
+                for spool_id, info in spools_data.items():
+                    status = info.get("status", "unknown")
+                    prompt = info.get("prompt", "")[:47]
+                    if len(info.get("prompt", "")) > 47:
+                        prompt += "..."
+                    print(f"{spool_id:<12} {status:<10} {prompt}")
+        else:
+            print(result)
+        sys.exit(0)
+
+    elif args.command == "wait":
+        result = _spin_wait_sync(
+            spool_ids=args.spool_ids,
+            mode=args.mode,
+            timeout=args.timeout,
+            time_param=args.time,
+        )
+        if args.human:
+            if result.startswith("Error:"):
+                print(result)
+            else:
+                try:
+                    parsed = json.loads(result)
+                    if "elapsed_seconds" in parsed:
+                        # Time-based wait result
+                        print(f"Waited {parsed.get('waited', 'unknown')} ({parsed['elapsed_seconds']}s)")
+                        if parsed.get("interrupted"):
+                            print("(interrupted)")
+                    else:
+                        # Spool results
+                        for spool_id, res in parsed.items():
+                            print(f"\n=== {spool_id} ===")
+                            print(res[:500] if len(res) > 500 else res)
+                except json.JSONDecodeError:
+                    print(result)
+        else:
+            print(result)
+        sys.exit(0)
+
+    elif args.command == "drop":
+        result = _spin_drop_sync(args.spool_id)
+        if args.human:
+            print(result)
+        else:
+            if result.startswith("Error:") or result.startswith("Spool"):
+                print(json.dumps({"message": result}))
+            else:
+                print(json.dumps({"dropped": args.spool_id}))
+        sys.exit(0)
+
+    elif args.command == "peek":
+        result = _spool_peek_sync(args.spool_id, lines=args.lines)
+        if args.human:
+            print(result)
+        else:
+            print(json.dumps({"spool_id": args.spool_id, "output": result}))
         sys.exit(0)
 
     elif args.command == "install-service":
