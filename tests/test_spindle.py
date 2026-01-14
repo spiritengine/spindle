@@ -33,6 +33,13 @@ from spindle import (
     PERMISSION_PROFILES,
     MAX_CONCURRENT,
     _spawn_shard,
+    # Gemini harness functions
+    GEMINI_DEFAULT_MODEL,
+    GEMINI_MODEL_ALIASES,
+    _gemini_spin_sync,
+    _gemini_unspool_sync,
+    _check_and_finalize_gemini_spool,
+    _cleanup_gemini_script,
 )
 
 
@@ -704,3 +711,260 @@ class TestWorktreeNameUniqueness:
         # Cleanup - remove worktrees
         subprocess.run(["git", "worktree", "remove", shard1["worktree_path"]], cwd=git_dir, capture_output=True)
         subprocess.run(["git", "worktree", "remove", shard2["worktree_path"]], cwd=git_dir, capture_output=True)
+
+
+class TestGeminiHarness:
+    """Test Gemini harness implementation."""
+
+    def test_gemini_default_model(self):
+        """Gemini default model should be set."""
+        assert GEMINI_DEFAULT_MODEL == "gemini-2.0-flash"
+
+    def test_gemini_model_aliases(self):
+        """Model aliases should resolve to full model names."""
+        assert GEMINI_MODEL_ALIASES["flash"] == "gemini-2.0-flash"
+        assert GEMINI_MODEL_ALIASES["pro"] == "gemini-1.5-pro"
+        assert GEMINI_MODEL_ALIASES["flash-lite"] == "gemini-2.0-flash-lite"
+        assert GEMINI_MODEL_ALIASES["2.5-flash"] == "gemini-2.5-flash"
+        assert GEMINI_MODEL_ALIASES["1.5-flash"] == "gemini-1.5-flash"
+
+    def test_gemini_spin_requires_working_dir(self, tmp_path):
+        """Gemini spin should require working_dir."""
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            result = _gemini_spin_sync(
+                prompt="Test prompt",
+                working_dir=None,
+                model=None,
+                system_prompt=None,
+                timeout=None,
+                tags=None,
+                env=None,
+            )
+            assert "working_dir required" in result
+
+    def test_gemini_spin_requires_api_key(self, tmp_path):
+        """Gemini spin should require API key."""
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            # Clear any existing API key
+            with patch.dict(os.environ, {}, clear=True):
+                result = _gemini_spin_sync(
+                    prompt="Test prompt",
+                    working_dir=str(tmp_path),
+                    model=None,
+                    system_prompt=None,
+                    timeout=None,
+                    tags=None,
+                    env=None,
+                )
+                assert "GOOGLE_API_KEY" in result or "GEMINI_API_KEY" in result
+
+    def test_gemini_spin_creates_spool(self, tmp_path):
+        """Gemini spin should create spool record."""
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle._spawn_detached", return_value=12345):
+                with patch.dict(os.environ, {"GOOGLE_API_KEY": "test-key"}):
+                    with patch("spindle._count_running", return_value=0):
+                        result = _gemini_spin_sync(
+                            prompt="Test prompt",
+                            working_dir=str(tmp_path),
+                            model="flash",
+                            system_prompt="Be helpful",
+                            timeout=60,
+                            tags="test,gemini",
+                            env=None,
+                        )
+
+            # Result should be a spool_id
+            assert result.startswith("gemini-")
+
+            # Spool file should exist
+            spool_files = list(tmp_path.glob("gemini-*.json"))
+            assert len(spool_files) == 1
+
+            # Read spool and verify contents
+            with open(spool_files[0]) as f:
+                spool = json.load(f)
+
+            assert spool["harness"] == "gemini"
+            assert spool["prompt"] == "Test prompt"
+            assert spool["model"] == "gemini-2.0-flash"  # alias resolved
+            assert spool["system_prompt"] == "Be helpful"
+            assert spool["timeout"] == 60
+            assert "gemini" in spool["tags"]
+            assert "test" in spool["tags"]
+            assert spool["status"] == "running"
+
+    def test_gemini_spin_creates_script_file(self, tmp_path):
+        """Gemini spin should create temporary Python script."""
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle._spawn_detached", return_value=12345):
+                with patch.dict(os.environ, {"GOOGLE_API_KEY": "test-key"}):
+                    with patch("spindle._count_running", return_value=0):
+                        spool_id = _gemini_spin_sync(
+                            prompt="Test prompt",
+                            working_dir=str(tmp_path),
+                            model=None,
+                            system_prompt=None,
+                            timeout=None,
+                            tags=None,
+                            env=None,
+                        )
+
+            # Script file should exist
+            script_path = tmp_path / f"{spool_id}.py"
+            assert script_path.exists()
+
+            # Script should contain google.genai import
+            script_content = script_path.read_text()
+            assert "from google import genai" in script_content
+            assert "genai.Client" in script_content
+
+    def test_gemini_unspool_nonexistent(self, tmp_path):
+        """Unspool should return error for nonexistent spool."""
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            result = _gemini_unspool_sync("gemini-nonexistent")
+            assert "Unknown spool_id" in result
+
+    def test_gemini_unspool_complete(self, tmp_path):
+        """Unspool should return result for complete spool."""
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            spool_id = "gemini-test123"
+            spool = {
+                "id": spool_id,
+                "status": "complete",
+                "result": "Test response from Gemini",
+                "harness": "gemini",
+                "created_at": datetime.now().isoformat(),
+            }
+            _write_spool(spool_id, spool)
+
+            result = _gemini_unspool_sync(spool_id)
+            assert result == "Test response from Gemini"
+
+    def test_gemini_unspool_error(self, tmp_path):
+        """Unspool should return error message for failed spool."""
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            spool_id = "gemini-test456"
+            spool = {
+                "id": spool_id,
+                "status": "error",
+                "error": "API key invalid",
+                "harness": "gemini",
+                "created_at": datetime.now().isoformat(),
+            }
+            _write_spool(spool_id, spool)
+
+            result = _gemini_unspool_sync(spool_id)
+            assert "failed" in result
+            assert "API key invalid" in result
+
+    def test_gemini_unspool_timeout(self, tmp_path):
+        """Unspool should return timeout message for timed out spool."""
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            spool_id = "gemini-test789"
+            spool = {
+                "id": spool_id,
+                "status": "timeout",
+                "error": "Timeout after 60s",
+                "harness": "gemini",
+                "created_at": datetime.now().isoformat(),
+            }
+            _write_spool(spool_id, spool)
+
+            result = _gemini_unspool_sync(spool_id)
+            assert "timed out" in result
+
+    def test_gemini_finalize_parses_json_output(self, tmp_path):
+        """Finalize should parse JSON output correctly."""
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            spool_id = "gemini-finalize1"
+
+            # Create running spool
+            spool = {
+                "id": spool_id,
+                "status": "running",
+                "pid": 999999999,  # Non-existent PID
+                "harness": "gemini",
+                "created_at": datetime.now().isoformat(),
+            }
+            _write_spool(spool_id, spool)
+
+            # Create stdout with valid JSON output
+            stdout_path = tmp_path / f"{spool_id}.stdout"
+            stdout_data = {
+                "result": "Hello from Gemini!",
+                "model": "gemini-2.0-flash",
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 20,
+                    "total_tokens": 30,
+                }
+            }
+            stdout_path.write_text(json.dumps(stdout_data))
+
+            # Finalize
+            _check_and_finalize_gemini_spool(spool_id)
+
+            # Read spool and verify
+            finalized = _read_spool(spool_id)
+            assert finalized["status"] == "complete"
+            assert finalized["result"] == "Hello from Gemini!"
+            assert finalized["cost"]["prompt_tokens"] == 10
+
+    def test_gemini_finalize_handles_error_output(self, tmp_path):
+        """Finalize should handle error in JSON output."""
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            spool_id = "gemini-finalize2"
+
+            # Create running spool
+            spool = {
+                "id": spool_id,
+                "status": "running",
+                "pid": 999999999,
+                "harness": "gemini",
+                "created_at": datetime.now().isoformat(),
+            }
+            _write_spool(spool_id, spool)
+
+            # Create stdout with error output
+            stdout_path = tmp_path / f"{spool_id}.stdout"
+            stdout_path.write_text(json.dumps({"error": "Invalid API key"}))
+
+            # Finalize
+            _check_and_finalize_gemini_spool(spool_id)
+
+            # Read spool and verify
+            finalized = _read_spool(spool_id)
+            assert finalized["status"] == "error"
+            assert finalized["error"] == "Invalid API key"
+
+    def test_gemini_cleanup_script(self, tmp_path):
+        """Cleanup should remove script file."""
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            spool_id = "gemini-cleanup1"
+            script_path = tmp_path / f"{spool_id}.py"
+            script_path.write_text("# test script")
+
+            assert script_path.exists()
+            _cleanup_gemini_script(spool_id)
+            assert not script_path.exists()
+
+    def test_gemini_spin_uses_env_api_key(self, tmp_path):
+        """Gemini spin should use API key from env parameter."""
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle._spawn_detached", return_value=12345):
+                with patch("spindle._count_running", return_value=0):
+                    # Don't set env var, but pass in env dict
+                    with patch.dict(os.environ, {}, clear=True):
+                        result = _gemini_spin_sync(
+                            prompt="Test prompt",
+                            working_dir=str(tmp_path),
+                            model=None,
+                            system_prompt=None,
+                            timeout=None,
+                            tags=None,
+                            env={"GOOGLE_API_KEY": "key-from-env-param"},
+                        )
+
+            # Should succeed with API key from env param
+            assert result.startswith("gemini-")
