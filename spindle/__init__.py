@@ -20,6 +20,7 @@ import re
 import shutil
 import signal
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -1217,10 +1218,11 @@ async def spin(
         working_dir: Directory for the agent to work in (defaults to current)
         allowed_tools: Override permission profile with explicit tool list
         tags: Comma-separated tags for organizing spools (e.g. "batch-1,triage")
-        model: Model to use - "haiku", "sonnet", or "opus" (default: inherit)
+        model: Model to use - for Claude: "haiku", "sonnet", "opus";
+               for Gemini: "flash", "pro", "2.5-flash", "gemini-2.0-flash", etc.
         timeout: Kill spool after this many seconds (default: no timeout)
         skeinless: Skip SKEIN context injection for shard agents (default: False)
-        harness: Which harness to use - "claude-code" (default) or "codex"
+        harness: Which harness to use - "claude-code" (default), "codex", or "gemini"
         env: Optional dict of environment variables to set in spawned agent
 
     Returns:
@@ -1232,6 +1234,7 @@ async def spin(
         spool_id = spin("Careful work", permission="careful+shard")
         spool_id = spin("Quick task", model="haiku", timeout=60)
         spool_id = spin("Write a parser", harness="codex")  # Use Codex instead
+        spool_id = spin("Summarize this", harness="gemini", model="flash")  # Use Gemini
         spool_id = spin("Do something", env={"CC_THINKING_BOOST": "1"})
         result = unspool(spool_id)
     """
@@ -1252,6 +1255,17 @@ async def spin(
             working_dir,
             model,
             sandbox,
+            timeout,
+            tags,
+            env,
+        )
+    elif harness == "gemini":
+        return await asyncio.to_thread(
+            _gemini_spin_sync,
+            prompt,
+            working_dir,
+            model,
+            system_prompt,
             timeout,
             tags,
             env,
@@ -1286,6 +1300,8 @@ def _unspool_sync(spool_id: str) -> str:
     # Route to appropriate harness implementation
     if harness == "codex":
         return _codex_unspool_sync(spool_id)
+    elif harness == "gemini":
+        return _gemini_unspool_sync(spool_id)
     else:
         # Claude Code harness (default)
         _check_and_finalize_spool(spool_id)
@@ -3105,6 +3121,325 @@ def _codex_respin_sync(session_id: str, prompt: str) -> str:
     monitor.start()
 
     return spool_id
+
+
+# ============================================================================
+# Gemini Harness Implementation
+# ============================================================================
+# Uses Google's google-genai SDK for headless Gemini API access.
+# Unlike CLI-based harnesses, this runs a Python subprocess with inline code.
+
+# Default Gemini model
+GEMINI_DEFAULT_MODEL = "gemini-2.0-flash"
+
+# Gemini model aliases for convenience
+GEMINI_MODEL_ALIASES = {
+    "flash": "gemini-2.0-flash",
+    "flash-lite": "gemini-2.0-flash-lite",
+    "pro": "gemini-1.5-pro",
+    "2.5-flash": "gemini-2.5-flash",
+    "2.0-flash": "gemini-2.0-flash",
+    "1.5-pro": "gemini-1.5-pro",
+    "1.5-flash": "gemini-1.5-flash",
+}
+
+
+def _gemini_spin_sync(
+    prompt: str,
+    working_dir: Optional[str],
+    model: Optional[str],
+    system_prompt: Optional[str],
+    timeout: Optional[int],
+    tags: Optional[str],
+    env: Optional[Dict[str, str]],
+) -> str:
+    """Synchronous implementation of gemini_spin - runs Gemini API in background subprocess."""
+    # Require working_dir
+    if not working_dir:
+        return "Error: working_dir required. Pass the project directory."
+
+    # Check for API key
+    api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
+    if env:
+        api_key = env.get("GOOGLE_API_KEY") or env.get("GEMINI_API_KEY") or api_key
+    if not api_key:
+        return "Error: GOOGLE_API_KEY or GEMINI_API_KEY environment variable required for Gemini harness."
+
+    # Generate spool ID
+    spool_id = "gemini-" + str(uuid.uuid4())[:8]
+
+    # Atomically check concurrency limit and create initial spool entry
+    success, error_msg = _try_reserve_slot_and_create(spool_id, initial_status="pending")
+    if not success:
+        return error_msg
+
+    # Resolve model name (handle aliases)
+    resolved_model = model
+    if model:
+        resolved_model = GEMINI_MODEL_ALIASES.get(model, model)
+    else:
+        resolved_model = GEMINI_DEFAULT_MODEL
+
+    # Parse tags
+    tag_list = [t.strip() for t in tags.split(",")] if tags else []
+    tag_list.append("gemini")  # Auto-tag as gemini spool
+
+    # Create spool record
+    spool = {
+        "id": spool_id,
+        "status": "pending",
+        "prompt": prompt,
+        "result": None,
+        "session_id": None,
+        "working_dir": working_dir,
+        "model": resolved_model,
+        "system_prompt": system_prompt,
+        "tags": tag_list,
+        "timeout": timeout,
+        "env": env,
+        "created_at": datetime.now().isoformat(),
+        "completed_at": None,
+        "pid": None,
+        "error": None,
+        "harness": "gemini",
+    }
+
+    _write_spool(spool_id, spool)
+
+    # Build the Python script to run Gemini API
+    # We use a subprocess with inline Python to avoid import issues if google-genai isn't installed
+    gemini_script = f'''
+import json
+import os
+import sys
+
+try:
+    from google import genai
+    from google.genai import types
+except ImportError:
+    print(json.dumps({{"error": "google-genai package not installed. Run: pip install google-genai"}}))
+    sys.exit(1)
+
+api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
+if not api_key:
+    print(json.dumps({{"error": "GOOGLE_API_KEY or GEMINI_API_KEY environment variable not set"}}))
+    sys.exit(1)
+
+try:
+    client = genai.Client(api_key=api_key)
+
+    config = types.GenerateContentConfig()
+    system_instruction = {repr(system_prompt) if system_prompt else "None"}
+    if system_instruction:
+        config.system_instruction = system_instruction
+
+    response = client.models.generate_content(
+        model={repr(resolved_model)},
+        contents={repr(prompt)},
+        config=config if system_instruction else None,
+    )
+
+    # Extract result
+    result_text = response.text if hasattr(response, "text") else str(response)
+
+    # Build output structure similar to other harnesses
+    output = {{
+        "result": result_text,
+        "model": {repr(resolved_model)},
+        "usage": None,
+    }}
+
+    # Try to extract usage info
+    if hasattr(response, "usage_metadata"):
+        usage = response.usage_metadata
+        output["usage"] = {{
+            "prompt_tokens": getattr(usage, "prompt_token_count", None),
+            "completion_tokens": getattr(usage, "candidates_token_count", None),
+            "total_tokens": getattr(usage, "total_token_count", None),
+        }}
+
+    print(json.dumps(output))
+
+except Exception as e:
+    print(json.dumps({{"error": str(e)}}))
+    sys.exit(1)
+'''
+
+    # Write script to a temp file and run it
+    script_path = SPINDLE_DIR / f"{spool_id}.py"
+    script_path.write_text(gemini_script)
+
+    # Build command
+    python_cmd = [sys.executable, str(script_path)]
+
+    # Merge API key into environment
+    process_env = env.copy() if env else {}
+    if api_key and "GOOGLE_API_KEY" not in process_env and "GEMINI_API_KEY" not in process_env:
+        process_env["GOOGLE_API_KEY"] = api_key
+
+    # Spawn detached process
+    pid = _spawn_detached(spool_id, python_cmd, working_dir, process_env)
+
+    # Update spool with PID and status
+    spool["pid"] = pid
+    spool["status"] = "running"
+    spool["script_path"] = str(script_path)
+    _write_spool(spool_id, spool)
+
+    # Start background monitor thread
+    monitor = threading.Thread(target=_monitor_gemini_spool, args=(spool_id,), daemon=True)
+    monitor.start()
+
+    return spool_id
+
+
+def _monitor_gemini_spool(spool_id: str) -> None:
+    """Background thread that monitors a Gemini spool until completion."""
+    while True:
+        # Check for timeout
+        spool = _read_spool(spool_id)
+        if spool and spool.get("timeout"):
+            created = datetime.fromisoformat(spool["created_at"])
+            elapsed = (datetime.now() - created).total_seconds()
+            if elapsed > spool["timeout"]:
+                # Kill the process
+                pid = spool.get("pid")
+                if pid and _is_pid_alive(pid):
+                    try:
+                        os.kill(pid, signal.SIGTERM)
+                        time.sleep(0.5)
+                        if _is_pid_alive(pid):
+                            os.kill(pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                # Mark as timeout
+                spool["status"] = "timeout"
+                spool["error"] = f'Timeout after {spool["timeout"]}s'
+                spool["completed_at"] = datetime.now().isoformat()
+                _write_spool(spool_id, spool)
+                _cleanup_gemini_script(spool_id)
+                break
+
+        if _check_and_finalize_gemini_spool(spool_id):
+            break
+        time.sleep(MONITOR_POLL_INTERVAL)
+
+
+def _check_and_finalize_gemini_spool(spool_id: str) -> bool:
+    """
+    Check if a Gemini spool's process has finished and finalize it.
+    Returns True if the spool was finalized, False if still running.
+    """
+    with _spool_lock(spool_id, blocking=False) as acquired:
+        if not acquired:
+            return False
+
+        spool = _read_spool(spool_id)
+        if not spool or spool.get("status") != "running":
+            return True
+
+        pid = spool.get("pid")
+        if not pid:
+            return False
+
+        # Check if process still alive
+        if _is_pid_alive(pid):
+            return False
+
+        # Process finished - read output
+        stdout_path = _get_output_path(spool_id)
+        stderr_path = _get_stderr_path(spool_id)
+
+        stdout = ""
+        stderr = ""
+
+        if stdout_path.exists():
+            try:
+                stdout = stdout_path.read_text()
+            except IOError:
+                pass
+
+        if stderr_path.exists():
+            try:
+                stderr = stderr_path.read_text()
+            except IOError:
+                pass
+
+        # Parse Gemini output (JSON format)
+        try:
+            if stdout.strip():
+                data = json.loads(stdout)
+                if "error" in data:
+                    spool["status"] = "error"
+                    spool["error"] = data["error"]
+                else:
+                    spool["status"] = "complete"
+                    spool["result"] = data.get("result", stdout)
+                    if data.get("usage"):
+                        spool["cost"] = data["usage"]
+            elif stderr.strip():
+                spool["status"] = "error"
+                spool["error"] = stderr[:500]
+            else:
+                spool["status"] = "error"
+                spool["error"] = "Process exited with no output"
+        except json.JSONDecodeError:
+            if stdout.strip():
+                spool["result"] = stdout
+                spool["status"] = "complete"
+            else:
+                spool["status"] = "error"
+                spool["error"] = "Failed to parse Gemini output"
+
+        spool["completed_at"] = datetime.now().isoformat()
+        _write_spool(spool_id, spool)
+
+        # Clean up files
+        if stdout_path.exists():
+            stdout_path.unlink()
+        if stderr_path.exists():
+            stderr_path.unlink()
+        _cleanup_gemini_script(spool_id)
+
+        return True
+
+
+def _cleanup_gemini_script(spool_id: str) -> None:
+    """Clean up the temporary Python script for a Gemini spool."""
+    script_path = SPINDLE_DIR / f"{spool_id}.py"
+    if script_path.exists():
+        try:
+            script_path.unlink()
+        except IOError:
+            pass
+
+
+def _gemini_unspool_sync(spool_id: str) -> str:
+    """Synchronous implementation of gemini_unspool."""
+    _check_and_finalize_gemini_spool(spool_id)
+    spool = _read_spool(spool_id)
+    if not spool:
+        return f"Error: Unknown spool_id '{spool_id}'"
+
+    status = spool.get("status")
+    if status == "pending":
+        return f"Spool {spool_id} pending (not yet started)"
+    elif status == "running":
+        pid = spool.get("pid")
+        if pid and not _is_pid_alive(pid):
+            _check_and_finalize_gemini_spool(spool_id)
+            spool = _read_spool(spool_id)
+            if spool.get("status") == "complete":
+                return spool.get("result", "No result")
+            elif spool.get("status") == "error":
+                return f"Spool {spool_id} failed: {spool.get('error', 'Unknown error')}"
+        return f"Spool {spool_id} still running: {spool.get('prompt', '')[:50]}..."
+    elif status == "complete":
+        return spool.get("result", "No result")
+    elif status == "timeout":
+        return f"Spool {spool_id} timed out: {spool.get('error', 'Timeout')}"
+    else:
+        return f"Spool {spool_id} failed: {spool.get('error', 'Unknown error')}"
 
 
 @mcp.tool()
