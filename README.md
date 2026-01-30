@@ -2,7 +2,7 @@
 
 <!-- Uncomment when published:
 [![PyPI version](https://badge.fury.io/py/spindle.svg)](https://badge.fury.io/py/spindle)
-[![CI](https://github.com/smythp/spindle/actions/workflows/ci.yml/badge.svg)](https://github.com/smythp/spindle/actions/workflows/ci.yml)
+[![CI](https://github.com/spiritengine/spindle/actions/workflows/ci.yml/badge.svg)](https://github.com/spiritengine/spindle/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 -->
 
