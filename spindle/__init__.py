@@ -27,7 +27,7 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional, Dict, Any, Generator
+from typing import Dict, Generator, Optional
 
 from fastmcp import FastMCP
 from starlette.requests import Request
@@ -183,11 +183,11 @@ def _spawn_shard(agent_id: str, working_dir: str) -> Optional[Dict[str, str]]:
                         # Extract other info
                         branch_name = None
                         shard_id = None
-                        for l in result.stdout.splitlines():
-                            if "Branch:" in l:
-                                branch_name = l.split("Branch:")[1].strip()
-                            if "Spawned SHARD:" in l:
-                                shard_id = l.split("Spawned SHARD:")[1].strip()
+                        for line in result.stdout.splitlines():
+                            if "Branch:" in line:
+                                branch_name = line.split("Branch:")[1].strip()
+                            if "Spawned SHARD:" in line:
+                                shard_id = line.split("Spawned SHARD:")[1].strip()
                         return {
                             "worktree_path": worktree_path,
                             "branch_name": branch_name or f"shard-{agent_id}",
@@ -248,8 +248,8 @@ def _close_tender_folios(worktree_name: str, working_dir: str) -> Optional[str]:
         return None
 
     try:
-        import urllib.request
         import urllib.error
+        import urllib.request
 
         # Query SKEIN for tender folios
         skein_url = os.environ.get("SKEIN_URL", "http://localhost:8001")
@@ -307,7 +307,9 @@ def _close_tender_folios(worktree_name: str, working_dir: str) -> Optional[str]:
         return None  # SKEIN not available or error, continue silently
 
 
-def _cleanup_shard(shard_info: Dict[str, str], working_dir: str, keep_branch: bool = False, spool_id: Optional[str] = None) -> bool:
+def _cleanup_shard(
+    shard_info: Dict[str, str], working_dir: str, keep_branch: bool = False, spool_id: Optional[str] = None
+) -> bool:
     """
     Clean up a SHARD worktree.
 
@@ -333,62 +335,54 @@ def _cleanup_shard(shard_info: Dict[str, str], working_dir: str, keep_branch: bo
             capture_output=True,
             text=True,
             cwd=working_dir,
-            timeout=30
+            timeout=30,
         )
         if result.returncode != 0:
             logger.error(
-                f"Failed to remove worktree {worktree_path}" +
-                (f" for spool {spool_id}" if spool_id else "") +
-                f": {result.stderr.strip()}"
+                f"Failed to remove worktree {worktree_path}"
+                + (f" for spool {spool_id}" if spool_id else "")
+                + f": {result.stderr.strip()}"
             )
             return False
 
         # Optionally delete branch
         if not keep_branch and branch_name:
             result = subprocess.run(
-                ["git", "branch", "-D", branch_name],
-                capture_output=True,
-                text=True,
-                cwd=working_dir,
-                timeout=10
+                ["git", "branch", "-D", branch_name], capture_output=True, text=True, cwd=working_dir, timeout=10
             )
             if result.returncode != 0:
                 logger.warning(
-                    f"Failed to delete branch {branch_name}" +
-                    (f" for spool {spool_id}" if spool_id else "") +
-                    f": {result.stderr.strip()}"
+                    f"Failed to delete branch {branch_name}"
+                    + (f" for spool {spool_id}" if spool_id else "")
+                    + f": {result.stderr.strip()}"
                 )
                 # Don't return False here - worktree removal succeeded
 
         # Prune worktree references
         result = subprocess.run(
-            ["git", "worktree", "prune"],
-            capture_output=True,
-            text=True,
-            cwd=working_dir,
-            timeout=10
+            ["git", "worktree", "prune"], capture_output=True, text=True, cwd=working_dir, timeout=10
         )
         if result.returncode != 0:
             logger.warning(
-                f"Failed to prune worktree references" +
-                (f" for spool {spool_id}" if spool_id else "") +
-                f": {result.stderr.strip()}"
+                "Failed to prune worktree references"
+                + (f" for spool {spool_id}" if spool_id else "")
+                + f": {result.stderr.strip()}"
             )
             # Don't return False here - worktree removal succeeded
 
         return True
     except subprocess.TimeoutExpired as e:
         logger.error(
-            f"Timeout during shard cleanup for worktree {worktree_path}" +
-            (f" (spool {spool_id})" if spool_id else "") +
-            f": {e}"
+            f"Timeout during shard cleanup for worktree {worktree_path}"
+            + (f" (spool {spool_id})" if spool_id else "")
+            + f": {e}"
         )
         return False
     except (FileNotFoundError, OSError) as e:
         logger.error(
-            f"Error during shard cleanup for worktree {worktree_path}" +
-            (f" (spool {spool_id})" if spool_id else "") +
-            f": {e}"
+            f"Error during shard cleanup for worktree {worktree_path}"
+            + (f" (spool {spool_id})" if spool_id else "")
+            + f": {e}"
         )
         return False
 
@@ -515,10 +509,7 @@ def _count_running() -> int:
     represent reserved slots that will become running shortly.
     This prevents TOCTOU race in concurrency limit enforcement.
     """
-    return sum(
-        1 for s in _list_spools()
-        if s.get("status") in ("running", "pending")
-    )
+    return sum(1 for s in _list_spools() if s.get("status") in ("running", "pending"))
 
 
 def _try_reserve_slot_and_create(spool_id: str, initial_status: str = "pending") -> tuple[bool, Optional[str]]:
@@ -603,17 +594,17 @@ def _parse_duration(time_str: str) -> Optional[int]:
     time_str = time_str.strip()
 
     # Try relative duration formats: 30s, 90m, 2h
-    match = re.match(r'^(\d+(?:\.\d+)?)\s*([smh])$', time_str.lower())
+    match = re.match(r"^(\d+(?:\.\d+)?)\s*([smh])$", time_str.lower())
     if match:
         value = float(match.group(1))
         unit = match.group(2)
 
         # Calculate seconds
-        if unit == 's':
+        if unit == "s":
             seconds = int(value)
-        elif unit == 'm':
+        elif unit == "m":
             seconds = int(value * 60)
-        elif unit == 'h':
+        elif unit == "h":
             seconds = int(value * 3600)
         else:
             return None
@@ -625,7 +616,7 @@ def _parse_duration(time_str: str) -> Optional[int]:
         return seconds
 
     # Try absolute time format: HH:MM
-    match = re.match(r'^(\d{1,2}):(\d{2})$', time_str)
+    match = re.match(r"^(\d{1,2}):(\d{2})$", time_str)
     if match:
         target_hour = int(match.group(1))
         target_minute = int(match.group(2))
@@ -724,7 +715,7 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
                     # Check harness type to determine completion detection method
                     if spool.get("harness") == "codex":
                         # Codex uses newline-delimited JSON with "turn.completed" event
-                        for line in content.strip().split('\n'):
+                        for line in content.strip().split("\n"):
                             try:
                                 event = json.loads(line)
                                 if event.get("type") == "turn.completed":
@@ -774,7 +765,7 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
                     spool["result"] = stdout
 
                     # Try to extract session_id from thread.started event
-                    for line in stdout.strip().split('\n'):
+                    for line in stdout.strip().split("\n"):
                         try:
                             event = json.loads(line)
                             if event.get("type") == "thread.started":
@@ -890,7 +881,7 @@ def _handle_expired_session(spool_id: str, spool: dict) -> bool:
 
 ---
 
-Continue from above. New message: {spool['prompt'].split(': ', 1)[-1]}"""
+Continue from above. New message: {spool["prompt"].split(": ", 1)[-1]}"""
 
     # Spawn new process without --resume flag, with transcript as context
     cmd = ["claude", "-p", context_prompt, "--output-format", "json"]
@@ -932,7 +923,7 @@ def _monitor_spool(spool_id: str) -> None:
                         pass
                 # Mark as timeout
                 spool["status"] = "timeout"
-                spool["error"] = f'Timeout after {spool["timeout"]}s'
+                spool["error"] = f"Timeout after {spool['timeout']}s"
                 spool["completed_at"] = datetime.now().isoformat()
                 _write_spool(spool_id, spool)
                 break
@@ -1036,7 +1027,7 @@ def _spin_sync(
         if shard_info:
             cwd = shard_info["worktree_path"]
         else:
-            return f"Error: Failed to create SHARD worktree. Check git repo status."
+            return "Error: Failed to create SHARD worktree. Check git repo status."
 
     # Inject SKEIN context for shard agents (unless skeinless=True)
     effective_prompt = prompt
@@ -1449,13 +1440,16 @@ def _spin_wait_sync(
         time_module.sleep(duration_seconds)
         elapsed = int((datetime.now() - start_time).total_seconds())
 
-        return json.dumps({
-            "waited": time_param,
-            "elapsed_seconds": elapsed,
-            "interrupted": False,
-            "started_at": start_time.isoformat(),
-            "ended_at": datetime.now().isoformat(),
-        }, indent=2)
+        return json.dumps(
+            {
+                "waited": time_param,
+                "elapsed_seconds": elapsed,
+                "interrupted": False,
+                "started_at": start_time.isoformat(),
+                "ended_at": datetime.now().isoformat(),
+            },
+            indent=2,
+        )
 
     # Must have spool_ids for spool-waiting mode
     if not spool_ids:
@@ -1658,7 +1652,6 @@ async def spin_wait(
             return f"Error: Invalid time format '{time}'. Use: 30s, 90m, 2h, or HH:MM"
 
         start_time = datetime.now()
-        target_time = start_time + timedelta(seconds=duration_seconds)
 
         # Sleep in chunks to allow interruption
         chunk_size = 5  # seconds
@@ -1673,21 +1666,27 @@ async def spin_wait(
         except asyncio.CancelledError:
             # Handle Ctrl+C gracefully
             elapsed = int((datetime.now() - start_time).total_seconds())
-            return json.dumps({
+            return json.dumps(
+                {
+                    "waited": time,
+                    "elapsed_seconds": elapsed,
+                    "interrupted": True,
+                    "started_at": start_time.isoformat(),
+                    "ended_at": datetime.now().isoformat(),
+                },
+                indent=2,
+            )
+
+        return json.dumps(
+            {
                 "waited": time,
                 "elapsed_seconds": elapsed,
-                "interrupted": True,
+                "interrupted": False,
                 "started_at": start_time.isoformat(),
                 "ended_at": datetime.now().isoformat(),
-            }, indent=2)
-
-        return json.dumps({
-            "waited": time,
-            "elapsed_seconds": elapsed,
-            "interrupted": False,
-            "started_at": start_time.isoformat(),
-            "ended_at": datetime.now().isoformat(),
-        }, indent=2)
+            },
+            indent=2,
+        )
 
     # Must have spool_ids for spool-waiting mode
     if not spool_ids:
@@ -1773,7 +1772,6 @@ async def spin_sleep(duration: str) -> str:
         return f"Error: Invalid duration format '{duration}'. Use: 30s, 90m, 2h, or HH:MM"
 
     start_time = datetime.now()
-    target_time = start_time + timedelta(seconds=duration_seconds)
 
     # Sleep in chunks to allow interruption
     chunk_size = 5  # seconds
@@ -1788,21 +1786,27 @@ async def spin_sleep(duration: str) -> str:
     except asyncio.CancelledError:
         # Handle Ctrl+C gracefully
         elapsed = int((datetime.now() - start_time).total_seconds())
-        return json.dumps({
+        return json.dumps(
+            {
+                "duration": duration,
+                "elapsed_seconds": elapsed,
+                "interrupted": True,
+                "started_at": start_time.isoformat(),
+                "ended_at": datetime.now().isoformat(),
+            },
+            indent=2,
+        )
+
+    return json.dumps(
+        {
             "duration": duration,
             "elapsed_seconds": elapsed,
-            "interrupted": True,
+            "interrupted": False,
             "started_at": start_time.isoformat(),
             "ended_at": datetime.now().isoformat(),
-        }, indent=2)
-
-    return json.dumps({
-        "duration": duration,
-        "elapsed_seconds": elapsed,
-        "interrupted": False,
-        "started_at": start_time.isoformat(),
-        "ended_at": datetime.now().isoformat(),
-    }, indent=2)
+        },
+        indent=2,
+    )
 
 
 @mcp.tool()
@@ -2728,11 +2732,11 @@ async def shard_merge(spool_id: str, keep_branch: bool = False, caller_cwd: str 
             ["git", "status", "--porcelain"], capture_output=True, text=True, cwd=worktree_path, timeout=10
         )
         if result.stdout.strip():
-            return f"Error: Shard has uncommitted changes. Commit or discard them first."
+            return "Error: Shard has uncommitted changes. Commit or discard them first."
 
         # Merge branch to master from main repo
         result = subprocess.run(
-            ["git", "merge", branch_name, "--no-ff", "-m", f'Merge shard {spool_id}: {spool.get("prompt", "")[:50]}'],
+            ["git", "merge", branch_name, "--no-ff", "-m", f"Merge shard {spool_id}: {spool.get('prompt', '')[:50]}"],
             capture_output=True,
             text=True,
             cwd=str(main_repo),
@@ -2799,7 +2803,7 @@ async def shard_abandon(spool_id: str, keep_branch: bool = False, caller_cwd: st
     worktree_path = shard_info.get("worktree_path")
 
     if not worktree_path:
-        return f"Error: No worktree path in shard info"
+        return "Error: No worktree path in shard info"
 
     # Check if caller's cwd is inside the worktree (would break their shell)
     if caller_cwd:
@@ -2975,7 +2979,7 @@ def _has_landlock_support() -> bool:
     kernel_version = platform.release()
 
     # Extract major.minor version
-    match = re.match(r'(\d+)\.(\d+)', kernel_version)
+    match = re.match(r"(\d+)\.(\d+)", kernel_version)
     if match:
         major, minor = int(match.group(1)), int(match.group(2))
         # Landlock added in 5.13
@@ -2983,7 +2987,7 @@ def _has_landlock_support() -> bool:
             return True
 
     # Also check if /sys/kernel/security/landlock exists
-    if os.path.exists('/sys/kernel/security/landlock'):
+    if os.path.exists("/sys/kernel/security/landlock"):
         return True
 
     return False
@@ -3021,6 +3025,7 @@ def _codex_spin_sync(
     else:
         # Kernel lacks Landlock support - use bypass mode
         import platform
+
         kernel_version = platform.release()
         print(f"[Spindle] Kernel {kernel_version} lacks Landlock support (needs 5.13+), using bypass mode for Codex")
         codex_cmd = ["codex", "exec", "--json", "--dangerously-bypass-approvals-and-sandbox", prompt]
@@ -3119,6 +3124,7 @@ def _codex_respin_sync(session_id: str, prompt: str) -> str:
     else:
         # Kernel lacks Landlock support - use bypass mode
         import platform
+
         kernel_version = platform.release()
         print(f"[Spindle] Kernel {kernel_version} lacks Landlock support (needs 5.13+), using bypass mode for Codex")
         codex_cmd = ["codex", "resume", session_id, "--json", "--dangerously-bypass-approvals-and-sandbox"]
@@ -3259,7 +3265,7 @@ def _gemini_spin_sync(
 
     # Build the Python script to run Gemini API
     # We use a subprocess with inline Python to avoid import issues if google-genai isn't installed
-    gemini_script = f'''
+    gemini_script = f"""
 import json
 import os
 import sys
@@ -3314,7 +3320,7 @@ try:
 except Exception as e:
     print(json.dumps({{"error": str(e)}}))
     sys.exit(1)
-'''
+"""
 
     # Write script to a temp file and run it
     script_path = SPINDLE_DIR / f"{spool_id}.py"
@@ -3365,7 +3371,7 @@ def _monitor_gemini_spool(spool_id: str) -> None:
                         pass
                 # Mark as timeout
                 spool["status"] = "timeout"
-                spool["error"] = f'Timeout after {spool["timeout"]}s'
+                spool["error"] = f"Timeout after {spool['timeout']}s"
                 spool["completed_at"] = datetime.now().isoformat()
                 _write_spool(spool_id, spool)
                 _cleanup_gemini_script(spool_id)
@@ -3528,10 +3534,10 @@ async def spindle_reload() -> str:
 
 
 def main():
-    import sys
     import argparse
-    import traceback
     import atexit
+    import sys
+    import traceback
 
     parser = argparse.ArgumentParser(description="Spindle MCP server")
     subparsers = parser.add_subparsers(dest="command")
@@ -3543,27 +3549,27 @@ def main():
     serve_parser.add_argument("--host", default="127.0.0.1", help="HTTP host (default: 127.0.0.1)")
 
     # start command - start via systemd or background
-    start_parser = subparsers.add_parser("start", help="Start spindle (via systemd if available)")
+    _start_parser = subparsers.add_parser("start", help="Start spindle (via systemd if available)")
 
     # reload command - restart spindle
-    reload_parser = subparsers.add_parser("reload", help="Reload spindle to pick up code changes")
+    _reload_parser = subparsers.add_parser("reload", help="Reload spindle to pick up code changes")
 
     # status command
-    status_parser = subparsers.add_parser("status", help="Check spindle status")
+    _status_parser = subparsers.add_parser("status", help="Check spindle status")
 
     # install-service command
-    install_service_parser = subparsers.add_parser(
-        "install-service", help="Install systemd user service"
-    )
-    install_service_parser.add_argument(
-        "--force", action="store_true", help="Overwrite existing service file"
-    )
+    install_service_parser = subparsers.add_parser("install-service", help="Install systemd user service")
+    install_service_parser.add_argument("--force", action="store_true", help="Overwrite existing service file")
 
     # spin command - spawn an agent
     spin_parser = subparsers.add_parser("spin", help="Spawn an agent to handle a task")
     spin_parser.add_argument("prompt", help="The task/question for the agent")
-    spin_parser.add_argument("--permission", "-p", choices=["readonly", "careful", "full", "shard", "careful+shard"],
-                             help="Permission profile (default: careful)")
+    spin_parser.add_argument(
+        "--permission",
+        "-p",
+        choices=["readonly", "careful", "full", "shard", "careful+shard"],
+        help="Permission profile (default: careful)",
+    )
     spin_parser.add_argument("--shard", "-s", action="store_true", help="Run in isolated git worktree")
     spin_parser.add_argument("--system-prompt", help="Optional system prompt")
     spin_parser.add_argument("--working-dir", "-d", help="Directory for the agent (default: current)")
@@ -3586,8 +3592,13 @@ def main():
     # wait command - wait for spools to complete
     wait_parser = subparsers.add_parser("wait", help="Wait for spools to complete")
     wait_parser.add_argument("spool_ids", nargs="?", help="Comma-separated spool IDs to wait for")
-    wait_parser.add_argument("--mode", "-m", choices=["gather", "yield"], default="gather",
-                            help="Wait mode: gather (all) or yield (first completed)")
+    wait_parser.add_argument(
+        "--mode",
+        "-m",
+        choices=["gather", "yield"],
+        default="gather",
+        help="Wait mode: gather (all) or yield (first completed)",
+    )
     wait_parser.add_argument("--timeout", "-t", type=int, help="Timeout in seconds")
     wait_parser.add_argument("--time", help="Duration to wait (e.g., 90m, 2h, 30s, 06:00)")
     wait_parser.add_argument("--human", action="store_true", help="Human-readable output instead of JSON")
@@ -3763,8 +3774,8 @@ def main():
         sys.exit(0)
 
     elif args.command == "install-service":
-        import shutil
         import platform
+        import shutil
 
         system = platform.system()
 
@@ -3784,9 +3795,7 @@ def main():
 
         if system == "Linux":
             # Check if systemd is actually running (important for WSL)
-            systemd_check = subprocess.run(
-                ["systemctl", "--user", "status"], capture_output=True, text=True
-            )
+            systemd_check = subprocess.run(["systemctl", "--user", "status"], capture_output=True, text=True)
             if systemd_check.returncode != 0 and "Failed to connect" in systemd_check.stderr:
                 # Detect WSL
                 is_wsl = False
@@ -3794,7 +3803,7 @@ def main():
                     with open("/proc/version", "r") as f:
                         if "microsoft" in f.read().lower():
                             is_wsl = True
-                except:
+                except Exception:
                     pass
 
                 if is_wsl:

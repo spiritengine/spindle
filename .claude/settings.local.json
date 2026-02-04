@@ -6,7 +6,9 @@
       "Bash(python3:*)",
       "Bash(xargs:*)",
       "mcp__spindle__spin",
-      "mcp__spindle__unspool"
+      "mcp__spindle__unspool",
+      "Bash(git checkout:*)",
+      "Bash(git add:*)"
     ],
     "deny": [],
     "ask": []

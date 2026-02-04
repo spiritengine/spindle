@@ -4,42 +4,35 @@ import json
 import multiprocessing
 import os
 import subprocess
-import tempfile
 import threading
-import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
-from unittest.mock import patch, MagicMock
-
-import pytest
+from unittest.mock import MagicMock, patch
 
 # Import the module to test
 from spindle import (
-    _resolve_permission,
-    _get_spool_path,
-    _write_spool,
-    _read_spool,
-    _is_pid_alive,
-    _parse_duration,
-    _spool_lock,
-    _check_and_finalize_spool,
-    _get_output_path,
-    _cleanup_shard,
-    PERMISSION_PROFILES,
-    SPINDLE_DIR,
-    _try_reserve_slot_and_create,
-    _count_running,
-    _list_spools,
-    PERMISSION_PROFILES,
-    MAX_CONCURRENT,
-    _spawn_shard,
     # Gemini harness functions
     GEMINI_DEFAULT_MODEL,
     GEMINI_MODEL_ALIASES,
+    MAX_CONCURRENT,
+    PERMISSION_PROFILES,
+    _check_and_finalize_gemini_spool,
+    _check_and_finalize_spool,
+    _cleanup_gemini_script,
+    _cleanup_shard,
+    _count_running,
     _gemini_spin_sync,
     _gemini_unspool_sync,
-    _check_and_finalize_gemini_spool,
-    _cleanup_gemini_script,
+    _get_spool_path,
+    _is_pid_alive,
+    _list_spools,
+    _parse_duration,
+    _read_spool,
+    _resolve_permission,
+    _spawn_shard,
+    _spool_lock,
+    _try_reserve_slot_and_create,
+    _write_spool,
 )
 
 
@@ -287,16 +280,16 @@ class TestParseDuration:
         """Values exceeding 24 hours should be rejected."""
         # 24 hours = 86400 seconds
         assert _parse_duration("86401s") is None  # 1 second over
-        assert _parse_duration("1441m") is None   # 1 minute over 24h
-        assert _parse_duration("25h") is None     # 1 hour over
-        assert _parse_duration("999999s") is None # Large overflow
+        assert _parse_duration("1441m") is None  # 1 minute over 24h
+        assert _parse_duration("25h") is None  # 1 hour over
+        assert _parse_duration("999999s") is None  # Large overflow
 
     def test_parse_accepts_boundary_values(self):
         """Values at the boundaries should work correctly."""
-        assert _parse_duration("1s") == 1         # Minimum
-        assert _parse_duration("86400s") == 86400 # Maximum (24 hours)
+        assert _parse_duration("1s") == 1  # Minimum
+        assert _parse_duration("86400s") == 86400  # Maximum (24 hours)
         assert _parse_duration("1440m") == 86400  # 24 hours in minutes
-        assert _parse_duration("24h") == 86400    # 24 hours
+        assert _parse_duration("24h") == 86400  # 24 hours
 
 
 class TestSpoolLocking:
@@ -333,10 +326,11 @@ class TestSpoolLocking:
 def _finalize_worker(tmp_path_str: str, spool_id: str, result_queue):
     """Worker function for concurrent finalization test."""
     import spindle
+
     tmp_path = Path(tmp_path_str)
 
     # Patch SPINDLE_DIR in this process
-    with patch.object(spindle, 'SPINDLE_DIR', tmp_path):
+    with patch.object(spindle, "SPINDLE_DIR", tmp_path):
         result = _check_and_finalize_spool(spool_id)
         result_queue.put(result)
 
@@ -370,14 +364,8 @@ class TestConcurrentFinalization:
         result_queue = multiprocessing.Queue()
 
         with patch("spindle.SPINDLE_DIR", tmp_path):
-            p1 = multiprocessing.Process(
-                target=_finalize_worker,
-                args=(str(tmp_path), spool_id, result_queue)
-            )
-            p2 = multiprocessing.Process(
-                target=_finalize_worker,
-                args=(str(tmp_path), spool_id, result_queue)
-            )
+            p1 = multiprocessing.Process(target=_finalize_worker, args=(str(tmp_path), spool_id, result_queue))
+            p2 = multiprocessing.Process(target=_finalize_worker, args=(str(tmp_path), spool_id, result_queue))
 
             p1.start()
             p2.start()
@@ -422,7 +410,7 @@ class TestConcurrentFinalization:
         with open(spool_path, "w") as f:
             json.dump(spool, f)
 
-        with patch.object(spindle, 'SPINDLE_DIR', tmp_path):
+        with patch.object(spindle, "SPINDLE_DIR", tmp_path):
             # Hold the lock
             with _spool_lock(spool_id, blocking=True) as acquired:
                 assert acquired is True
@@ -433,6 +421,8 @@ class TestConcurrentFinalization:
 
             # Now without lock, it should work (though may error since no output)
             # The key is it doesn't block or corrupt
+
+
 class TestConcurrencyLimit:
     """Test that concurrency limit is enforced atomically."""
 
@@ -517,26 +507,28 @@ class TestConcurrencyLimit:
             failure_count = len(results["failure"])
 
             # All threads should have completed
-            assert success_count + failure_count == num_threads, \
+            assert success_count + failure_count == num_threads, (
                 f"Expected {num_threads} results, got {success_count + failure_count}"
+            )
 
             # We started with initial_running, so only (MAX_CONCURRENT - initial_running)
             # new slots should be available
             max_new_slots = MAX_CONCURRENT - initial_running
 
-            assert success_count == max_new_slots, \
+            assert success_count == max_new_slots, (
                 f"Expected exactly {max_new_slots} successful reservations, got {success_count}"
+            )
 
             # The rest should have been rejected
             expected_failures = num_threads - max_new_slots
-            assert failure_count == expected_failures, \
-                f"Expected {expected_failures} rejections, got {failure_count}"
+            assert failure_count == expected_failures, f"Expected {expected_failures} rejections, got {failure_count}"
 
             # Verify we never exceeded the limit by checking total running
             all_spools = _list_spools()
             running_count = sum(1 for s in all_spools if s.get("status") == "running")
-            assert running_count == MAX_CONCURRENT, \
+            assert running_count == MAX_CONCURRENT, (
                 f"Expected exactly {MAX_CONCURRENT} running spools, got {running_count}"
+            )
 
     def test_lock_file_created(self, tmp_path):
         """Lock file should be created during reservation."""
@@ -562,8 +554,8 @@ class TestConcurrencyLimit:
 class TestShardCleanup:
     """Test shard cleanup returncode checking and logging."""
 
-    @patch('spindle.subprocess.run')
-    @patch('spindle.logger')
+    @patch("spindle.subprocess.run")
+    @patch("spindle.logger")
     def test_cleanup_shard_logs_worktree_removal_failure(self, mock_logger, mock_run):
         """Failed worktree removal should be logged and return False."""
         # Mock subprocess to return error for worktree removal
@@ -572,10 +564,7 @@ class TestShardCleanup:
         mock_result.stderr = "fatal: worktree not found"
         mock_run.return_value = mock_result
 
-        shard_info = {
-            "worktree_path": "/tmp/test-worktree",
-            "branch_name": "test-branch"
-        }
+        shard_info = {"worktree_path": "/tmp/test-worktree", "branch_name": "test-branch"}
 
         success = _cleanup_shard(shard_info, "/tmp/repo", spool_id="test123")
 
@@ -587,10 +576,11 @@ class TestShardCleanup:
         assert "test123" in error_msg
         assert "fatal: worktree not found" in error_msg
 
-    @patch('spindle.subprocess.run')
-    @patch('spindle.logger')
+    @patch("spindle.subprocess.run")
+    @patch("spindle.logger")
     def test_cleanup_shard_logs_branch_deletion_failure(self, mock_logger, mock_run):
         """Failed branch deletion should be logged but not fail cleanup."""
+
         # Mock subprocess: worktree removal succeeds, branch deletion fails
         def mock_run_side_effect(*args, **kwargs):
             result = MagicMock()
@@ -608,10 +598,7 @@ class TestShardCleanup:
 
         mock_run.side_effect = mock_run_side_effect
 
-        shard_info = {
-            "worktree_path": "/tmp/test-worktree",
-            "branch_name": "test-branch"
-        }
+        shard_info = {"worktree_path": "/tmp/test-worktree", "branch_name": "test-branch"}
 
         success = _cleanup_shard(shard_info, "/tmp/repo", spool_id="test123")
 
@@ -624,17 +611,15 @@ class TestShardCleanup:
         assert "test-branch" in warning_msg
         assert "test123" in warning_msg
 
-    @patch('spindle.subprocess.run')
-    @patch('spindle.logger')
+    @patch("spindle.subprocess.run")
+    @patch("spindle.logger")
     def test_cleanup_shard_logs_timeout(self, mock_logger, mock_run):
         """Timeout during cleanup should be logged."""
         import subprocess as sp
+
         mock_run.side_effect = sp.TimeoutExpired("git", 30)
 
-        shard_info = {
-            "worktree_path": "/tmp/test-worktree",
-            "branch_name": "test-branch"
-        }
+        shard_info = {"worktree_path": "/tmp/test-worktree", "branch_name": "test-branch"}
 
         success = _cleanup_shard(shard_info, "/tmp/repo", spool_id="test123")
 
@@ -645,21 +630,20 @@ class TestShardCleanup:
         assert "/tmp/test-worktree" in error_msg
         assert "test123" in error_msg
 
-    @patch('spindle.subprocess.run')
+    @patch("spindle.subprocess.run")
     def test_cleanup_shard_works_without_spool_id(self, mock_run):
         """Cleanup should work without spool_id for logging."""
         mock_result = MagicMock()
         mock_result.returncode = 0
         mock_run.return_value = mock_result
 
-        shard_info = {
-            "worktree_path": "/tmp/test-worktree",
-            "branch_name": "test-branch"
-        }
+        shard_info = {"worktree_path": "/tmp/test-worktree", "branch_name": "test-branch"}
 
         # Should not raise exception even without spool_id
         success = _cleanup_shard(shard_info, "/tmp/repo")
         assert success is True
+
+
 class TestWorktreeNameUniqueness:
     """Test that worktree names are unique even when created rapidly."""
 
@@ -701,8 +685,9 @@ class TestWorktreeNameUniqueness:
         assert shard1_id != shard2_id, f"Shard IDs collided: {shard1_id} == {shard2_id}"
 
         # Branch names should also be different
-        assert shard1["branch_name"] != shard2["branch_name"], \
+        assert shard1["branch_name"] != shard2["branch_name"], (
             f"Branch names collided: {shard1['branch_name']} == {shard2['branch_name']}"
+        )
 
         # Verify both worktrees exist
         assert Path(shard1["worktree_path"]).exists(), f"Worktree 1 doesn't exist: {shard1['worktree_path']}"
@@ -898,7 +883,7 @@ class TestGeminiHarness:
                     "prompt_tokens": 10,
                     "completion_tokens": 20,
                     "total_tokens": 30,
-                }
+                },
             }
             stdout_path.write_text(json.dumps(stdout_data))
 
