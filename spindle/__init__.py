@@ -1772,38 +1772,56 @@ async def spin_sleep(duration: str) -> str:
         return f"Error: Invalid duration format '{duration}'. Use: 30s, 90m, 2h, or HH:MM"
 
     start_time = datetime.now()
-
-    # Sleep in chunks to allow interruption
-    chunk_size = 5  # seconds
-    elapsed = 0
+    interrupted = False
 
     try:
-        while elapsed < duration_seconds:
-            remaining = duration_seconds - elapsed
-            sleep_time = min(chunk_size, remaining)
-            await asyncio.sleep(sleep_time)
-            elapsed = int((datetime.now() - start_time).total_seconds())
-    except asyncio.CancelledError:
-        # Handle Ctrl+C gracefully
+        # Use blocking subprocess with sleep command
+        process = subprocess.Popen(
+            ["sleep", str(duration_seconds)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        stdout, stderr = process.communicate()
+
+        # Check if sleep command failed
+        if process.returncode != 0:
+            return json.dumps(
+                {
+                    "error": f"Sleep command failed with code {process.returncode}",
+                    "stderr": stderr,
+                    "duration": duration,
+                    "started_at": start_time.isoformat(),
+                    "ended_at": datetime.now().isoformat(),
+                },
+                indent=2,
+            )
+    except Exception as e:
+        # Handle any errors during subprocess execution
+        interrupted = True
         elapsed = int((datetime.now() - start_time).total_seconds())
         return json.dumps(
             {
                 "duration": duration,
                 "elapsed_seconds": elapsed,
                 "interrupted": True,
+                "error": str(e),
                 "started_at": start_time.isoformat(),
                 "ended_at": datetime.now().isoformat(),
             },
             indent=2,
         )
 
+    end_time = datetime.now()
+    elapsed = int((end_time - start_time).total_seconds())
+
     return json.dumps(
         {
             "duration": duration,
             "elapsed_seconds": elapsed,
-            "interrupted": False,
+            "interrupted": interrupted,
             "started_at": start_time.isoformat(),
-            "ended_at": datetime.now().isoformat(),
+            "ended_at": end_time.isoformat(),
         },
         indent=2,
     )
