@@ -1362,20 +1362,22 @@ def _spin_drop_sync(spool_id: str) -> str:
 
     pid = spool.get("pid")
 
-    if pid:
-        # Kill the process group (since we used start_new_session)
-        try:
-            os.killpg(pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass  # Already dead
-        except OSError:
-            # Try killing just the process
-            try:
-                os.kill(pid, signal.SIGTERM)
-            except (ProcessLookupError, OSError):
-                pass
+    if not pid:
+        return f"Spool {spool_id} has no PID recorded yet"
 
-    # Update spool status (also cancels sleep spools which have no PID)
+    # Kill the process group (since we used start_new_session)
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass  # Already dead
+    except OSError:
+        # Try killing just the process
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except (ProcessLookupError, OSError):
+            pass
+
+    # Update spool status
     spool["status"] = "error"
     spool["error"] = "Cancelled by user"
     spool["completed_at"] = datetime.now().isoformat()
@@ -1645,7 +1647,46 @@ async def spin_wait(
     """
     # Time-based waiting mode (no spool_ids)
     if time and not spool_ids:
-        return _create_sleep_spool(time)
+        duration_seconds = _parse_duration(time)
+        if duration_seconds is None:
+            return f"Error: Invalid time format '{time}'. Use: 30s, 90m, 2h, or HH:MM"
+
+        start_time = datetime.now()
+
+        # Sleep in chunks to allow interruption
+        chunk_size = 5  # seconds
+        elapsed = 0
+
+        try:
+            while elapsed < duration_seconds:
+                remaining = duration_seconds - elapsed
+                sleep_time = min(chunk_size, remaining)
+                await asyncio.sleep(sleep_time)
+                elapsed = int((datetime.now() - start_time).total_seconds())
+        except asyncio.CancelledError:
+            # Handle Ctrl+C gracefully
+            elapsed = int((datetime.now() - start_time).total_seconds())
+            return json.dumps(
+                {
+                    "waited": time,
+                    "elapsed_seconds": elapsed,
+                    "interrupted": True,
+                    "started_at": start_time.isoformat(),
+                    "ended_at": datetime.now().isoformat(),
+                },
+                indent=2,
+            )
+
+        return json.dumps(
+            {
+                "waited": time,
+                "elapsed_seconds": elapsed,
+                "interrupted": False,
+                "started_at": start_time.isoformat(),
+                "ended_at": datetime.now().isoformat(),
+            },
+            indent=2,
+        )
 
     # Must have spool_ids for spool-waiting mode
     if not spool_ids:
@@ -1705,62 +1746,6 @@ async def spin_wait(
         return json.dumps(results, indent=2)
 
 
-def _sleep_timer(spool_id: str, duration_seconds: int, duration_label: str) -> None:
-    """Background thread that sleeps for a duration and marks the spool complete."""
-    start_time = datetime.now()
-    time.sleep(duration_seconds)
-    elapsed = int((datetime.now() - start_time).total_seconds())
-
-    spool = _read_spool(spool_id)
-    if spool and spool.get("status") == "running":
-        spool["status"] = "complete"
-        spool["result"] = json.dumps(
-            {
-                "duration": duration_label,
-                "elapsed_seconds": elapsed,
-                "interrupted": False,
-                "started_at": start_time.isoformat(),
-                "ended_at": datetime.now().isoformat(),
-            },
-            indent=2,
-        )
-        spool["completed_at"] = datetime.now().isoformat()
-        _write_spool(spool_id, spool)
-
-
-def _create_sleep_spool(duration: str) -> str:
-    """Create a sleep spool that completes after the given duration. Returns spool_id or error."""
-    duration_seconds = _parse_duration(duration)
-    if duration_seconds is None:
-        return f"Error: Invalid duration format '{duration}'. Use: 30s, 90m, 2h, or HH:MM"
-
-    spool_id = str(uuid.uuid4())[:8]
-
-    spool = {
-        "id": spool_id,
-        "status": "running",
-        "prompt": f"sleep {duration}",
-        "result": None,
-        "session_id": None,
-        "working_dir": None,
-        "sleep_duration": duration,
-        "sleep_seconds": duration_seconds,
-        "created_at": datetime.now().isoformat(),
-        "completed_at": None,
-        "pid": None,
-        "error": None,
-    }
-
-    _write_spool(spool_id, spool)
-
-    timer = threading.Thread(
-        target=_sleep_timer, args=(spool_id, duration_seconds, duration), daemon=True
-    )
-    timer.start()
-
-    return spool_id
-
-
 @mcp.tool()
 async def spin_sleep(duration: str) -> str:
     """
@@ -1782,7 +1767,46 @@ async def spin_sleep(duration: str) -> str:
         spin_sleep("30s")       # Sleep for 30 seconds
         spin_sleep("06:00")     # Wait until 6 AM
     """
-    return _create_sleep_spool(duration)
+    duration_seconds = _parse_duration(duration)
+    if duration_seconds is None:
+        return f"Error: Invalid duration format '{duration}'. Use: 30s, 90m, 2h, or HH:MM"
+
+    start_time = datetime.now()
+
+    # Sleep in chunks to allow interruption
+    chunk_size = 5  # seconds
+    elapsed = 0
+
+    try:
+        while elapsed < duration_seconds:
+            remaining = duration_seconds - elapsed
+            sleep_time = min(chunk_size, remaining)
+            await asyncio.sleep(sleep_time)
+            elapsed = int((datetime.now() - start_time).total_seconds())
+    except asyncio.CancelledError:
+        # Handle Ctrl+C gracefully
+        elapsed = int((datetime.now() - start_time).total_seconds())
+        return json.dumps(
+            {
+                "duration": duration,
+                "elapsed_seconds": elapsed,
+                "interrupted": True,
+                "started_at": start_time.isoformat(),
+                "ended_at": datetime.now().isoformat(),
+            },
+            indent=2,
+        )
+
+    return json.dumps(
+        {
+            "duration": duration,
+            "elapsed_seconds": elapsed,
+            "interrupted": False,
+            "started_at": start_time.isoformat(),
+            "ended_at": datetime.now().isoformat(),
+        },
+        indent=2,
+    )
 
 
 @mcp.tool()
@@ -1806,20 +1830,22 @@ async def spin_drop(spool_id: str) -> str:
 
     pid = spool.get("pid")
 
-    if pid:
-        # Kill the process group (since we used start_new_session)
-        try:
-            os.killpg(pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass  # Already dead
-        except OSError:
-            # Try killing just the process
-            try:
-                os.kill(pid, signal.SIGTERM)
-            except (ProcessLookupError, OSError):
-                pass
+    if not pid:
+        return f"Spool {spool_id} has no PID recorded yet"
 
-    # Update spool status (also cancels sleep spools which have no PID)
+    # Kill the process group (since we used start_new_session)
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass  # Already dead
+    except OSError:
+        # Try killing just the process
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except (ProcessLookupError, OSError):
+            pass
+
+    # Update spool status
     spool["status"] = "error"
     spool["error"] = "Cancelled by user"
     spool["completed_at"] = datetime.now().isoformat()
