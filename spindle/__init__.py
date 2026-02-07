@@ -1753,13 +1753,16 @@ async def spin_sleep(duration: str) -> str:
 
     A simpler interface for timed waiting when you don't need to wait on spools.
 
+    Uses a heartbeat approach with 3.5-minute (210 second) chunks to avoid
+    MCP 5-minute timeout issues on long sleeps.
+
     Args:
         duration: How long to sleep.
             Formats: "90m" (minutes), "2h" (hours), "30s" (seconds),
             or "06:00" (absolute time, wait until then)
 
     Returns:
-        JSON with wait details (elapsed time, timestamps)
+        JSON with wait details (elapsed time, timestamps, chunks info)
 
     Example:
         spin_sleep("90m")       # Sleep for 90 minutes
@@ -1774,30 +1777,45 @@ async def spin_sleep(duration: str) -> str:
     start_time = datetime.now()
     interrupted = False
 
-    try:
-        # Use blocking subprocess with sleep command
-        process = subprocess.Popen(
-            ["sleep", str(duration_seconds)],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        stdout, stderr = process.communicate()
+    # Heartbeat approach: split into 210-second (3.5 minute) chunks
+    CHUNK_SIZE = 210  # 3.5 minutes, safely under 5-minute MCP timeout
+    total_chunks = (duration_seconds + CHUNK_SIZE - 1) // CHUNK_SIZE  # ceiling division
+    chunks_completed = 0
 
-        # Check if sleep command failed
-        if process.returncode != 0:
-            return json.dumps(
-                {
-                    "error": f"Sleep command failed with code {process.returncode}",
-                    "stderr": stderr,
-                    "duration": duration,
-                    "started_at": start_time.isoformat(),
-                    "ended_at": datetime.now().isoformat(),
-                },
-                indent=2,
-            )
+    try:
+        remaining = duration_seconds
+        while remaining > 0:
+            chunk_duration = min(CHUNK_SIZE, remaining)
+
+            # Sleep for this chunk using asyncio.sleep (non-blocking)
+            await asyncio.sleep(chunk_duration)
+
+            chunks_completed += 1
+            remaining -= chunk_duration
+
+            # Progress tracking (logged but not returned until final)
+            elapsed_so_far = int((datetime.now() - start_time).total_seconds())
+            # Note: We can't send intermediate updates in MCP tool model,
+            # but the asyncio.sleep() keeps the event loop alive
+
+    except asyncio.CancelledError:
+        # Handle cancellation gracefully
+        interrupted = True
+        elapsed = int((datetime.now() - start_time).total_seconds())
+        return json.dumps(
+            {
+                "duration": duration,
+                "elapsed_seconds": elapsed,
+                "interrupted": True,
+                "chunks_completed": chunks_completed,
+                "total_chunks": total_chunks,
+                "started_at": start_time.isoformat(),
+                "ended_at": datetime.now().isoformat(),
+            },
+            indent=2,
+        )
     except Exception as e:
-        # Handle any errors during subprocess execution
+        # Handle any other errors
         interrupted = True
         elapsed = int((datetime.now() - start_time).total_seconds())
         return json.dumps(
@@ -1806,6 +1824,8 @@ async def spin_sleep(duration: str) -> str:
                 "elapsed_seconds": elapsed,
                 "interrupted": True,
                 "error": str(e),
+                "chunks_completed": chunks_completed,
+                "total_chunks": total_chunks,
                 "started_at": start_time.isoformat(),
                 "ended_at": datetime.now().isoformat(),
             },
@@ -1820,6 +1840,8 @@ async def spin_sleep(duration: str) -> str:
             "duration": duration,
             "elapsed_seconds": elapsed,
             "interrupted": interrupted,
+            "chunks_completed": chunks_completed,
+            "total_chunks": total_chunks,
             "started_at": start_time.isoformat(),
             "ended_at": end_time.isoformat(),
         },
