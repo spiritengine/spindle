@@ -703,12 +703,12 @@ class TestGeminiHarness:
 
     def test_gemini_default_model(self):
         """Gemini default model should be set."""
-        assert GEMINI_DEFAULT_MODEL == "gemini-2.0-flash"
+        assert GEMINI_DEFAULT_MODEL == "gemini-2.5-flash"
 
     def test_gemini_model_aliases(self):
         """Model aliases should resolve to full model names."""
-        assert GEMINI_MODEL_ALIASES["flash"] == "gemini-2.0-flash"
-        assert GEMINI_MODEL_ALIASES["pro"] == "gemini-1.5-pro"
+        assert GEMINI_MODEL_ALIASES["flash"] == "gemini-3-flash"
+        assert GEMINI_MODEL_ALIASES["pro"] == "gemini-3-pro"
         assert GEMINI_MODEL_ALIASES["flash-lite"] == "gemini-2.0-flash-lite"
         assert GEMINI_MODEL_ALIASES["2.5-flash"] == "gemini-2.5-flash"
         assert GEMINI_MODEL_ALIASES["1.5-flash"] == "gemini-1.5-flash"
@@ -772,7 +772,7 @@ class TestGeminiHarness:
 
             assert spool["harness"] == "gemini"
             assert spool["prompt"] == "Test prompt"
-            assert spool["model"] == "gemini-2.0-flash"  # alias resolved
+            assert spool["model"] == "gemini-3-flash"  # alias resolved
             assert spool["system_prompt"] == "Be helpful"
             assert spool["timeout"] == 60
             assert "gemini" in spool["tags"]

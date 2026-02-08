@@ -1794,7 +1794,6 @@ async def spin_sleep(duration: str) -> str:
             remaining -= chunk_duration
 
             # Progress tracking (logged but not returned until final)
-            elapsed_so_far = int((datetime.now() - start_time).total_seconds())
             # Note: We can't send intermediate updates in MCP tool model,
             # but the asyncio.sleep() keeps the event loop alive
 
