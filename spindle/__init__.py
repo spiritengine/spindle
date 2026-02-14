@@ -560,6 +560,31 @@ def _try_reserve_slot_and_create(spool_id: str, initial_status: str = "pending")
             fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
 
+def _extract_last_json_object(text: str) -> Optional[dict]:
+    """Extract the last JSON object from text that may contain non-JSON lines.
+
+    Handles multi-line pretty-printed JSON by scanning backwards for balanced braces.
+    """
+    # Find the last '}' and scan backwards to find the matching '{'
+    text = text.rstrip()
+    end = text.rfind("}")
+    if end == -1:
+        return None
+
+    depth = 0
+    for i in range(end, -1, -1):
+        if text[i] == "}":
+            depth += 1
+        elif text[i] == "{":
+            depth -= 1
+            if depth == 0:
+                try:
+                    return json.loads(text[i : end + 1])
+                except json.JSONDecodeError:
+                    return None
+    return None
+
+
 def _is_pid_alive(pid: int) -> bool:
     """Check if a process is still running (not a zombie)."""
     try:
@@ -751,17 +776,9 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
             try:
                 stderr_content = stderr_path.read_text()
                 if stderr_content.strip():
-                    # Look for final JSON object in stderr (may have log lines before it)
-                    for line in reversed(stderr_content.strip().split("\n")):
-                        line = line.strip()
-                        if line.startswith("{"):
-                            try:
-                                data = json.loads(line)
-                                if "error" in data or "session_id" in data:
-                                    output_complete = True
-                                    break
-                            except json.JSONDecodeError:
-                                continue
+                    parsed = _extract_last_json_object(stderr_content)
+                    if parsed and ("error" in parsed or "session_id" in parsed):
+                        output_complete = True
             except IOError:
                 pass
 
@@ -834,26 +851,20 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
                     spool["session_id"] = data.get("session_id")
                     spool["status"] = "complete"
                 except json.JSONDecodeError:
-                    # Raw text output
                     spool["result"] = stdout
                     spool["status"] = "complete"
             elif stderr.strip():
-                # Try to extract structured error from the last JSON line in stderr
-                error_msg = None
-                for line in reversed(stderr.strip().split("\n")):
-                    line = line.strip()
-                    if line.startswith("{"):
-                        try:
-                            data = json.loads(line)
-                            if "error" in data:
-                                err = data["error"]
-                                error_msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
-                                spool["session_id"] = data.get("session_id")
-                            break
-                        except json.JSONDecodeError:
-                            continue
-                spool["status"] = "error"
-                spool["error"] = error_msg or stderr[:500]
+                # Extract structured error from multi-line JSON in stderr
+                data = _extract_last_json_object(stderr)
+                if data and "error" in data:
+                    err = data["error"]
+                    error_msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+                    spool["session_id"] = data.get("session_id")
+                    spool["status"] = "error"
+                    spool["error"] = error_msg
+                else:
+                    spool["status"] = "error"
+                    spool["error"] = stderr[:500]
             else:
                 spool["status"] = "error"
                 spool["error"] = "Process exited with no output"
