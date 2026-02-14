@@ -16,6 +16,8 @@ from spindle import (
     _check_and_finalize_spool,
     _cleanup_shard,
     _count_running,
+    _gemini_spin_sync,
+    _gemini_unspool_sync,
     _get_spool_path,
     _is_pid_alive,
     _list_spools,
@@ -689,5 +691,172 @@ class TestWorktreeNameUniqueness:
         # Cleanup - remove worktrees
         subprocess.run(["git", "worktree", "remove", shard1["worktree_path"]], cwd=git_dir, capture_output=True)
         subprocess.run(["git", "worktree", "remove", shard2["worktree_path"]], cwd=git_dir, capture_output=True)
+
+
+class TestGeminiHarness:
+    """Test Gemini CLI harness implementation."""
+
+    def test_gemini_spin_requires_working_dir(self, tmp_path):
+        """Gemini spin should require working_dir."""
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            result = _gemini_spin_sync(
+                prompt="Test prompt",
+                working_dir=None,
+                model=None,
+                system_prompt=None,
+                timeout=None,
+                tags=None,
+                env=None,
+            )
+            assert "working_dir required" in result
+
+    def test_gemini_spin_creates_spool(self, tmp_path):
+        """Gemini spin should create spool record with correct harness metadata."""
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle._spawn_detached", return_value=12345):
+                with patch("spindle._count_running", return_value=0):
+                    result = _gemini_spin_sync(
+                        prompt="Test prompt",
+                        working_dir=str(tmp_path),
+                        model="gemini-2.5-flash",
+                        system_prompt=None,
+                        timeout=60,
+                        tags="test",
+                        env=None,
+                    )
+
+            assert result.startswith("gemini-")
+
+            spool_files = list(tmp_path.glob("gemini-*.json"))
+            assert len(spool_files) == 1
+
+            with open(spool_files[0]) as f:
+                spool = json.load(f)
+
+            assert spool["harness"] == "gemini"
+            assert spool["prompt"] == "Test prompt"
+            assert spool["model"] == "gemini-2.5-flash"
+            assert spool["timeout"] == 60
+            assert "gemini" in spool["tags"]
+            assert "test" in spool["tags"]
+            assert spool["status"] == "running"
+
+    def test_gemini_spin_builds_correct_command(self, tmp_path):
+        """Gemini spin should build the correct CLI command."""
+        captured_cmd = []
+
+        def fake_spawn(spool_id, cmd, cwd, env=None):
+            captured_cmd.extend(cmd)
+            return 12345
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle._spawn_detached", side_effect=fake_spawn):
+                with patch("spindle._count_running", return_value=0):
+                    _gemini_spin_sync(
+                        prompt="Explain this code",
+                        working_dir=str(tmp_path),
+                        model="gemini-2.5-pro",
+                        system_prompt=None,
+                        timeout=None,
+                        tags=None,
+                        env=None,
+                    )
+
+        assert captured_cmd[0] == "gemini"
+        assert "-p" in captured_cmd
+        assert "-y" in captured_cmd
+        assert "-o" in captured_cmd
+        assert "json" in captured_cmd
+        assert "-m" in captured_cmd
+        assert "gemini-2.5-pro" in captured_cmd
+
+    def test_gemini_spin_system_prompt_prepended(self, tmp_path):
+        """System prompt should be prepended to the prompt."""
+        captured_cmd = []
+
+        def fake_spawn(spool_id, cmd, cwd, env=None):
+            captured_cmd.extend(cmd)
+            return 12345
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle._spawn_detached", side_effect=fake_spawn):
+                with patch("spindle._count_running", return_value=0):
+                    _gemini_spin_sync(
+                        prompt="What is 2+2?",
+                        working_dir=str(tmp_path),
+                        model=None,
+                        system_prompt="You are a math tutor",
+                        timeout=None,
+                        tags=None,
+                        env=None,
+                    )
+
+        # The prompt passed to -p should contain both system prompt and user prompt
+        p_idx = captured_cmd.index("-p")
+        combined = captured_cmd[p_idx + 1]
+        assert "You are a math tutor" in combined
+        assert "What is 2+2?" in combined
+
+    def test_gemini_spin_passes_env(self, tmp_path):
+        """Gemini spin should pass env to _spawn_detached."""
+        captured_env = []
+
+        def fake_spawn(spool_id, cmd, cwd, env=None):
+            captured_env.append(env)
+            return 12345
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle._spawn_detached", side_effect=fake_spawn):
+                with patch("spindle._count_running", return_value=0):
+                    _gemini_spin_sync(
+                        prompt="Test",
+                        working_dir=str(tmp_path),
+                        model=None,
+                        system_prompt=None,
+                        timeout=None,
+                        tags=None,
+                        env={"GEMINI_API_KEY": "test-key"},
+                    )
+
+        assert captured_env[0] == {"GEMINI_API_KEY": "test-key"}
+
+    def test_gemini_unspool_complete(self, tmp_path):
+        """Unspool should return result for complete spool."""
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            spool_id = "gemini-test123"
+            spool = {
+                "id": spool_id,
+                "status": "complete",
+                "result": "Hello from Gemini CLI",
+                "harness": "gemini",
+                "created_at": datetime.now().isoformat(),
+            }
+            _write_spool(spool_id, spool)
+
+            result = _gemini_unspool_sync(spool_id)
+            assert result == "Hello from Gemini CLI"
+
+    def test_gemini_unspool_error(self, tmp_path):
+        """Unspool should return error message for failed spool."""
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            spool_id = "gemini-test456"
+            spool = {
+                "id": spool_id,
+                "status": "error",
+                "error": "gemini CLI not found",
+                "harness": "gemini",
+                "created_at": datetime.now().isoformat(),
+            }
+            _write_spool(spool_id, spool)
+
+            result = _gemini_unspool_sync(spool_id)
+            assert "failed" in result
+            assert "gemini CLI not found" in result
+
+    def test_gemini_unspool_nonexistent(self, tmp_path):
+        """Unspool should return error for nonexistent spool."""
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            result = _gemini_unspool_sync("gemini-nonexistent")
+            assert "Unknown spool_id" in result
 
 

@@ -1253,6 +1253,17 @@ async def spin(
             tags,
             env,
         )
+    elif harness_lower == "gemini":
+        return await asyncio.to_thread(
+            _gemini_spin_sync,
+            prompt,
+            working_dir,
+            model,
+            system_prompt,
+            timeout,
+            tags,
+            env,
+        )
     else:
         # Default to Claude Code harness
         return await asyncio.to_thread(
@@ -1284,6 +1295,8 @@ def _unspool_sync(spool_id: str) -> str:
     # Route to appropriate harness implementation
     if harness_lower == "codex":
         return _codex_unspool_sync(spool_id)
+    elif harness_lower == "gemini":
+        return _gemini_unspool_sync(spool_id)
     else:
         # Claude Code harness (default)
         _check_and_finalize_spool(spool_id)
@@ -2179,6 +2192,17 @@ async def spool_retry(spool_id: str) -> str:
             spool.get("working_dir"),
             spool.get("model"),
             sandbox,
+            spool.get("timeout"),
+            tags_str,
+            spool.get("env"),
+        )
+    elif harness_lower == "gemini":
+        return await asyncio.to_thread(
+            _gemini_spin_sync,
+            spool.get("prompt", ""),
+            spool.get("working_dir"),
+            spool.get("model"),
+            spool.get("system_prompt"),
             spool.get("timeout"),
             tags_str,
             spool.get("env"),
@@ -3184,6 +3208,114 @@ def _codex_respin_sync(session_id: str, prompt: str) -> str:
     monitor.start()
 
     return spool_id
+
+
+# ============================================================================
+# Gemini Harness Implementation
+# ============================================================================
+# Uses Google's Gemini CLI in headless mode (-p flag), matching the pattern
+# used by Claude Code and Codex harnesses.
+
+
+def _gemini_spin_sync(
+    prompt: str,
+    working_dir: Optional[str],
+    model: Optional[str],
+    system_prompt: Optional[str],
+    timeout: Optional[int],
+    tags: Optional[str],
+    env: Optional[Dict[str, str]],
+) -> str:
+    """Synchronous implementation of gemini_spin - runs Gemini CLI in background."""
+    # Require working_dir
+    if not working_dir:
+        return "Error: working_dir required. Pass the project directory."
+
+    # Generate spool ID
+    spool_id = "gemini-" + str(uuid.uuid4())[:8]
+
+    # Atomically check concurrency limit and create initial spool entry
+    success, error_msg = _try_reserve_slot_and_create(spool_id, initial_status="pending")
+    if not success:
+        return error_msg
+
+    # Build gemini command: headless mode with auto-approve and JSON output
+    gemini_cmd = ["gemini", "-p", prompt, "-y", "-o", "json"]
+
+    if model:
+        gemini_cmd.extend(["-m", model])
+
+    if system_prompt:
+        # Gemini CLI doesn't have a separate system prompt flag,
+        # so prepend it to the prompt
+        combined_prompt = f"System instructions: {system_prompt}\n\n{prompt}"
+        gemini_cmd[2] = combined_prompt
+
+    # Parse tags
+    tag_list = [t.strip() for t in tags.split(",")] if tags else []
+    tag_list.append("gemini")  # Auto-tag as gemini spool
+
+    # Create spool record
+    spool = {
+        "id": spool_id,
+        "status": "pending",
+        "prompt": prompt,
+        "result": None,
+        "session_id": None,
+        "working_dir": working_dir,
+        "model": model or "default",
+        "system_prompt": system_prompt,
+        "tags": tag_list,
+        "timeout": timeout,
+        "env": env,
+        "created_at": datetime.now().isoformat(),
+        "completed_at": None,
+        "pid": None,
+        "error": None,
+        "harness": "gemini",
+    }
+
+    _write_spool(spool_id, spool)
+
+    # Spawn detached process
+    pid = _spawn_detached(spool_id, gemini_cmd, working_dir, env)
+
+    # Update spool with PID and status
+    spool["pid"] = pid
+    spool["status"] = "running"
+    _write_spool(spool_id, spool)
+
+    # Start background monitor thread (reuse the standard monitor)
+    monitor = threading.Thread(target=_monitor_spool, args=(spool_id,), daemon=True)
+    monitor.start()
+
+    return spool_id
+
+
+def _gemini_unspool_sync(spool_id: str) -> str:
+    """Synchronous implementation of gemini_unspool."""
+    _check_and_finalize_spool(spool_id)
+    spool = _read_spool(spool_id)
+    if not spool:
+        return f"Error: Unknown spool_id '{spool_id}'"
+
+    status = spool.get("status")
+    if status == "pending":
+        return f"Spool {spool_id} pending (not yet started)"
+    elif status == "running":
+        pid = spool.get("pid")
+        if pid and not _is_pid_alive(pid):
+            _check_and_finalize_spool(spool_id)
+            spool = _read_spool(spool_id)
+            if spool.get("status") == "complete":
+                return spool.get("result", "No result")
+            elif spool.get("status") == "error":
+                return f"Spool {spool_id} failed: {spool.get('error', 'Unknown error')}"
+        return f"Spool {spool_id} still running: {spool.get('prompt', '')[:50]}..."
+    elif status == "complete":
+        return spool.get("result", "No result")
+    else:
+        return f"Spool {spool_id} failed: {spool.get('error', 'Unknown error')}"
 
 
 @mcp.tool()
