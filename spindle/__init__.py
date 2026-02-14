@@ -561,12 +561,29 @@ def _try_reserve_slot_and_create(spool_id: str, initial_status: str = "pending")
 
 
 def _is_pid_alive(pid: int) -> bool:
-    """Check if a process is still running."""
+    """Check if a process is still running (not a zombie)."""
     try:
-        os.kill(pid, 0)  # Doesn't kill, just checks
-        return True
+        os.kill(pid, 0)  # Doesn't kill, just checks existence
     except (OSError, ProcessLookupError):
         return False
+
+    # os.kill(pid, 0) succeeds for zombie processes too.
+    # Try to reap it — if it's our zombie child, waitpid will collect it.
+    try:
+        waited_pid, _ = os.waitpid(pid, os.WNOHANG)
+        if waited_pid == pid:
+            return False  # Was a zombie, now reaped
+    except ChildProcessError:
+        # Not our child process — check /proc status instead
+        try:
+            with open(f"/proc/{pid}/status") as f:
+                for line in f:
+                    if line.startswith("State:"):
+                        return "Z" not in line  # Z = zombie
+        except (FileNotFoundError, PermissionError):
+            pass  # Process disappeared or not accessible
+
+    return True
 
 
 def _parse_duration(time_str: str) -> Optional[int]:
@@ -705,34 +722,51 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
         stdout_path = _get_output_path(spool_id)
         stderr_path = _get_stderr_path(spool_id)
 
-        # Check if stdout has complete JSON result (claude may not exit promptly)
-        # For Codex, check for "turn.completed" event in newline-delimited JSON
-        stdout_complete = False
+        # Check if output has complete JSON result (CLI may not exit promptly)
+        output_complete = False
         if stdout_path.exists():
             try:
                 content = stdout_path.read_text()
                 if content.strip():
-                    # Check harness type to determine completion detection method
                     if spool.get("harness") == "codex":
                         # Codex uses newline-delimited JSON with "turn.completed" event
                         for line in content.strip().split("\n"):
                             try:
                                 event = json.loads(line)
                                 if event.get("type") == "turn.completed":
-                                    stdout_complete = True
+                                    output_complete = True
                                     break
                             except json.JSONDecodeError:
                                 continue
                     else:
-                        # Claude Code uses single JSON object with "result" or "error"
+                        # Claude Code / Gemini use single JSON object
                         data = json.loads(content)
-                        if "result" in data or "error" in data:
-                            stdout_complete = True
+                        if "result" in data or "error" in data or "response" in data:
+                            output_complete = True
             except (IOError, json.JSONDecodeError):
                 pass
 
+        # Gemini CLI writes error JSON to stderr — check there too
+        if not output_complete and spool.get("harness") == "gemini" and stderr_path.exists():
+            try:
+                stderr_content = stderr_path.read_text()
+                if stderr_content.strip():
+                    # Look for final JSON object in stderr (may have log lines before it)
+                    for line in reversed(stderr_content.strip().split("\n")):
+                        line = line.strip()
+                        if line.startswith("{"):
+                            try:
+                                data = json.loads(line)
+                                if "error" in data or "session_id" in data:
+                                    output_complete = True
+                                    break
+                            except json.JSONDecodeError:
+                                continue
+            except IOError:
+                pass
+
         # If PID alive and no complete output yet, still running
-        if _is_pid_alive(pid) and not stdout_complete:
+        if _is_pid_alive(pid) and not output_complete:
             return False
 
         # Process finished or output complete - finalize
@@ -756,22 +790,20 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
                 pass
 
         # Parse result based on harness type
-        if spool.get("harness") == "codex":
+        harness_type = spool.get("harness", "claude-code")
+
+        if harness_type == "codex":
             # Parse Codex newline-delimited JSON format
             try:
                 if stdout.strip():
-                    # Just store the complete newline-delimited JSON as result
-                    # (Same as the successful codex-321bd642 example)
                     spool["result"] = stdout
 
-                    # Try to extract session_id from thread.started event
                     for line in stdout.strip().split("\n"):
                         try:
                             event = json.loads(line)
                             if event.get("type") == "thread.started":
                                 spool["session_id"] = event.get("thread_id")
                             elif event.get("type") == "turn.completed":
-                                # Extract usage/cost information if available
                                 usage = event.get("usage", {})
                                 if usage:
                                     spool["cost"] = usage
@@ -786,15 +818,48 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
                     spool["status"] = "error"
                     spool["error"] = "Process exited with no output"
             except Exception:
-                # Fallback: treat as raw output
                 if stdout.strip():
                     spool["result"] = stdout
                     spool["status"] = "complete"
                 else:
                     spool["status"] = "error"
                     spool["error"] = "Failed to parse Codex output"
+
+        elif harness_type == "gemini":
+            # Gemini CLI: JSON output to stdout on success, error JSON to stderr
+            if stdout.strip():
+                try:
+                    data = json.loads(stdout)
+                    spool["result"] = data.get("response", stdout)
+                    spool["session_id"] = data.get("session_id")
+                    spool["status"] = "complete"
+                except json.JSONDecodeError:
+                    # Raw text output
+                    spool["result"] = stdout
+                    spool["status"] = "complete"
+            elif stderr.strip():
+                # Try to extract structured error from the last JSON line in stderr
+                error_msg = None
+                for line in reversed(stderr.strip().split("\n")):
+                    line = line.strip()
+                    if line.startswith("{"):
+                        try:
+                            data = json.loads(line)
+                            if "error" in data:
+                                err = data["error"]
+                                error_msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+                                spool["session_id"] = data.get("session_id")
+                            break
+                        except json.JSONDecodeError:
+                            continue
+                spool["status"] = "error"
+                spool["error"] = error_msg or stderr[:500]
+            else:
+                spool["status"] = "error"
+                spool["error"] = "Process exited with no output"
+
         else:
-            # Parse Claude Code single JSON object format
+            # Claude Code: single JSON object format
             try:
                 data = json.loads(stdout)
                 spool["result"] = data.get("result", stdout)
