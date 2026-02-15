@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, patch
 
 # Import the module to test
 from spindle import (
+    GEMINI_MODEL_ALIASES,
     MAX_CONCURRENT,
     PERMISSION_PROFILES,
     _check_and_finalize_spool,
@@ -695,6 +696,35 @@ class TestWorktreeNameUniqueness:
 
 class TestGeminiHarness:
     """Test Gemini CLI harness implementation."""
+
+    def test_gemini_model_aliases(self):
+        """Model aliases should resolve to full model names."""
+        assert GEMINI_MODEL_ALIASES["flash"] == "gemini-2.5-flash"
+        assert GEMINI_MODEL_ALIASES["pro"] == "gemini-2.5-pro"
+        assert GEMINI_MODEL_ALIASES["lite"] == "gemini-2.0-flash-lite"
+
+    def test_gemini_spin_resolves_alias(self, tmp_path):
+        """Gemini spin should resolve model aliases in the CLI command."""
+        captured_cmd = []
+
+        def fake_spawn(spool_id, cmd, cwd, env=None):
+            captured_cmd.extend(cmd)
+            return 12345
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle._spawn_detached", side_effect=fake_spawn):
+                with patch("spindle._count_running", return_value=0):
+                    _gemini_spin_sync(
+                        prompt="Test",
+                        working_dir=str(tmp_path),
+                        model="pro",
+                        system_prompt=None,
+                        timeout=None,
+                        tags=None,
+                        env=None,
+                    )
+
+        assert "gemini-2.5-pro" in captured_cmd
 
     def test_gemini_spin_requires_working_dir(self, tmp_path):
         """Gemini spin should require working_dir."""

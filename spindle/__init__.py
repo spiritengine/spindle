@@ -1286,7 +1286,7 @@ async def spin(
         allowed_tools: Override permission profile with explicit tool list
         tags: Comma-separated tags for organizing spools (e.g. "batch-1,triage")
         model: Model to use - for Claude: "haiku", "sonnet", "opus";
-               for Gemini: "flash", "pro", "2.5-flash", "gemini-2.0-flash", etc.
+               for Gemini: "flash", "pro", "lite", or full model names like "gemini-2.5-pro".
         timeout: Kill spool after this many seconds (default: no timeout)
         skeinless: Skip SKEIN context injection for shard agents (default: False)
         harness: Which harness to use - "claude-code" (default), "codex", or "gemini"
@@ -3292,6 +3292,13 @@ def _codex_respin_sync(session_id: str, prompt: str) -> str:
 # Uses Google's Gemini CLI in headless mode (-p flag), matching the pattern
 # used by Claude Code and Codex harnesses.
 
+# Short aliases for common models. Anything not here passes through to the CLI.
+GEMINI_MODEL_ALIASES = {
+    "flash": "gemini-2.5-flash",
+    "pro": "gemini-2.5-pro",
+    "lite": "gemini-2.0-flash-lite",
+}
+
 
 def _gemini_spin_sync(
     prompt: str,
@@ -3315,11 +3322,14 @@ def _gemini_spin_sync(
     if not success:
         return error_msg
 
+    # Resolve model aliases
+    resolved_model = GEMINI_MODEL_ALIASES.get(model, model) if model else None
+
     # Build gemini command: headless mode with auto-approve and JSON output
     gemini_cmd = ["gemini", "-p", prompt, "-y", "-o", "json"]
 
-    if model:
-        gemini_cmd.extend(["-m", model])
+    if resolved_model:
+        gemini_cmd.extend(["-m", resolved_model])
 
     if system_prompt:
         # Gemini CLI doesn't have a separate system prompt flag,
@@ -3339,7 +3349,7 @@ def _gemini_spin_sync(
         "result": None,
         "session_id": None,
         "working_dir": working_dir,
-        "model": model or "default",
+        "model": resolved_model or "auto",
         "system_prompt": system_prompt,
         "tags": tag_list,
         "timeout": timeout,
