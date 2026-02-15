@@ -3323,8 +3323,8 @@ def _gemini_spin_sync(
     if not success:
         return error_msg
 
-    # Resolve model aliases
-    resolved_model = GEMINI_MODEL_ALIASES.get(model, model) if model else None
+    # Resolve model aliases (default to pro if no model specified)
+    resolved_model = GEMINI_MODEL_ALIASES.get(model, model) if model else "gemini-2.5-pro"
 
     # Build gemini command: headless mode with auto-approve and JSON output
     gemini_cmd = ["gemini", "-p", prompt, "-y", "-o", "json"]
