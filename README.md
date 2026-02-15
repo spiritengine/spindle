@@ -14,7 +14,7 @@ MCP server for Claude Code to Claude Code delegation. Spawn background agents th
 - **Optional blocking with gather/yield** - Wait for all results at once, or stream them as agents complete. Alternatively, agent can continue other work, spins are nonblocking by default
 - **Permission profiles** - Control what tools child agents can use (readonly, careful, full)
 - **Shard isolation** - Run agents in sandboxed git worktrees to prevent conflicts
-- **Model selection** - Route tasks to haiku, sonnet, or opus per-agent
+- **Model selection** - Route tasks to different models per-agent
 - **Session continuity** - Resume conversations with child agents (auto-recovers expired sessions)
 - **Rich querying** - Search, filter, peek at running output, export results
 
@@ -209,17 +209,24 @@ Spindle supports multiple AI agent harnesses, allowing you to choose the best to
 
 ### Available Harnesses
 
-**Claude Code** (default) - Anthropic's Claude models via claude CLI
+**Claude Code** (default) - Anthropic's Claude models via `claude` CLI
 - Superior code understanding and reasoning
 - Best for complex refactoring, architecture decisions
 - Slower startup (~3-4 minutes to first response)
 - Use `harness="claude-code"` or omit harness parameter
 
-**Codex CLI** - OpenAI's GPT-5 Codex models via codex CLI
+**Codex CLI** - OpenAI's GPT-5 Codex models via `codex` CLI
 - Extremely fast startup (~10 seconds to first response)
 - Good for quick edits, simple tasks, prototyping
 - Requires ChatGPT Plus/Pro/Enterprise
 - Use `harness="codex"`
+
+**Gemini CLI** - Google's Gemini models via `gemini` CLI
+- Fast startup (~5-10 seconds to first response)
+- Full agent with tool use, file access, multi-step reasoning
+- Generous free tier (1000 req/day with Google account)
+- Models: `"flash"`, `"pro"`, `"lite"`, or any full model name
+- Use `harness="gemini"`
 
 ### Basic Usage
 
@@ -234,9 +241,15 @@ spool_id = spin(
     working_dir="/path/to/project"
 )
 
+# Gemini CLI - fast with free tier
+spool_id = spin(
+    prompt="Summarize this codebase",
+    harness="gemini",
+    working_dir="/path/to/project"
+)
+
 # All harnesses use the same API
 result = unspool(spool_id)  # Auto-detects harness
-respin(session_id, "Follow up")  # Auto-detects harness
 ```
 
 ### Choosing a Harness
@@ -245,31 +258,34 @@ respin(session_id, "Follow up")  # Auto-detects harness
 - Task requires deep reasoning or architecture decisions
 - Working on complex refactoring across multiple files
 - Need thorough code review or analysis
-- Time isn't critical (can wait 3-4 minutes)
 
 **Use Codex when:**
 - Need quick edits or simple implementations
 - Prototyping or exploring ideas rapidly
-- Running many parallel tasks (faster = more throughput)
-- Time is critical (10 second startup vs 3-4 minutes)
+
+**Use Gemini when:**
+- Want fast results without API key management (Google account login)
+- Running many parallel tasks on a budget (free tier)
+- Need a quick general-purpose agent
 
 ### Requirements
 
 **Claude Code:**
 - [Claude CLI](https://docs.anthropic.com/en/docs/claude-code) installed and authenticated
-- Anthropic API key or Claude subscription
 
 **Codex CLI:**
 - [Codex CLI](https://developers.openai.com/codex/cli/) installed (`npm i -g @openai/codex`)
 - ChatGPT Plus/Pro/Enterprise subscription
-- Codex CLI authenticated
-- Linux kernel 5.13+ for sandbox support (automatically bypassed on older kernels)
+
+**Gemini CLI:**
+- [Gemini CLI](https://github.com/google-gemini/gemini-cli) installed (`npm i -g @google/gemini-cli`)
+- Google account login (`gemini` → "Login with Google") or `GEMINI_API_KEY` env var
 
 See [docs/MULTI_HARNESS_GUIDE.md](docs/MULTI_HARNESS_GUIDE.md) and [docs/CODEX_SETUP.md](docs/CODEX_SETUP.md) for detailed documentation.
 
 ## API
 
-### Unified API (works with both harnesses)
+### Unified API (works with all harnesses)
 
 | Tool | Purpose |
 |------|---------|
@@ -279,17 +295,17 @@ See [docs/MULTI_HARNESS_GUIDE.md](docs/MULTI_HARNESS_GUIDE.md) and [docs/CODEX_S
 
 **spin() parameters:**
 - `prompt` (required): The task for the agent
-- `harness` (optional): "claude-code" (default) or "codex"
-- `working_dir` (optional for Claude, required for Codex): Project directory
+- `harness` (optional): "claude-code" (default), "codex", or "gemini"
+- `working_dir` (optional for Claude, required for Codex/Gemini): Project directory
 - `permission` (optional): "readonly", "careful" (default), "full", "shard", "careful+shard"
-- `model` (optional): Model to use ("sonnet", "opus", "haiku" for Claude; "gpt-5-codex" for Codex)
+- `model` (optional): Model to use ("sonnet", "opus", "haiku" for Claude; for Gemini: "flash", "pro", "lite")
 - `timeout` (optional): Auto-kill after N seconds
 - `tags` (optional): Comma-separated tags for organization
 - `shard` (optional): Create isolated git worktree (can also use `permission="shard"`)
 - `system_prompt` (optional): Custom system prompt for Claude Code
 - `allowed_tools` (optional): Override permission profile with explicit tool list
 
-### Spool Management (works with both harnesses)
+### Spool Management (works with all harnesses)
 
 | Tool | Purpose |
 |------|---------|

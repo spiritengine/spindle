@@ -14,20 +14,20 @@ Spindle abstracts the underlying AI agent implementation through a "harness" lay
 - Transparent integration with Spindle's spool management
 
 ```
-┌─────────────────────────────────────────────┐
-│           Spindle MCP Server                │
-│  ┌────────────────────────────────────────┐ │
-│  │    Unified API (spin/unspool/respin)   │ │
-│  └────────────────────────────────────────┘ │
-│              ▼                  ▼            │
-│  ┌──────────────────┐  ┌─────────────────┐  │
-│  │  Claude Harness  │  │  Codex Harness  │  │
-│  └──────────────────┘  └─────────────────┘  │
-│         ▼                      ▼             │
-│  ┌──────────────────┐  ┌─────────────────┐  │
-│  │    claude CLI    │  │   codex CLI     │  │
-│  └──────────────────┘  └─────────────────┘  │
-└─────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│                    Spindle MCP Server                        │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │         Unified API (spin/unspool/respin)              │  │
+│  └────────────────────────────────────────────────────────┘  │
+│         ▼                  ▼                  ▼              │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐   │
+│  │Claude Harness│  │Codex Harness │  │ Gemini Harness   │   │
+│  └──────────────┘  └──────────────┘  └──────────────────┘   │
+│         ▼                  ▼                  ▼              │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐   │
+│  │  claude CLI  │  │  codex CLI   │  │   gemini CLI     │   │
+│  └──────────────┘  └──────────────┘  └──────────────────┘   │
+└──────────────────────────────────────────────────────────────┘
 ```
 
 ## Available Harnesses
@@ -78,6 +78,33 @@ spin(
 
 **Important:** Codex requires `working_dir` to be specified. Claude Code can infer it from the current session.
 
+### Gemini CLI
+
+**CLI:** `gemini` (Google's Gemini CLI)
+**Models:** Gemini 2.5 Pro, 2.5 Flash, 2.0 Flash Lite (Auto routing by default)
+**Startup time:** ~5-10 seconds to first response
+**Strengths:** Fast startup, generous free tier, good for quick tasks
+
+The Gemini harness uses Google's Gemini CLI in headless mode. It's a full agent with tool use, file access, and multi-step reasoning. Auth is handled by the CLI (Google account login or API key).
+
+**Usage:**
+```python
+spin(
+    prompt="Summarize this codebase",
+    harness="gemini",
+    working_dir="/path/to/project"
+)
+```
+
+**Model aliases:**
+- `"flash"` → `gemini-2.5-flash`
+- `"pro"` → `gemini-2.5-pro`
+- `"lite"` → `gemini-2.0-flash-lite`
+- No model specified → CLI's Auto routing (picks based on task complexity)
+- Any other string passes through to the CLI as-is
+
+**Important:** Gemini requires `working_dir` to be specified. Auth via `gemini` interactive login or `GEMINI_API_KEY` env var.
+
 ## Unified API
 
 All harnesses use the same API surface, making them interchangeable:
@@ -100,7 +127,7 @@ spool_id = spin(
 
 **Common parameters (work with all harnesses):**
 - `prompt` - The task description
-- `harness` - "claude-code" or "codex"
+- `harness` - "claude-code", "codex", or "gemini"
 - `model` - Model to use (harness-specific)
 - `timeout` - Auto-kill after N seconds
 - `tags` - Organization tags
@@ -114,6 +141,10 @@ spool_id = spin(
 **Codex-specific parameters:**
 - `working_dir` - Required project directory
 - `sandbox` - Derived from permission parameter
+
+**Gemini-specific parameters:**
+- `working_dir` - Required project directory
+- `system_prompt` - Prepended to prompt (Gemini CLI has no separate system prompt flag)
 
 ### unspool()
 
@@ -145,15 +176,15 @@ Session continuity is harness-aware - Spindle remembers which harness was used a
 
 ## Performance Comparison
 
-| Metric | Claude Code | Codex CLI |
-|--------|-------------|-----------|
-| Startup time | 3-4 minutes | ~10 seconds |
-| Code understanding | Excellent | Good |
-| Reasoning depth | Deep | Moderate |
-| Best for | Complex tasks | Quick edits |
-| Cost per task | Higher | Lower |
+| Metric | Claude Code | Codex CLI | Gemini CLI |
+|--------|-------------|-----------|------------|
+| Startup time | 3-4 minutes | ~10 seconds | ~5-10 seconds |
+| Code understanding | Excellent | Good | Good |
+| Reasoning depth | Deep | Moderate | Good (2.5 Pro) |
+| Best for | Complex tasks | Quick edits | Fast general work |
+| Cost per task | Higher | Lower | Free tier available |
 
-**Rule of thumb:** Use Claude for thinking, Codex for typing.
+**Rule of thumb:** Use Claude for thinking, Codex for typing, Gemini for a fast free option.
 
 ## Automatic Harness Detection
 
@@ -179,7 +210,7 @@ This means you can work with spools without remembering which harness created th
 
 ## Session Continuity
 
-Both harnesses support session continuity through `respin()`:
+Claude Code and Codex support session continuity through `respin()`:
 
 **Claude Code:**
 - Uses `--resume <session_id>` flag
@@ -190,6 +221,10 @@ Both harnesses support session continuity through `respin()`:
 - Uses `codex resume <session_id>` command
 - Session IDs extracted from JSON output
 - Preserves conversation state
+
+**Gemini:**
+- `respin()` not yet supported
+- Each spin is a fresh session
 
 ## Choosing the Right Harness
 
@@ -213,6 +248,23 @@ spin("Review the payment processor for security issues")
 ✅ **Multi-file changes**
 ```python
 spin("Add logging throughout the application", permission="shard")
+```
+
+### Use Gemini for:
+
+✅ **Fast general tasks with free tier**
+```python
+spin("Explain this error message", harness="gemini", working_dir="/app")
+```
+
+✅ **Quick code generation**
+```python
+spin("Generate a JSON schema for the user API", harness="gemini", working_dir="/app")
+```
+
+✅ **Parallel research tasks** (generous rate limits)
+```python
+spin("Summarize the test coverage", harness="gemini", working_dir="/app", model="flash")
 ```
 
 ### Use Codex for:
@@ -335,11 +387,12 @@ Use `spools()` to check status or `spin_drop(spool_id)` to cancel running work.
 
 ### Harness Not Found
 
-**Error:** `"codex: command not found"`
+**Error:** `"codex: command not found"` or `"gemini: command not found"`
 
 **Solution:** Install the CLI:
 ```bash
-npm i -g @openai/codex  # For Codex
+npm i -g @openai/codex    # For Codex
+npm i -g @google/gemini-cli  # For Gemini
 ```
 
 ### Authentication Issues
@@ -354,6 +407,13 @@ claude login      # Authenticate
 ```bash
 codex --version   # Verify installation
 codex             # Run interactively to authenticate (requires ChatGPT Plus/Pro)
+```
+
+**Gemini:**
+```bash
+gemini --version  # Verify installation
+gemini            # Run interactively, select "Login with Google"
+# Or set GEMINI_API_KEY environment variable
 ```
 
 ### Landlock Errors (Codex)
