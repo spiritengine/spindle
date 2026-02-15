@@ -150,7 +150,7 @@ spool_id = spin(
 Get results from any harness - automatically detects which harness the spool used:
 
 ```python
-result = unspool(spool_id)  # Works for both Claude and Codex
+result = unspool(spool_id)  # Works for all harnesses
 ```
 
 The harness is stored in the spool metadata and automatically loaded when you call unspool.
@@ -222,8 +222,8 @@ Claude Code and Codex support session continuity through `respin()`:
 - Preserves conversation state
 
 **Gemini:**
-- `respin()` not yet supported
-- Each spin is a fresh session
+- Uses `gemini --resume <session_id>` flag
+- Session IDs extracted from JSON output
 
 ## Choosing the Right Harness
 
@@ -344,7 +344,7 @@ This ensures Codex works on older systems (e.g., Ubuntu 20.04 with kernel 5.4) w
 
 ## Spool Management
 
-Both harnesses integrate seamlessly with Spindle's spool management:
+All harnesses integrate seamlessly with Spindle's spool management:
 
 ```python
 # List all spools (mixed harnesses)
@@ -360,7 +360,7 @@ spool_dashboard()
 spin_wait("id1,id2,id3")
 ```
 
-Codex spools are automatically tagged with "codex" for easy filtering.
+Codex and Gemini spools are automatically tagged with "codex" or "gemini" for easy filtering.
 
 ## Concurrency Limits
 
@@ -372,6 +372,7 @@ This prevents resource exhaustion regardless of which harness you use:
 # Mix of harnesses, max 15 total
 spin("Task 1", harness="claude-code")  # 1/15
 spin("Task 2", harness="codex", working_dir="/app")  # 2/15
+spin("Task 3", harness="gemini", working_dir="/app")  # 3/15
 # ... up to 15 total
 ```
 
@@ -459,6 +460,7 @@ If `respin()` fails:
 
 3. **Claude Code:** Falls back to transcript injection automatically
 4. **Codex:** Session ID must be valid from previous `codex exec --json` output
+5. **Gemini:** Uses `gemini --resume <session_id>`
 
 ## Future Enhancements
 
@@ -475,12 +477,12 @@ Planned improvements to the harness system:
 ## Best Practices
 
 1. **Default to Claude for complex work** - Better reasoning and code understanding
-2. **Use Codex for speed** - 30x faster startup for simple tasks
-3. **Batch quick tasks with Codex** - Higher throughput for parallel work
-4. **Always specify working_dir for Codex** - Required parameter
+2. **Use Codex or Gemini for speed** - Much faster startup for simple tasks
+3. **Use Gemini for budget work** - Generous free tier with Google account
+4. **Always specify working_dir for Codex/Gemini** - Required parameter
 5. **Use tags to organize** - Tag by harness, task type, or project
 6. **Monitor with spool_dashboard()** - Track mixed harness workloads
-7. **Test on both harnesses** - Validate that tasks work with your chosen harness
+7. **Test on your chosen harness** - Validate that tasks work as expected
 
 ## Examples
 
@@ -500,8 +502,16 @@ prototype_id = spin(
     working_dir="/path/to/project"
 )
 
-# Wait for both
-results = spin_wait(f"{analysis_id},{prototype_id}", mode="gather")
+# Quick research with Gemini
+research_id = spin(
+    "What caching libraries exist for Python? Summarize the top 3.",
+    harness="gemini",
+    working_dir="/path/to/project",
+    model="flash"
+)
+
+# Wait for all
+results = spin_wait(f"{analysis_id},{prototype_id},{research_id}", mode="gather")
 
 # Continue with Claude based on analysis
 session = _read_spool(analysis_id)["session_id"]
