@@ -99,7 +99,7 @@ spin(
 **Model aliases:**
 - `"flash"` → `gemini-2.5-flash`
 - `"pro"` → `gemini-2.5-pro`
-- `"lite"` → `gemini-2.0-flash-lite`
+- `"lite"` → `gemini-2.0-flash`
 - No model specified → CLI's Auto routing (picks based on task complexity)
 - Any other string passes through to the CLI as-is
 
