@@ -225,7 +225,7 @@ Spindle supports multiple AI agent harnesses, allowing you to choose the best to
 - Fast startup (~5-10 seconds to first response)
 - Full agent with tool use, file access, multi-step reasoning
 - Generous free tier (1000 req/day with Google account)
-- Models: `"flash"`, `"pro"`, `"lite"`, or any full model name
+- Models: `"flash"`, `"pro"`, or any full model name
 - Use `harness="gemini"`
 
 ### Basic Usage
@@ -298,7 +298,7 @@ See [docs/MULTI_HARNESS_GUIDE.md](docs/MULTI_HARNESS_GUIDE.md) and [docs/CODEX_S
 - `harness` (optional): "claude-code" (default), "codex", or "gemini"
 - `working_dir` (optional for Claude, required for Codex/Gemini): Project directory
 - `permission` (optional): "readonly", "careful" (default), "full", "shard", "careful+shard"
-- `model` (optional): Model to use ("sonnet", "opus", "haiku" for Claude; for Gemini: "flash", "pro", "lite")
+- `model` (optional): Model to use ("sonnet", "opus", "haiku" for Claude; for Gemini: "flash", "pro")
 - `timeout` (optional): Auto-kill after N seconds
 - `tags` (optional): Comma-separated tags for organization
 - `shard` (optional): Create isolated git worktree (can also use `permission="shard"`)

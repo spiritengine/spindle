@@ -701,7 +701,6 @@ class TestGeminiHarness:
         """Model aliases should resolve to full model names."""
         assert GEMINI_MODEL_ALIASES["flash"] == "gemini-2.5-flash"
         assert GEMINI_MODEL_ALIASES["pro"] == "gemini-2.5-pro"
-        assert GEMINI_MODEL_ALIASES["lite"] == "gemini-2.0-flash"
 
     def test_gemini_spin_resolves_alias(self, tmp_path):
         """Gemini spin should resolve model aliases in the CLI command."""

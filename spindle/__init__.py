@@ -3296,7 +3296,6 @@ def _codex_respin_sync(session_id: str, prompt: str) -> str:
 GEMINI_MODEL_ALIASES = {
     "flash": "gemini-2.5-flash",
     "pro": "gemini-2.5-pro",
-    "lite": "gemini-2.0-flash",
 }
 
 
