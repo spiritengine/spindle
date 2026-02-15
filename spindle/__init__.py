@@ -1610,6 +1610,8 @@ def _respin_sync(session_id: str, prompt: str) -> str:
     # Route to appropriate harness implementation
     if harness == "codex":
         return _codex_respin_sync(session_id, prompt)
+    elif harness == "gemini":
+        return _gemini_respin_sync(session_id, prompt, original_spool)
     else:
         # Claude Code harness (default)
         # Generate spool ID first
@@ -3371,6 +3373,56 @@ def _gemini_spin_sync(
     _write_spool(spool_id, spool)
 
     # Start background monitor thread (reuse the standard monitor)
+    monitor = threading.Thread(target=_monitor_spool, args=(spool_id,), daemon=True)
+    monitor.start()
+
+    return spool_id
+
+
+def _gemini_respin_sync(session_id: str, prompt: str, original_spool: dict) -> str:
+    """Synchronous implementation of gemini respin - continue a Gemini session."""
+    spool_id = "gemini-" + str(uuid.uuid4())[:8]
+
+    success, error_msg = _try_reserve_slot_and_create(spool_id, initial_status="pending")
+    if not success:
+        return error_msg
+
+    # Build gemini resume command
+    gemini_cmd = ["gemini", "--resume", session_id, "-p", prompt, "-y", "-o", "json"]
+
+    # Use model from original spool if set
+    model = original_spool.get("model")
+    if model and model != "auto":
+        gemini_cmd.extend(["-m", model])
+
+    working_dir = original_spool.get("working_dir") or os.getcwd()
+    env = original_spool.get("env")
+
+    spool = {
+        "id": spool_id,
+        "status": "pending",
+        "prompt": f"Continue {session_id}: {prompt}",
+        "result": None,
+        "session_id": session_id,
+        "working_dir": working_dir,
+        "tags": ["gemini", "respin"],
+        "env": env,
+        "model": model or "auto",
+        "created_at": datetime.now().isoformat(),
+        "completed_at": None,
+        "pid": None,
+        "error": None,
+        "harness": "gemini",
+    }
+
+    _write_spool(spool_id, spool)
+
+    pid = _spawn_detached(spool_id, gemini_cmd, working_dir, env)
+
+    spool["pid"] = pid
+    spool["status"] = "running"
+    _write_spool(spool_id, spool)
+
     monitor = threading.Thread(target=_monitor_spool, args=(spool_id,), daemon=True)
     monitor.start()
 
