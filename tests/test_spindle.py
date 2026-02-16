@@ -12,6 +12,7 @@ from unittest.mock import MagicMock, patch
 # Import the module to test
 from spindle import (
     GEMINI_MODEL_ALIASES,
+    KIMI_MODEL_ALIASES,
     MAX_CONCURRENT,
     PERMISSION_PROFILES,
     _check_and_finalize_spool,
@@ -21,6 +22,9 @@ from spindle import (
     _gemini_unspool_sync,
     _get_spool_path,
     _is_pid_alive,
+    _kimi_respin_sync,
+    _kimi_spin_sync,
+    _kimi_unspool_sync,
     _list_spools,
     _parse_duration,
     _read_spool,
@@ -887,5 +891,240 @@ class TestGeminiHarness:
         with patch("spindle.SPINDLE_DIR", tmp_path):
             result = _gemini_unspool_sync("gemini-nonexistent")
             assert "Unknown spool_id" in result
+
+
+class TestKimiHarness:
+    """Test Kimi CLI harness implementation."""
+
+    def test_kimi_model_aliases(self):
+        """Model aliases should resolve to full model names."""
+        assert KIMI_MODEL_ALIASES["thinking"] == "moonshot-ai/kimi-k2-thinking"
+        assert KIMI_MODEL_ALIASES["thinking-turbo"] == "moonshot-ai/kimi-k2-thinking-turbo"
+        assert KIMI_MODEL_ALIASES["turbo"] == "moonshot-ai/kimi-k2-turbo-preview"
+        assert KIMI_MODEL_ALIASES["latest"] == "moonshot-ai/kimi-k2.5"
+
+    def test_kimi_spin_resolves_alias(self, tmp_path):
+        """Kimi spin should resolve model aliases in the CLI command."""
+        captured_cmd = []
+
+        def fake_spawn(spool_id, cmd, cwd, env=None):
+            captured_cmd.extend(cmd)
+            return 12345
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle._spawn_detached", side_effect=fake_spawn):
+                with patch("spindle._count_running", return_value=0):
+                    _kimi_spin_sync(
+                        prompt="Test",
+                        working_dir=str(tmp_path),
+                        model="thinking",
+                        system_prompt=None,
+                        timeout=None,
+                        tags=None,
+                        env=None,
+                    )
+
+        assert "moonshot-ai/kimi-k2-thinking" in captured_cmd
+
+    def test_kimi_spin_requires_working_dir(self, tmp_path):
+        """Kimi spin should require working_dir."""
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            result = _kimi_spin_sync(
+                prompt="Test prompt",
+                working_dir=None,
+                model=None,
+                system_prompt=None,
+                timeout=None,
+                tags=None,
+                env=None,
+            )
+            assert "working_dir required" in result
+
+    def test_kimi_spin_creates_spool(self, tmp_path):
+        """Kimi spin should create spool record with correct harness metadata."""
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle._spawn_detached", return_value=12345):
+                with patch("spindle._count_running", return_value=0):
+                    result = _kimi_spin_sync(
+                        prompt="Test prompt",
+                        working_dir=str(tmp_path),
+                        model="moonshot-ai/kimi-k2.5",
+                        system_prompt=None,
+                        timeout=60,
+                        tags="test",
+                        env=None,
+                    )
+
+            assert result.startswith("kimi-")
+
+            spool_files = list(tmp_path.glob("kimi-*.json"))
+            assert len(spool_files) == 1
+
+            with open(spool_files[0]) as f:
+                spool = json.load(f)
+
+            assert spool["harness"] == "kimi"
+            assert spool["prompt"] == "Test prompt"
+            assert spool["model"] == "moonshot-ai/kimi-k2.5"
+            assert spool["timeout"] == 60
+            assert "kimi" in spool["tags"]
+            assert "test" in spool["tags"]
+            assert spool["status"] == "running"
+            # Kimi generates session_id upfront
+            assert spool["session_id"] is not None
+            assert len(spool["session_id"]) == 36  # UUID length
+
+    def test_kimi_spin_builds_correct_command(self, tmp_path):
+        """Kimi spin should build the correct CLI command with session ID."""
+        captured_cmd = []
+
+        def fake_spawn(spool_id, cmd, cwd, env=None):
+            captured_cmd.extend(cmd)
+            return 12345
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle._spawn_detached", side_effect=fake_spawn):
+                with patch("spindle._count_running", return_value=0):
+                    _kimi_spin_sync(
+                        prompt="Explain this code",
+                        working_dir=str(tmp_path),
+                        model="moonshot-ai/kimi-k2-thinking-turbo",
+                        system_prompt=None,
+                        timeout=None,
+                        tags=None,
+                        env=None,
+                    )
+
+        assert captured_cmd[0] == "kimi-cli"
+        assert "--session" in captured_cmd
+        assert "--print" in captured_cmd
+        assert "--yolo" in captured_cmd
+        assert "--output-format" in captured_cmd
+        assert "stream-json" in captured_cmd
+        assert "-p" in captured_cmd
+        assert "-m" in captured_cmd
+        assert "moonshot-ai/kimi-k2-thinking-turbo" in captured_cmd
+        assert "-w" in captured_cmd
+
+    def test_kimi_spin_system_prompt_prepended(self, tmp_path):
+        """System prompt should be prepended to the prompt."""
+        captured_cmd = []
+
+        def fake_spawn(spool_id, cmd, cwd, env=None):
+            captured_cmd.extend(cmd)
+            return 12345
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle._spawn_detached", side_effect=fake_spawn):
+                with patch("spindle._count_running", return_value=0):
+                    _kimi_spin_sync(
+                        prompt="What is 2+2?",
+                        working_dir=str(tmp_path),
+                        model=None,
+                        system_prompt="You are a math tutor",
+                        timeout=None,
+                        tags=None,
+                        env=None,
+                    )
+
+        # The prompt passed to -p should contain both system prompt and user prompt
+        p_idx = captured_cmd.index("-p")
+        combined = captured_cmd[p_idx + 1]
+        assert "You are a math tutor" in combined
+        assert "What is 2+2?" in combined
+
+    def test_kimi_spin_passes_env(self, tmp_path):
+        """Kimi spin should pass env to _spawn_detached."""
+        captured_env = []
+
+        def fake_spawn(spool_id, cmd, cwd, env=None):
+            captured_env.append(env)
+            return 12345
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle._spawn_detached", side_effect=fake_spawn):
+                with patch("spindle._count_running", return_value=0):
+                    _kimi_spin_sync(
+                        prompt="Test",
+                        working_dir=str(tmp_path),
+                        model=None,
+                        system_prompt=None,
+                        timeout=None,
+                        tags=None,
+                        env={"KIMI_API_KEY": "test-key"},
+                    )
+
+        assert captured_env[0] == {"KIMI_API_KEY": "test-key"}
+
+    def test_kimi_unspool_complete(self, tmp_path):
+        """Unspool should return result for complete spool."""
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            spool_id = "kimi-test123"
+            spool = {
+                "id": spool_id,
+                "status": "complete",
+                "result": "Hello from Kimi CLI",
+                "harness": "kimi",
+                "created_at": datetime.now().isoformat(),
+            }
+            _write_spool(spool_id, spool)
+
+            result = _kimi_unspool_sync(spool_id)
+            assert result == "Hello from Kimi CLI"
+
+    def test_kimi_unspool_error(self, tmp_path):
+        """Unspool should return error message for failed spool."""
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            spool_id = "kimi-test456"
+            spool = {
+                "id": spool_id,
+                "status": "error",
+                "error": "kimi CLI not found",
+                "harness": "kimi",
+                "created_at": datetime.now().isoformat(),
+            }
+            _write_spool(spool_id, spool)
+
+            result = _kimi_unspool_sync(spool_id)
+            assert "failed" in result
+            assert "kimi CLI not found" in result
+
+    def test_kimi_unspool_nonexistent(self, tmp_path):
+        """Unspool should return error for nonexistent spool."""
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            result = _kimi_unspool_sync("kimi-nonexistent")
+            assert "Unknown spool_id" in result
+
+    def test_kimi_respin_uses_explicit_session(self, tmp_path):
+        """Kimi respin should use explicit session ID from original spool."""
+        captured_cmd = []
+
+        def fake_spawn(spool_id, cmd, cwd, env=None):
+            captured_cmd.extend(cmd)
+            return 12345
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle._spawn_detached", side_effect=fake_spawn):
+                with patch("spindle._count_running", return_value=0):
+                    original_spool = {
+                        "id": "kimi-original",
+                        "session_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                        "working_dir": str(tmp_path),
+                        "model": "moonshot-ai/kimi-k2-thinking",
+                        "env": None,
+                    }
+
+                    _kimi_respin_sync(
+                        session_id="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                        prompt="Follow up question",
+                        original_spool=original_spool,
+                    )
+
+        assert "kimi-cli" in captured_cmd
+        assert "--session" in captured_cmd
+        # The exact session ID should be in the command
+        assert "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee" in captured_cmd
+        assert "--print" in captured_cmd
+        assert "Follow up question" in captured_cmd
 
 

@@ -104,6 +104,34 @@ spin(
 
 **Important:** Gemini requires `working_dir` to be specified. Auth via `gemini` interactive login or `GEMINI_API_KEY` env var.
 
+### Kimi CLI
+
+**CLI:** `kimi-cli` (Moonshot AI's Kimi Code CLI)
+**Models:** Kimi K2.5, K2-Thinking, K2-Thinking-Turbo
+**Startup time:** ~5-10 seconds to first response
+**Strengths:** Fast startup, thinking mode for complex reasoning, multimodal support
+
+The Kimi harness uses Moonshot AI's Kimi Code CLI in headless mode. Full agent with tool use, file access, and multi-step reasoning. Auth via Kimi/Moonshot API credentials configured in `~/.kimi/config.toml`.
+
+**Usage:**
+```python
+spin(
+    prompt="Analyze this bug and suggest a fix",
+    harness="kimi",
+    working_dir="/path/to/project"
+)
+```
+
+**Model aliases:**
+- `"thinking"` → `moonshot-ai/kimi-k2-thinking` (best for complex reasoning)
+- `"thinking-turbo"` → `moonshot-ai/kimi-k2-thinking-turbo` (faster with thinking)
+- `"turbo"` → `moonshot-ai/kimi-k2-turbo-preview` (fastest)
+- `"latest"` → `moonshot-ai/kimi-k2.5` (latest stable)
+- No model specified → `moonshot-ai/kimi-k2-thinking` (default)
+- Any other string passes through to the CLI as-is
+
+**Important:** Kimi requires `working_dir` to be specified. Session continuity is working-directory based (not explicit session IDs). Auth via `kimi-cli login` or direct API key configuration.
+
 ## Unified API
 
 All harnesses use the same API surface, making them interchangeable:
@@ -175,15 +203,15 @@ Session continuity is harness-aware - Spindle remembers which harness was used a
 
 ## Performance Comparison
 
-| Metric | Claude Code | Codex CLI | Gemini CLI |
-|--------|-------------|-----------|------------|
-| Startup time | 3-4 minutes | ~10 seconds | ~5-10 seconds |
-| Code understanding | Excellent | Good | Good |
-| Reasoning depth | Deep | Moderate | Good (2.5 Pro) |
-| Best for | Complex tasks | Quick edits | Fast general work |
-| Cost per task | Higher | Lower | Free tier available |
+| Metric | Claude Code | Codex CLI | Gemini CLI | Kimi CLI |
+|--------|-------------|-----------|------------|----------|
+| Startup time | 3-4 minutes | ~10 seconds | ~5-10 seconds | ~5-10 seconds |
+| Code understanding | Excellent | Good | Good | Good |
+| Reasoning depth | Deep | Moderate | Good (2.5 Pro) | Excellent (K2-Thinking) |
+| Best for | Complex tasks | Quick edits | Fast general work | Fast reasoning tasks |
+| Cost per task | Higher | Lower | Free tier available | Varies by plan |
 
-**Rule of thumb:** Use Claude for thinking, Codex for typing, Gemini for a fast free option.
+**Rule of thumb:** Use Claude for deep thinking, Codex for typing, Gemini for a fast free option, Kimi for fast reasoning with thinking mode.
 
 ## Automatic Harness Detection
 

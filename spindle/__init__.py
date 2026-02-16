@@ -25,7 +25,7 @@ import threading
 import time
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, Generator, Optional
 
@@ -869,6 +869,49 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
                 spool["status"] = "error"
                 spool["error"] = "Process exited with no output"
 
+        elif harness_type == "kimi":
+            # Kimi CLI: JSONL output (one JSON per line) to stdout
+            # Final response is in the last line with role:"assistant" and type:"text"
+            if stdout.strip():
+                try:
+                    # Parse JSONL - split by lines and parse each JSON object
+                    lines = stdout.strip().split("\n")
+                    result_text = None
+
+                    # Process lines to find final assistant text response
+                    for line in lines:
+                        if not line.strip():
+                            continue
+                        try:
+                            data = json.loads(line)
+                            if data.get("role") == "assistant" and "content" in data:
+                                # Extract text from content array
+                                for item in data.get("content", []):
+                                    if isinstance(item, dict) and item.get("type") == "text":
+                                        result_text = item.get("text", "")
+                        except json.JSONDecodeError:
+                            continue
+
+                    if result_text:
+                        spool["result"] = result_text
+                        spool["status"] = "complete"
+                        # session_id already set when spool was created
+                    else:
+                        # Fallback to raw output if no text found
+                        spool["result"] = stdout
+                        spool["status"] = "complete"
+                        # session_id already set when spool was created
+                except Exception as e:
+                    spool["result"] = stdout
+                    spool["status"] = "complete"
+            elif stderr.strip():
+                # Kimi errors might be in stderr
+                spool["status"] = "error"
+                spool["error"] = stderr[:500]
+            else:
+                spool["status"] = "error"
+                spool["error"] = "Process exited with no output"
+
         else:
             # Claude Code: single JSON object format
             try:
@@ -1340,6 +1383,17 @@ async def spin(
             tags,
             env,
         )
+    elif harness_lower == "kimi":
+        return await asyncio.to_thread(
+            _kimi_spin_sync,
+            prompt,
+            working_dir,
+            model,
+            system_prompt,
+            timeout,
+            tags,
+            env,
+        )
     else:
         # Default to Claude Code harness
         return await asyncio.to_thread(
@@ -1373,6 +1427,8 @@ def _unspool_sync(spool_id: str) -> str:
         return _codex_unspool_sync(spool_id)
     elif harness_lower == "gemini":
         return _gemini_unspool_sync(spool_id)
+    elif harness_lower == "kimi":
+        return _kimi_unspool_sync(spool_id)
     else:
         # Claude Code harness (default)
         _check_and_finalize_spool(spool_id)
@@ -1612,6 +1668,8 @@ def _respin_sync(session_id: str, prompt: str) -> str:
         return _codex_respin_sync(session_id, prompt)
     elif harness == "gemini":
         return _gemini_respin_sync(session_id, prompt, original_spool)
+    elif harness == "kimi":
+        return _kimi_respin_sync(session_id, prompt, original_spool)
     else:
         # Claude Code harness (default)
         # Generate spool ID first
@@ -2277,6 +2335,17 @@ async def spool_retry(spool_id: str) -> str:
     elif harness_lower == "gemini":
         return await asyncio.to_thread(
             _gemini_spin_sync,
+            spool.get("prompt", ""),
+            spool.get("working_dir"),
+            spool.get("model"),
+            spool.get("system_prompt"),
+            spool.get("timeout"),
+            tags_str,
+            spool.get("env"),
+        )
+    elif harness_lower == "kimi":
+        return await asyncio.to_thread(
+            _kimi_spin_sync,
             spool.get("prompt", ""),
             spool.get("working_dir"),
             spool.get("model"),
@@ -3300,6 +3369,13 @@ GEMINI_MODEL_ALIASES = {
     "pro": "gemini-2.5-pro",
 }
 
+KIMI_MODEL_ALIASES = {
+    "thinking": "moonshot-ai/kimi-k2-thinking",
+    "thinking-turbo": "moonshot-ai/kimi-k2-thinking-turbo",
+    "turbo": "moonshot-ai/kimi-k2-turbo-preview",
+    "latest": "moonshot-ai/kimi-k2.5",
+}
+
 
 def _gemini_spin_sync(
     prompt: str,
@@ -3431,6 +3507,198 @@ def _gemini_respin_sync(session_id: str, prompt: str, original_spool: dict) -> s
 
 def _gemini_unspool_sync(spool_id: str) -> str:
     """Synchronous implementation of gemini_unspool."""
+    _check_and_finalize_spool(spool_id)
+    spool = _read_spool(spool_id)
+    if not spool:
+        return f"Error: Unknown spool_id '{spool_id}'"
+
+    status = spool.get("status")
+    if status == "pending":
+        return f"Spool {spool_id} pending (not yet started)"
+    elif status == "running":
+        pid = spool.get("pid")
+        if pid and not _is_pid_alive(pid):
+            _check_and_finalize_spool(spool_id)
+            spool = _read_spool(spool_id)
+            if spool.get("status") == "complete":
+                return spool.get("result", "No result")
+            elif spool.get("status") == "error":
+                return f"Spool {spool_id} failed: {spool.get('error', 'Unknown error')}"
+        return f"Spool {spool_id} still running: {spool.get('prompt', '')[:50]}..."
+    elif status == "complete":
+        return spool.get("result", "No result")
+    else:
+        return f"Spool {spool_id} failed: {spool.get('error', 'Unknown error')}"
+
+
+def _kimi_spin_sync(
+    prompt: str,
+    working_dir: Optional[str],
+    model: Optional[str],
+    system_prompt: Optional[str],
+    timeout: Optional[int],
+    tags: Optional[str],
+    env: Optional[Dict[str, str]],
+) -> str:
+    """Synchronous implementation of kimi_spin - runs Kimi CLI in background."""
+    # Require working_dir
+    if not working_dir:
+        return "Error: working_dir required. Pass the project directory."
+
+    # Generate spool ID and session ID
+    spool_id = "kimi-" + str(uuid.uuid4())[:8]
+    session_id = str(uuid.uuid4())  # Generate our own session ID
+
+    # Atomically check concurrency limit and create initial spool entry
+    success, error_msg = _try_reserve_slot_and_create(spool_id, initial_status="pending")
+    if not success:
+        return error_msg
+
+    # Resolve model aliases (default to kimi-k2-thinking if no model specified)
+    resolved_model = KIMI_MODEL_ALIASES.get(model, model) if model else "moonshot-ai/kimi-k2-thinking"
+
+    # Build kimi command: headless mode with auto-approve, stream-json output, and explicit session ID
+    kimi_cmd = ["kimi-cli", "--session", session_id, "--print", "--yolo", "--output-format", "stream-json", "-p", prompt]
+
+    if resolved_model:
+        kimi_cmd.extend(["-m", resolved_model])
+
+    if working_dir:
+        kimi_cmd.extend(["-w", working_dir])
+
+    if system_prompt:
+        # Kimi CLI doesn't have a separate system prompt flag,
+        # so prepend it to the prompt
+        combined_prompt = f"System instructions: {system_prompt}\n\n{prompt}"
+        # Find and replace the prompt argument
+        prompt_idx = kimi_cmd.index("-p") + 1
+        kimi_cmd[prompt_idx] = combined_prompt
+
+    # Parse tags
+    tag_list = [t.strip() for t in tags.split(",")] if tags else []
+    tag_list.append("kimi")  # Auto-tag as kimi spool
+
+    # Create spool record
+    spool = {
+        "id": spool_id,
+        "status": "pending",
+        "prompt": prompt,
+        "result": None,
+        "session_id": session_id,  # Store our generated session ID
+        "working_dir": working_dir,
+        "model": resolved_model or "auto",
+        "system_prompt": system_prompt,
+        "tags": tag_list,
+        "timeout": timeout,
+        "env": env,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "completed_at": None,
+        "pid": None,
+        "error": None,
+        "harness": "kimi",
+    }
+
+    # Write spool to disk
+    _write_spool(spool_id, spool)
+
+    # Spawn the process detached
+    pid = _spawn_detached(spool_id, kimi_cmd, working_dir, env)
+
+    # Update spool with PID and status
+    spool["pid"] = pid
+    spool["status"] = "running"
+    _write_spool(spool_id, spool)
+
+    # Start background monitor thread
+    threading.Thread(target=_monitor_spool, args=(spool_id,), daemon=True).start()
+
+    return spool_id
+
+
+def _kimi_respin_sync(
+    session_id: str,
+    prompt: str,
+    original_spool: dict,
+) -> str:
+    """Synchronous implementation of kimi_respin - continues Kimi session."""
+    working_dir = original_spool.get("working_dir")
+    if not working_dir:
+        return "Error: original spool missing working_dir"
+
+    # Generate new spool ID
+    spool_id = "kimi-" + str(uuid.uuid4())[:8]
+
+    # Atomically check concurrency limit and create initial spool entry
+    success, error_msg = _try_reserve_slot_and_create(spool_id, initial_status="pending")
+    if not success:
+        return error_msg
+
+    # Inherit model from original spool
+    model = original_spool.get("model")
+    if model == "auto":
+        model = None  # Let CLI choose
+
+    # Build kimi resume command: use explicit session ID
+    kimi_cmd = [
+        "kimi-cli",
+        "--session",
+        session_id,  # Use the explicit session ID from the original spool
+        "--print",
+        "--yolo",
+        "--output-format",
+        "stream-json",
+        "-p",
+        prompt,
+    ]
+
+    if model:
+        kimi_cmd.extend(["-m", model])
+
+    if working_dir:
+        kimi_cmd.extend(["-w", working_dir])
+
+    # Parse tags
+    tag_list = ["kimi", "respin"]
+
+    # Create spool record
+    spool = {
+        "id": spool_id,
+        "status": "pending",
+        "prompt": prompt,
+        "result": None,
+        "session_id": session_id,  # Keep reference to original
+        "working_dir": working_dir,
+        "model": model or "auto",
+        "system_prompt": None,
+        "tags": tag_list,
+        "timeout": original_spool.get("timeout"),
+        "env": original_spool.get("env"),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "completed_at": None,
+        "pid": None,
+        "error": None,
+        "harness": "kimi",
+    }
+
+    # Write spool to disk
+    _write_spool(spool_id, spool)
+
+    # Spawn the process detached
+    pid = _spawn_detached(spool_id, kimi_cmd, working_dir, original_spool.get("env"))
+
+    # Update spool with PID and status
+    spool["pid"] = pid
+    spool["status"] = "running"
+    _write_spool(spool_id, spool)
+
+    # Start background monitor thread
+    threading.Thread(target=_monitor_spool, args=(spool_id,), daemon=True).start()
+
+    return spool_id
+
+
+def _kimi_unspool_sync(spool_id: str) -> str:
+    """Synchronous implementation of kimi_unspool - checks Kimi spool status."""
     _check_and_finalize_spool(spool_id)
     spool = _read_spool(spool_id)
     if not spool:
