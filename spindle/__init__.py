@@ -1592,17 +1592,28 @@ def _spin_wait_sync(
     poll_interval = 3  # seconds
 
     if mode == "yield":
-        # Return as soon as any completes
+        # Return first completed spool with its ID so caller can track progress.
+        # Includes remaining IDs for the caller to use in the next yield call.
         while True:
             for spool_id in ids:
                 _check_and_finalize_spool(spool_id)
                 spool = _read_spool(spool_id)
                 if not spool:
-                    return f"Error: Unknown spool_id '{spool_id}'"
+                    return json.dumps({"spool_id": spool_id, "error": f"Unknown spool_id '{spool_id}'"})
                 if spool.get("status") == "complete":
-                    return spool.get("result", "No result")
+                    remaining = [s for s in ids if s != spool_id]
+                    return json.dumps({
+                        "spool_id": spool_id,
+                        "result": spool.get("result", "No result"),
+                        "remaining": remaining,
+                    })
                 elif spool.get("status") == "error":
-                    return f"Error: {spool.get('error')}"
+                    remaining = [s for s in ids if s != spool_id]
+                    return json.dumps({
+                        "spool_id": spool_id,
+                        "error": spool.get("error"),
+                        "remaining": remaining,
+                    })
 
             if timeout:
                 elapsed = (datetime.now() - start_time).total_seconds()
@@ -1773,7 +1784,10 @@ async def spin_wait(
               or "06:00" (absolute time, wait until then)
 
     Returns:
-        Results from completed spools, or wait status if using time parameter
+        Results from completed spools, or wait status if using time parameter.
+        In yield mode, returns JSON with {spool_id, result, remaining} so the
+        caller knows which spool completed and can pass remaining IDs to the
+        next yield call.
 
     Examples:
         spin_wait("abc123,def456")  # Wait for spools
@@ -1833,17 +1847,28 @@ async def spin_wait(
     poll_interval = 3  # seconds
 
     if mode == "yield":
-        # Return as soon as any completes
+        # Return first completed spool with its ID so caller can track progress.
+        # Includes remaining IDs for the caller to use in the next yield call.
         while True:
             for spool_id in ids:
                 _check_and_finalize_spool(spool_id)
                 spool = _read_spool(spool_id)
                 if not spool:
-                    return f"Error: Unknown spool_id '{spool_id}'"
+                    return json.dumps({"spool_id": spool_id, "error": f"Unknown spool_id '{spool_id}'"})
                 if spool.get("status") == "complete":
-                    return spool.get("result", "No result")
+                    remaining = [s for s in ids if s != spool_id]
+                    return json.dumps({
+                        "spool_id": spool_id,
+                        "result": spool.get("result", "No result"),
+                        "remaining": remaining,
+                    })
                 elif spool.get("status") == "error":
-                    return f"Error: {spool.get('error')}"
+                    remaining = [s for s in ids if s != spool_id]
+                    return json.dumps({
+                        "spool_id": spool_id,
+                        "error": spool.get("error"),
+                        "remaining": remaining,
+                    })
 
             if timeout:
                 elapsed = (datetime.now() - start_time).total_seconds()
@@ -2312,15 +2337,8 @@ async def spool_retry(spool_id: str) -> str:
     harness_lower = harness.lower() if harness else "claude-code"
 
     if harness_lower == "codex":
-        # Map Claude Code parameters to Codex parameters
-        permission = spool.get("permission")
-        sandbox = None
-        if permission == "readonly":
-            sandbox = "read-only"
-        elif permission in ("full", "shard"):
-            sandbox = "danger-full-access"
-        else:
-            sandbox = "workspace-write"
+        # Use stored sandbox directly (Codex spools store sandbox, not permission)
+        sandbox = spool.get("sandbox", "workspace-write")
 
         return await asyncio.to_thread(
             _codex_spin_sync,
