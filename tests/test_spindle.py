@@ -1,5 +1,6 @@
 """Tests for Spindle MCP server."""
 
+import asyncio
 import json
 import multiprocessing
 import os
@@ -14,6 +15,8 @@ from spindle import (
     GEMINI_MODEL_ALIASES,
     KIMI_MODEL_ALIASES,
     MAX_CONCURRENT,
+    _get_harnesses,
+    spin,
     PERMISSION_PROFILES,
     _check_and_finalize_spool,
     _cleanup_shard,
@@ -1128,3 +1131,41 @@ class TestKimiHarness:
         assert "Follow up question" in captured_cmd
 
 
+class TestSpinHarnesses:
+    """Test the spin_harnesses discovery tool."""
+
+    def test_returns_all_harnesses(self):
+        """spin_harnesses should list all four harnesses."""
+        result = _get_harnesses()
+        assert set(result.keys()) == {"claude-code", "codex", "gemini", "kimi"}
+
+    def test_each_harness_has_required_keys(self):
+        """Each harness entry should have models, default_model, and requires."""
+        result = _get_harnesses()
+        for name, info in result.items():
+            assert "models" in info, f"{name} missing 'models'"
+            assert "default_model" in info, f"{name} missing 'default_model'"
+            assert "requires" in info, f"{name} missing 'requires'"
+
+    def test_gemini_models_match_aliases(self):
+        """Gemini models in harnesses should match GEMINI_MODEL_ALIASES."""
+        result = _get_harnesses()
+        assert result["gemini"]["models"] == GEMINI_MODEL_ALIASES
+
+    def test_kimi_models_match_aliases(self):
+        """Kimi models in harnesses should match KIMI_MODEL_ALIASES."""
+        result = _get_harnesses()
+        assert result["kimi"]["models"] == KIMI_MODEL_ALIASES
+
+    def test_claude_code_models(self):
+        """Claude Code should list haiku, sonnet, opus."""
+        result = _get_harnesses()
+        assert set(result["claude-code"]["models"].keys()) == {"haiku", "sonnet", "opus"}
+
+    def test_unknown_harness_returns_error(self):
+        """spin() should return error JSON for unknown harness names."""
+        result = asyncio.run(spin.fn("test prompt", harness="bogus"))
+        parsed = json.loads(result)
+        assert "error" in parsed
+        assert "bogus" in parsed["error"]
+        assert "claude-code" in parsed["error"]

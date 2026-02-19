@@ -1028,7 +1028,8 @@ def _monitor_spool(spool_id: str) -> None:
         spool = _read_spool(spool_id)
         if spool and spool.get("timeout"):
             created = datetime.fromisoformat(spool["created_at"])
-            elapsed = (datetime.now() - created).total_seconds()
+            now = datetime.now(timezone.utc) if created.tzinfo else datetime.now()
+            elapsed = (now - created).total_seconds()
             if elapsed > spool["timeout"]:
                 # Kill the process
                 pid = spool.get("pid")
@@ -1329,10 +1330,13 @@ async def spin(
         allowed_tools: Override permission profile with explicit tool list
         tags: Comma-separated tags for organizing spools (e.g. "batch-1,triage")
         model: Model to use - for Claude: "haiku", "sonnet", "opus";
-               for Gemini: "flash", "pro", "lite", or full model names like "gemini-2.5-pro".
+               for Gemini: "flash", "pro", or full model names like "gemini-2.5-pro";
+               for Kimi: "thinking", "thinking-turbo", "turbo", "latest", or full model names.
+               Use spin_harnesses() to see all available models.
         timeout: Kill spool after this many seconds (default: no timeout)
         skeinless: Skip SKEIN context injection for shard agents (default: False)
-        harness: Which harness to use - "claude-code" (default), "codex", or "gemini"
+        harness: Which harness to use - "claude-code" (default), "codex", "gemini", or "kimi".
+                 Use spin_harnesses() to see available harnesses and their models.
         env: Optional dict of environment variables to set in spawned agent
 
     Returns:
@@ -1345,11 +1349,19 @@ async def spin(
         spool_id = spin("Quick task", model="haiku", timeout=60)
         spool_id = spin("Write a parser", harness="codex")  # Use Codex instead
         spool_id = spin("Summarize this", harness="gemini", model="flash")  # Use Gemini
+        spool_id = spin("Analyze code", harness="kimi", model="thinking")  # Use Kimi
         spool_id = spin("Do something", env={"CC_THINKING_BOOST": "1"})
         result = unspool(spool_id)
     """
     # Normalize harness parameter (case-insensitive)
     harness_lower = harness.lower() if harness else None
+
+    # Validate harness name
+    valid_harnesses = set(_get_harnesses().keys())
+    if harness_lower and harness_lower not in valid_harnesses:
+        return json.dumps({
+            "error": f"Unknown harness: {harness!r}. Valid harnesses: {', '.join(sorted(valid_harnesses))}. Use spin_harnesses() to see details.",
+        })
 
     # Route to appropriate harness
     if harness_lower == "codex":
@@ -1749,11 +1761,12 @@ async def respin(
     prompt: str,
 ) -> str:
     """
-    Continue an existing Claude Code session with a new message.
+    Continue an existing session with a new message.
     Returns immediately with spool_id.
 
-    If the session has expired on Claude's end, automatically falls back
-    to transcript injection to recreate context.
+    Auto-detects the harness (claude-code, codex, gemini, kimi) from the
+    original spool. For Claude Code sessions, falls back to transcript
+    injection if the session has expired.
 
     Args:
         session_id: The session ID to continue
@@ -2725,6 +2738,46 @@ async def spool_stats() -> str:
     return json.dumps(stats, indent=2)
 
 
+def _get_harnesses() -> dict:
+    """Return harness metadata. Separate function so tests can import it."""
+    return {
+        "claude-code": {
+            "models": {"haiku": "haiku", "sonnet": "sonnet", "opus": "opus"},
+            "default_model": "sonnet",
+            "requires": "claude CLI",
+        },
+        "codex": {
+            "models": "pass-through (any model string accepted by codex CLI)",
+            "default_model": None,
+            "requires": "codex CLI",
+        },
+        "gemini": {
+            "models": GEMINI_MODEL_ALIASES,
+            "default_model": "gemini-2.5-pro",
+            "requires": "gemini CLI",
+        },
+        "kimi": {
+            "models": KIMI_MODEL_ALIASES,
+            "default_model": "moonshot-ai/kimi-k2-thinking",
+            "requires": "kimi-cli",
+        },
+    }
+
+
+@mcp.tool()
+async def spin_harnesses() -> str:
+    """
+    List available harnesses and their supported models.
+
+    Returns JSON with each harness, its model aliases, default model, and
+    required CLI tool. Use this to discover what's available for spin().
+
+    Example:
+        harnesses = spin_harnesses()  # See all harnesses and models
+    """
+    return json.dumps(_get_harnesses(), indent=2)
+
+
 @mcp.tool()
 async def spool_export(
     spool_ids: str,
@@ -3609,7 +3662,7 @@ def _kimi_spin_sync(
         "tags": tag_list,
         "timeout": timeout,
         "env": env,
-        "created_at": datetime.now(timezone.utc).isoformat(),
+        "created_at": datetime.now().isoformat(),
         "completed_at": None,
         "pid": None,
         "error": None,
@@ -3691,7 +3744,7 @@ def _kimi_respin_sync(
         "tags": tag_list,
         "timeout": original_spool.get("timeout"),
         "env": original_spool.get("env"),
-        "created_at": datetime.now(timezone.utc).isoformat(),
+        "created_at": datetime.now().isoformat(),
         "completed_at": None,
         "pid": None,
         "error": None,
@@ -3817,7 +3870,7 @@ def main():
     spin_parser.add_argument("--working-dir", "-d", help="Directory for the agent (default: current)")
     spin_parser.add_argument("--allowed-tools", help="Override permission profile with explicit tool list")
     spin_parser.add_argument("--tags", help="Comma-separated tags for organizing spools")
-    spin_parser.add_argument("--model", "-m", choices=["haiku", "sonnet", "opus"], help="Model to use")
+    spin_parser.add_argument("--model", "-m", help="Model to use (e.g. haiku/sonnet/opus for Claude, flash/pro for Gemini, thinking/turbo for Kimi)")
     spin_parser.add_argument("--timeout", "-t", type=int, help="Kill spool after N seconds")
     spin_parser.add_argument("--skeinless", action="store_true", help="Skip SKEIN context injection for shard agents")
     spin_parser.add_argument("--human", action="store_true", help="Human-readable output instead of JSON")

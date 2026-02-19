@@ -6,7 +6,7 @@
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 -->
 
-MCP server for Claude Code to Claude Code delegation. Spawn background agents that run asynchronously, with optional git worktree isolation for safe parallel work.
+MCP server for multi-harness AI agent delegation. Spawn background agents (Claude Code, Codex, Gemini, Kimi) that run asynchronously, with optional git worktree isolation for safe parallel work.
 
 ## Features
 
@@ -228,6 +228,12 @@ Spindle supports multiple AI agent harnesses, allowing you to choose the best to
 - Models: `"flash"`, `"pro"`, or any full model name
 - Use `harness="gemini"`
 
+**Kimi CLI** - Moonshot AI's Kimi models via `kimi-cli`
+- Fast startup (~5-10 seconds to first response)
+- Thinking mode for complex reasoning
+- Models: `"thinking"`, `"thinking-turbo"`, `"turbo"`, `"latest"`, or any full model name
+- Use `harness="kimi"`
+
 ### Basic Usage
 
 ```python
@@ -245,6 +251,13 @@ spool_id = spin(
 spool_id = spin(
     prompt="Summarize this codebase",
     harness="gemini",
+    working_dir="/path/to/project"
+)
+
+# Kimi CLI - fast reasoning with thinking mode
+spool_id = spin(
+    prompt="Analyze this bug",
+    harness="kimi",
     working_dir="/path/to/project"
 )
 
@@ -268,6 +281,10 @@ result = unspool(spool_id)  # Auto-detects harness
 - Running many parallel tasks on a budget (free tier)
 - Need a quick general-purpose agent
 
+**Use Kimi when:**
+- Need thinking mode for complex reasoning at speed
+- Want fast startup with strong reasoning capabilities
+
 ### Requirements
 
 **Claude Code:**
@@ -281,6 +298,10 @@ result = unspool(spool_id)  # Auto-detects harness
 - [Gemini CLI](https://github.com/google-gemini/gemini-cli) installed (`npm i -g @google/gemini-cli`)
 - Google account login (`gemini` → "Login with Google") or `GEMINI_API_KEY` env var
 
+**Kimi CLI:**
+- [Kimi CLI](https://github.com/MoonshotAI/kimi-cli) installed (`pip install kimi-cli`)
+- Auth via `kimi-cli login` or API key in `~/.kimi/config.toml`
+
 See [docs/MULTI_HARNESS_GUIDE.md](docs/MULTI_HARNESS_GUIDE.md) and [docs/CODEX_SETUP.md](docs/CODEX_SETUP.md) for detailed documentation.
 
 ## API
@@ -289,16 +310,16 @@ See [docs/MULTI_HARNESS_GUIDE.md](docs/MULTI_HARNESS_GUIDE.md) and [docs/CODEX_S
 
 | Tool | Purpose |
 |------|---------|
-| `spin(prompt, permission?, shard?, system_prompt?, working_dir?, allowed_tools?, tags?, model?, timeout?, harness?)` | Spawn agent (Claude Code or Codex), return spool_id |
+| `spin(prompt, permission?, shard?, system_prompt?, working_dir?, allowed_tools?, tags?, model?, timeout?, harness?)` | Spawn agent, return spool_id |
 | `unspool(spool_id)` | Get result (auto-detects harness, non-blocking) |
 | `respin(session_id, prompt)` | Continue session (auto-detects harness) |
 
 **spin() parameters:**
 - `prompt` (required): The task for the agent
-- `harness` (optional): "claude-code" (default), "codex", or "gemini"
-- `working_dir` (optional for Claude, required for Codex/Gemini): Project directory
+- `harness` (optional): "claude-code" (default), "codex", "gemini", or "kimi"
+- `working_dir` (optional for Claude, required for Codex/Gemini/Kimi): Project directory
 - `permission` (optional): "readonly", "careful" (default), "full", "shard", "careful+shard"
-- `model` (optional): Model to use ("sonnet", "opus", "haiku" for Claude; for Gemini: "flash", "pro")
+- `model` (optional): Model to use ("sonnet", "opus", "haiku" for Claude; "flash", "pro" for Gemini; "thinking", "turbo" for Kimi)
 - `timeout` (optional): Auto-kill after N seconds
 - `tags` (optional): Comma-separated tags for organization
 - `shard` (optional): Create isolated git worktree (can also use `permission="shard"`)
@@ -320,6 +341,7 @@ See [docs/MULTI_HARNESS_GUIDE.md](docs/MULTI_HARNESS_GUIDE.md) and [docs/CODEX_S
 | `spool_peek(spool_id, lines?)` | See partial output while running |
 | `spool_dashboard()` | Overview of running/complete/needs-attention |
 | `spool_stats()` | Get summary statistics |
+| `spin_harnesses()` | List available harnesses, models, and defaults |
 | `spool_export(spool_ids, format?, output_path?)` | Export to file |
 | `shard_status(spool_id)` | Check shard worktree status |
 | `shard_merge(spool_id, keep_branch?)` | Merge shard to master |
@@ -408,7 +430,7 @@ Storage location: `~/.spindle/spools/`
 
 ## How It Works
 
-1. **spin()** spawns a detached `claude` CLI process with the given prompt
+1. **spin()** spawns a detached CLI process (claude, codex, gemini, or kimi-cli) with the given prompt
 2. The process runs in background, writing output to temporary files
 3. A monitor thread polls for completion
 4. **unspool()** returns the result once complete (non-blocking check)

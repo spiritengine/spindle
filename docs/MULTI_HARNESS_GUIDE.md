@@ -14,20 +14,21 @@ Spindle abstracts the underlying AI agent implementation through a "harness" lay
 - Transparent integration with Spindle's spool management
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│                    Spindle MCP Server                        │
-│  ┌────────────────────────────────────────────────────────┐  │
-│  │         Unified API (spin/unspool/respin)              │  │
-│  └────────────────────────────────────────────────────────┘  │
-│         ▼                  ▼                  ▼              │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐   │
-│  │Claude Harness│  │Codex Harness │  │ Gemini Harness   │   │
-│  └──────────────┘  └──────────────┘  └──────────────────┘   │
-│         ▼                  ▼                  ▼              │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐   │
-│  │  claude CLI  │  │  codex CLI   │  │   gemini CLI     │   │
-│  └──────────────┘  └──────────────┘  └──────────────────┘   │
-└──────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                           Spindle MCP Server                                 │
+│  ┌────────────────────────────────────────────────────────────────────────┐  │
+│  │              Unified API (spin/unspool/respin/spin_harnesses)          │  │
+│  └────────────────────────────────────────────────────────────────────────┘  │
+│       ▼                ▼                ▼                ▼                   │
+│  ┌──────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐        │
+│  │  Claude  │  │    Codex     │  │    Gemini    │  │     Kimi     │        │
+│  │  Harness │  │    Harness   │  │    Harness   │  │    Harness   │        │
+│  └──────────┘  └──────────────┘  └──────────────┘  └──────────────┘        │
+│       ▼                ▼                ▼                ▼                   │
+│  ┌──────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐        │
+│  │claude CLI│  │  codex CLI   │  │  gemini CLI  │  │  kimi-cli    │        │
+│  └──────────┘  └──────────────┘  └──────────────┘  └──────────────┘        │
+└──────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Available Harnesses
@@ -130,7 +131,7 @@ spin(
 - No model specified → `moonshot-ai/kimi-k2-thinking` (default)
 - Any other string passes through to the CLI as-is
 
-**Important:** Kimi requires `working_dir` to be specified. Session continuity is working-directory based (not explicit session IDs). Auth via `kimi-cli login` or direct API key configuration.
+**Important:** Kimi requires `working_dir` to be specified. Session continuity uses explicit UUID session IDs generated upfront. Auth via `kimi-cli login` or direct API key configuration in `~/.kimi/config.toml`.
 
 ## Unified API
 
@@ -154,7 +155,7 @@ spool_id = spin(
 
 **Common parameters (work with all harnesses):**
 - `prompt` - The task description
-- `harness` - "claude-code", "codex", or "gemini"
+- `harness` - "claude-code", "codex", "gemini", or "kimi" (use `spin_harnesses()` to discover)
 - `model` - Model to use (harness-specific)
 - `timeout` - Auto-kill after N seconds
 - `tags` - Organization tags
@@ -172,6 +173,10 @@ spool_id = spin(
 **Gemini-specific parameters:**
 - `working_dir` - Required project directory
 - `system_prompt` - Prepended to prompt (Gemini CLI has no separate system prompt flag)
+
+**Kimi-specific parameters:**
+- `working_dir` - Required project directory
+- `system_prompt` - Prepended to prompt
 
 ### unspool()
 
@@ -237,7 +242,7 @@ This means you can work with spools without remembering which harness created th
 
 ## Session Continuity
 
-Claude Code and Codex support session continuity through `respin()`:
+All harnesses support session continuity through `respin()`:
 
 **Claude Code:**
 - Uses `--resume <session_id>` flag
@@ -252,6 +257,10 @@ Claude Code and Codex support session continuity through `respin()`:
 **Gemini:**
 - Uses `gemini --resume <session_id>` flag
 - Session IDs extracted from JSON output
+
+**Kimi:**
+- Uses `kimi-cli --session <session_id>` with explicit UUID
+- Session IDs generated upfront and stored in spool metadata
 
 ## Choosing the Right Harness
 
@@ -316,6 +325,23 @@ spin("Create a basic REST API for user CRUD", harness="codex", working_dir="/app
 # Launch 10 quick edits in parallel
 for task in quick_tasks:
     spin(task, harness="codex", working_dir="/app")
+```
+
+### Use Kimi for:
+
+✅ **Complex reasoning at speed** (thinking mode)
+```python
+spin("Analyze this race condition and propose a fix", harness="kimi", working_dir="/app")
+```
+
+✅ **Deep code analysis**
+```python
+spin("Review this module for subtle bugs", harness="kimi", working_dir="/app", model="thinking")
+```
+
+✅ **Fast general tasks**
+```python
+spin("Add input validation to the API endpoints", harness="kimi", working_dir="/app", model="turbo")
 ```
 
 ## Sandbox and Permission Models
@@ -388,7 +414,7 @@ spool_dashboard()
 spin_wait("id1,id2,id3")
 ```
 
-Codex and Gemini spools are automatically tagged with "codex" or "gemini" for easy filtering.
+Non-default harness spools are automatically tagged with their harness name ("codex", "gemini", "kimi") for easy filtering.
 
 ## Concurrency Limits
 
@@ -401,6 +427,7 @@ This prevents resource exhaustion regardless of which harness you use:
 spin("Task 1", harness="claude-code")  # 1/15
 spin("Task 2", harness="codex", working_dir="/app")  # 2/15
 spin("Task 3", harness="gemini", working_dir="/app")  # 3/15
+spin("Task 4", harness="kimi", working_dir="/app")  # 4/15
 # ... up to 15 total
 ```
 
@@ -415,12 +442,13 @@ Use `spools()` to check status or `spin_drop(spool_id)` to cancel running work.
 
 ### Harness Not Found
 
-**Error:** `"codex: command not found"` or `"gemini: command not found"`
+**Error:** `"codex: command not found"` or `"gemini: command not found"` or `"kimi-cli: command not found"`
 
 **Solution:** Install the CLI:
 ```bash
-npm i -g @openai/codex    # For Codex
+npm i -g @openai/codex       # For Codex
 npm i -g @google/gemini-cli  # For Gemini
+pip install kimi-cli         # For Kimi
 ```
 
 ### Authentication Issues
@@ -442,6 +470,13 @@ codex             # Run interactively to authenticate (requires ChatGPT Plus/Pro
 gemini --version  # Verify installation
 gemini            # Run interactively, select "Login with Google"
 # Or set GEMINI_API_KEY environment variable
+```
+
+**Kimi:**
+```bash
+kimi-cli --version  # Verify installation
+kimi-cli login      # Authenticate
+# Or configure API key in ~/.kimi/config.toml
 ```
 
 ### Landlock Errors (Codex)
@@ -489,6 +524,7 @@ If `respin()` fails:
 3. **Claude Code:** Falls back to transcript injection automatically
 4. **Codex:** Session ID must be valid from previous `codex exec --json` output
 5. **Gemini:** Uses `gemini --resume <session_id>`
+6. **Kimi:** Uses explicit UUID session ID from spool metadata
 
 ## Future Enhancements
 
@@ -507,7 +543,8 @@ Planned improvements to the harness system:
 1. **Default to Claude for complex work** - Better reasoning and code understanding
 2. **Use Codex or Gemini for speed** - Much faster startup for simple tasks
 3. **Use Gemini for budget work** - Generous free tier with Google account
-4. **Always specify working_dir for Codex/Gemini** - Required parameter
+4. **Use Kimi for fast reasoning** - Thinking mode at speed
+5. **Always specify working_dir for Codex/Gemini/Kimi** - Required parameter
 5. **Use tags to organize** - Tag by harness, task type, or project
 6. **Monitor with spool_dashboard()** - Track mixed harness workloads
 7. **Test on your chosen harness** - Validate that tasks work as expected
@@ -538,8 +575,16 @@ research_id = spin(
     model="flash"
 )
 
+# Deep reasoning with Kimi
+review_id = spin(
+    "Review the LRU cache for edge cases and thread safety issues",
+    harness="kimi",
+    working_dir="/path/to/project",
+    model="thinking"
+)
+
 # Wait for all
-results = spin_wait(f"{analysis_id},{prototype_id},{research_id}", mode="gather")
+results = spin_wait(f"{analysis_id},{prototype_id},{research_id},{review_id}", mode="gather")
 
 # Continue with Claude based on analysis
 session = _read_spool(analysis_id)["session_id"]

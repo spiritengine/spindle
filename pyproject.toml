@@ -1,7 +1,7 @@
 [project]
 name = "spindle-mcp"
-version = "1.0.2"
-description = "MCP server for Claude Code to Claude Code delegation"
+version = "1.1.0"
+description = "MCP server for multi-harness AI agent delegation"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
