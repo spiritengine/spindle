@@ -1278,7 +1278,7 @@ Your task:
         "system_prompt": system_prompt,
         "tags": tag_list,
         "shard": shard_info,
-        "base_branch": base_branch if base_branch != "master" else None,
+        "base_branch": base_branch,
         "model": model,
         "timeout": timeout,
         "env": env,
