@@ -1345,7 +1345,7 @@ async def spin(
         harness: Which harness to use - "claude-code" (default), "codex", "gemini", or "kimi".
                  Use spin_harnesses() to see available harnesses and their models.
         env: Optional dict of environment variables to set in spawned agent
-        base_branch: Branch to fork shard from (default: "master"). Only used with shard/shard permissions.
+        base_branch: Branch to fork shard from (default: "master"). Only used with shard or careful+shard permissions.
 
     Returns:
         spool_id to check result later
@@ -3883,6 +3883,7 @@ def main():
     spin_parser.add_argument("--model", "-m", help="Model to use (e.g. haiku/sonnet/opus for Claude, flash/pro for Gemini, thinking/turbo for Kimi)")
     spin_parser.add_argument("--timeout", "-t", type=int, help="Kill spool after N seconds")
     spin_parser.add_argument("--skeinless", action="store_true", help="Skip SKEIN context injection for shard agents")
+    spin_parser.add_argument("--base-branch", default=None, help="Branch to fork shard from (default: master)")
     spin_parser.add_argument("--human", action="store_true", help="Human-readable output instead of JSON")
 
     # unspool command - get result
@@ -3979,6 +3980,7 @@ def main():
             model=args.model,
             timeout=args.timeout,
             skeinless=args.skeinless,
+            base_branch=args.base_branch or "master",
             env=None,
         )
         if result.startswith("Error:"):
