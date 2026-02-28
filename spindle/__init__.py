@@ -150,7 +150,7 @@ def _resolve_permission(permission: Optional[str], allowed_tools: Optional[str])
     return PERMISSION_PROFILES["careful"], False
 
 
-def _spawn_shard(agent_id: str, working_dir: str) -> Optional[Dict[str, str]]:
+def _spawn_shard(agent_id: str, working_dir: str, base_branch: str = "master") -> Optional[Dict[str, str]]:
     """
     Create an isolated git worktree (SHARD) for the agent.
 
@@ -159,6 +159,7 @@ def _spawn_shard(agent_id: str, working_dir: str) -> Optional[Dict[str, str]]:
     Args:
         agent_id: Identifier for the shard (used in worktree name)
         working_dir: Base directory for the worktree
+        base_branch: Branch to fork from (default: "master")
 
     Returns:
         Dict with shard info if successful, None if failed
@@ -167,8 +168,11 @@ def _spawn_shard(agent_id: str, working_dir: str) -> Optional[Dict[str, str]]:
     if _has_skein(working_dir):
         # Use SKEIN's shard spawn command
         try:
+            cmd = ["skein", "shard", "spawn", "--agent", agent_id, "--description", f"Spindle spool for {agent_id}"]
+            if base_branch != "master":
+                cmd.extend(["--base", base_branch])
             result = subprocess.run(
-                ["skein", "shard", "spawn", "--agent", agent_id, "--description", f"Spindle spool for {agent_id}"],
+                cmd,
                 capture_output=True,
                 text=True,
                 cwd=working_dir,
@@ -210,9 +214,9 @@ def _spawn_shard(agent_id: str, working_dir: str) -> Optional[Dict[str, str]]:
         worktree_path = worktrees_dir / worktree_name
         branch_name = f"shard-{worktree_name}"
 
-        # Create git worktree with new branch
+        # Create git worktree with new branch forked from base_branch
         result = subprocess.run(
-            ["git", "worktree", "add", str(worktree_path), "-b", branch_name],
+            ["git", "worktree", "add", str(worktree_path), "-b", branch_name, base_branch],
             capture_output=True,
             text=True,
             cwd=working_dir,
@@ -1115,6 +1119,7 @@ def _spin_sync(
     timeout: Optional[int],
     skeinless: bool,
     env: Optional[Dict[str, str]],
+    base_branch: str = "master",
 ) -> str:
     """Synchronous implementation of spin - runs in thread pool."""
     # Require working_dir - os.getcwd() returns MCP server dir, not caller's project
@@ -1143,7 +1148,7 @@ def _spin_sync(
     # Handle shard creation
     shard_info = None
     if use_shard:
-        shard_info = _spawn_shard(spool_id, cwd)
+        shard_info = _spawn_shard(spool_id, cwd, base_branch=base_branch)
         if shard_info:
             cwd = shard_info["worktree_path"]
         else:
@@ -1273,6 +1278,7 @@ Your task:
         "system_prompt": system_prompt,
         "tags": tag_list,
         "shard": shard_info,
+        "base_branch": base_branch if base_branch != "master" else None,
         "model": model,
         "timeout": timeout,
         "env": env,
@@ -1314,6 +1320,7 @@ async def spin(
     skeinless: bool = False,
     harness: Optional[str] = None,
     env: Optional[Dict[str, str]] = None,
+    base_branch: Optional[str] = None,
 ) -> str:
     """
     Spawn an agent to handle a task. Returns immediately with spool_id.
@@ -1338,6 +1345,7 @@ async def spin(
         harness: Which harness to use - "claude-code" (default), "codex", "gemini", or "kimi".
                  Use spin_harnesses() to see available harnesses and their models.
         env: Optional dict of environment variables to set in spawned agent
+        base_branch: Branch to fork shard from (default: "master"). Only used with shard or careful+shard permissions.
 
     Returns:
         spool_id to check result later
@@ -1351,6 +1359,7 @@ async def spin(
         spool_id = spin("Summarize this", harness="gemini", model="flash")  # Use Gemini
         spool_id = spin("Analyze code", harness="kimi", model="thinking")  # Use Kimi
         spool_id = spin("Do something", env={"CC_THINKING_BOOST": "1"})
+        spool_id = spin("Fork from branch", permission="shard", base_branch="feature-x")
         result = unspool(spool_id)
     """
     # Normalize harness parameter (case-insensitive)
@@ -1421,6 +1430,7 @@ async def spin(
             timeout,
             skeinless,
             env,
+            base_branch=base_branch or "master",
         )
 
 
@@ -3873,6 +3883,7 @@ def main():
     spin_parser.add_argument("--model", "-m", help="Model to use (e.g. haiku/sonnet/opus for Claude, flash/pro for Gemini, thinking/turbo for Kimi)")
     spin_parser.add_argument("--timeout", "-t", type=int, help="Kill spool after N seconds")
     spin_parser.add_argument("--skeinless", action="store_true", help="Skip SKEIN context injection for shard agents")
+    spin_parser.add_argument("--base-branch", default=None, help="Branch to fork shard from (default: master)")
     spin_parser.add_argument("--human", action="store_true", help="Human-readable output instead of JSON")
 
     # unspool command - get result
@@ -3969,6 +3980,7 @@ def main():
             model=args.model,
             timeout=args.timeout,
             skeinless=args.skeinless,
+            base_branch=args.base_branch or "master",
             env=None,
         )
         if result.startswith("Error:"):
