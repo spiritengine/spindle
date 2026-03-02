@@ -589,6 +589,23 @@ def _extract_last_json_object(text: str) -> Optional[dict]:
     return None
 
 
+def _extract_cc_result(data) -> Optional[dict]:
+    """Extract the result dict from Claude Code CLI output.
+
+    Handles both the old format (single JSON object with result/error/session_id)
+    and the new format (JSON array of events, with the result in a type=result event).
+    Returns the result dict, or None if not found.
+    """
+    if isinstance(data, dict):
+        return data
+    if isinstance(data, list):
+        # New format: array of events. Find the result event.
+        for item in reversed(data):
+            if isinstance(item, dict) and item.get("type") == "result":
+                return item
+    return None
+
+
 def _is_pid_alive(pid: int) -> bool:
     """Check if a process is still running (not a zombie)."""
     try:
@@ -768,9 +785,10 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
                             except json.JSONDecodeError:
                                 continue
                     else:
-                        # Claude Code / Gemini use single JSON object
+                        # Claude Code / Gemini output
                         data = json.loads(content)
-                        if "result" in data or "error" in data or "response" in data:
+                        cc_result = _extract_cc_result(data)
+                        if cc_result and ("result" in cc_result or "error" in cc_result or "response" in cc_result):
                             output_complete = True
             except (IOError, json.JSONDecodeError):
                 pass
@@ -917,13 +935,22 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
                 spool["error"] = "Process exited with no output"
 
         else:
-            # Claude Code: single JSON object format
+            # Claude Code: JSON object or JSON array of events
             try:
                 data = json.loads(stdout)
-                spool["result"] = data.get("result", stdout)
-                spool["session_id"] = data.get("session_id")
-                spool["cost"] = data.get("cost")
-                spool["status"] = "complete"
+                cc_result = _extract_cc_result(data)
+                if cc_result:
+                    spool["result"] = cc_result.get("result", stdout)
+                    spool["session_id"] = cc_result.get("session_id")
+                    spool["cost"] = cc_result.get("cost") or cc_result.get("total_cost_usd")
+                    spool["status"] = "complete"
+                    if cc_result.get("is_error"):
+                        spool["status"] = "error"
+                        spool["error"] = cc_result.get("result", "Unknown error")
+                else:
+                    # Parsed JSON but no recognizable result structure
+                    spool["result"] = stdout
+                    spool["status"] = "complete"
             except json.JSONDecodeError:
                 if stdout.strip():
                     spool["result"] = stdout
