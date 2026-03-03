@@ -3908,6 +3908,7 @@ def main():
     spin_parser.add_argument("--allowed-tools", help="Override permission profile with explicit tool list")
     spin_parser.add_argument("--tags", help="Comma-separated tags for organizing spools")
     spin_parser.add_argument("--model", "-m", help="Model to use (e.g. haiku/sonnet/opus for Claude, flash/pro for Gemini, thinking/turbo for Kimi)")
+    spin_parser.add_argument("--harness", help="Harness to use: claude-code (default), codex, gemini, or kimi")
     spin_parser.add_argument("--timeout", "-t", type=int, help="Kill spool after N seconds")
     spin_parser.add_argument("--skeinless", action="store_true", help="Skip SKEIN context injection for shard agents")
     spin_parser.add_argument("--base-branch", default=None, help="Branch to fork shard from (default: master)")
@@ -3996,20 +3997,59 @@ def main():
 
     elif args.command == "spin":
         working_dir = args.working_dir or os.getcwd()
-        result = _spin_sync(
-            prompt=args.prompt,
-            permission=args.permission,
-            shard=args.shard,
-            system_prompt=args.system_prompt,
-            working_dir=working_dir,
-            allowed_tools=args.allowed_tools,
-            tags=args.tags,
-            model=args.model,
-            timeout=args.timeout,
-            skeinless=args.skeinless,
-            base_branch=args.base_branch or "master",
-            env=None,
-        )
+        harness_lower = args.harness.lower() if args.harness else None
+        if harness_lower == "codex":
+            sandbox = None
+            if args.permission == "readonly":
+                sandbox = "read-only"
+            elif args.permission in ("full", "shard"):
+                sandbox = "danger-full-access"
+            else:
+                sandbox = "workspace-write"
+            result = _codex_spin_sync(
+                args.prompt,
+                working_dir,
+                args.model,
+                sandbox,
+                args.timeout,
+                args.tags,
+                None,
+            )
+        elif harness_lower == "gemini":
+            result = _gemini_spin_sync(
+                args.prompt,
+                working_dir,
+                args.model,
+                args.system_prompt,
+                args.timeout,
+                args.tags,
+                None,
+            )
+        elif harness_lower == "kimi":
+            result = _kimi_spin_sync(
+                args.prompt,
+                working_dir,
+                args.model,
+                args.system_prompt,
+                args.timeout,
+                args.tags,
+                None,
+            )
+        else:
+            result = _spin_sync(
+                prompt=args.prompt,
+                permission=args.permission,
+                shard=args.shard,
+                system_prompt=args.system_prompt,
+                working_dir=working_dir,
+                allowed_tools=args.allowed_tools,
+                tags=args.tags,
+                model=args.model,
+                timeout=args.timeout,
+                skeinless=args.skeinless,
+                base_branch=args.base_branch or "master",
+                env=None,
+            )
         if result.startswith("Error:"):
             if args.human:
                 print(f"Error: {result}")
