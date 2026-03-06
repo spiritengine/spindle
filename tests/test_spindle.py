@@ -6,7 +6,7 @@ import multiprocessing
 import os
 import subprocess
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -15,6 +15,7 @@ from spindle import (
     GEMINI_MODEL_ALIASES,
     KIMI_MODEL_ALIASES,
     MAX_CONCURRENT,
+    PENDING_SPAWN_TIMEOUT,
     PERMISSION_PROFILES,
     _check_and_finalize_spool,
     _cleanup_shard,
@@ -30,8 +31,10 @@ from spindle import (
     _list_spools,
     _parse_duration,
     _read_spool,
+    _recover_orphans,
     _resolve_permission,
     _spawn_shard,
+    _spin_sync,
     _spool_lock,
     _try_reserve_slot_and_create,
     _write_spool,
@@ -1170,3 +1173,158 @@ class TestSpinHarnesses:
         assert "error" in parsed
         assert "bogus" in parsed["error"]
         assert "claude-code" in parsed["error"]
+
+
+class TestSpawnFailureRecovery:
+    """Test that spawn failures mark spool as error instead of leaving it pending."""
+
+    def test_spin_sync_spawn_failure_marks_error(self, tmp_path):
+        """If _spawn_detached raises, spool should be marked as error."""
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle._count_running", return_value=0):
+                with patch("spindle._spawn_detached", side_effect=OSError("No such file")):
+                    result = _spin_sync(
+                        prompt="test prompt",
+                        permission=None,
+                        shard=False,
+                        system_prompt=None,
+                        working_dir="/tmp",
+                        allowed_tools=None,
+                        tags=None,
+                        model=None,
+                        timeout=None,
+                        skeinless=True,
+                        env=None,
+                    )
+
+            # Should return an error string
+            assert "Error" in result
+            assert "spawn" in result.lower()
+
+            # Spool should be marked as error, not pending
+            spools = _list_spools()
+            assert len(spools) == 1
+            spool = spools[0]
+            assert spool["status"] == "error"
+            assert "spawn failed" in spool["error"]
+            assert spool["completed_at"] is not None
+
+    def test_spin_sync_spawn_failure_frees_slot(self, tmp_path):
+        """After spawn failure, the slot should not count toward concurrency limit."""
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle._count_running", return_value=0):
+                with patch("spindle._spawn_detached", side_effect=OSError("No such file")):
+                    _spin_sync(
+                        prompt="test",
+                        permission=None,
+                        shard=False,
+                        system_prompt=None,
+                        working_dir="/tmp",
+                        allowed_tools=None,
+                        tags=None,
+                        model=None,
+                        timeout=None,
+                        skeinless=True,
+                        env=None,
+                    )
+
+            # Error spools should not count as running
+            count = _count_running()
+            assert count == 0
+
+    def test_kimi_spin_sync_spawn_failure_marks_error(self, tmp_path):
+        """If _spawn_detached raises in kimi path, spool should be marked as error."""
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle._count_running", return_value=0):
+                with patch("spindle._spawn_detached", side_effect=FileNotFoundError("kimi-cli not found")):
+                    result = _kimi_spin_sync(
+                        prompt="test prompt",
+                        working_dir="/tmp",
+                        model=None,
+                        system_prompt=None,
+                        timeout=None,
+                        tags=None,
+                        env=None,
+                    )
+
+            assert "Error" in result
+
+            spools = _list_spools()
+            assert len(spools) == 1
+            spool = spools[0]
+            assert spool["status"] == "error"
+            assert "spawn failed" in spool["error"]
+
+
+class TestRecoverOrphansPending:
+    """Test that _recover_orphans cleans up stale pending spools."""
+
+    def test_stale_pending_spool_marked_error(self, tmp_path):
+        """Pending spool with no PID older than timeout should be marked error."""
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            # Create a stale pending spool (created 120 seconds ago)
+            stale_time = (datetime.now() - timedelta(seconds=PENDING_SPAWN_TIMEOUT + 60)).isoformat()
+            _write_spool("stale1", {
+                "id": "stale1",
+                "status": "pending",
+                "pid": None,
+                "created_at": stale_time,
+            })
+
+            _recover_orphans()
+
+            spool = _read_spool("stale1")
+            assert spool["status"] == "error"
+            assert "spawn timeout" in spool["error"]
+            assert spool["completed_at"] is not None
+
+    def test_fresh_pending_spool_not_touched(self, tmp_path):
+        """Pending spool within timeout should remain pending."""
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            # Create a fresh pending spool (just now)
+            _write_spool("fresh1", {
+                "id": "fresh1",
+                "status": "pending",
+                "pid": None,
+                "created_at": datetime.now().isoformat(),
+            })
+
+            _recover_orphans()
+
+            spool = _read_spool("fresh1")
+            assert spool["status"] == "pending"
+
+    def test_pending_spool_with_pid_not_touched(self, tmp_path):
+        """Pending spool that has a PID should not be marked as error."""
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            stale_time = (datetime.now() - timedelta(seconds=PENDING_SPAWN_TIMEOUT + 60)).isoformat()
+            _write_spool("haspid", {
+                "id": "haspid",
+                "status": "pending",
+                "pid": 12345,
+                "created_at": stale_time,
+            })
+
+            _recover_orphans()
+
+            spool = _read_spool("haspid")
+            assert spool["status"] == "pending"
+
+    def test_stale_pending_frees_concurrency_slot(self, tmp_path):
+        """After recovery, stale pending spool should not count toward concurrency."""
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            stale_time = (datetime.now() - timedelta(seconds=PENDING_SPAWN_TIMEOUT + 60)).isoformat()
+            _write_spool("stale2", {
+                "id": "stale2",
+                "status": "pending",
+                "pid": None,
+                "created_at": stale_time,
+            })
+
+            # Before recovery, counts as running
+            assert _count_running() == 1
+
+            _recover_orphans()
+
+            # After recovery, no longer counts
+            assert _count_running() == 0

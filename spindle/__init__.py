@@ -64,6 +64,9 @@ SPINDLE_DIR = Path.home() / ".spindle" / "spools"
 # Concurrency limit (configurable via env var)
 MAX_CONCURRENT = int(os.environ.get("SPINDLE_MAX_CONCURRENT", "15"))
 
+# Timeout for pending spools that never got a PID (seconds)
+PENDING_SPAWN_TIMEOUT = 60
+
 # Poll interval for monitoring detached processes
 MONITOR_POLL_INTERVAL = 2  # seconds
 
@@ -985,10 +988,27 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
 
 
 def _recover_orphans() -> None:
-    """Check all running spools and finalize any that have completed."""
+    """Check all running spools and finalize any that have completed.
+
+    Also cleans up pending spools that never got a PID (spawn timeout).
+    """
+    now = datetime.now()
     for spool in _list_spools():
         if spool.get("status") == "running":
             _check_and_finalize_spool(spool["id"])
+        elif spool.get("status") == "pending" and not spool.get("pid"):
+            # Check if this pending spool has been stuck too long
+            created_at = spool.get("created_at")
+            if created_at:
+                try:
+                    created_time = datetime.fromisoformat(created_at)
+                    if (now - created_time).total_seconds() > PENDING_SPAWN_TIMEOUT:
+                        spool["status"] = "error"
+                        spool["error"] = "spawn timeout - never started"
+                        spool["completed_at"] = now.isoformat()
+                        _write_spool(spool["id"], spool)
+                except (ValueError, TypeError):
+                    pass
 
 
 def _handle_expired_session(spool_id: str, spool: dict) -> bool:
@@ -1319,7 +1339,15 @@ Your task:
     _write_spool(spool_id, spool)
 
     # Spawn detached process
-    pid = _spawn_detached(spool_id, cmd, cwd, env)
+    try:
+        pid = _spawn_detached(spool_id, cmd, cwd, env)
+    except Exception as e:
+        # Spawn failed - mark spool as error so the slot is freed
+        spool["status"] = "error"
+        spool["error"] = f"spawn failed: {e}"
+        spool["completed_at"] = datetime.now().isoformat()
+        _write_spool(spool_id, spool)
+        return f"Error: Failed to spawn process: {e}"
 
     # Update spool with PID and status
     spool["pid"] = pid
@@ -3619,7 +3647,15 @@ def _kimi_spin_sync(
     _write_spool(spool_id, spool)
 
     # Spawn the process detached
-    pid = _spawn_detached(spool_id, kimi_cmd, working_dir, env)
+    try:
+        pid = _spawn_detached(spool_id, kimi_cmd, working_dir, env)
+    except Exception as e:
+        # Spawn failed - mark spool as error so the slot is freed
+        spool["status"] = "error"
+        spool["error"] = f"spawn failed: {e}"
+        spool["completed_at"] = datetime.now().isoformat()
+        _write_spool(spool_id, spool)
+        return f"Error: Failed to spawn process: {e}"
 
     # Update spool with PID and status
     spool["pid"] = pid
