@@ -71,7 +71,7 @@ MONITOR_POLL_INTERVAL = 2  # seconds
 # These map to Claude Code's --allowedTools flag
 # Profiles ending with "+shard" auto-enable shard isolation
 PERMISSION_PROFILES = {
-    "readonly": "Read,Grep,Glob,Bash(ls:*),Bash(cat:*),Bash(head:*),Bash(tail:*),Bash(git status:*),Bash(git log:*),Bash(git diff:*)",
+    "readonly": "Read,Grep,Glob,Bash(ls:*),Bash(cat:*),Bash(head:*),Bash(tail:*),Bash(git status:*),Bash(git log:*),Bash(git diff:*),Bash(skein:*),Bash(python:*),Bash(find:*)",
     "careful": "Read,Write,Edit,Grep,Glob,Bash(git:*),Bash(make:*),Bash(pytest:*),Bash(python:*),Bash(npm:*),Bash(skein:*),Bash(muster:*)",
     "full": None,  # None means no restrictions
     # Shard variants - same permissions but auto-enable worktree isolation
@@ -923,7 +923,7 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
                         spool["result"] = stdout
                         spool["status"] = "complete"
                         # session_id already set when spool was created
-                except Exception as e:
+                except Exception:
                     spool["result"] = stdout
                     spool["status"] = "complete"
             elif stderr.strip():
@@ -3868,7 +3868,6 @@ async def spindle_reload() -> str:
 def main():
     import argparse
     import atexit
-    import sys
     import traceback
 
     parser = argparse.ArgumentParser(description="Spindle MCP server")

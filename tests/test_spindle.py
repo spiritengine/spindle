@@ -15,14 +15,13 @@ from spindle import (
     GEMINI_MODEL_ALIASES,
     KIMI_MODEL_ALIASES,
     MAX_CONCURRENT,
-    _get_harnesses,
-    spin,
     PERMISSION_PROFILES,
     _check_and_finalize_spool,
     _cleanup_shard,
     _count_running,
     _gemini_spin_sync,
     _gemini_unspool_sync,
+    _get_harnesses,
     _get_spool_path,
     _is_pid_alive,
     _kimi_respin_sync,
@@ -36,6 +35,7 @@ from spindle import (
     _spool_lock,
     _try_reserve_slot_and_create,
     _write_spool,
+    spin,
 )
 
 
@@ -144,7 +144,6 @@ class TestProcessUtils:
 
     def test_is_pid_alive_current_process(self):
         """Current process PID should be alive."""
-        import os
 
         assert _is_pid_alive(os.getpid()) is True
 
