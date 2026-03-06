@@ -1163,7 +1163,9 @@ class TestSpinHarnesses:
 
     def test_unknown_harness_returns_error(self):
         """spin() should return error JSON for unknown harness names."""
-        result = asyncio.run(spin.fn("test prompt", harness="bogus"))
+        # spin may be a FunctionTool (with .fn) or a plain function depending on fastmcp version
+        _spin = spin.fn if hasattr(spin, "fn") else spin
+        result = asyncio.run(_spin("test prompt", harness="bogus"))
         parsed = json.loads(result)
         assert "error" in parsed
         assert "bogus" in parsed["error"]

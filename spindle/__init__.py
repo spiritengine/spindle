@@ -1395,9 +1395,11 @@ async def spin(
     # Validate harness name
     valid_harnesses = set(_get_harnesses().keys())
     if harness_lower and harness_lower not in valid_harnesses:
-        return json.dumps({
-            "error": f"Unknown harness: {harness!r}. Valid harnesses: {', '.join(sorted(valid_harnesses))}. Use spin_harnesses() to see details.",
-        })
+        return json.dumps(
+            {
+                "error": f"Unknown harness: {harness!r}. Valid harnesses: {', '.join(sorted(valid_harnesses))}. Use spin_harnesses() to see details.",
+            }
+        )
 
     # Route to appropriate harness
     if harness_lower == "codex":
@@ -1651,18 +1653,22 @@ def _spin_wait_sync(
                     return json.dumps({"spool_id": spool_id, "error": f"Unknown spool_id '{spool_id}'"})
                 if spool.get("status") == "complete":
                     remaining = [s for s in ids if s != spool_id]
-                    return json.dumps({
-                        "spool_id": spool_id,
-                        "result": spool.get("result", "No result"),
-                        "remaining": remaining,
-                    })
+                    return json.dumps(
+                        {
+                            "spool_id": spool_id,
+                            "result": spool.get("result", "No result"),
+                            "remaining": remaining,
+                        }
+                    )
                 elif spool.get("status") == "error":
                     remaining = [s for s in ids if s != spool_id]
-                    return json.dumps({
-                        "spool_id": spool_id,
-                        "error": spool.get("error"),
-                        "remaining": remaining,
-                    })
+                    return json.dumps(
+                        {
+                            "spool_id": spool_id,
+                            "error": spool.get("error"),
+                            "remaining": remaining,
+                        }
+                    )
 
             if timeout:
                 elapsed = (datetime.now() - start_time).total_seconds()
@@ -1907,18 +1913,22 @@ async def spin_wait(
                     return json.dumps({"spool_id": spool_id, "error": f"Unknown spool_id '{spool_id}'"})
                 if spool.get("status") == "complete":
                     remaining = [s for s in ids if s != spool_id]
-                    return json.dumps({
-                        "spool_id": spool_id,
-                        "result": spool.get("result", "No result"),
-                        "remaining": remaining,
-                    })
+                    return json.dumps(
+                        {
+                            "spool_id": spool_id,
+                            "result": spool.get("result", "No result"),
+                            "remaining": remaining,
+                        }
+                    )
                 elif spool.get("status") == "error":
                     remaining = [s for s in ids if s != spool_id]
-                    return json.dumps({
-                        "spool_id": spool_id,
-                        "error": spool.get("error"),
-                        "remaining": remaining,
-                    })
+                    return json.dumps(
+                        {
+                            "spool_id": spool_id,
+                            "error": spool.get("error"),
+                            "remaining": remaining,
+                        }
+                    )
 
             if timeout:
                 elapsed = (datetime.now() - start_time).total_seconds()
@@ -3666,7 +3676,17 @@ def _kimi_spin_sync(
     resolved_model = KIMI_MODEL_ALIASES.get(model, model) if model else "moonshot-ai/kimi-k2-thinking"
 
     # Build kimi command: headless mode with auto-approve, stream-json output, and explicit session ID
-    kimi_cmd = ["kimi-cli", "--session", session_id, "--print", "--yolo", "--output-format", "stream-json", "-p", prompt]
+    kimi_cmd = [
+        "kimi-cli",
+        "--session",
+        session_id,
+        "--print",
+        "--yolo",
+        "--output-format",
+        "stream-json",
+        "-p",
+        prompt,
+    ]
 
     if resolved_model:
         kimi_cmd.extend(["-m", resolved_model])
@@ -3906,7 +3926,11 @@ def main():
     spin_parser.add_argument("--working-dir", "-d", help="Directory for the agent (default: current)")
     spin_parser.add_argument("--allowed-tools", help="Override permission profile with explicit tool list")
     spin_parser.add_argument("--tags", help="Comma-separated tags for organizing spools")
-    spin_parser.add_argument("--model", "-m", help="Model to use (e.g. haiku/sonnet/opus for Claude, flash/pro for Gemini, thinking/turbo for Kimi)")
+    spin_parser.add_argument(
+        "--model",
+        "-m",
+        help="Model to use (e.g. haiku/sonnet/opus for Claude, flash/pro for Gemini, thinking/turbo for Kimi)",
+    )
     spin_parser.add_argument("--harness", help="Harness to use: claude-code (default), codex, gemini, or kimi")
     spin_parser.add_argument("--timeout", "-t", type=int, help="Kill spool after N seconds")
     spin_parser.add_argument("--skeinless", action="store_true", help="Skip SKEIN context injection for shard agents")
