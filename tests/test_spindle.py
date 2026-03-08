@@ -1265,12 +1265,15 @@ class TestRecoverOrphansPending:
         with patch("spindle.SPINDLE_DIR", tmp_path):
             # Create a stale pending spool (created 120 seconds ago)
             stale_time = (datetime.now() - timedelta(seconds=PENDING_SPAWN_TIMEOUT + 60)).isoformat()
-            _write_spool("stale1", {
-                "id": "stale1",
-                "status": "pending",
-                "pid": None,
-                "created_at": stale_time,
-            })
+            _write_spool(
+                "stale1",
+                {
+                    "id": "stale1",
+                    "status": "pending",
+                    "pid": None,
+                    "created_at": stale_time,
+                },
+            )
 
             _recover_orphans()
 
@@ -1283,12 +1286,15 @@ class TestRecoverOrphansPending:
         """Pending spool within timeout should remain pending."""
         with patch("spindle.SPINDLE_DIR", tmp_path):
             # Create a fresh pending spool (just now)
-            _write_spool("fresh1", {
-                "id": "fresh1",
-                "status": "pending",
-                "pid": None,
-                "created_at": datetime.now().isoformat(),
-            })
+            _write_spool(
+                "fresh1",
+                {
+                    "id": "fresh1",
+                    "status": "pending",
+                    "pid": None,
+                    "created_at": datetime.now().isoformat(),
+                },
+            )
 
             _recover_orphans()
 
@@ -1299,12 +1305,15 @@ class TestRecoverOrphansPending:
         """Pending spool that has a PID should not be marked as error."""
         with patch("spindle.SPINDLE_DIR", tmp_path):
             stale_time = (datetime.now() - timedelta(seconds=PENDING_SPAWN_TIMEOUT + 60)).isoformat()
-            _write_spool("haspid", {
-                "id": "haspid",
-                "status": "pending",
-                "pid": 12345,
-                "created_at": stale_time,
-            })
+            _write_spool(
+                "haspid",
+                {
+                    "id": "haspid",
+                    "status": "pending",
+                    "pid": 12345,
+                    "created_at": stale_time,
+                },
+            )
 
             _recover_orphans()
 
@@ -1315,12 +1324,15 @@ class TestRecoverOrphansPending:
         """After recovery, stale pending spool should not count toward concurrency."""
         with patch("spindle.SPINDLE_DIR", tmp_path):
             stale_time = (datetime.now() - timedelta(seconds=PENDING_SPAWN_TIMEOUT + 60)).isoformat()
-            _write_spool("stale2", {
-                "id": "stale2",
-                "status": "pending",
-                "pid": None,
-                "created_at": stale_time,
-            })
+            _write_spool(
+                "stale2",
+                {
+                    "id": "stale2",
+                    "status": "pending",
+                    "pid": None,
+                    "created_at": stale_time,
+                },
+            )
 
             # Before recovery, counts as running
             assert _count_running() == 1
@@ -1329,6 +1341,7 @@ class TestRecoverOrphansPending:
 
             # After recovery, no longer counts
             assert _count_running() == 0
+
 
 class TestShellExpressionDetection:
     """Test that shell expressions in prompts are caught and rejected."""
