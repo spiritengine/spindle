@@ -18,6 +18,7 @@ from spindle import (
     PENDING_SPAWN_TIMEOUT,
     PERMISSION_PROFILES,
     _check_and_finalize_spool,
+    _check_shell_expressions,
     _cleanup_shard,
     _count_running,
     _gemini_spin_sync,
@@ -1328,3 +1329,59 @@ class TestRecoverOrphansPending:
 
             # After recovery, no longer counts
             assert _count_running() == 0
+
+class TestShellExpressionDetection:
+    """Test that shell expressions in prompts are caught and rejected."""
+
+    def test_dollar_paren_detected(self):
+        """$(command) expressions should be caught."""
+        result = _check_shell_expressions("Process this: $(cat data.txt)")
+        assert result is not None
+        assert "$(...)" in result
+
+    def test_backtick_detected(self):
+        """Backtick expressions should be caught."""
+        result = _check_shell_expressions("Result: `cat file.txt`")
+        assert result is not None
+        assert "backtick expression" in result
+
+    def test_dollar_brace_detected(self):
+        """${VAR} expressions should be caught."""
+        result = _check_shell_expressions("Value is ${MY_VAR}")
+        assert result is not None
+        assert "${...}" in result
+
+    def test_clean_prompt_returns_none(self):
+        """A prompt with no shell expressions should return None."""
+        assert _check_shell_expressions("Just a normal prompt") is None
+        assert _check_shell_expressions("") is None
+        assert _check_shell_expressions("Use $HOME as the path") is None
+
+    def test_error_message_is_actionable(self):
+        """Error message should tell the user what to do instead."""
+        result = _check_shell_expressions("$(cat file.txt)")
+        assert "Read the file" in result or "evaluate" in result.lower()
+
+    def test_spin_rejects_dollar_paren(self):
+        """spin() should return error JSON when prompt contains $(...) expression."""
+        _spin = spin.fn if hasattr(spin, "fn") else spin
+        result = asyncio.run(_spin("Do this: $(cat secrets.txt)"))
+        parsed = json.loads(result)
+        assert "error" in parsed
+        assert "$(...)" in parsed["error"]
+
+    def test_spin_rejects_backtick(self):
+        """spin() should return error JSON when prompt contains backtick expression."""
+        _spin = spin.fn if hasattr(spin, "fn") else spin
+        result = asyncio.run(_spin("Value: `whoami`"))
+        parsed = json.loads(result)
+        assert "error" in parsed
+        assert "backtick" in parsed["error"]
+
+    def test_spin_rejects_dollar_brace(self):
+        """spin() should return error JSON when prompt contains ${...} expression."""
+        _spin = spin.fn if hasattr(spin, "fn") else spin
+        result = asyncio.run(_spin("Path: ${HOME}/data"))
+        parsed = json.loads(result)
+        assert "error" in parsed
+        assert "${...}" in parsed["error"]

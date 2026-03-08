@@ -123,6 +123,24 @@ def _has_skein(working_dir: str) -> bool:
     return _skein_available[cache_key]
 
 
+_SHELL_EXPR_PATTERNS = [
+    (re.compile(r"\$\([^)]+\)"), "$(...)"),
+    (re.compile(r"`[^`]+`"), "backtick expression"),
+    (re.compile(r"\$\{[^}]+\}"), "${...}"),
+]
+
+
+def _check_shell_expressions(prompt: str) -> Optional[str]:
+    """Return an error message if the prompt contains unexpanded shell expressions, else None."""
+    for pattern, label in _SHELL_EXPR_PATTERNS:
+        if pattern.search(prompt):
+            return (
+                f"Shell expressions are not expanded in prompts (found {label}). "
+                "Read the file or evaluate the expression first and pass the result directly."
+            )
+    return None
+
+
 def _resolve_permission(permission: Optional[str], allowed_tools: Optional[str]) -> tuple[Optional[str], bool]:
     """
     Resolve permission profile to allowed_tools string and shard flag.
@@ -1417,6 +1435,11 @@ async def spin(
         spool_id = spin("Fork from branch", permission="shard", base_branch="feature-x")
         result = unspool(spool_id)
     """
+    # Detect unexpanded shell expressions in the prompt
+    shell_expr_error = _check_shell_expressions(prompt)
+    if shell_expr_error:
+        return json.dumps({"error": shell_expr_error})
+
     # Normalize harness parameter (case-insensitive)
     harness_lower = harness.lower() if harness else None
 
