@@ -1353,10 +1353,17 @@ class TestShellExpressionDetection:
         assert "$(cat data.txt)" in result
 
     def test_backtick_detected(self):
-        """Backtick expressions should be caught."""
+        """Backtick expressions with shell commands should be caught."""
         result = _check_shell_expressions("Result: `cat file.txt`")
         assert result is not None
         assert "`cat file.txt`" in result
+
+    def test_backtick_markdown_not_detected(self):
+        """Markdown inline code like `render()` should NOT trigger a warning."""
+        assert _check_shell_expressions("Call `render()` to update") is None
+        assert _check_shell_expressions("Use `fix` for the bug") is None
+        assert _check_shell_expressions("The `MyClass` instance") is None
+        assert _check_shell_expressions("Run `pytest` first") is None
 
     def test_dollar_brace_detected(self):
         """${VAR} expressions should be caught."""
@@ -1395,9 +1402,9 @@ class TestShellExpressionDetection:
     def test_spin_warns_but_proceeds_backtick(self, tmp_path):
         """spin() should still proceed when prompt contains backtick expression."""
         _spin = spin.fn if hasattr(spin, "fn") else spin
-        result = asyncio.run(_spin("Value: `whoami`", working_dir=str(tmp_path)))
+        result = asyncio.run(_spin("Value: `cat /etc/passwd`", working_dir=str(tmp_path)))
         assert "Warning" in result
-        assert "`whoami`" in result
+        assert "`cat /etc/passwd`" in result
         spool_id = result.split("\n")[0].strip()
         assert len(spool_id) == 8
 
@@ -1412,8 +1419,8 @@ class TestShellExpressionDetection:
 
     def test_multiple_expressions_all_listed(self):
         """Multiple shell expressions should all appear in the warning."""
-        result = _check_shell_expressions("$(cat f.txt) and `whoami` and ${VAR}")
+        result = _check_shell_expressions("$(cat f.txt) and `ls -la` and ${VAR}")
         assert result is not None
         assert "$(cat f.txt)" in result
-        assert "`whoami`" in result
+        assert "`ls -la`" in result
         assert "${VAR}" in result

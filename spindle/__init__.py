@@ -125,7 +125,7 @@ def _has_skein(working_dir: str) -> bool:
 
 _SHELL_EXPR_PATTERNS = [
     (re.compile(r"\$\([^)]+\)"), "$(...)"),
-    (re.compile(r"`[^`]+`"), "backtick expression"),
+    (re.compile(r"`[^`]*\s[^`]*`"), "backtick expression"),
     (re.compile(r"\$\{[^}]+\}"), "${...}"),
 ]
 
@@ -1725,10 +1725,11 @@ def _spin_wait_sync(
                     return json.dumps({"spool_id": spool_id, "error": f"Unknown spool_id '{spool_id}'"})
                 if spool.get("status") == "complete":
                     remaining = [s for s in ids if s != spool_id]
+                    result = _prepend_shell_warning(spool, spool.get("result", "No result"))
                     return json.dumps(
                         {
                             "spool_id": spool_id,
-                            "result": spool.get("result", "No result"),
+                            "result": result,
                             "remaining": remaining,
                         }
                     )
@@ -1760,7 +1761,7 @@ def _spin_wait_sync(
                 if not spool:
                     return f"Error: Unknown spool_id '{spool_id}'"
                 if spool.get("status") == "complete":
-                    results[spool_id] = spool.get("result", "No result")
+                    results[spool_id] = _prepend_shell_warning(spool, spool.get("result", "No result"))
                     pending.remove(spool_id)
                 elif spool.get("status") == "error":
                     results[spool_id] = f"Error: {spool.get('error')}"
@@ -2219,6 +2220,9 @@ async def spool_results(
         result_text = spool.get("result", "")
         if isinstance(result_text, dict):
             result_text = json.dumps(result_text)
+
+        if result_text:
+            result_text = _prepend_shell_warning(spool, result_text)
 
         results.append(
             {
