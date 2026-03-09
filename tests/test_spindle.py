@@ -513,17 +513,17 @@ class TestConcurrencyLimit:
             failure_count = len(results["failure"])
 
             # All threads should have completed
-            assert success_count + failure_count == num_threads, (
-                f"Expected {num_threads} results, got {success_count + failure_count}"
-            )
+            assert (
+                success_count + failure_count == num_threads
+            ), f"Expected {num_threads} results, got {success_count + failure_count}"
 
             # We started with initial_running, so only (MAX_CONCURRENT - initial_running)
             # new slots should be available
             max_new_slots = MAX_CONCURRENT - initial_running
 
-            assert success_count == max_new_slots, (
-                f"Expected exactly {max_new_slots} successful reservations, got {success_count}"
-            )
+            assert (
+                success_count == max_new_slots
+            ), f"Expected exactly {max_new_slots} successful reservations, got {success_count}"
 
             # The rest should have been rejected
             expected_failures = num_threads - max_new_slots
@@ -532,9 +532,9 @@ class TestConcurrencyLimit:
             # Verify we never exceeded the limit by checking total running
             all_spools = _list_spools()
             running_count = sum(1 for s in all_spools if s.get("status") == "running")
-            assert running_count == MAX_CONCURRENT, (
-                f"Expected exactly {MAX_CONCURRENT} running spools, got {running_count}"
-            )
+            assert (
+                running_count == MAX_CONCURRENT
+            ), f"Expected exactly {MAX_CONCURRENT} running spools, got {running_count}"
 
     def test_lock_file_created(self, tmp_path):
         """Lock file should be created during reservation."""
@@ -691,9 +691,9 @@ class TestWorktreeNameUniqueness:
         assert shard1_id != shard2_id, f"Shard IDs collided: {shard1_id} == {shard2_id}"
 
         # Branch names should also be different
-        assert shard1["branch_name"] != shard2["branch_name"], (
-            f"Branch names collided: {shard1['branch_name']} == {shard2['branch_name']}"
-        )
+        assert (
+            shard1["branch_name"] != shard2["branch_name"]
+        ), f"Branch names collided: {shard1['branch_name']} == {shard2['branch_name']}"
 
         # Verify both worktrees exist
         assert Path(shard1["worktree_path"]).exists(), f"Worktree 1 doesn't exist: {shard1['worktree_path']}"
@@ -1344,25 +1344,32 @@ class TestRecoverOrphansPending:
 
 
 class TestShellExpressionDetection:
-    """Test that shell expressions in prompts are caught and rejected."""
+    """Test that shell expressions in prompts produce warnings (not errors)."""
 
     def test_dollar_paren_detected(self):
         """$(command) expressions should be caught."""
         result = _check_shell_expressions("Process this: $(cat data.txt)")
         assert result is not None
-        assert "$(...)" in result
+        assert "$(cat data.txt)" in result
 
     def test_backtick_detected(self):
-        """Backtick expressions should be caught."""
+        """Backtick expressions with shell commands should be caught."""
         result = _check_shell_expressions("Result: `cat file.txt`")
         assert result is not None
-        assert "backtick expression" in result
+        assert "`cat file.txt`" in result
+
+    def test_backtick_markdown_not_detected(self):
+        """Markdown inline code like `render()` should NOT trigger a warning."""
+        assert _check_shell_expressions("Call `render()` to update") is None
+        assert _check_shell_expressions("Use `fix` for the bug") is None
+        assert _check_shell_expressions("The `MyClass` instance") is None
+        assert _check_shell_expressions("Run `pytest` first") is None
 
     def test_dollar_brace_detected(self):
         """${VAR} expressions should be caught."""
         result = _check_shell_expressions("Value is ${MY_VAR}")
         assert result is not None
-        assert "${...}" in result
+        assert "${MY_VAR}" in result
 
     def test_clean_prompt_returns_none(self):
         """A prompt with no shell expressions should return None."""
@@ -1370,31 +1377,50 @@ class TestShellExpressionDetection:
         assert _check_shell_expressions("") is None
         assert _check_shell_expressions("Use $HOME as the path") is None
 
-    def test_error_message_is_actionable(self):
-        """Error message should tell the user what to do instead."""
+    def test_normal_curly_braces_not_detected(self):
+        """Simple {template_var} should NOT trigger a warning."""
+        assert _check_shell_expressions("Hello {name}, welcome to {place}") is None
+        assert _check_shell_expressions("Format: {0} and {1}") is None
+
+    def test_warning_message_is_actionable(self):
+        """Warning message should tell the user what to do instead."""
         result = _check_shell_expressions("$(cat file.txt)")
-        assert "Read the file" in result or "evaluate" in result.lower()
+        assert "Warning" in result
+        assert "read the file contents first" in result.lower()
 
-    def test_spin_rejects_dollar_paren(self):
-        """spin() should return error JSON when prompt contains $(...) expression."""
+    def test_spin_warns_but_proceeds_dollar_paren(self, tmp_path):
+        """spin() should still proceed when prompt contains $(...), with warning."""
         _spin = spin.fn if hasattr(spin, "fn") else spin
-        result = asyncio.run(_spin("Do this: $(cat secrets.txt)"))
-        parsed = json.loads(result)
-        assert "error" in parsed
-        assert "$(...)" in parsed["error"]
+        result = asyncio.run(_spin("Do this: $(cat secrets.txt)", working_dir=str(tmp_path)))
+        # Should contain warning text — spin proceeds (not error JSON)
+        assert "Warning" in result
+        assert "$(cat secrets.txt)" in result
+        # Should still contain a spool ID (8-char hex) as first line
+        spool_id = result.split("\n")[0].strip()
+        assert len(spool_id) == 8
 
-    def test_spin_rejects_backtick(self):
-        """spin() should return error JSON when prompt contains backtick expression."""
+    def test_spin_warns_but_proceeds_backtick(self, tmp_path):
+        """spin() should still proceed when prompt contains backtick expression."""
         _spin = spin.fn if hasattr(spin, "fn") else spin
-        result = asyncio.run(_spin("Value: `whoami`"))
-        parsed = json.loads(result)
-        assert "error" in parsed
-        assert "backtick" in parsed["error"]
+        result = asyncio.run(_spin("Value: `cat /etc/passwd`", working_dir=str(tmp_path)))
+        assert "Warning" in result
+        assert "`cat /etc/passwd`" in result
+        spool_id = result.split("\n")[0].strip()
+        assert len(spool_id) == 8
 
-    def test_spin_rejects_dollar_brace(self):
-        """spin() should return error JSON when prompt contains ${...} expression."""
+    def test_spin_warns_but_proceeds_dollar_brace(self, tmp_path):
+        """spin() should still proceed when prompt contains ${...} expression."""
         _spin = spin.fn if hasattr(spin, "fn") else spin
-        result = asyncio.run(_spin("Path: ${HOME}/data"))
-        parsed = json.loads(result)
-        assert "error" in parsed
-        assert "${...}" in parsed["error"]
+        result = asyncio.run(_spin("Path: ${HOME}/data", working_dir=str(tmp_path)))
+        assert "Warning" in result
+        assert "${HOME}" in result
+        spool_id = result.split("\n")[0].strip()
+        assert len(spool_id) == 8
+
+    def test_multiple_expressions_all_listed(self):
+        """Multiple shell expressions should all appear in the warning."""
+        result = _check_shell_expressions("$(cat f.txt) and `ls -la` and ${VAR}")
+        assert result is not None
+        assert "$(cat f.txt)" in result
+        assert "`ls -la`" in result
+        assert "${VAR}" in result
