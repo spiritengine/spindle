@@ -131,14 +131,22 @@ _SHELL_EXPR_PATTERNS = [
 
 
 def _check_shell_expressions(prompt: str) -> Optional[str]:
-    """Return an error message if the prompt contains unexpanded shell expressions, else None."""
+    """Return a warning message if the prompt contains unexpanded shell expressions, else None."""
+    found = []
+    examples = []
     for pattern, label in _SHELL_EXPR_PATTERNS:
-        if pattern.search(prompt):
-            return (
-                f"Shell expressions are not expanded in prompts (found {label}). "
-                "Read the file or evaluate the expression first and pass the result directly."
-            )
-    return None
+        match = pattern.search(prompt)
+        if match:
+            found.append(label)
+            examples.append(match.group())
+    if not found:
+        return None
+    expr_list = ", ".join(examples)
+    return (
+        f"Warning: prompt contains what looks like unexpanded shell expressions: "
+        f"{expr_list}. Shell expressions are not expanded in MCP tool calls — "
+        f"read the file contents first and pass them directly."
+    )
 
 
 def _resolve_permission(permission: Optional[str], allowed_tools: Optional[str]) -> tuple[Optional[str], bool]:
@@ -1185,6 +1193,7 @@ def _spin_sync(
     skeinless: bool,
     env: Optional[Dict[str, str]],
     base_branch: str = "master",
+    shell_expr_warning: Optional[str] = None,
 ) -> str:
     """Synchronous implementation of spin - runs in thread pool."""
     # Require working_dir - os.getcwd() returns MCP server dir, not caller's project
@@ -1352,6 +1361,7 @@ Your task:
         "pid": None,
         "error": None,
         "harness": "claude-code",
+        "shell_expr_warning": shell_expr_warning,
     }
 
     _write_spool(spool_id, spool)
@@ -1376,6 +1386,8 @@ Your task:
     monitor = threading.Thread(target=_monitor_spool, args=(spool_id,), daemon=True)
     monitor.start()
 
+    if shell_expr_warning:
+        return f"{spool_id}\n\n{shell_expr_warning}"
     return spool_id
 
 
@@ -1435,10 +1447,10 @@ async def spin(
         spool_id = spin("Fork from branch", permission="shard", base_branch="feature-x")
         result = unspool(spool_id)
     """
-    # Detect unexpanded shell expressions in the prompt
-    shell_expr_error = _check_shell_expressions(prompt)
-    if shell_expr_error:
-        return json.dumps({"error": shell_expr_error})
+    # Detect unexpanded shell expressions in the prompt (warn, don't block)
+    shell_expr_warning = _check_shell_expressions(prompt)
+    if shell_expr_warning:
+        logger.warning("Shell expression in spin() prompt: %s", shell_expr_warning)
 
     # Normalize harness parameter (case-insensitive)
     harness_lower = harness.lower() if harness else None
@@ -1511,7 +1523,16 @@ async def spin(
             skeinless,
             env,
             base_branch=base_branch or "master",
+            shell_expr_warning=shell_expr_warning,
         )
+
+
+def _prepend_shell_warning(spool: dict, result: str) -> str:
+    """Prepend shell expression warning to result if the spool has one."""
+    warning = spool.get("shell_expr_warning")
+    if warning:
+        return f"{warning}\n\n{result}"
+    return result
 
 
 def _unspool_sync(spool_id: str) -> str:
@@ -1546,12 +1567,12 @@ def _unspool_sync(spool_id: str) -> str:
                 _check_and_finalize_spool(spool_id)
                 spool = _read_spool(spool_id)
                 if spool.get("status") == "complete":
-                    return spool.get("result", "No result")
+                    return _prepend_shell_warning(spool, spool.get("result", "No result"))
                 elif spool.get("status") == "error":
                     return f"Spool {spool_id} failed: {spool.get('error', 'Unknown error')}"
             return f"Spool {spool_id} still running: {spool.get('prompt', '')[:50]}..."
         elif status == "complete":
-            return spool.get("result", "No result")
+            return _prepend_shell_warning(spool, spool.get("result", "No result"))
         else:
             return f"Spool {spool_id} failed: {spool.get('error', 'Unknown error')}"
 
