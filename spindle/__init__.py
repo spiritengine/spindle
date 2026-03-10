@@ -1441,6 +1441,7 @@ async def spin(
         spool_id = spin("Careful work", permission="careful+shard")
         spool_id = spin("Quick task", model="haiku", timeout=60)
         spool_id = spin("Write a parser", harness="codex")  # Use Codex instead
+        spool_id = spin("Fix bug fast", harness="codex", permission="shard", model="5.4")  # Codex + shard
         spool_id = spin("Summarize this", harness="gemini", model="flash")  # Use Gemini
         spool_id = spin("Analyze code", harness="kimi", model="thinking")  # Use Kimi
         spool_id = spin("Do something", env={"CC_THINKING_BOOST": "1"})
@@ -1468,11 +1469,14 @@ async def spin(
     if harness_lower == "codex":
         # Map Claude Code parameters to Codex parameters
         sandbox = None
+        use_shard = shard or (permission and "shard" in permission)
         if permission == "readonly":
             sandbox = "read-only"
-        elif permission in ("full", "shard"):
+        elif permission == "full":
             sandbox = "danger-full-access"
         else:
+            # "careful", "shard", "careful+shard" all get workspace-write
+            # Shards use --add-dir for git access rather than full filesystem
             sandbox = "workspace-write"
 
         return await asyncio.to_thread(
@@ -1484,6 +1488,9 @@ async def spin(
             timeout,
             tags,
             env,
+            shard=use_shard,
+            base_branch=base_branch or "master",
+            skeinless=skeinless,
         )
     elif harness_lower == "gemini":
         return await asyncio.to_thread(
@@ -2759,9 +2766,10 @@ def _get_harnesses() -> dict:
             "requires": "claude CLI",
         },
         "codex": {
-            "models": "pass-through (any model string accepted by codex CLI)",
-            "default_model": None,
+            "models": CODEX_MODEL_ALIASES,
+            "default_model": "gpt-5.4",
             "requires": "codex CLI",
+            "note": "Aliases are shortcuts; any model string accepted by codex CLI also works",
         },
         "gemini": {
             "models": GEMINI_MODEL_ALIASES,
@@ -3270,11 +3278,17 @@ def _codex_spin_sync(
     timeout: Optional[int],
     tags: Optional[str],
     env: Optional[Dict[str, str]],
+    shard: bool = False,
+    base_branch: str = "master",
+    skeinless: bool = False,
 ) -> str:
     """Synchronous implementation of codex_spin - runs Codex CLI in background."""
     # Require working_dir
     if not working_dir:
         return "Error: working_dir required. Pass the project directory."
+
+    # Resolve model alias
+    resolved_model = CODEX_MODEL_ALIASES.get(model, model) if model else None
 
     # Generate spool ID
     spool_id = "codex-" + str(uuid.uuid4())[:8]
@@ -3284,27 +3298,85 @@ def _codex_spin_sync(
     if not success:
         return error_msg
 
+    cwd = working_dir
+
+    # Handle shard creation
+    shard_info = None
+    if shard:
+        shard_info = _spawn_shard(spool_id, cwd, base_branch=base_branch)
+        if shard_info:
+            cwd = shard_info["worktree_path"]
+        else:
+            # Clean up reserved slot
+            spool_path = SPINDLE_DIR / f"{spool_id}.json"
+            spool_path.unlink(missing_ok=True)
+            return "Error: Failed to create SHARD worktree. Check git repo status."
+
+    # Inject shard instructions into prompt
+    effective_prompt = prompt
+    if shard_info:
+        if _has_skein(working_dir) and not skeinless:
+            worktree_name = shard_info.get("shard_id", spool_id)
+            skein_preamble = f"""You are working in an isolated SHARD worktree.
+
+Before starting work, orient yourself with SKEIN:
+1. Run: skein ignite --message "{prompt[:100]}..."
+2. Then: skein ready --name "spool-{spool_id}"
+
+After completing work:
+1. Commit: git add -A && git commit -m "Your commit message"
+2. Tender: skein shard tender {worktree_name} --summary "What you did" --confidence N
+   (confidence 1-10: 10=safe/isolated, 5=needs review, 1=risky)
+3. Retire: skein torch && skein complete
+
+Your task:
+"""
+            effective_prompt = skein_preamble + prompt
+        else:
+            shard_preamble = """You are working in an isolated SHARD worktree.
+
+After completing work:
+1. Commit: git add -A && git commit -m "Your commit message"
+
+Your task:
+"""
+            effective_prompt = shard_preamble + prompt
+
     # Build codex exec command
     # Check for Landlock support and use appropriate flags
     has_landlock = _has_landlock_support()
 
     if has_landlock:
         # Use --json for structured output, --full-auto for non-interactive execution
-        codex_cmd = ["codex", "exec", "--json", "--full-auto", prompt]
+        codex_cmd = ["codex", "exec", "--json", "--full-auto"]
     else:
         # Kernel lacks Landlock support - use bypass mode
         import platform
 
         kernel_version = platform.release()
         print(f"[Spindle] Kernel {kernel_version} lacks Landlock support (needs 5.13+), using bypass mode for Codex")
-        codex_cmd = ["codex", "exec", "--json", "--dangerously-bypass-approvals-and-sandbox", prompt]
+        codex_cmd = ["codex", "exec", "--json", "--dangerously-bypass-approvals-and-sandbox"]
 
-    if model:
-        codex_cmd.extend(["--model", model])
+    if resolved_model:
+        codex_cmd.extend(["--model", resolved_model])
 
     if sandbox and has_landlock:
         # Only apply sandbox flag if we have Landlock support
         codex_cmd.extend(["--sandbox", sandbox])
+
+    # For shards, grant write access to main repo's .git for commits
+    if shard_info and has_landlock:
+        git_file = Path(cwd) / ".git"
+        if git_file.exists() and git_file.is_file():
+            git_content = git_file.read_text().strip()
+            if git_content.startswith("gitdir:"):
+                git_worktree_dir = git_content.split("gitdir:")[1].strip()
+                main_git = Path(git_worktree_dir).parent.parent
+                if main_git.exists() and main_git.name == ".git":
+                    codex_cmd.extend(["--add-dir", str(main_git)])
+
+    # Prompt goes last
+    codex_cmd.append(effective_prompt)
 
     # Parse tags
     tag_list = [t.strip() for t in tags.split(",")] if tags else []
@@ -3317,12 +3389,14 @@ def _codex_spin_sync(
         "prompt": prompt,
         "result": None,
         "session_id": None,  # Will be extracted from output
-        "working_dir": working_dir,
-        "model": model or "default",
+        "working_dir": cwd,
+        "model": resolved_model or "default",
         "sandbox": sandbox or "workspace-write",
         "tags": tag_list,
         "timeout": timeout,
         "env": env,
+        "shard": shard_info,
+        "base_branch": base_branch,
         "created_at": datetime.now().isoformat(),
         "completed_at": None,
         "pid": None,
@@ -3333,7 +3407,18 @@ def _codex_spin_sync(
     _write_spool(spool_id, spool)
 
     # Spawn detached process
-    pid = _spawn_detached(spool_id, codex_cmd, working_dir, env)
+    try:
+        pid = _spawn_detached(spool_id, codex_cmd, cwd, env)
+    except Exception as e:
+        # Spawn failed - mark spool as error so the slot is freed
+        spool["status"] = "error"
+        spool["error"] = f"spawn failed: {e}"
+        spool["completed_at"] = datetime.now().isoformat()
+        _write_spool(spool_id, spool)
+        # Clean up shard worktree if one was created
+        if shard_info:
+            _cleanup_shard(shard_info, working_dir)
+        return f"Error: Failed to spawn process: {e}"
 
     # Update spool with PID and status
     spool["pid"] = pid
@@ -3383,28 +3468,40 @@ def _codex_respin_sync(session_id: str, prompt: str) -> str:
     if not success:
         return error_msg
 
-    # Build codex resume command
+    # Build codex exec resume command
     # Check for Landlock support and use appropriate flags
     has_landlock = _has_landlock_support()
 
     if has_landlock:
         # Use --json for structured output, --full-auto for non-interactive
-        codex_cmd = ["codex", "resume", session_id, "--json", "--full-auto"]
+        codex_cmd = ["codex", "exec", "resume", session_id, "--json", "--full-auto"]
     else:
         # Kernel lacks Landlock support - use bypass mode
         import platform
 
         kernel_version = platform.release()
         print(f"[Spindle] Kernel {kernel_version} lacks Landlock support (needs 5.13+), using bypass mode for Codex")
-        codex_cmd = ["codex", "resume", session_id, "--json", "--dangerously-bypass-approvals-and-sandbox"]
+        codex_cmd = ["codex", "exec", "resume", session_id, "--json", "--dangerously-bypass-approvals-and-sandbox"]
 
-    # The prompt is passed as additional argument to resume
-    codex_cmd.append(prompt)
-
-    # Get working_dir and env from original spool if possible
+    # Get working_dir, env, and shard info from original spool if possible
     original_spool = _find_spool_by_session(session_id)
     working_dir = original_spool.get("working_dir") if original_spool else os.getcwd()
     env = original_spool.get("env") if original_spool else None
+    shard_info = original_spool.get("shard") if original_spool else None
+
+    # For shards, grant write access to main repo's .git for commits
+    if shard_info and has_landlock:
+        git_file = Path(working_dir) / ".git"
+        if git_file.exists() and git_file.is_file():
+            git_content = git_file.read_text().strip()
+            if git_content.startswith("gitdir:"):
+                git_worktree_dir = git_content.split("gitdir:")[1].strip()
+                main_git = Path(git_worktree_dir).parent.parent
+                if main_git.exists() and main_git.name == ".git":
+                    codex_cmd.extend(["--add-dir", str(main_git)])
+
+    # The prompt is passed as additional argument to resume
+    codex_cmd.append(prompt)
 
     # Create spool record
     spool = {
@@ -3416,6 +3513,7 @@ def _codex_respin_sync(session_id: str, prompt: str) -> str:
         "working_dir": working_dir,
         "tags": ["codex", "respin"],
         "env": env,
+        "shard": shard_info,
         "created_at": datetime.now().isoformat(),
         "completed_at": None,
         "pid": None,
@@ -3426,7 +3524,14 @@ def _codex_respin_sync(session_id: str, prompt: str) -> str:
     _write_spool(spool_id, spool)
 
     # Spawn detached process
-    pid = _spawn_detached(spool_id, codex_cmd, working_dir, env)
+    try:
+        pid = _spawn_detached(spool_id, codex_cmd, working_dir, env)
+    except Exception as e:
+        spool["status"] = "error"
+        spool["error"] = f"spawn failed: {e}"
+        spool["completed_at"] = datetime.now().isoformat()
+        _write_spool(spool_id, spool)
+        return f"Error: Failed to spawn process: {e}"
 
     # Update spool with PID and status
     spool["pid"] = pid
@@ -3438,6 +3543,24 @@ def _codex_respin_sync(session_id: str, prompt: str) -> str:
     monitor.start()
 
     return spool_id
+
+
+# Short aliases for common Codex/OpenAI models. Anything not here passes through.
+CODEX_MODEL_ALIASES = {
+    # GPT-5 series
+    "5": "gpt-5",
+    "5-mini": "gpt-5-mini",
+    "5.4": "gpt-5.4",
+    "5.4-mini": "gpt-5.4-mini",
+    # Reasoning models
+    "o3": "o3",
+    "o3-pro": "o3-pro",
+    "o4-mini": "o4-mini",
+    # GPT-4.1 series
+    "4.1": "gpt-4.1",
+    "4.1-mini": "gpt-4.1-mini",
+    "4.1-nano": "gpt-4.1-nano",
+}
 
 
 # ============================================================================
