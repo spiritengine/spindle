@@ -1472,9 +1472,11 @@ async def spin(
         use_shard = shard or (permission and "shard" in permission)
         if permission == "readonly":
             sandbox = "read-only"
-        elif permission in ("full", "shard") or (permission and "+shard" in permission):
+        elif permission == "full":
             sandbox = "danger-full-access"
         else:
+            # "careful", "shard", "careful+shard" all get workspace-write
+            # Shards use --add-dir for git access rather than full filesystem
             sandbox = "workspace-write"
 
         return await asyncio.to_thread(
@@ -3405,7 +3407,18 @@ Your task:
     _write_spool(spool_id, spool)
 
     # Spawn detached process
-    pid = _spawn_detached(spool_id, codex_cmd, cwd, env)
+    try:
+        pid = _spawn_detached(spool_id, codex_cmd, cwd, env)
+    except Exception as e:
+        # Spawn failed - mark spool as error so the slot is freed
+        spool["status"] = "error"
+        spool["error"] = f"spawn failed: {e}"
+        spool["completed_at"] = datetime.now().isoformat()
+        _write_spool(spool_id, spool)
+        # Clean up shard worktree if one was created
+        if shard_info:
+            _cleanup_shard(shard_info, working_dir)
+        return f"Error: Failed to spawn process: {e}"
 
     # Update spool with PID and status
     spool["pid"] = pid
