@@ -3308,7 +3308,7 @@ def _codex_spin_sync(
             cwd = shard_info["worktree_path"]
         else:
             # Clean up reserved slot
-            spool_path = SPOOLS_DIR / f"{spool_id}.json"
+            spool_path = SPINDLE_DIR / f"{spool_id}.json"
             spool_path.unlink(missing_ok=True)
             return "Error: Failed to create SHARD worktree. Check git repo status."
 
@@ -3483,14 +3483,25 @@ def _codex_respin_sync(session_id: str, prompt: str) -> str:
         print(f"[Spindle] Kernel {kernel_version} lacks Landlock support (needs 5.13+), using bypass mode for Codex")
         codex_cmd = ["codex", "exec", "resume", session_id, "--json", "--dangerously-bypass-approvals-and-sandbox"]
 
-    # The prompt is passed as additional argument to resume
-    codex_cmd.append(prompt)
-
     # Get working_dir, env, and shard info from original spool if possible
     original_spool = _find_spool_by_session(session_id)
     working_dir = original_spool.get("working_dir") if original_spool else os.getcwd()
     env = original_spool.get("env") if original_spool else None
     shard_info = original_spool.get("shard") if original_spool else None
+
+    # For shards, grant write access to main repo's .git for commits
+    if shard_info and has_landlock:
+        git_file = Path(working_dir) / ".git"
+        if git_file.exists() and git_file.is_file():
+            git_content = git_file.read_text().strip()
+            if git_content.startswith("gitdir:"):
+                git_worktree_dir = git_content.split("gitdir:")[1].strip()
+                main_git = Path(git_worktree_dir).parent.parent
+                if main_git.exists() and main_git.name == ".git":
+                    codex_cmd.extend(["--add-dir", str(main_git)])
+
+    # The prompt is passed as additional argument to resume
+    codex_cmd.append(prompt)
 
     # Create spool record
     spool = {
@@ -3513,7 +3524,14 @@ def _codex_respin_sync(session_id: str, prompt: str) -> str:
     _write_spool(spool_id, spool)
 
     # Spawn detached process
-    pid = _spawn_detached(spool_id, codex_cmd, working_dir, env)
+    try:
+        pid = _spawn_detached(spool_id, codex_cmd, working_dir, env)
+    except Exception as e:
+        spool["status"] = "error"
+        spool["error"] = f"spawn failed: {e}"
+        spool["completed_at"] = datetime.now().isoformat()
+        _write_spool(spool_id, spool)
+        return f"Error: Failed to spawn process: {e}"
 
     # Update spool with PID and status
     spool["pid"] = pid
