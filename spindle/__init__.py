@@ -618,6 +618,30 @@ def _extract_last_json_object(text: str) -> Optional[dict]:
     return None
 
 
+def _extract_gemini_stderr_error(stderr: str) -> str:
+    """Extract a meaningful error message from gemini CLI stderr.
+
+    The gemini CLI has a bug where JS error objects get serialized as
+    "[object Object]" instead of their actual message. The real error
+    details are in the plain-text portion of stderr before the JSON block.
+    """
+    import re
+    error_lines = []
+    for line in stderr.split("\n"):
+        line = line.strip()
+        if not line or line.startswith("{") or line.startswith("}"):
+            continue
+        match = re.match(r"^(?:Error:|.*Error:)\s*(.+)", line)
+        if match and "[object Object]" not in line:
+            error_lines.append(match.group(1).strip())
+    if error_lines:
+        return error_lines[-1]
+    json_start = stderr.find("{")
+    if json_start > 0:
+        return stderr[:json_start].strip()[-500:]
+    return stderr[:500]
+
+
 def _extract_cc_result(data) -> Optional[dict]:
     """Extract the result dict from Claude Code CLI output.
 
@@ -910,6 +934,8 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
                 if data and "error" in data:
                     err = data["error"]
                     error_msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+                    if error_msg == "[object Object]":
+                        error_msg = _extract_gemini_stderr_error(stderr)
                     spool["session_id"] = data.get("session_id")
                     spool["status"] = "error"
                     spool["error"] = error_msg
@@ -1199,6 +1225,9 @@ def _spin_sync(
     # Require working_dir - os.getcwd() returns MCP server dir, not caller's project
     if not working_dir:
         return "Error: working_dir required. Pass the project directory."
+
+    # Resolve to absolute path to avoid cwd-dependent resolution
+    working_dir = str(Path(working_dir).resolve())
 
     # Generate spool ID first
     spool_id = str(uuid.uuid4())[:8]
@@ -3597,6 +3626,9 @@ def _gemini_spin_sync(
     if not working_dir:
         return "Error: working_dir required. Pass the project directory."
 
+    # Resolve to absolute path to avoid cwd-dependent resolution
+    working_dir = str(Path(working_dir).resolve())
+
     # Generate spool ID
     spool_id = "gemini-" + str(uuid.uuid4())[:8]
 
@@ -4115,7 +4147,7 @@ def main():
         sys.exit(0)
 
     elif args.command == "spin":
-        working_dir = args.working_dir or os.getcwd()
+        working_dir = os.path.abspath(args.working_dir or os.getcwd())
         harness_lower = args.harness.lower() if args.harness else None
         if harness_lower == "codex":
             sandbox = None
