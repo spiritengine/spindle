@@ -82,7 +82,7 @@ spin(
 ### Gemini CLI
 
 **CLI:** `gemini` (Google's Gemini CLI)
-**Models:** Gemini 2.5 Pro, 2.5 Flash, 2.0 Flash Lite (Auto routing by default)
+**Models:** Gemini 2.5 Pro, 2.5 Flash, 3.1 Pro, 3.1 Flash Lite (Auto routing by default)
 **Startup time:** ~5-10 seconds to first response
 **Strengths:** Fast startup, generous free tier, good for quick tasks
 
@@ -100,6 +100,8 @@ spin(
 **Model aliases:**
 - `"flash"` → `gemini-2.5-flash`
 - `"pro"` → `gemini-2.5-pro`
+- `"3.1-pro"` → `gemini-3.1-pro`
+- `"3.1-flash-lite"` → `gemini-3.1-flash-lite`
 - No model specified → CLI's Auto routing (picks based on task complexity)
 - Any other string passes through to the CLI as-is
 
