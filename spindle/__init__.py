@@ -1508,7 +1508,7 @@ async def spin(
             # Shards use --add-dir for git access rather than full filesystem
             sandbox = "workspace-write"
 
-        return await asyncio.to_thread(
+        result = await asyncio.to_thread(
             _codex_spin_sync,
             prompt,
             working_dir,
@@ -1522,7 +1522,7 @@ async def spin(
             skeinless=skeinless,
         )
     elif harness_lower == "gemini":
-        return await asyncio.to_thread(
+        result = await asyncio.to_thread(
             _gemini_spin_sync,
             prompt,
             working_dir,
@@ -1533,7 +1533,7 @@ async def spin(
             env,
         )
     elif harness_lower == "kimi":
-        return await asyncio.to_thread(
+        result = await asyncio.to_thread(
             _kimi_spin_sync,
             prompt,
             working_dir,
@@ -1561,6 +1561,18 @@ async def spin(
             base_branch=base_branch or "master",
             shell_expr_warning=shell_expr_warning,
         )
+
+    # For non-CC harnesses, handle shell expression warning centrally
+    if shell_expr_warning and not result.startswith("Error"):
+        # Store warning in spool metadata for unspool path
+        spool_id = result.strip()
+        spool = _read_spool(spool_id)
+        if spool:
+            spool["shell_expr_warning"] = shell_expr_warning
+            _write_spool(spool_id, spool)
+        return f"{spool_id}\n\n{shell_expr_warning}"
+
+    return result
 
 
 def _prepend_shell_warning(spool: dict, result: str) -> str:
@@ -3477,12 +3489,12 @@ def _codex_unspool_sync(spool_id: str) -> str:
             _check_and_finalize_spool(spool_id)
             spool = _read_spool(spool_id)
             if spool.get("status") == "complete":
-                return spool.get("result", "No result")
+                return _prepend_shell_warning(spool, spool.get("result", "No result"))
             elif spool.get("status") == "error":
                 return f"Spool {spool_id} failed: {spool.get('error', 'Unknown error')}"
         return f"Spool {spool_id} still running: {spool.get('prompt', '')[:50]}..."
     elif status == "complete":
-        return spool.get("result", "No result")
+        return _prepend_shell_warning(spool, spool.get("result", "No result"))
     else:
         return f"Spool {spool_id} failed: {spool.get('error', 'Unknown error')}"
 
@@ -3759,12 +3771,12 @@ def _gemini_unspool_sync(spool_id: str) -> str:
             _check_and_finalize_spool(spool_id)
             spool = _read_spool(spool_id)
             if spool.get("status") == "complete":
-                return spool.get("result", "No result")
+                return _prepend_shell_warning(spool, spool.get("result", "No result"))
             elif spool.get("status") == "error":
                 return f"Spool {spool_id} failed: {spool.get('error', 'Unknown error')}"
         return f"Spool {spool_id} still running: {spool.get('prompt', '')[:50]}..."
     elif status == "complete":
-        return spool.get("result", "No result")
+        return _prepend_shell_warning(spool, spool.get("result", "No result"))
     else:
         return f"Spool {spool_id} failed: {spool.get('error', 'Unknown error')}"
 
@@ -3969,12 +3981,12 @@ def _kimi_unspool_sync(spool_id: str) -> str:
             _check_and_finalize_spool(spool_id)
             spool = _read_spool(spool_id)
             if spool.get("status") == "complete":
-                return spool.get("result", "No result")
+                return _prepend_shell_warning(spool, spool.get("result", "No result"))
             elif spool.get("status") == "error":
                 return f"Spool {spool_id} failed: {spool.get('error', 'Unknown error')}"
         return f"Spool {spool_id} still running: {spool.get('prompt', '')[:50]}..."
     elif status == "complete":
-        return spool.get("result", "No result")
+        return _prepend_shell_warning(spool, spool.get("result", "No result"))
     else:
         return f"Spool {spool_id} failed: {spool.get('error', 'Unknown error')}"
 

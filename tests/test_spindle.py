@@ -1424,3 +1424,127 @@ class TestShellExpressionDetection:
         assert "$(cat f.txt)" in result
         assert "`ls -la`" in result
         assert "${VAR}" in result
+
+    def test_gemini_spin_warns_shell_expressions(self, tmp_path):
+        """Gemini harness should return shell expression warning from spin()."""
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle._spawn_detached", return_value=12345):
+                with patch("spindle._count_running", return_value=0):
+                    result = _gemini_spin_sync(
+                        prompt="Summarize $(cat data.txt)",
+                        working_dir=str(tmp_path),
+                        model=None,
+                        system_prompt=None,
+                        timeout=None,
+                        tags=None,
+                        env=None,
+                    )
+        # Gemini harness doesn't handle warning internally — spin() does centrally
+        # But spool should be created successfully
+        spool_id = result.strip()
+        assert spool_id.startswith("gemini-")
+
+    def test_kimi_spin_warns_shell_expressions(self, tmp_path):
+        """Kimi harness should return shell expression warning from spin()."""
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle._spawn_detached", return_value=12345):
+                with patch("spindle._count_running", return_value=0):
+                    result = _kimi_spin_sync(
+                        prompt="Analyze ${HOME}/secrets",
+                        working_dir=str(tmp_path),
+                        model=None,
+                        system_prompt=None,
+                        timeout=None,
+                        tags=None,
+                        env=None,
+                    )
+        spool_id = result.strip()
+        assert spool_id.startswith("kimi-")
+
+    def test_spin_gemini_harness_warns_shell_expressions(self, tmp_path):
+        """spin() with harness='gemini' should return warning for shell expressions."""
+        _spin = spin.fn if hasattr(spin, "fn") else spin
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle._spawn_detached", return_value=12345):
+                with patch("spindle._count_running", return_value=0):
+                    result = asyncio.run(
+                        _spin(
+                            "Summarize $(cat data.txt)",
+                            working_dir=str(tmp_path),
+                            harness="gemini",
+                        )
+                    )
+        assert "Warning" in result
+        assert "$(cat data.txt)" in result
+        # First line should be the spool ID
+        spool_id = result.split("\n")[0].strip()
+        assert spool_id.startswith("gemini-")
+
+    def test_spin_kimi_harness_warns_shell_expressions(self, tmp_path):
+        """spin() with harness='kimi' should return warning for shell expressions."""
+        _spin = spin.fn if hasattr(spin, "fn") else spin
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle._spawn_detached", return_value=12345):
+                with patch("spindle._count_running", return_value=0):
+                    result = asyncio.run(
+                        _spin(
+                            "Read `cat /etc/hosts`",
+                            working_dir=str(tmp_path),
+                            harness="kimi",
+                        )
+                    )
+        assert "Warning" in result
+        assert "`cat /etc/hosts`" in result
+        spool_id = result.split("\n")[0].strip()
+        assert spool_id.startswith("kimi-")
+
+    def test_spin_stores_warning_in_spool_for_gemini(self, tmp_path):
+        """spin() should store shell_expr_warning in spool metadata for Gemini."""
+        _spin = spin.fn if hasattr(spin, "fn") else spin
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle._spawn_detached", return_value=12345):
+                with patch("spindle._count_running", return_value=0):
+                    result = asyncio.run(
+                        _spin(
+                            "Process $(cat file.txt)",
+                            working_dir=str(tmp_path),
+                            harness="gemini",
+                        )
+                    )
+            spool_id = result.split("\n")[0].strip()
+            spool = _read_spool(spool_id)
+            assert spool is not None
+            assert spool.get("shell_expr_warning") is not None
+            assert "$(cat file.txt)" in spool["shell_expr_warning"]
+
+    def test_gemini_unspool_prepends_warning(self, tmp_path):
+        """Gemini unspool should prepend shell expression warning to result."""
+        spool_id = "gemini-testshel"
+        spool = {
+            "id": spool_id,
+            "status": "complete",
+            "result": "Here is the analysis.",
+            "shell_expr_warning": "Warning: prompt contains unexpanded shell expressions: $(cat data.txt).",
+            "harness": "gemini",
+        }
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool(spool_id, spool)
+            result = _gemini_unspool_sync(spool_id)
+        assert result.startswith("Warning:")
+        assert "Here is the analysis." in result
+
+    def test_kimi_unspool_prepends_warning(self, tmp_path):
+        """Kimi unspool should prepend shell expression warning to result."""
+        spool_id = "kimi-testshell"
+        spool = {
+            "id": spool_id,
+            "status": "complete",
+            "result": "Analysis complete.",
+            "shell_expr_warning": "Warning: prompt contains unexpanded shell expressions: ${HOME}.",
+            "harness": "kimi",
+        }
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool(spool_id, spool)
+            result = _kimi_unspool_sync(spool_id)
+        assert result.startswith("Warning:")
+        assert "Analysis complete." in result
