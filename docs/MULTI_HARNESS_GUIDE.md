@@ -102,7 +102,6 @@ spin(
 - `"pro"` → `gemini-2.5-pro`
 - `"3.1-pro"` → `gemini-3.1-pro`
 - `"3.1-flash-lite"` → `gemini-3.1-flash-lite`
-- `"3.1-flash"` → `gemini-3.1-flash-lite`
 - No model specified → CLI's Auto routing (picks based on task complexity)
 - Any other string passes through to the CLI as-is
 
