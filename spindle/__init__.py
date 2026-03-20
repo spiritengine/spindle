@@ -29,7 +29,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, Generator, Optional
 
-from fastmcp import FastMCP
+from fastmcp import Context, FastMCP
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
@@ -1947,6 +1947,7 @@ async def spin_wait(
     mode: str = "gather",
     timeout: Optional[int] = None,
     time: Optional[str] = None,
+    ctx: Context = None,
 ) -> str:
     """
     Block until spools complete.
@@ -1971,9 +1972,141 @@ async def spin_wait(
         spin_wait(time="2h")        # Sleep for 2 hours
         spin_wait(time="06:00")     # Wait until 6 AM
     """
-    import asyncio
+    # Heartbeat chunk size: sleep in 60s intervals to keep MCP connection alive.
+    # Long blocking sleeps cause the calling CC session's heartbeat to stop.
+    HEARTBEAT_INTERVAL = 60  # seconds
 
-    return await asyncio.to_thread(_spin_wait_sync, spool_ids, mode, timeout, time)
+    # Time-based waiting mode (no spool_ids)
+    if time and not spool_ids:
+        duration_seconds = _parse_duration(time)
+        if duration_seconds is None:
+            return f"Error: Invalid time format '{time}'. Use: 30s, 90m, 2h, or HH:MM"
+
+        start_time = datetime.now()
+        remaining = duration_seconds
+        total_chunks = max(1, (duration_seconds + HEARTBEAT_INTERVAL - 1) // HEARTBEAT_INTERVAL)
+        chunks_done = 0
+
+        while remaining > 0:
+            chunk = min(HEARTBEAT_INTERVAL, remaining)
+            await asyncio.sleep(chunk)
+            remaining -= chunk
+            chunks_done += 1
+
+            if ctx and remaining > 0:
+                elapsed = int((datetime.now() - start_time).total_seconds())
+                try:
+                    await ctx.report_progress(chunks_done, total_chunks)
+                except Exception:
+                    pass
+                try:
+                    await ctx.info(f"spin_wait: {elapsed}s/{duration_seconds}s elapsed")
+                except Exception:
+                    pass
+
+        elapsed = int((datetime.now() - start_time).total_seconds())
+        return json.dumps(
+            {
+                "waited": time,
+                "elapsed_seconds": elapsed,
+                "interrupted": False,
+                "started_at": start_time.isoformat(),
+                "ended_at": datetime.now().isoformat(),
+            },
+            indent=2,
+        )
+
+    # Must have spool_ids for spool-waiting mode
+    if not spool_ids:
+        return "Error: Provide spool_ids to wait for spools, or time to wait for a duration"
+
+    ids = [s.strip() for s in spool_ids.split(",")]
+    start_time = datetime.now()
+    poll_interval = 3  # seconds
+    last_heartbeat = datetime.now()
+
+    if mode == "yield":
+        while True:
+            for spool_id in ids:
+                await asyncio.to_thread(_check_and_finalize_spool, spool_id)
+                spool = await asyncio.to_thread(_read_spool, spool_id)
+                if not spool:
+                    return json.dumps({"spool_id": spool_id, "error": f"Unknown spool_id '{spool_id}'"})
+                if spool.get("status") == "complete":
+                    remaining_ids = [s for s in ids if s != spool_id]
+                    result = _prepend_shell_warning(spool, spool.get("result", "No result"))
+                    return json.dumps(
+                        {
+                            "spool_id": spool_id,
+                            "result": result,
+                            "remaining": remaining_ids,
+                        }
+                    )
+                elif spool.get("status") == "error":
+                    remaining_ids = [s for s in ids if s != spool_id]
+                    return json.dumps(
+                        {
+                            "spool_id": spool_id,
+                            "error": spool.get("error"),
+                            "remaining": remaining_ids,
+                        }
+                    )
+
+            if timeout:
+                elapsed = (datetime.now() - start_time).total_seconds()
+                if elapsed >= timeout:
+                    return f"Timeout after {timeout}s. Spools still running: {', '.join(ids)}"
+
+            # Periodic heartbeat to keep MCP connection alive
+            now = datetime.now()
+            if ctx and (now - last_heartbeat).total_seconds() >= HEARTBEAT_INTERVAL:
+                elapsed = int((now - start_time).total_seconds())
+                try:
+                    await ctx.info(f"spin_wait: waiting {elapsed}s, pending: {', '.join(ids)}")
+                except Exception:
+                    pass
+                last_heartbeat = now
+
+            await asyncio.sleep(poll_interval)
+    else:
+        # gather mode - wait for all
+        results = {}
+        pending = set(ids)
+
+        while pending:
+            for spool_id in list(pending):
+                await asyncio.to_thread(_check_and_finalize_spool, spool_id)
+                spool = await asyncio.to_thread(_read_spool, spool_id)
+                if not spool:
+                    return f"Error: Unknown spool_id '{spool_id}'"
+                if spool.get("status") == "complete":
+                    results[spool_id] = _prepend_shell_warning(spool, spool.get("result", "No result"))
+                    pending.remove(spool_id)
+                elif spool.get("status") == "error":
+                    results[spool_id] = f"Error: {spool.get('error')}"
+                    pending.remove(spool_id)
+
+            if not pending:
+                break
+
+            if timeout:
+                elapsed = (datetime.now() - start_time).total_seconds()
+                if elapsed >= timeout:
+                    return f"Timeout after {timeout}s. Still pending: {', '.join(pending)}. Completed: {json.dumps(results)}"
+
+            # Periodic heartbeat to keep MCP connection alive
+            now = datetime.now()
+            if ctx and (now - last_heartbeat).total_seconds() >= HEARTBEAT_INTERVAL:
+                elapsed = int((now - start_time).total_seconds())
+                try:
+                    await ctx.info(f"spin_wait: waiting {elapsed}s, pending: {', '.join(pending)}, done: {len(results)}/{len(ids)}")
+                except Exception:
+                    pass
+                last_heartbeat = now
+
+            await asyncio.sleep(poll_interval)
+
+        return json.dumps(results, indent=2)
 
 
 @mcp.tool()
