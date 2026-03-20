@@ -1520,6 +1520,7 @@ async def spin(
             shard=use_shard,
             base_branch=base_branch or "master",
             skeinless=skeinless,
+            shell_expr_warning=shell_expr_warning,
         )
     elif harness_lower == "gemini":
         result = await asyncio.to_thread(
@@ -1531,6 +1532,7 @@ async def spin(
             timeout,
             tags,
             env,
+            shell_expr_warning=shell_expr_warning,
         )
     elif harness_lower == "kimi":
         result = await asyncio.to_thread(
@@ -1542,6 +1544,7 @@ async def spin(
             timeout,
             tags,
             env,
+            shell_expr_warning=shell_expr_warning,
         )
     else:
         # Default to Claude Code harness
@@ -1562,14 +1565,10 @@ async def spin(
             shell_expr_warning=shell_expr_warning,
         )
 
-    # For non-CC harnesses, handle shell expression warning centrally
+    # For non-CC harnesses, append shell expression warning to return value
+    # (warning is already stored in spool by the harness-specific spin function)
     if shell_expr_warning and not result.startswith("Error"):
-        # Store warning in spool metadata for unspool path
         spool_id = result.strip()
-        spool = _read_spool(spool_id)
-        if spool:
-            spool["shell_expr_warning"] = shell_expr_warning
-            _write_spool(spool_id, spool)
         return f"{spool_id}\n\n{shell_expr_warning}"
 
     return result
@@ -3322,6 +3321,7 @@ def _codex_spin_sync(
     shard: bool = False,
     base_branch: str = "master",
     skeinless: bool = False,
+    shell_expr_warning: Optional[str] = None,
 ) -> str:
     """Synchronous implementation of codex_spin - runs Codex CLI in background."""
     # Require working_dir
@@ -3443,6 +3443,7 @@ Your task:
         "pid": None,
         "error": None,
         "harness": "codex",  # Mark as codex harness
+        "shell_expr_warning": shell_expr_warning,
     }
 
     _write_spool(spool_id, spool)
@@ -3634,6 +3635,7 @@ def _gemini_spin_sync(
     timeout: Optional[int],
     tags: Optional[str],
     env: Optional[Dict[str, str]],
+    shell_expr_warning: Optional[str] = None,
 ) -> str:
     """Synchronous implementation of gemini_spin - runs Gemini CLI in background."""
     # Require working_dir
@@ -3690,6 +3692,7 @@ def _gemini_spin_sync(
         "pid": None,
         "error": None,
         "harness": "gemini",
+        "shell_expr_warning": shell_expr_warning,
     }
 
     _write_spool(spool_id, spool)
@@ -3793,6 +3796,7 @@ def _kimi_spin_sync(
     timeout: Optional[int],
     tags: Optional[str],
     env: Optional[Dict[str, str]],
+    shell_expr_warning: Optional[str] = None,
 ) -> str:
     """Synchronous implementation of kimi_spin - runs Kimi CLI in background."""
     # Require working_dir
@@ -3860,6 +3864,7 @@ def _kimi_spin_sync(
         "pid": None,
         "error": None,
         "harness": "kimi",
+        "shell_expr_warning": shell_expr_warning,
     }
 
     # Write spool to disk
