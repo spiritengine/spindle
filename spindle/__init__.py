@@ -3602,8 +3602,8 @@ CODEX_MODEL_ALIASES = {
 GEMINI_MODEL_ALIASES = {
     "flash": "gemini-2.5-flash",
     "pro": "gemini-2.5-pro",
-    "3.1-pro": "gemini-3.1-pro",
-    "3.1-flash-lite": "gemini-3.1-flash-lite",
+    "3.1-pro": "gemini-3.1-pro-preview",
+    "flash-lite": "gemini-2.5-flash-lite",
 }
 
 KIMI_MODEL_ALIASES = {
@@ -3642,8 +3642,10 @@ def _gemini_spin_sync(
     # Resolve model aliases (default to pro if no model specified)
     resolved_model = GEMINI_MODEL_ALIASES.get(model, model) if model else "gemini-2.5-pro"
 
-    # Build gemini command: headless mode with auto-approve and JSON output
-    gemini_cmd = ["gemini", "-p", prompt, "-y", "-o", "json"]
+    # Build gemini command: headless mode with sandbox and JSON output
+    # Note: -y (YOLO) is blocked by Google Workspace secureModeEnabled setting.
+    # -s (sandbox) works and is sufficient for research-only spins.
+    gemini_cmd = ["gemini", "-p", prompt, "-s", "-o", "json"]
 
     if resolved_model:
         gemini_cmd.extend(["-m", resolved_model])

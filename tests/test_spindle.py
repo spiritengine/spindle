@@ -711,8 +711,8 @@ class TestGeminiHarness:
         """Model aliases should resolve to full model names."""
         assert GEMINI_MODEL_ALIASES["flash"] == "gemini-2.5-flash"
         assert GEMINI_MODEL_ALIASES["pro"] == "gemini-2.5-pro"
-        assert GEMINI_MODEL_ALIASES["3.1-pro"] == "gemini-3.1-pro"
-        assert GEMINI_MODEL_ALIASES["3.1-flash-lite"] == "gemini-3.1-flash-lite"
+        assert GEMINI_MODEL_ALIASES["3.1-pro"] == "gemini-3.1-pro-preview"
+        assert GEMINI_MODEL_ALIASES["flash-lite"] == "gemini-2.5-flash-lite"
 
     def test_gemini_spin_resolves_alias(self, tmp_path):
         """Gemini spin should resolve model aliases in the CLI command."""
@@ -805,7 +805,7 @@ class TestGeminiHarness:
 
         assert captured_cmd[0] == "gemini"
         assert "-p" in captured_cmd
-        assert "-y" in captured_cmd
+        assert "-s" in captured_cmd
         assert "-o" in captured_cmd
         assert "json" in captured_cmd
         assert "-m" in captured_cmd
