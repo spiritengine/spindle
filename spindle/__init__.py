@@ -596,26 +596,44 @@ def _try_reserve_slot_and_create(spool_id: str, initial_status: str = "pending")
 def _extract_last_json_object(text: str) -> Optional[dict]:
     """Extract the last JSON object from text that may contain non-JSON lines.
 
-    Handles multi-line pretty-printed JSON by scanning backwards for balanced braces.
+    Scans forward, tracking string boundaries so that '{' or '}' inside JSON
+    string literals don't throw off the brace depth.
     """
-    # Find the last '}' and scan backwards to find the matching '{'
-    text = text.rstrip()
-    end = text.rfind("}")
-    if end == -1:
-        return None
-
+    last_start = -1
+    last_end = -1
     depth = 0
-    for i in range(end, -1, -1):
-        if text[i] == "}":
-            depth += 1
-        elif text[i] == "{":
-            depth -= 1
+    start = -1
+    in_string = False
+    escape = False
+    for i, ch in enumerate(text):
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
             if depth == 0:
-                try:
-                    return json.loads(text[i : end + 1])
-                except json.JSONDecodeError:
-                    return None
-    return None
+                start = i
+            depth += 1
+        elif ch == "}":
+            if depth > 0:
+                depth -= 1
+                if depth == 0 and start != -1:
+                    last_start = start
+                    last_end = i
+                    start = -1
+
+    if last_start == -1:
+        return None
+    try:
+        return json.loads(text[last_start : last_end + 1])
+    except json.JSONDecodeError:
+        return None
 
 
 def _extract_gemini_stderr_error(stderr: str) -> str:
