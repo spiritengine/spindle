@@ -3759,8 +3759,10 @@ CODEX_MODEL_ALIASES = {
     "5.4-nano": "gpt-5.4-nano",
     # GPT-5 / 5.1 base
     "5": "gpt-5",
+    "5-mini": "gpt-5-mini",
     "5.1": "gpt-5.1",
     # GPT-4.1 series — cheap no-reasoning text
+    "4.1": "gpt-4.1",
     "4.1-mini": "gpt-4.1-mini",
     "4.1-nano": "gpt-4.1-nano",
 }
