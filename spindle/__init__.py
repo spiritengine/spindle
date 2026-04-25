@@ -1291,7 +1291,8 @@ Your task:
     claude_cmd = ["claude", "-p", effective_prompt, "--output-format", "json"]
 
     if model:
-        claude_cmd.extend(["--model", model])
+        resolved_model = CLAUDE_MODEL_ALIASES.get(model, model)
+        claude_cmd.extend(["--model", resolved_model])
 
     # Auto-accept edits for non-interactive execution
     # Use acceptEdits for careful mode, bypassPermissions for full/shard
@@ -1470,7 +1471,7 @@ async def spin(
         spool_id = spin("Careful work", permission="careful+shard")
         spool_id = spin("Quick task", model="haiku", timeout=60)
         spool_id = spin("Write a parser", harness="codex")  # Use Codex instead
-        spool_id = spin("Fix bug fast", harness="codex", permission="shard", model="5.4")  # Codex + shard
+        spool_id = spin("Fix bug fast", harness="codex", permission="shard", model="codex")  # Codex + shard
         spool_id = spin("Summarize this", harness="gemini", model="flash")  # Use Gemini
         spool_id = spin("Analyze code", harness="kimi", model="thinking")  # Use Kimi
         spool_id = spin("Do something", env={"CC_THINKING_BOOST": "1"})
@@ -2934,13 +2935,14 @@ def _get_harnesses() -> dict:
     """Return harness metadata. Separate function so tests can import it."""
     return {
         "claude-code": {
-            "models": {"haiku": "haiku", "sonnet": "sonnet", "opus": "opus"},
+            "models": CLAUDE_MODEL_ALIASES,
             "default_model": "sonnet",
             "requires": "claude CLI",
+            "note": "Aliases are shortcuts; any model string accepted by claude CLI also works",
         },
         "codex": {
             "models": CODEX_MODEL_ALIASES,
-            "default_model": "gpt-5.4",
+            "default_model": "gpt-5.3-codex",
             "requires": "codex CLI",
             "note": "Aliases are shortcuts; any model string accepted by codex CLI also works",
         },
@@ -3720,19 +3722,45 @@ def _codex_respin_sync(session_id: str, prompt: str) -> str:
     return spool_id
 
 
+# Short aliases for common Claude models. Anything not here passes through.
+# The plain "haiku"/"sonnet"/"opus" aliases are also accepted by the claude CLI
+# directly; they're listed here so spin_harnesses() can advertise them.
+# Source of truth: anthropics/skills/skills/claude-api/shared/models.md
+CLAUDE_MODEL_ALIASES = {
+    "haiku": "haiku",
+    "sonnet": "sonnet",
+    "opus": "opus",
+    "haiku-4.5": "claude-haiku-4-5",
+    "sonnet-4.6": "claude-sonnet-4-6",
+    "opus-4.6": "claude-opus-4-6",
+    "opus-4.7": "claude-opus-4-7",
+    # Opus 4.7 already has 1M context at standard pricing; the [1m] suffix
+    # is preserved for explicit-context callers and back-compat.
+    "opus-4.7-1m": "claude-opus-4-7[1m]",
+    "opus-1m": "claude-opus-4-7[1m]",
+}
+
+
 # Short aliases for common Codex/OpenAI models. Anything not here passes through.
+# Source of truth: openai/codex repo (codex-rs/skills/.../latest-model.md)
 CODEX_MODEL_ALIASES = {
-    # GPT-5 series
-    "5": "gpt-5",
-    "5-mini": "gpt-5-mini",
+    # GPT-5.5 series — current default for general/reasoning tasks
+    "5.5": "gpt-5.5",
+    "5.5-pro": "gpt-5.5-pro",
+    # GPT-5.3 / 5.1 codex variants — recommended for coding
+    "5.3-codex": "gpt-5.3-codex",
+    "codex": "gpt-5.3-codex",
+    "5.1-codex-max": "gpt-5.1-codex-max",
+    "5.1-codex-mini": "gpt-5.1-codex-mini",
+    "codex-mini": "gpt-5.1-codex-mini",
+    # GPT-5.4 series — previous default, still active
     "5.4": "gpt-5.4",
     "5.4-mini": "gpt-5.4-mini",
-    # Reasoning models
-    "o3": "o3",
-    "o3-pro": "o3-pro",
-    "o4-mini": "o4-mini",
-    # GPT-4.1 series
-    "4.1": "gpt-4.1",
+    "5.4-nano": "gpt-5.4-nano",
+    # GPT-5 / 5.1 base
+    "5": "gpt-5",
+    "5.1": "gpt-5.1",
+    # GPT-4.1 series — cheap no-reasoning text
     "4.1-mini": "gpt-4.1-mini",
     "4.1-nano": "gpt-4.1-nano",
 }
@@ -3745,18 +3773,34 @@ CODEX_MODEL_ALIASES = {
 # used by Claude Code and Codex harnesses.
 
 # Short aliases for common models. Anything not here passes through to the CLI.
+# Source of truth: google-gemini/gemini-cli (packages/core/src/config/models.ts)
 GEMINI_MODEL_ALIASES = {
+    # 2.5 family — current CLI default
     "flash": "gemini-2.5-flash",
     "pro": "gemini-2.5-pro",
-    "3.1-pro": "gemini-3.1-pro-preview",
     "flash-lite": "gemini-2.5-flash-lite",
+    # 3.x family — all currently shipped as preview
+    "3-pro": "gemini-3-pro-preview",
+    "3-flash": "gemini-3-flash-preview",
+    "3.1-pro": "gemini-3.1-pro-preview",
+    "3.1-flash-lite": "gemini-3.1-flash-lite-preview",
+    "3.1-customtools": "gemini-3.1-pro-preview-customtools",
+    # Gemma 4 open-weight variants
+    "gemma-4": "gemma-4-31b-it",
+    "gemma-4-mini": "gemma-4-26b-a4b-it",
 }
 
+# Source of truth: MoonshotAI/kimi-cli; aliases use the kimi-cli managed-provider
+# key format ("moonshot-ai/<model>"). The local kimi config must register these
+# under [models.…] (see ~/.kimi/config.toml). Run `kimi /setup` to refresh if
+# a newer model isn't yet in the local config.
 KIMI_MODEL_ALIASES = {
     "thinking": "moonshot-ai/kimi-k2-thinking",
     "thinking-turbo": "moonshot-ai/kimi-k2-thinking-turbo",
     "turbo": "moonshot-ai/kimi-k2-turbo-preview",
-    "latest": "moonshot-ai/kimi-k2.5",
+    "k2.5": "moonshot-ai/kimi-k2.5",
+    "k2.6": "moonshot-ai/kimi-k2.6",
+    "latest": "moonshot-ai/kimi-k2.6",
 }
 
 

@@ -909,7 +909,7 @@ class TestKimiHarness:
         assert KIMI_MODEL_ALIASES["thinking"] == "moonshot-ai/kimi-k2-thinking"
         assert KIMI_MODEL_ALIASES["thinking-turbo"] == "moonshot-ai/kimi-k2-thinking-turbo"
         assert KIMI_MODEL_ALIASES["turbo"] == "moonshot-ai/kimi-k2-turbo-preview"
-        assert KIMI_MODEL_ALIASES["latest"] == "moonshot-ai/kimi-k2.5"
+        assert KIMI_MODEL_ALIASES["latest"] == "moonshot-ai/kimi-k2.6"
 
     def test_kimi_spin_resolves_alias(self, tmp_path):
         """Kimi spin should resolve model aliases in the CLI command."""
@@ -1163,9 +1163,9 @@ class TestSpinHarnesses:
         assert result["kimi"]["models"] == KIMI_MODEL_ALIASES
 
     def test_claude_code_models(self):
-        """Claude Code should list haiku, sonnet, opus."""
+        """Claude Code should at least list the plain haiku/sonnet/opus aliases."""
         result = _get_harnesses()
-        assert set(result["claude-code"]["models"].keys()) == {"haiku", "sonnet", "opus"}
+        assert {"haiku", "sonnet", "opus"} <= set(result["claude-code"]["models"].keys())
 
     def test_unknown_harness_returns_error(self):
         """spin() should return error JSON for unknown harness names."""
