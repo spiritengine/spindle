@@ -513,17 +513,17 @@ class TestConcurrencyLimit:
             failure_count = len(results["failure"])
 
             # All threads should have completed
-            assert (
-                success_count + failure_count == num_threads
-            ), f"Expected {num_threads} results, got {success_count + failure_count}"
+            assert success_count + failure_count == num_threads, (
+                f"Expected {num_threads} results, got {success_count + failure_count}"
+            )
 
             # We started with initial_running, so only (MAX_CONCURRENT - initial_running)
             # new slots should be available
             max_new_slots = MAX_CONCURRENT - initial_running
 
-            assert (
-                success_count == max_new_slots
-            ), f"Expected exactly {max_new_slots} successful reservations, got {success_count}"
+            assert success_count == max_new_slots, (
+                f"Expected exactly {max_new_slots} successful reservations, got {success_count}"
+            )
 
             # The rest should have been rejected
             expected_failures = num_threads - max_new_slots
@@ -532,9 +532,9 @@ class TestConcurrencyLimit:
             # Verify we never exceeded the limit by checking total running
             all_spools = _list_spools()
             running_count = sum(1 for s in all_spools if s.get("status") == "running")
-            assert (
-                running_count == MAX_CONCURRENT
-            ), f"Expected exactly {MAX_CONCURRENT} running spools, got {running_count}"
+            assert running_count == MAX_CONCURRENT, (
+                f"Expected exactly {MAX_CONCURRENT} running spools, got {running_count}"
+            )
 
     def test_lock_file_created(self, tmp_path):
         """Lock file should be created during reservation."""
@@ -691,9 +691,9 @@ class TestWorktreeNameUniqueness:
         assert shard1_id != shard2_id, f"Shard IDs collided: {shard1_id} == {shard2_id}"
 
         # Branch names should also be different
-        assert (
-            shard1["branch_name"] != shard2["branch_name"]
-        ), f"Branch names collided: {shard1['branch_name']} == {shard2['branch_name']}"
+        assert shard1["branch_name"] != shard2["branch_name"], (
+            f"Branch names collided: {shard1['branch_name']} == {shard2['branch_name']}"
+        )
 
         # Verify both worktrees exist
         assert Path(shard1["worktree_path"]).exists(), f"Worktree 1 doesn't exist: {shard1['worktree_path']}"
@@ -1393,7 +1393,10 @@ class TestShellExpressionDetection:
     def test_spin_warns_but_proceeds_dollar_paren(self, tmp_path):
         """spin() should still proceed when prompt contains $(...), with warning."""
         _spin = spin.fn if hasattr(spin, "fn") else spin
-        result = asyncio.run(_spin("Do this: $(cat secrets.txt)", working_dir=str(tmp_path)))
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle._spawn_detached", return_value=12345):
+                with patch("spindle._count_running", return_value=0):
+                    result = asyncio.run(_spin("Do this: $(cat secrets.txt)", working_dir=str(tmp_path)))
         # Should contain warning text — spin proceeds (not error JSON)
         assert "Warning" in result
         assert "$(cat secrets.txt)" in result
@@ -1404,7 +1407,10 @@ class TestShellExpressionDetection:
     def test_spin_warns_but_proceeds_backtick(self, tmp_path):
         """spin() should still proceed when prompt contains backtick expression."""
         _spin = spin.fn if hasattr(spin, "fn") else spin
-        result = asyncio.run(_spin("Value: `cat /etc/passwd`", working_dir=str(tmp_path)))
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle._spawn_detached", return_value=12345):
+                with patch("spindle._count_running", return_value=0):
+                    result = asyncio.run(_spin("Value: `cat /etc/passwd`", working_dir=str(tmp_path)))
         assert "Warning" in result
         assert "`cat /etc/passwd`" in result
         spool_id = result.split("\n")[0].strip()
@@ -1413,7 +1419,10 @@ class TestShellExpressionDetection:
     def test_spin_warns_but_proceeds_dollar_brace(self, tmp_path):
         """spin() should still proceed when prompt contains ${...} expression."""
         _spin = spin.fn if hasattr(spin, "fn") else spin
-        result = asyncio.run(_spin("Path: ${HOME}/data", working_dir=str(tmp_path)))
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle._spawn_detached", return_value=12345):
+                with patch("spindle._count_running", return_value=0):
+                    result = asyncio.run(_spin("Path: ${HOME}/data", working_dir=str(tmp_path)))
         assert "Warning" in result
         assert "${HOME}" in result
         spool_id = result.split("\n")[0].strip()

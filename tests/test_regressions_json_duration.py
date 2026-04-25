@@ -7,11 +7,7 @@ from spindle import _extract_last_json_object, _parse_duration
 
 def test_extract_last_json_object_ignores_braces_in_strings():
     # Last JSON object is valid; it contains a '}' inside a string value.
-    text = (
-        "noise\n"
-        '{"ok": true, "msg": "this has a brace } in a string"}\n'
-        "trailer"
-    )
+    text = 'noise\n{"ok": true, "msg": "this has a brace } in a string"}\ntrailer'
     obj = _extract_last_json_object(text)
     assert obj == {"ok": True, "msg": "this has a brace } in a string"}
 

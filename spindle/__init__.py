@@ -628,6 +628,7 @@ def _extract_gemini_stderr_error(stderr: str) -> str:
     details are in the plain-text portion of stderr before the JSON block.
     """
     import re
+
     error_lines = []
     for line in stderr.split("\n"):
         line = line.strip()
@@ -2102,7 +2103,9 @@ async def spin_wait(
             if ctx and (now - last_heartbeat).total_seconds() >= HEARTBEAT_INTERVAL:
                 elapsed = int((now - start_time).total_seconds())
                 try:
-                    await ctx.info(f"spin_wait: waiting {elapsed}s, pending: {', '.join(pending)}, done: {len(results)}/{len(ids)}")
+                    await ctx.info(
+                        f"spin_wait: waiting {elapsed}s, pending: {', '.join(pending)}, done: {len(results)}/{len(ids)}"
+                    )
                 except Exception:
                     pass
                 last_heartbeat = now
