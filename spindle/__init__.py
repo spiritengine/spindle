@@ -606,7 +606,7 @@ def _extract_last_json_object(text: str) -> Optional[dict]:
     i = 0
     n = len(text)
     while i < n:
-        if text[i] == "{":
+        if text[i] in ("{", "["):
             try:
                 obj, end = decoder.raw_decode(text, i)
             except json.JSONDecodeError:
@@ -614,8 +614,8 @@ def _extract_last_json_object(text: str) -> Optional[dict]:
                 continue
             if isinstance(obj, dict):
                 last = obj
-                i = end
-                continue
+            i = end
+            continue
         i += 1
     return last
 
