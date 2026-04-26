@@ -1699,3 +1699,100 @@ class TestDetectExistingShard:
         assert str(Path(wt_path).resolve()) == str(Path(captured_cwd[0]).resolve()), (
             f"Agent cwd {captured_cwd[0]!r} does not match existing shard {wt_path!r}"
         )
+
+    def test_returns_none_for_worktrees_in_path_but_not_under_repo_root(self, tmp_path):
+        """
+        Regression for detection broadness: /home/worktrees/my-project on a shard-*
+        branch must NOT be detected as a shard worktree — 'worktrees' must be a
+        sub-directory of the repo root, not just anywhere in the path.
+        """
+        # Create a standalone repo whose path happens to contain "worktrees"
+        worktrees_dir = tmp_path / "worktrees"
+        worktrees_dir.mkdir()
+        repo = worktrees_dir / "my-project"
+        repo.mkdir()
+        for cmd in [
+            ["git", "init"],
+            ["git", "config", "user.email", "test@test.com"],
+            ["git", "config", "user.name", "Test User"],
+        ]:
+            subprocess.run(cmd, cwd=repo, capture_output=True)
+        (repo / "f.txt").write_text("x")
+        subprocess.run(["git", "add", "."], cwd=repo, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True)
+        # Create and switch to a shard-* branch
+        subprocess.run(
+            ["git", "checkout", "-b", "shard-fake-20260426-001"],
+            cwd=repo,
+            capture_output=True,
+        )
+
+        result = _detect_existing_shard(str(repo))
+
+        assert result is None, (
+            "A repo whose path contains 'worktrees' but is not under another "
+            "repo's worktrees/ dir should not be detected as a shard"
+        )
+
+
+class TestSpinSyncShardCleanupOnFailure:
+    """Verify that _spin_sync cleans up newly created shards on spawn failure
+    but leaves pre-existing shards untouched."""
+
+    def _make_fake_shard_info(self, path):
+        return {
+            "worktree_path": str(path),
+            "branch_name": "shard-test-20260426-001",
+            "shard_id": "test-20260426-001",
+        }
+
+    def test_newly_created_shard_cleaned_up_on_spawn_failure(self, tmp_path):
+        """When _spin_sync creates a new shard and spawn fails, _cleanup_shard is called."""
+        fake_shard = self._make_fake_shard_info(tmp_path)
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle._count_running", return_value=0):
+                with patch("spindle._has_skein", return_value=False):
+                    with patch("spindle._spawn_shard", return_value=fake_shard):
+                        with patch("spindle._detect_existing_shard", return_value=None):
+                            with patch("spindle._spawn_detached", side_effect=OSError("boom")):
+                                with patch("spindle._cleanup_shard") as mock_cleanup:
+                                    _spin_sync(
+                                        "do work",
+                                        "shard",
+                                        False,
+                                        None,
+                                        str(tmp_path),
+                                        None,
+                                        None,
+                                        None,
+                                        None,
+                                        True,
+                                        None,
+                                    )
+                                    mock_cleanup.assert_called_once_with(fake_shard, str(tmp_path))
+
+    def test_preexisting_shard_not_cleaned_up_on_spawn_failure(self, tmp_path):
+        """When _spin_sync reuses an existing shard and spawn fails, _cleanup_shard is NOT called."""
+        fake_shard = self._make_fake_shard_info(tmp_path)
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle._count_running", return_value=0):
+                with patch("spindle._has_skein", return_value=False):
+                    with patch("spindle._detect_existing_shard", return_value=fake_shard):
+                        with patch("spindle._spawn_detached", side_effect=OSError("boom")):
+                            with patch("spindle._cleanup_shard") as mock_cleanup:
+                                _spin_sync(
+                                    "do work",
+                                    "shard",
+                                    False,
+                                    None,
+                                    str(tmp_path),
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    True,
+                                    None,
+                                )
+                                mock_cleanup.assert_not_called()

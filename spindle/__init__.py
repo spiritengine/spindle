@@ -270,13 +270,39 @@ def _detect_existing_shard(path: str) -> Optional[Dict[str, str]]:
     Returns shard_info dict if path is a shard worktree, None otherwise.
 
     A path qualifies as a shard worktree when both conditions hold:
-    1. It lives under a worktrees/ directory
+    1. It lives under <repo-root>/worktrees/ (anchored via git-common-dir)
     2. Its current git branch matches shard-*
     """
     resolved = Path(path).resolve()
 
-    # Must be under a worktrees/ directory
-    if "worktrees" not in resolved.parts:
+    # Use git-common-dir to anchor worktrees/ to the actual repo root.
+    # For a linked worktree this returns an absolute path to the main .git
+    # directory; for the main repo itself it returns the relative string ".git".
+    try:
+        gcd = subprocess.run(
+            ["git", "rev-parse", "--git-common-dir"],
+            capture_output=True,
+            text=True,
+            cwd=str(resolved),
+            timeout=10,
+        )
+        if gcd.returncode != 0:
+            return None
+        common_dir = gcd.stdout.strip()
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return None
+
+    # A relative result means we're inside the main repo, not a linked worktree.
+    if not Path(common_dir).is_absolute():
+        return None
+
+    # repo root is the parent of the common .git directory
+    repo_root = Path(common_dir).parent
+
+    # Must be directly under <repo-root>/worktrees/
+    try:
+        resolved.relative_to(repo_root / "worktrees")
+    except ValueError:
         return None
 
     # Get current git branch
@@ -1295,11 +1321,13 @@ def _spin_sync(
 
     # Handle shard creation
     shard_info = None
+    shard_newly_created = False
     if use_shard:
         # Reuse the worktree if working_dir already points at an existing shard
         shard_info = _detect_existing_shard(cwd)
         if shard_info is None:
             shard_info = _spawn_shard(spool_id, cwd, base_branch=base_branch)
+            shard_newly_created = shard_info is not None
         if shard_info:
             cwd = shard_info["worktree_path"]
         else:
@@ -1453,6 +1481,9 @@ Your task:
         spool["error"] = f"spawn failed: {e}"
         spool["completed_at"] = datetime.now().isoformat()
         _write_spool(spool_id, spool)
+        # Clean up shard worktree only if we created it; don't destroy pre-existing shards
+        if shard_newly_created:
+            _cleanup_shard(shard_info, working_dir)
         return f"Error: Failed to spawn process: {e}"
 
     # Update spool with PID and status
