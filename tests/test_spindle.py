@@ -20,6 +20,7 @@ from spindle import (
     _check_and_finalize_spool,
     _check_shell_expressions,
     _cleanup_shard,
+    _codex_spin_sync,
     _count_running,
     _detect_existing_shard,
     _gemini_spin_sync,
@@ -1598,7 +1599,7 @@ class TestDetectExistingShard:
         assert result is not None, "Should detect existing shard"
         assert result["worktree_path"] == str(Path(wt_path).resolve())
         assert result["branch_name"] == branch
-        assert result["shard_id"] == branch[len("shard-"):]
+        assert result["shard_id"] == branch[len("shard-") :]
 
     def test_returns_none_for_non_worktree_path(self, tmp_path):
         """Should return None when path is a plain repo (not under worktrees/)."""
@@ -1690,8 +1691,7 @@ class TestDetectExistingShard:
 
         # _spawn_shard must NOT have been called — the existing shard was reused
         assert len(spawned) == 0, (
-            f"_spawn_shard was called {len(spawned)} time(s); should be 0 when "
-            f"working_dir is already a shard worktree"
+            f"_spawn_shard was called {len(spawned)} time(s); should be 0 when working_dir is already a shard worktree"
         )
 
         # The agent's cwd should be the existing worktree, not a new one
@@ -1732,6 +1732,170 @@ class TestDetectExistingShard:
         assert result is None, (
             "A repo whose path contains 'worktrees' but is not under another "
             "repo's worktrees/ dir should not be detected as a shard"
+        )
+
+    def test_returns_none_for_substring_worktrees_in_path_component(self, tmp_path):
+        """
+        Regression for substring matching: a path component that *contains*
+        the substring 'worktrees' (e.g. 'my-worktrees-copy') must not be
+        treated as the worktrees/ dir. Using `git rev-parse --git-common-dir`
+        anchors detection to the actual repo root, not string matching.
+        """
+        # Repo path component literally contains 'worktrees' as a substring
+        wrap = tmp_path / "my-worktrees-copy"
+        wrap.mkdir()
+        repo = wrap / "repo"
+        repo.mkdir()
+        for cmd in [
+            ["git", "init"],
+            ["git", "config", "user.email", "test@test.com"],
+            ["git", "config", "user.name", "Test User"],
+        ]:
+            subprocess.run(cmd, cwd=repo, capture_output=True)
+        (repo / "f.txt").write_text("x")
+        subprocess.run(["git", "add", "."], cwd=repo, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True)
+        subprocess.run(
+            ["git", "checkout", "-b", "shard-fake-20260426-002"],
+            cwd=repo,
+            capture_output=True,
+        )
+
+        # Add a worktrees/ subdirectory that is NOT actually a git worktree —
+        # just a plain directory. Detection must not be fooled.
+        (repo / "worktrees").mkdir()
+        (repo / "worktrees" / "stash-foo").mkdir()
+
+        # Probe both the repo root and the bogus worktrees/<name> subdir
+        for probe in [repo, repo / "worktrees" / "stash-foo"]:
+            result = _detect_existing_shard(str(probe))
+            assert result is None, (
+                f"{probe} should not be detected as a shard — path component "
+                f"'my-worktrees-copy' merely contains the substring 'worktrees'"
+            )
+
+    def test_existing_shard_worktree_subdirectory(self, tmp_path):
+        """
+        Regression: when --working-dir points at a subdirectory inside an
+        existing shard worktree, the agent must land in that subdirectory but
+        shard_info['worktree_path'] must be the worktree ROOT so that
+        merge/drop logic (which does .parent.parent) computes the correct
+        main repo.
+        """
+        repo, wt_path, branch = self._make_repo_with_shard(tmp_path)
+
+        subdir = Path(wt_path) / "src" / "deep"
+        subdir.mkdir(parents=True)
+
+        captured_cwd = []
+
+        def fake_detached(spool_id, cmd, cwd, env=None):
+            captured_cwd.append(cwd)
+            return 99999
+
+        spawn_calls = []
+        original_spawn = __import__("spindle")._spawn_shard
+
+        def tracking_spawn(*args, **kwargs):
+            spawn_calls.append((args, kwargs))
+            return original_spawn(*args, **kwargs)
+
+        spindle_state = tmp_path / "spindle_state"
+        spindle_state.mkdir()
+        with patch("spindle.SPINDLE_DIR", spindle_state):
+            with patch("spindle._has_skein", return_value=False):
+                with patch("spindle._spawn_shard", side_effect=tracking_spawn):
+                    with patch("spindle._spawn_detached", side_effect=fake_detached):
+                        with patch("spindle._count_running", return_value=0):
+                            spool_id = _spin_sync(
+                                "echo from subdir",
+                                "shard",
+                                False,
+                                None,
+                                str(subdir),
+                                None,
+                                None,
+                                None,
+                                None,
+                                False,
+                                None,
+                            )
+                            # Read the spool while SPINDLE_DIR is still patched
+                            spool = _read_spool(spool_id)
+
+        # Existing shard should be reused, not a new one spawned
+        assert spawn_calls == [], (
+            f"_spawn_shard called {len(spawn_calls)} time(s); existing shard "
+            f"should have been reused for subdirectory cwd"
+        )
+
+        # Agent lands in the subdirectory the user pointed at
+        assert len(captured_cwd) == 1
+        assert Path(captured_cwd[0]).resolve() == subdir.resolve(), (
+            f"Agent cwd {captured_cwd[0]!r} should be the requested subdir {str(subdir)!r}"
+        )
+
+        # shard_info['worktree_path'] is the worktree ROOT, not the subdir
+        assert spool is not None
+        shard_info = spool.get("shard")
+        assert shard_info is not None
+        assert Path(shard_info["worktree_path"]).resolve() == Path(wt_path).resolve(), (
+            f"shard_info['worktree_path'] {shard_info['worktree_path']!r} should be "
+            f"worktree root {wt_path!r}, not the subdirectory cwd"
+        )
+
+        # Verify merge/drop's main_repo derivation (worktrees/<name> -> repo)
+        main_repo = Path(shard_info["worktree_path"]).parent.parent
+        assert main_repo.resolve() == Path(repo).resolve(), (
+            f"main_repo derived via .parent.parent {main_repo!r} must match the actual repo root {repo!r}"
+        )
+
+    def test_codex_spin_sync_reuses_existing_shard(self, tmp_path):
+        """
+        Mirror of test_spin_reuses_existing_shard_instead_of_spawning_new for
+        the codex harness — same reuse semantics must hold for _codex_spin_sync.
+        """
+        repo, wt_path, branch = self._make_repo_with_shard(tmp_path)
+
+        spawn_calls = []
+        original_spawn = __import__("spindle")._spawn_shard
+
+        def tracking_spawn(*args, **kwargs):
+            spawn_calls.append((args, kwargs))
+            return original_spawn(*args, **kwargs)
+
+        captured_cwd = []
+
+        def fake_detached(spool_id, cmd, cwd, env=None):
+            captured_cwd.append(cwd)
+            return 99999
+
+        spindle_state = tmp_path / "spindle_state"
+        spindle_state.mkdir()
+        with patch("spindle.SPINDLE_DIR", spindle_state):
+            with patch("spindle._has_skein", return_value=False):
+                with patch("spindle._spawn_shard", side_effect=tracking_spawn):
+                    with patch("spindle._spawn_detached", side_effect=fake_detached):
+                        with patch("spindle._count_running", return_value=0):
+                            _codex_spin_sync(
+                                "pwd",
+                                wt_path,
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                                shard=True,
+                            )
+
+        assert spawn_calls == [], (
+            f"_spawn_shard called {len(spawn_calls)} time(s); _codex_spin_sync "
+            f"should reuse the existing shard when working_dir is already a "
+            f"shard worktree"
+        )
+        assert len(captured_cwd) == 1
+        assert str(Path(wt_path).resolve()) == str(Path(captured_cwd[0]).resolve()), (
+            f"Codex agent cwd {captured_cwd[0]!r} does not match existing shard {wt_path!r}"
         )
 
 
