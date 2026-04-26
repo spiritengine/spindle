@@ -20,6 +20,7 @@ from spindle import (
     _check_and_finalize_spool,
     _check_shell_expressions,
     _cleanup_shard,
+    _codex_respin_sync,
     _codex_spin_sync,
     _count_running,
     _detect_existing_shard,
@@ -41,6 +42,8 @@ from spindle import (
     _spool_lock,
     _try_reserve_slot_and_create,
     _write_spool,
+    shard_abandon,
+    shard_merge,
     spin,
 )
 
@@ -1960,3 +1963,170 @@ class TestSpinSyncShardCleanupOnFailure:
                                     None,
                                 )
                                 mock_cleanup.assert_not_called()
+
+
+class TestShardOpsBlockedBySubdirectorySpool:
+    """Regression for round-3 fell finding A: shard_merge / shard_abandon must
+    block when another running spool's working_dir is a *subdirectory* of the
+    worktree, not just an exact match. After the round-2 fix that lets
+    --working-dir point at a subdir of an existing shard, the prior equality
+    check would let merge/abandon clobber the worktree out from under a live
+    spool."""
+
+    def _setup_spools(self, tmp_path, other_working_dir):
+        """Write a 'complete' spool with a shard plus an 'other' running spool
+        whose working_dir is at `other_working_dir`. Returns the merge-target
+        spool_id and worktree_path."""
+        spindle_state = tmp_path / "spindle_state"
+        spindle_state.mkdir()
+        wt_path = tmp_path / "worktrees" / "shard-test-001"
+        wt_path.mkdir(parents=True)
+        # Mark wt_path as a directory git would consider a worktree by giving
+        # it a .git file (won't actually be used — merge stops at the in-use
+        # check before any git invocation).
+        (wt_path / ".git").write_text("gitdir: irrelevant")
+
+        target_id = "spool-target"
+        target = {
+            "id": target_id,
+            "status": "complete",
+            "result": "done",
+            "shard": {
+                "worktree_path": str(wt_path),
+                "branch_name": "shard-test-001",
+                "shard_id": "test-001",
+            },
+            "harness": "claude-code",
+        }
+
+        other_id = "spool-other-running"
+        other = {
+            "id": other_id,
+            "status": "running",
+            "working_dir": str(other_working_dir),
+            "harness": "claude-code",
+        }
+
+        with patch("spindle.SPINDLE_DIR", spindle_state):
+            _write_spool(target_id, target)
+            _write_spool(other_id, other)
+
+        return spindle_state, target_id, wt_path
+
+    def test_shard_merge_blocked_by_active_spool_in_subdirectory(self, tmp_path):
+        """A running spool with working_dir inside the worktree (subdir) must
+        block shard_merge from cleaning up that worktree."""
+        wt_path = tmp_path / "worktrees" / "shard-test-001"
+        subdir = wt_path / "src" / "deep"
+        spindle_state, target_id, _ = self._setup_spools(tmp_path, subdir)
+        subdir.mkdir(parents=True)
+
+        # caller_cwd is outside the worktree so we don't trip the cwd guard
+        caller_cwd = str(tmp_path / "outside")
+        (tmp_path / "outside").mkdir()
+
+        _shard_merge = shard_merge.fn if hasattr(shard_merge, "fn") else shard_merge
+        with patch("spindle.SPINDLE_DIR", spindle_state):
+            result = asyncio.run(_shard_merge(target_id, caller_cwd=caller_cwd))
+
+        assert "still running" in result, (
+            f"shard_merge should refuse when another spool has a subdirectory "
+            f"working_dir inside the worktree; got: {result!r}"
+        )
+
+    def test_shard_abandon_blocked_by_active_spool_in_subdirectory(self, tmp_path):
+        """Same regression as shard_merge, for shard_abandon."""
+        wt_path = tmp_path / "worktrees" / "shard-test-001"
+        subdir = wt_path / "src" / "deep"
+        spindle_state, target_id, _ = self._setup_spools(tmp_path, subdir)
+        subdir.mkdir(parents=True)
+
+        caller_cwd = str(tmp_path / "outside")
+        (tmp_path / "outside").mkdir()
+
+        _shard_abandon = shard_abandon.fn if hasattr(shard_abandon, "fn") else shard_abandon
+        with patch("spindle.SPINDLE_DIR", spindle_state):
+            result = asyncio.run(_shard_abandon(target_id, caller_cwd=caller_cwd))
+
+        assert "still running" in result, (
+            f"shard_abandon should refuse when another spool has a subdirectory "
+            f"working_dir inside the worktree; got: {result!r}"
+        )
+
+
+class TestCodexRespinPreservesGitAccess:
+    """Regression for round-3 fell finding B: _codex_respin_sync must derive
+    .git from shard_info['worktree_path'], not working_dir, so a subdirectory
+    cwd doesn't lose --add-dir grants for the main repo and worktree root."""
+
+    def test_codex_respin_subdirectory_cwd_preserves_git_access(self, tmp_path):
+        # Build a real repo + worktree so the gitdir resolution exercises
+        # actual filesystem state instead of mocks.
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        for cmd in [
+            ["git", "init"],
+            ["git", "config", "user.email", "test@test.com"],
+            ["git", "config", "user.name", "Test User"],
+        ]:
+            subprocess.run(cmd, cwd=repo, capture_output=True)
+        (repo / "README.md").write_text("hello")
+        subprocess.run(["git", "add", "."], cwd=repo, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True)
+
+        wt_path = repo / "worktrees" / "shard-codex-respin-001"
+        wt_path.parent.mkdir(exist_ok=True)
+        subprocess.run(
+            ["git", "worktree", "add", str(wt_path), "-b", "shard-codex-respin-001"],
+            cwd=repo,
+            capture_output=True,
+        )
+        # Subdirectory inside the worktree — what working_dir will point at
+        subdir = wt_path / "pkg" / "deep"
+        subdir.mkdir(parents=True)
+
+        session_id = "codex-session-xyz"
+        original_id = "codex-original"
+        original_spool = {
+            "id": original_id,
+            "status": "complete",
+            "session_id": session_id,
+            "working_dir": str(subdir),
+            "shard": {
+                "worktree_path": str(wt_path),
+                "branch_name": "shard-codex-respin-001",
+                "shard_id": "codex-respin-001",
+            },
+            "harness": "codex",
+            "tags": ["codex"],
+        }
+
+        captured_cmd = []
+
+        def fake_detached(spool_id, cmd, cwd, env=None):
+            captured_cmd.append(list(cmd))
+            return 99999
+
+        spindle_state = tmp_path / "spindle_state"
+        spindle_state.mkdir()
+        with patch("spindle.SPINDLE_DIR", spindle_state):
+            _write_spool(original_id, original_spool)
+            with patch("spindle._has_landlock_support", return_value=True):
+                with patch("spindle._spawn_detached", side_effect=fake_detached):
+                    with patch("spindle._count_running", return_value=0):
+                        _codex_respin_sync(session_id, "follow up")
+
+        assert len(captured_cmd) == 1, "Expected one spawn for codex respin"
+        cmd = captured_cmd[0]
+        # Collect every --add-dir argument
+        add_dirs = [cmd[i + 1] for i, tok in enumerate(cmd) if tok == "--add-dir"]
+        resolved = {str(Path(d).resolve()) for d in add_dirs}
+
+        main_git = (repo / ".git").resolve()
+        assert str(main_git) in resolved, (
+            f"codex respin must --add-dir the main repo's .git ({main_git}); got {add_dirs!r}"
+        )
+        assert str(wt_path.resolve()) in resolved, (
+            f"codex respin must --add-dir the worktree root ({wt_path}) so a "
+            f"subdirectory cwd retains write access to sibling files; got {add_dirs!r}"
+        )

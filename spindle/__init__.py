@@ -3281,7 +3281,10 @@ async def shard_merge(spool_id: str, keep_branch: bool = False, caller_cwd: str 
     for other in _list_spools():
         if other.get("status") == "running" and other.get("id") != spool_id:
             other_wd = other.get("working_dir", "")
-            if other_wd and Path(other_wd).resolve() == wt_path:
+            if not other_wd:
+                continue
+            other_path = Path(other_wd).resolve()
+            if other_path == wt_path or wt_path in other_path.parents:
                 return f"Error: Spool {other['id']} is still running in this worktree. Wait for it to complete or use spin_drop() first."
 
     # Find the main repo path
@@ -3379,7 +3382,10 @@ async def shard_abandon(spool_id: str, keep_branch: bool = False, caller_cwd: st
     for other in _list_spools():
         if other.get("status") == "running" and other.get("id") != spool_id:
             other_wd = other.get("working_dir", "")
-            if other_wd and Path(other_wd).resolve() == wt_path:
+            if not other_wd:
+                continue
+            other_path = Path(other_wd).resolve()
+            if other_path == wt_path or wt_path in other_path.parents:
                 return f"Error: Spool {other['id']} is still running in this worktree. Wait for it to complete or use spin_drop() first."
 
     # Find the main repo path
@@ -3787,9 +3793,11 @@ def _codex_respin_sync(session_id: str, prompt: str) -> str:
     env = original_spool.get("env") if original_spool else None
     shard_info = original_spool.get("shard") if original_spool else None
 
-    # For shards, grant write access to main repo's .git for commits
+    # For shards, grant write access to main repo's .git for commits.
+    # Resolve .git via the worktree root (shard_info), not working_dir, since
+    # working_dir may be a subdirectory inside the worktree.
     if shard_info and has_landlock:
-        git_file = Path(working_dir) / ".git"
+        git_file = Path(shard_info["worktree_path"]) / ".git"
         if git_file.exists() and git_file.is_file():
             git_content = git_file.read_text().strip()
             if git_content.startswith("gitdir:"):
@@ -3797,6 +3805,9 @@ def _codex_respin_sync(session_id: str, prompt: str) -> str:
                 main_git = Path(git_worktree_dir).parent.parent
                 if main_git.exists() and main_git.name == ".git":
                     codex_cmd.extend(["--add-dir", str(main_git)])
+                    # Also grant write access to the worktree root so a
+                    # subdirectory cwd doesn't lock the agent out of sibling files.
+                    codex_cmd.extend(["--add-dir", shard_info["worktree_path"]])
 
     # The prompt is passed as additional argument to resume
     codex_cmd.append(prompt)
