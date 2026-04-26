@@ -21,6 +21,7 @@ from spindle import (
     _check_shell_expressions,
     _cleanup_shard,
     _count_running,
+    _detect_existing_shard,
     _gemini_spin_sync,
     _gemini_unspool_sync,
     _get_harnesses,
@@ -1559,3 +1560,142 @@ class TestShellExpressionDetection:
             result = _kimi_unspool_sync(spool_id)
         assert result.startswith("Warning:")
         assert "Analysis complete." in result
+
+
+class TestDetectExistingShard:
+    """Tests for _detect_existing_shard — reuse an existing shard worktree.
+
+    Regression guard for brief-20260426-4swg: when --working-dir already points
+    at a shard worktree, spindle must not spawn a second one.
+    """
+
+    def _make_repo_with_shard(self, tmp_path):
+        """Helper: create a git repo with one shard worktree, return (repo_dir, worktree_path, branch_name)."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        for cmd in [
+            ["git", "init"],
+            ["git", "config", "user.email", "test@test.com"],
+            ["git", "config", "user.name", "Test User"],
+        ]:
+            subprocess.run(cmd, cwd=repo, capture_output=True)
+        (repo / "README.md").write_text("hello")
+        subprocess.run(["git", "add", "."], cwd=repo, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True)
+
+        with patch("spindle._has_skein", return_value=False):
+            shard_info = _spawn_shard("test-agent", str(repo))
+
+        assert shard_info is not None, "Shard creation failed in test setup"
+        return repo, shard_info["worktree_path"], shard_info["branch_name"]
+
+    def test_detects_shard_worktree(self, tmp_path):
+        """Should return shard_info when path is under worktrees/ on a shard-* branch."""
+        _repo, wt_path, branch = self._make_repo_with_shard(tmp_path)
+
+        result = _detect_existing_shard(wt_path)
+
+        assert result is not None, "Should detect existing shard"
+        assert result["worktree_path"] == str(Path(wt_path).resolve())
+        assert result["branch_name"] == branch
+        assert result["shard_id"] == branch[len("shard-"):]
+
+    def test_returns_none_for_non_worktree_path(self, tmp_path):
+        """Should return None when path is a plain repo (not under worktrees/)."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        for cmd in [
+            ["git", "init"],
+            ["git", "config", "user.email", "test@test.com"],
+            ["git", "config", "user.name", "Test User"],
+        ]:
+            subprocess.run(cmd, cwd=repo, capture_output=True)
+        (repo / "f.txt").write_text("x")
+        subprocess.run(["git", "add", "."], cwd=repo, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True)
+
+        result = _detect_existing_shard(str(repo))
+
+        assert result is None, "Should not detect plain repo as shard"
+
+    def test_returns_none_for_non_shard_branch(self, tmp_path):
+        """Should return None when path is under worktrees/ but branch doesn't start with shard-."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        for cmd in [
+            ["git", "init"],
+            ["git", "config", "user.email", "test@test.com"],
+            ["git", "config", "user.name", "Test User"],
+        ]:
+            subprocess.run(cmd, cwd=repo, capture_output=True)
+        (repo / "f.txt").write_text("x")
+        subprocess.run(["git", "add", "."], cwd=repo, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True)
+
+        # Create a worktree under worktrees/ but on a non-shard branch
+        wt_dir = repo / "worktrees" / "feature-branch"
+        wt_dir.parent.mkdir(exist_ok=True)
+        subprocess.run(
+            ["git", "worktree", "add", str(wt_dir), "-b", "feature-branch", "HEAD"],
+            cwd=repo,
+            capture_output=True,
+        )
+
+        result = _detect_existing_shard(str(wt_dir))
+
+        assert result is None, "Should not detect non-shard-prefixed branch as shard"
+
+    def test_spin_reuses_existing_shard_instead_of_spawning_new(self, tmp_path):
+        """
+        Repro test for brief-20260426-4swg.
+
+        spin(..., permission="shard", working_dir=<existing-shard-worktree>) must
+        place the agent in the existing worktree, not create a fresh one.
+        """
+        repo, wt_path, branch = self._make_repo_with_shard(tmp_path)
+
+        spawned = []
+        original_spawn = __import__("spindle")._spawn_shard
+
+        def tracking_spawn(*args, **kwargs):
+            result = original_spawn(*args, **kwargs)
+            spawned.append(result)
+            return result
+
+        captured_cwd = []
+
+        def fake_detached(spool_id, cmd, cwd, env=None):
+            captured_cwd.append(cwd)
+            return 99999
+
+        with patch("spindle.SPINDLE_DIR", tmp_path / "spindle_state"):
+            (tmp_path / "spindle_state").mkdir()
+            with patch("spindle._has_skein", return_value=False):
+                with patch("spindle._spawn_shard", side_effect=tracking_spawn):
+                    with patch("spindle._spawn_detached", side_effect=fake_detached):
+                        with patch("spindle._count_running", return_value=0):
+                            _spin_sync(
+                                "pwd && git log --oneline -1",
+                                "shard",
+                                False,
+                                None,
+                                wt_path,
+                                None,
+                                None,
+                                None,
+                                None,
+                                False,
+                                None,
+                            )
+
+        # _spawn_shard must NOT have been called — the existing shard was reused
+        assert len(spawned) == 0, (
+            f"_spawn_shard was called {len(spawned)} time(s); should be 0 when "
+            f"working_dir is already a shard worktree"
+        )
+
+        # The agent's cwd should be the existing worktree, not a new one
+        assert len(captured_cwd) == 1
+        assert str(Path(wt_path).resolve()) == str(Path(captured_cwd[0]).resolve()), (
+            f"Agent cwd {captured_cwd[0]!r} does not match existing shard {wt_path!r}"
+        )

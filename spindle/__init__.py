@@ -263,6 +263,48 @@ def _spawn_shard(agent_id: str, working_dir: str, base_branch: str = "master") -
     return None
 
 
+def _detect_existing_shard(path: str) -> Optional[Dict[str, str]]:
+    """
+    Check if path is already an existing shard worktree.
+
+    Returns shard_info dict if path is a shard worktree, None otherwise.
+
+    A path qualifies as a shard worktree when both conditions hold:
+    1. It lives under a worktrees/ directory
+    2. Its current git branch matches shard-*
+    """
+    resolved = Path(path).resolve()
+
+    # Must be under a worktrees/ directory
+    if "worktrees" not in resolved.parts:
+        return None
+
+    # Get current git branch
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True,
+            text=True,
+            cwd=str(resolved),
+            timeout=10,
+        )
+        if result.returncode != 0:
+            return None
+        branch_name = result.stdout.strip()
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return None
+
+    if not branch_name.startswith("shard-"):
+        return None
+
+    shard_id = branch_name[len("shard-"):]
+    return {
+        "worktree_path": str(resolved),
+        "branch_name": branch_name,
+        "shard_id": shard_id,
+    }
+
+
 def _close_tender_folios(worktree_name: str, working_dir: str) -> Optional[str]:
     """
     Close any tender folios associated with a worktree after successful merge.
@@ -1254,7 +1296,10 @@ def _spin_sync(
     # Handle shard creation
     shard_info = None
     if use_shard:
-        shard_info = _spawn_shard(spool_id, cwd, base_branch=base_branch)
+        # Reuse the worktree if working_dir already points at an existing shard
+        shard_info = _detect_existing_shard(cwd)
+        if shard_info is None:
+            shard_info = _spawn_shard(spool_id, cwd, base_branch=base_branch)
         if shard_info:
             cwd = shard_info["worktree_path"]
         else:
@@ -3484,7 +3529,10 @@ def _codex_spin_sync(
     # Handle shard creation
     shard_info = None
     if shard:
-        shard_info = _spawn_shard(spool_id, cwd, base_branch=base_branch)
+        # Reuse the worktree if working_dir already points at an existing shard
+        shard_info = _detect_existing_shard(cwd)
+        if shard_info is None:
+            shard_info = _spawn_shard(spool_id, cwd, base_branch=base_branch)
         if shard_info:
             cwd = shard_info["worktree_path"]
         else:
