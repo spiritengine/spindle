@@ -263,6 +263,96 @@ def _spawn_shard(agent_id: str, working_dir: str, base_branch: str = "master") -
     return None
 
 
+def _detect_existing_shard(path: str) -> Optional[Dict[str, str]]:
+    """
+    Check if path is inside an existing shard worktree (root or subdirectory).
+
+    Returns shard_info dict if path is in a shard worktree, None otherwise.
+    The returned `worktree_path` is the worktree ROOT, not the input path —
+    callers may pass a subdirectory of the worktree, but merge/cleanup logic
+    needs the root to derive the main repo via `.parent.parent`.
+
+    A path qualifies when all conditions hold:
+    1. `git rev-parse --show-toplevel` resolves to a worktree root
+    2. That root is a direct child of <repo-root>/worktrees/ (anchored via git-common-dir)
+    3. The worktree's current branch matches shard-*
+    """
+    resolved = Path(path).resolve()
+
+    # Find the actual worktree root from the input path. This handles both
+    # the worktree root itself and any subdirectory of it.
+    try:
+        toplevel = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            cwd=str(resolved),
+            timeout=10,
+        )
+        if toplevel.returncode != 0:
+            return None
+        worktree_root = Path(toplevel.stdout.strip()).resolve()
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return None
+
+    # Use git-common-dir to anchor worktrees/ to the actual repo root.
+    # For a linked worktree this returns an absolute path to the main .git
+    # directory; for the main repo itself it returns the relative string ".git".
+    try:
+        gcd = subprocess.run(
+            ["git", "rev-parse", "--git-common-dir"],
+            capture_output=True,
+            text=True,
+            cwd=str(resolved),
+            timeout=10,
+        )
+        if gcd.returncode != 0:
+            return None
+        common_dir = gcd.stdout.strip()
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return None
+
+    # A relative result means we're inside the main repo, not a linked worktree.
+    if not Path(common_dir).is_absolute():
+        return None
+
+    # repo root is the parent of the common .git directory
+    repo_root = Path(common_dir).parent.resolve()
+
+    # Worktree root must be directly under <repo-root>/worktrees/
+    try:
+        relative = worktree_root.relative_to(repo_root / "worktrees")
+    except ValueError:
+        return None
+    if len(relative.parts) != 1:
+        return None
+
+    # Get current git branch from the worktree root
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True,
+            text=True,
+            cwd=str(worktree_root),
+            timeout=10,
+        )
+        if result.returncode != 0:
+            return None
+        branch_name = result.stdout.strip()
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return None
+
+    if not branch_name.startswith("shard-"):
+        return None
+
+    shard_id = branch_name[len("shard-") :]
+    return {
+        "worktree_path": str(worktree_root),
+        "branch_name": branch_name,
+        "shard_id": shard_id,
+    }
+
+
 def _close_tender_folios(worktree_name: str, working_dir: str) -> Optional[str]:
     """
     Close any tender folios associated with a worktree after successful merge.
@@ -1253,11 +1343,19 @@ def _spin_sync(
 
     # Handle shard creation
     shard_info = None
+    shard_newly_created = False
     if use_shard:
-        shard_info = _spawn_shard(spool_id, cwd, base_branch=base_branch)
-        if shard_info:
-            cwd = shard_info["worktree_path"]
-        else:
+        # Reuse the worktree if working_dir already points inside an existing shard.
+        # When reusing, keep the agent's cwd at the requested working_dir (which may
+        # be a subdirectory of the worktree). shard_info["worktree_path"] holds the
+        # actual worktree root for merge/cleanup paths.
+        shard_info = _detect_existing_shard(cwd)
+        if shard_info is None:
+            shard_info = _spawn_shard(spool_id, cwd, base_branch=base_branch)
+            shard_newly_created = shard_info is not None
+            if shard_info:
+                cwd = shard_info["worktree_path"]
+        if shard_info is None:
             return "Error: Failed to create SHARD worktree. Check git repo status."
 
     # Inject SKEIN context for shard agents (unless skeinless=True)
@@ -1313,14 +1411,17 @@ Your task:
     # Wrap in bwrap sandbox for shards - worktree writable, rest read-only
     if shard_info and shutil.which("bwrap"):
         home = str(Path.home())
+        # Bind the full worktree (not just cwd) so subdirectory-cwd shards can
+        # still read/write any file in the shard.
+        worktree_root = shard_info["worktree_path"]
         cmd = [
             "bwrap",
             "--ro-bind",
             "/",
             "/",  # Root read-only
             "--bind",
-            cwd,
-            cwd,  # Worktree writable
+            worktree_root,
+            worktree_root,  # Worktree writable
             "--bind",
             "/tmp",
             "/tmp",  # Tmp writable
@@ -1336,7 +1437,7 @@ Your task:
         #   .git/worktrees/<name>/ - index, HEAD, logs
         #   .git/objects/ - store new blobs, trees, commits
         #   .git/refs/heads/ - update branch pointers
-        git_file = Path(cwd) / ".git"
+        git_file = Path(worktree_root) / ".git"
         if git_file.exists() and git_file.is_file():
             git_content = git_file.read_text().strip()
             if git_content.startswith("gitdir:"):
@@ -1408,6 +1509,9 @@ Your task:
         spool["error"] = f"spawn failed: {e}"
         spool["completed_at"] = datetime.now().isoformat()
         _write_spool(spool_id, spool)
+        # Clean up shard worktree only if we created it; don't destroy pre-existing shards
+        if shard_newly_created:
+            _cleanup_shard(shard_info, working_dir)
         return f"Error: Failed to spawn process: {e}"
 
     # Update spool with PID and status
@@ -3177,7 +3281,10 @@ async def shard_merge(spool_id: str, keep_branch: bool = False, caller_cwd: str 
     for other in _list_spools():
         if other.get("status") == "running" and other.get("id") != spool_id:
             other_wd = other.get("working_dir", "")
-            if other_wd and Path(other_wd).resolve() == wt_path:
+            if not other_wd:
+                continue
+            other_path = Path(other_wd).resolve()
+            if other_path == wt_path or wt_path in other_path.parents:
                 return f"Error: Spool {other['id']} is still running in this worktree. Wait for it to complete or use spin_drop() first."
 
     # Find the main repo path
@@ -3275,7 +3382,10 @@ async def shard_abandon(spool_id: str, keep_branch: bool = False, caller_cwd: st
     for other in _list_spools():
         if other.get("status") == "running" and other.get("id") != spool_id:
             other_wd = other.get("working_dir", "")
-            if other_wd and Path(other_wd).resolve() == wt_path:
+            if not other_wd:
+                continue
+            other_path = Path(other_wd).resolve()
+            if other_path == wt_path or wt_path in other_path.parents:
                 return f"Error: Spool {other['id']} is still running in this worktree. Wait for it to complete or use spin_drop() first."
 
     # Find the main repo path
@@ -3483,11 +3593,19 @@ def _codex_spin_sync(
 
     # Handle shard creation
     shard_info = None
+    shard_newly_created = False
     if shard:
-        shard_info = _spawn_shard(spool_id, cwd, base_branch=base_branch)
-        if shard_info:
-            cwd = shard_info["worktree_path"]
-        else:
+        # Reuse the worktree if working_dir already points inside an existing shard.
+        # When reusing, keep the agent's cwd at the requested working_dir (which may
+        # be a subdirectory of the worktree). shard_info["worktree_path"] holds the
+        # actual worktree root for merge/cleanup paths.
+        shard_info = _detect_existing_shard(cwd)
+        if shard_info is None:
+            shard_info = _spawn_shard(spool_id, cwd, base_branch=base_branch)
+            shard_newly_created = shard_info is not None
+            if shard_info:
+                cwd = shard_info["worktree_path"]
+        if shard_info is None:
             # Clean up reserved slot
             spool_path = SPINDLE_DIR / f"{spool_id}.json"
             spool_path.unlink(missing_ok=True)
@@ -3547,7 +3665,8 @@ Your task:
 
     # For shards, grant write access to main repo's .git for commits
     if shard_info and has_landlock:
-        git_file = Path(cwd) / ".git"
+        # Resolve .git via the worktree root, since cwd may be a subdirectory.
+        git_file = Path(shard_info["worktree_path"]) / ".git"
         if git_file.exists() and git_file.is_file():
             git_content = git_file.read_text().strip()
             if git_content.startswith("gitdir:"):
@@ -3555,6 +3674,9 @@ Your task:
                 main_git = Path(git_worktree_dir).parent.parent
                 if main_git.exists() and main_git.name == ".git":
                     codex_cmd.extend(["--add-dir", str(main_git)])
+                    # Also grant write access to the worktree root so a
+                    # subdirectory cwd doesn't lock the agent out of sibling files.
+                    codex_cmd.extend(["--add-dir", shard_info["worktree_path"]])
 
     # Prompt goes last
     codex_cmd.append(effective_prompt)
@@ -3597,8 +3719,8 @@ Your task:
         spool["error"] = f"spawn failed: {e}"
         spool["completed_at"] = datetime.now().isoformat()
         _write_spool(spool_id, spool)
-        # Clean up shard worktree if one was created
-        if shard_info:
+        # Clean up shard worktree only if we created it; don't destroy pre-existing shards
+        if shard_newly_created:
             _cleanup_shard(shard_info, working_dir)
         return f"Error: Failed to spawn process: {e}"
 
@@ -3671,9 +3793,11 @@ def _codex_respin_sync(session_id: str, prompt: str) -> str:
     env = original_spool.get("env") if original_spool else None
     shard_info = original_spool.get("shard") if original_spool else None
 
-    # For shards, grant write access to main repo's .git for commits
+    # For shards, grant write access to main repo's .git for commits.
+    # Resolve .git via the worktree root (shard_info), not working_dir, since
+    # working_dir may be a subdirectory inside the worktree.
     if shard_info and has_landlock:
-        git_file = Path(working_dir) / ".git"
+        git_file = Path(shard_info["worktree_path"]) / ".git"
         if git_file.exists() and git_file.is_file():
             git_content = git_file.read_text().strip()
             if git_content.startswith("gitdir:"):
@@ -3681,6 +3805,9 @@ def _codex_respin_sync(session_id: str, prompt: str) -> str:
                 main_git = Path(git_worktree_dir).parent.parent
                 if main_git.exists() and main_git.name == ".git":
                     codex_cmd.extend(["--add-dir", str(main_git)])
+                    # Also grant write access to the worktree root so a
+                    # subdirectory cwd doesn't lock the agent out of sibling files.
+                    codex_cmd.extend(["--add-dir", shard_info["worktree_path"]])
 
     # The prompt is passed as additional argument to resume
     codex_cmd.append(prompt)
