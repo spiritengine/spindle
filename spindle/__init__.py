@@ -3528,11 +3528,13 @@ def _codex_spin_sync(
 
     # Handle shard creation
     shard_info = None
+    shard_newly_created = False
     if shard:
         # Reuse the worktree if working_dir already points at an existing shard
         shard_info = _detect_existing_shard(cwd)
         if shard_info is None:
             shard_info = _spawn_shard(spool_id, cwd, base_branch=base_branch)
+            shard_newly_created = shard_info is not None
         if shard_info:
             cwd = shard_info["worktree_path"]
         else:
@@ -3645,8 +3647,8 @@ Your task:
         spool["error"] = f"spawn failed: {e}"
         spool["completed_at"] = datetime.now().isoformat()
         _write_spool(spool_id, spool)
-        # Clean up shard worktree if one was created
-        if shard_info:
+        # Clean up shard worktree only if we created it; don't destroy pre-existing shards
+        if shard_newly_created:
             _cleanup_shard(shard_info, working_dir)
         return f"Error: Failed to spawn process: {e}"
 
