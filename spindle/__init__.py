@@ -232,9 +232,17 @@ def _spawn_shard(agent_id: str, working_dir: str, base_branch: str = "master") -
     if _has_skein(working_dir):
         # Use SKEIN's shard spawn command
         try:
-            cmd = ["skein", "shard", "spawn", "--agent", agent_id, "--description", f"Spindle spool for {agent_id}"]
-            if base_branch != "master":
-                cmd.extend(["--base", base_branch])
+            cmd = [
+                "skein",
+                "shard",
+                "spawn",
+                "--agent",
+                agent_id,
+                "--description",
+                f"Spindle spool for {agent_id}",
+                "--base",
+                base_branch,
+            ]
             result = subprocess.run(
                 cmd,
                 capture_output=True,
@@ -1390,6 +1398,7 @@ def _spin_sync(
 
     # Handle shard creation
     shard_info = None
+    shard_error = None
     shard_newly_created = False
     if use_shard:
         # Reuse the worktree if working_dir already points inside an existing shard.
@@ -2703,16 +2712,20 @@ async def spool_retry(spool_id: str) -> str:
     if harness_lower == "codex":
         # Use stored sandbox directly (Codex spools store sandbox, not permission)
         sandbox = spool.get("sandbox", "workspace-write")
+        retry_working_dir = spool.get("working_dir")
+        retry_base_branch = spool.get("base_branch") or _detect_default_branch(retry_working_dir or os.getcwd())
 
         return await asyncio.to_thread(
             _codex_spin_sync,
             spool.get("prompt", ""),
-            spool.get("working_dir"),
+            retry_working_dir,
             spool.get("model"),
             sandbox,
             spool.get("timeout"),
             tags_str,
             spool.get("env"),
+            shard=bool(spool.get("shard")),
+            base_branch=retry_base_branch,
         )
     elif harness_lower == "gemini":
         return await asyncio.to_thread(
@@ -2738,21 +2751,42 @@ async def spool_retry(spool_id: str) -> str:
         )
     else:
         # Default to Claude Code harness
+        retry_working_dir = spool.get("working_dir")
+        retry_base_branch = spool.get("base_branch") or _detect_default_branch(retry_working_dir or os.getcwd())
         return await asyncio.to_thread(
             _spin_sync,
             spool.get("prompt", ""),  # prompt
             spool.get("permission"),  # permission
             bool(spool.get("shard")),  # shard
             spool.get("system_prompt"),  # system_prompt
-            spool.get("working_dir"),  # working_dir
+            retry_working_dir,  # working_dir
             spool.get("allowed_tools"),  # allowed_tools
             tags_str,  # tags
             spool.get("model"),  # model
             spool.get("timeout"),  # timeout
             False,  # skeinless
             spool.get("env"),  # env
-            spool.get("base_branch", "master"),  # base_branch
+            retry_base_branch,  # base_branch
         )
+
+
+def _shard_base_branch(spool: dict) -> str:
+    """Resolve the base branch a shard was forked from.
+
+    Prefers the value persisted on the spool record. Falls back to detecting
+    the default branch of the main repo (worktree's parent.parent), so older
+    spools created before base_branch was persisted still work on main repos.
+    """
+    base = spool.get("base_branch")
+    if base:
+        return base
+    shard_info = spool.get("shard") or {}
+    worktree_path = shard_info.get("worktree_path")
+    if worktree_path:
+        main_repo = Path(worktree_path).parent.parent
+        if main_repo.exists():
+            return _detect_default_branch(str(main_repo))
+    return "master"
 
 
 def _get_shard_commit_status(spool: dict) -> Optional[str]:
@@ -2779,6 +2813,8 @@ def _get_shard_commit_status(spool: dict) -> Optional[str]:
     if not worktree_path or not Path(worktree_path).exists():
         return "no_worktree"
 
+    base_branch = _shard_base_branch(spool)
+
     try:
         # Check for uncommitted changes
         result = subprocess.run(
@@ -2786,9 +2822,9 @@ def _get_shard_commit_status(spool: dict) -> Optional[str]:
         )
         has_uncommitted = bool(result.stdout.strip()) if result.returncode == 0 else False
 
-        # Check for commits ahead of master
+        # Check for commits ahead of base branch
         result = subprocess.run(
-            ["git", "rev-list", "--count", "master..HEAD"],
+            ["git", "rev-list", "--count", f"{base_branch}..HEAD"],
             capture_output=True,
             text=True,
             cwd=worktree_path,
@@ -2808,7 +2844,7 @@ def _get_shard_commit_status(spool: dict) -> Optional[str]:
         if branch_name:
             # Find merge base first
             result = subprocess.run(
-                ["git", "merge-base", "master", branch_name],
+                ["git", "merge-base", base_branch, branch_name],
                 capture_output=True,
                 text=True,
                 cwd=str(main_repo),
@@ -2818,7 +2854,7 @@ def _get_shard_commit_status(spool: dict) -> Optional[str]:
                 merge_base = result.stdout.strip()
                 # Use 3-way merge-tree with explicit base (old-style merge-tree)
                 result = subprocess.run(
-                    ["git", "merge-tree", merge_base, "master", branch_name],
+                    ["git", "merge-tree", merge_base, base_branch, branch_name],
                     capture_output=True,
                     text=True,
                     cwd=str(main_repo),
@@ -2848,9 +2884,11 @@ def _get_shard_change_stats(spool: dict) -> Optional[dict]:
     if not worktree_path or not Path(worktree_path).exists():
         return None
 
+    base_branch = _shard_base_branch(spool)
+
     try:
         result = subprocess.run(
-            ["git", "diff", "--stat", "--stat-width=1000", "master...HEAD"],
+            ["git", "diff", "--stat", "--stat-width=1000", f"{base_branch}...HEAD"],
             capture_output=True,
             text=True,
             cwd=worktree_path,
@@ -3227,11 +3265,13 @@ def _shard_status_sync(spool_id: str) -> str:
             indent=2,
         )
 
+    base_branch = _shard_base_branch(spool)
     status_info = {
         "spool_id": spool_id,
         "shard": shard_info,
         "exists": True,
         "spool_status": spool.get("status"),
+        "base_branch": base_branch,
     }
 
     try:
@@ -3242,7 +3282,7 @@ def _shard_status_sync(spool_id: str) -> str:
             status_info["git_changes"] = result.stdout.strip().split("\n") if result.stdout.strip() else []
 
         result = subprocess.run(
-            ["git", "rev-list", "--count", "master..HEAD"],
+            ["git", "rev-list", "--count", f"{base_branch}..HEAD"],
             capture_output=True,
             text=True,
             cwd=worktree_path,
@@ -3339,6 +3379,7 @@ async def shard_merge(spool_id: str, keep_branch: bool = False, caller_cwd: str 
 
     # Find the main repo path
     main_repo = Path(worktree_path).parent.parent  # worktrees/name -> repo
+    base_branch = _shard_base_branch(spool)
 
     try:
         # Check for uncommitted changes
@@ -3348,7 +3389,7 @@ async def shard_merge(spool_id: str, keep_branch: bool = False, caller_cwd: str 
         if result.stdout.strip():
             return "Error: Shard has uncommitted changes. Commit or discard them first."
 
-        # Merge branch to master from main repo
+        # Merge branch into the main repo's current HEAD
         result = subprocess.run(
             ["git", "merge", branch_name, "--no-ff", "-m", f"Merge shard {spool_id}: {spool.get('prompt', '')[:50]}"],
             capture_output=True,
@@ -3371,7 +3412,7 @@ async def shard_merge(spool_id: str, keep_branch: bool = False, caller_cwd: str 
         worktree_name = shard_info.get("shard_id") or Path(worktree_path).name
         tender_result = _close_tender_folios(worktree_name, str(main_repo))
 
-        msg = f"Successfully merged shard {spool_id} to master"
+        msg = f"Successfully merged shard {spool_id} to {base_branch}"
         if tender_result:
             msg += f". {tender_result}"
         return msg
@@ -3490,17 +3531,23 @@ async def triage(worktree_path: str) -> str:
     # Extract worktree name for tender command
     worktree_name = Path(worktree_path).name
 
+    # Detect the main repo's default branch so the agent runs the right
+    # diff commands on main-default repos as well as master-default ones.
+    main_repo = Path(worktree_path).parent.parent
+    base_branch = _detect_default_branch(str(main_repo)) if main_repo.exists() else "master"
+
     prompt = f"""## Worktree Triage
 
 Assess the work in this worktree and create a tender.
 
 **Worktree:** {worktree_path}
 **Name:** {worktree_name}
+**Base branch:** {base_branch}
 
 ### Steps:
 
-1. Run `git log --oneline master..HEAD` to see commits
-2. Run `git diff --stat master` to see scope of changes
+1. Run `git log --oneline {base_branch}..HEAD` to see commits
+2. Run `git diff --stat {base_branch}` to see scope of changes
 3. Run `git status` to see uncommitted work
 4. Read key files if needed to understand intent
 5. If there are uncommitted changes worth keeping, commit them:
@@ -3643,6 +3690,7 @@ def _codex_spin_sync(
 
     # Handle shard creation
     shard_info = None
+    shard_error = None
     shard_newly_created = False
     if shard:
         # Reuse the worktree if working_dir already points inside an existing shard.
