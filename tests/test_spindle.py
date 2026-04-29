@@ -23,6 +23,7 @@ from spindle import (
     _codex_respin_sync,
     _codex_spin_sync,
     _count_running,
+    _detect_default_branch,
     _detect_existing_shard,
     _gemini_spin_sync,
     _gemini_unspool_sync,
@@ -683,8 +684,8 @@ class TestWorktreeNameUniqueness:
         # Create two shards rapidly (without SKEIN, using plain git worktree)
         # Mock _has_skein to return False so we use the plain git path
         with patch("spindle._has_skein", return_value=False):
-            shard1 = _spawn_shard("test-agent-1", str(git_dir))
-            shard2 = _spawn_shard("test-agent-2", str(git_dir))
+            shard1, _ = _spawn_shard("test-agent-1", str(git_dir))
+            shard2, _ = _spawn_shard("test-agent-2", str(git_dir))
 
         # Both should succeed
         assert shard1 is not None, "First shard creation failed"
@@ -1588,7 +1589,7 @@ class TestDetectExistingShard:
         subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True)
 
         with patch("spindle._has_skein", return_value=False):
-            shard_info = _spawn_shard("test-agent", str(repo))
+            shard_info, _ = _spawn_shard("test-agent", str(repo))
 
         assert shard_info is not None, "Shard creation failed in test setup"
         return repo, shard_info["worktree_path"], shard_info["branch_name"]
@@ -1920,7 +1921,7 @@ class TestSpinSyncShardCleanupOnFailure:
         with patch("spindle.SPINDLE_DIR", tmp_path):
             with patch("spindle._count_running", return_value=0):
                 with patch("spindle._has_skein", return_value=False):
-                    with patch("spindle._spawn_shard", return_value=fake_shard):
+                    with patch("spindle._spawn_shard", return_value=(fake_shard, None)):
                         with patch("spindle._detect_existing_shard", return_value=None):
                             with patch("spindle._spawn_detached", side_effect=OSError("boom")):
                                 with patch("spindle._cleanup_shard") as mock_cleanup:
@@ -2130,3 +2131,98 @@ class TestCodexRespinPreservesGitAccess:
             f"codex respin must --add-dir the worktree root ({wt_path}) so a "
             f"subdirectory cwd retains write access to sibling files; got {add_dirs!r}"
         )
+
+
+class TestDetectDefaultBranch:
+    """Tests for _detect_default_branch and improved shard error messages.
+
+    Regression guard for brief-20260429-2ace: spindle hardcoded 'master' as
+    the default base branch, causing silent failures on repos that use 'main'.
+    """
+
+    @patch("spindle.subprocess.run")
+    def test_returns_main_when_origin_head_is_main(self, mock_run):
+        """Returns 'main' when origin/HEAD points at main."""
+        m = MagicMock()
+        m.returncode = 0
+        m.stdout = "refs/remotes/origin/main\n"
+        mock_run.return_value = m
+        assert _detect_default_branch("/any") == "main"
+
+    @patch("spindle.subprocess.run")
+    def test_returns_master_when_origin_head_is_master(self, mock_run):
+        """Returns 'master' when origin/HEAD points at master."""
+        m = MagicMock()
+        m.returncode = 0
+        m.stdout = "refs/remotes/origin/master\n"
+        mock_run.return_value = m
+        assert _detect_default_branch("/any") == "master"
+
+    @patch("spindle.subprocess.run")
+    def test_falls_back_to_local_main_when_no_origin_head(self, mock_run):
+        """Falls back to local branch check when origin/HEAD is missing."""
+        def side_effect(cmd, **kwargs):
+            m = MagicMock()
+            if "symbolic-ref" in cmd:
+                m.returncode = 1
+                m.stdout = ""
+            elif "rev-parse" in cmd:
+                m.returncode = 0 if "main" in cmd else 1
+            return m
+
+        mock_run.side_effect = side_effect
+        assert _detect_default_branch("/any") == "main"
+
+    @patch("spindle.subprocess.run")
+    def test_returns_master_last_resort(self, mock_run):
+        """Returns 'master' when no origin/HEAD and neither main nor master exists locally."""
+        m = MagicMock()
+        m.returncode = 1
+        m.stdout = ""
+        mock_run.return_value = m
+        assert _detect_default_branch("/any") == "master"
+
+    def test_spawn_shard_succeeds_on_main_only_repo(self, tmp_path):
+        """_spawn_shard with base_branch='main' works on a main-only repo."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        for cmd in [
+            ["git", "init"],
+            ["git", "config", "user.email", "test@test.com"],
+            ["git", "config", "user.name", "Test User"],
+        ]:
+            subprocess.run(cmd, cwd=repo, capture_output=True)
+        (repo / "f.txt").write_text("x")
+        subprocess.run(["git", "add", "."], cwd=repo, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True)
+        # Rename default branch to main regardless of git's default
+        subprocess.run(["git", "branch", "-M", "main"], cwd=repo, capture_output=True)
+
+        with patch("spindle._has_skein", return_value=False):
+            shard_info, shard_error = _spawn_shard("test-agent", str(repo), base_branch="main")
+
+        assert shard_error is None, f"Unexpected error: {shard_error}"
+        assert shard_info is not None, "Shard creation failed on main-only repo"
+        assert Path(shard_info["worktree_path"]).exists()
+
+    def test_spawn_shard_error_message_names_bad_branch(self, tmp_path):
+        """When shard creation fails due to invalid base branch, error names it."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        for cmd in [
+            ["git", "init"],
+            ["git", "config", "user.email", "test@test.com"],
+            ["git", "config", "user.name", "Test User"],
+        ]:
+            subprocess.run(cmd, cwd=repo, capture_output=True)
+        (repo / "f.txt").write_text("x")
+        subprocess.run(["git", "add", "."], cwd=repo, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True)
+
+        with patch("spindle._has_skein", return_value=False):
+            shard_info, shard_error = _spawn_shard("test-agent", str(repo), base_branch="bogus-branch-xyz")
+
+        assert shard_info is None
+        assert shard_error is not None
+        assert "bogus-branch-xyz" in shard_error
+        assert "--base-branch" in shard_error

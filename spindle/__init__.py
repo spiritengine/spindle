@@ -27,7 +27,7 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, Generator, Optional
+from typing import Dict, Generator, Optional, Tuple
 
 from fastmcp import Context, FastMCP
 from starlette.requests import Request
@@ -179,7 +179,41 @@ def _resolve_permission(permission: Optional[str], allowed_tools: Optional[str])
     return PERMISSION_PROFILES["careful"], False
 
 
-def _spawn_shard(agent_id: str, working_dir: str, base_branch: str = "master") -> Optional[Dict[str, str]]:
+def _detect_default_branch(working_dir: str) -> str:
+    """Return the working dir's default branch name.
+
+    Checks origin/HEAD first, then local main/master, falls back to 'master'.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "symbolic-ref", "refs/remotes/origin/HEAD"],
+            cwd=working_dir,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0:
+            ref = result.stdout.strip()
+            return ref.rsplit("/", 1)[-1]
+    except Exception:
+        pass
+    for candidate in ("main", "master"):
+        try:
+            result = subprocess.run(
+                ["git", "rev-parse", "--verify", candidate],
+                cwd=working_dir,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if result.returncode == 0:
+                return candidate
+        except Exception:
+            pass
+    return "master"
+
+
+def _spawn_shard(agent_id: str, working_dir: str, base_branch: str = "master") -> Tuple[Optional[Dict[str, str]], Optional[str]]:
     """
     Create an isolated git worktree (SHARD) for the agent.
 
@@ -188,11 +222,12 @@ def _spawn_shard(agent_id: str, working_dir: str, base_branch: str = "master") -
     Args:
         agent_id: Identifier for the shard (used in worktree name)
         working_dir: Base directory for the worktree
-        base_branch: Branch to fork from (default: "master")
+        base_branch: Branch to fork from (default: auto-detected)
 
     Returns:
-        Dict with shard info if successful, None if failed
-        Keys: worktree_path, branch_name, shard_id
+        Tuple of (shard_info, error_message). On success shard_info is a dict
+        with keys worktree_path/branch_name/shard_id and error_message is None.
+        On failure shard_info is None and error_message describes the problem.
     """
     if _has_skein(working_dir):
         # Use SKEIN's shard spawn command
@@ -221,11 +256,14 @@ def _spawn_shard(agent_id: str, working_dir: str, base_branch: str = "master") -
                                 branch_name = line.split("Branch:")[1].strip()
                             if "Spawned SHARD:" in line:
                                 shard_id = line.split("Spawned SHARD:")[1].strip()
-                        return {
-                            "worktree_path": worktree_path,
-                            "branch_name": branch_name or f"shard-{agent_id}",
-                            "shard_id": shard_id or agent_id,
-                        }
+                        return (
+                            {
+                                "worktree_path": worktree_path,
+                                "branch_name": branch_name or f"shard-{agent_id}",
+                                "shard_id": shard_id or agent_id,
+                            },
+                            None,
+                        )
         except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
             pass
 
@@ -252,15 +290,24 @@ def _spawn_shard(agent_id: str, working_dir: str, base_branch: str = "master") -
             timeout=30,
         )
         if result.returncode == 0:
-            return {
-                "worktree_path": str(worktree_path),
-                "branch_name": branch_name,
-                "shard_id": worktree_name,
-            }
+            return (
+                {
+                    "worktree_path": str(worktree_path),
+                    "branch_name": branch_name,
+                    "shard_id": worktree_name,
+                },
+                None,
+            )
+        # Surface branch-not-found errors explicitly so callers can report them
+        if result.returncode != 0 and "invalid reference" in result.stderr:
+            return (
+                None,
+                f"base branch '{base_branch}' not found in repo at {working_dir}. Try --base-branch <correct-name>.",
+            )
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
         pass
 
-    return None
+    return (None, None)
 
 
 def _detect_existing_shard(path: str) -> Optional[Dict[str, str]]:
@@ -1351,11 +1398,13 @@ def _spin_sync(
         # actual worktree root for merge/cleanup paths.
         shard_info = _detect_existing_shard(cwd)
         if shard_info is None:
-            shard_info = _spawn_shard(spool_id, cwd, base_branch=base_branch)
+            shard_info, shard_error = _spawn_shard(spool_id, cwd, base_branch=base_branch)
             shard_newly_created = shard_info is not None
             if shard_info:
                 cwd = shard_info["worktree_path"]
         if shard_info is None:
+            if shard_error:
+                return f"Error: Failed to create SHARD worktree — {shard_error}"
             return "Error: Failed to create SHARD worktree. Check git repo status."
 
     # Inject SKEIN context for shard agents (unless skeinless=True)
@@ -1567,7 +1616,7 @@ async def spin(
         harness: Which harness to use - "claude-code" (default), "codex", "gemini", or "kimi".
                  Use spin_harnesses() to see available harnesses and their models.
         env: Optional dict of environment variables to set in spawned agent
-        base_branch: Branch to fork shard from (default: "master"). Only used with shard or careful+shard permissions.
+        base_branch: Branch to fork shard from (default: auto-detected from repo). Only used with shard or careful+shard permissions.
 
     Returns:
         spool_id to check result later
@@ -1626,7 +1675,7 @@ async def spin(
             tags,
             env,
             shard=use_shard,
-            base_branch=base_branch or "master",
+            base_branch=base_branch or _detect_default_branch(working_dir or os.getcwd()),
             skeinless=skeinless,
             shell_expr_warning=shell_expr_warning,
         )
@@ -1669,7 +1718,7 @@ async def spin(
             timeout,
             skeinless,
             env,
-            base_branch=base_branch or "master",
+            base_branch=base_branch or _detect_default_branch(working_dir or os.getcwd()),
             shell_expr_warning=shell_expr_warning,
         )
 
@@ -3601,7 +3650,7 @@ def _codex_spin_sync(
         # actual worktree root for merge/cleanup paths.
         shard_info = _detect_existing_shard(cwd)
         if shard_info is None:
-            shard_info = _spawn_shard(spool_id, cwd, base_branch=base_branch)
+            shard_info, shard_error = _spawn_shard(spool_id, cwd, base_branch=base_branch)
             shard_newly_created = shard_info is not None
             if shard_info:
                 cwd = shard_info["worktree_path"]
@@ -3609,6 +3658,8 @@ def _codex_spin_sync(
             # Clean up reserved slot
             spool_path = SPINDLE_DIR / f"{spool_id}.json"
             spool_path.unlink(missing_ok=True)
+            if shard_error:
+                return f"Error: Failed to create SHARD worktree — {shard_error}"
             return "Error: Failed to create SHARD worktree. Check git repo status."
 
     # Inject shard instructions into prompt
@@ -4394,7 +4445,7 @@ def main():
     spin_parser.add_argument("--harness", help="Harness to use: claude-code (default), codex, gemini, or kimi")
     spin_parser.add_argument("--timeout", "-t", type=int, help="Kill spool after N seconds")
     spin_parser.add_argument("--skeinless", action="store_true", help="Skip SKEIN context injection for shard agents")
-    spin_parser.add_argument("--base-branch", default=None, help="Branch to fork shard from (default: master)")
+    spin_parser.add_argument("--base-branch", default=None, help="Branch to fork shard from (default: auto-detected from repo)")
     spin_parser.add_argument("--human", action="store_true", help="Human-readable output instead of JSON")
 
     # unspool command - get result
@@ -4530,7 +4581,7 @@ def main():
                 model=args.model,
                 timeout=args.timeout,
                 skeinless=args.skeinless,
-                base_branch=args.base_branch or "master",
+                base_branch=args.base_branch or _detect_default_branch(working_dir),
                 env=None,
             )
         if result.startswith("Error:"):
