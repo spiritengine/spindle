@@ -2751,6 +2751,7 @@ async def spool_retry(spool_id: str) -> str:
             spool.get("timeout"),  # timeout
             False,  # skeinless
             spool.get("env"),  # env
+            spool.get("base_branch", "master"),  # base_branch
         )
 
 
