@@ -2226,3 +2226,87 @@ class TestDetectDefaultBranch:
         assert shard_error is not None
         assert "bogus-branch-xyz" in shard_error
         assert "--base-branch" in shard_error
+
+    def test_spin_auto_detects_main_branch_end_to_end(self, tmp_path):
+        """spin() against a main-default repo (no base_branch arg) creates a
+        shard forked from main.
+
+        This is the regression that the brief's acceptance criterion targets:
+        the user-visible failure was `spin --permission shard` against a main
+        repo silently failing because base_branch defaulted to 'master'. The
+        unit tests for _detect_default_branch all mock subprocess and the
+        existing _spawn_shard test passes base_branch='main' explicitly, so
+        nothing exercises spin() -> _detect_default_branch(real_main_repo) ->
+        _spawn_shard end-to-end. This test does.
+        """
+        repo = tmp_path / "main-repo"
+        repo.mkdir()
+        for cmd in [
+            ["git", "init"],
+            ["git", "config", "user.email", "test@test.com"],
+            ["git", "config", "user.name", "Test User"],
+        ]:
+            subprocess.run(cmd, cwd=repo, capture_output=True)
+        (repo / "f.txt").write_text("x")
+        subprocess.run(["git", "add", "."], cwd=repo, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True)
+        # Force default branch to main regardless of git's global init.defaultBranch.
+        # Also delete master if it exists so any leftover hardcoded "master"
+        # reference would fail loudly rather than masquerade as success.
+        subprocess.run(["git", "branch", "-M", "main"], cwd=repo, capture_output=True)
+        subprocess.run(["git", "branch", "-D", "master"], cwd=repo, capture_output=True)
+
+        spool_dir = tmp_path / "spools"
+        spool_dir.mkdir()
+
+        _spin = spin.fn if hasattr(spin, "fn") else spin
+        with patch("spindle.SPINDLE_DIR", spool_dir):
+            with patch("spindle._has_skein", return_value=False):
+                with patch("spindle._spawn_detached", return_value=12345):
+                    with patch("spindle._count_running", return_value=0):
+                        result = asyncio.run(
+                            _spin(
+                                "test prompt",
+                                permission="shard",
+                                working_dir=str(repo),
+                            )
+                        )
+
+        # Should not be an error
+        assert not result.startswith("Error"), f"spin returned error: {result}"
+        spool_id = result.split("\n")[0].strip()
+
+        # Worktree must exist on disk under repo/worktrees/
+        worktrees = list((repo / "worktrees").iterdir())
+        assert len(worktrees) == 1, f"Expected exactly one worktree, got {worktrees}"
+        worktree_path = worktrees[0]
+        assert worktree_path.is_dir()
+
+        # The shard branch must descend from main (auto-detected). If
+        # base_branch had defaulted to 'master', _spawn_shard would have
+        # failed because we deleted master. Verify by checking merge-base.
+        head_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=worktree_path,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        main_sha = subprocess.run(
+            ["git", "rev-parse", "main"],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        assert head_sha == main_sha, (
+            f"Shard HEAD {head_sha} does not match main {main_sha} — "
+            f"shard was not forked from main"
+        )
+
+        # Spool record should have base_branch persisted as 'main' so retries
+        # don't fall back to literal 'master'.
+        spool_path = spool_dir / f"{spool_id}.json"
+        assert spool_path.exists()
+        spool = json.loads(spool_path.read_text())
+        assert spool.get("base_branch") == "main", (
+            f"Expected spool.base_branch='main', got {spool.get('base_branch')!r}"
+        )
