@@ -123,32 +123,6 @@ def _has_skein(working_dir: str) -> bool:
     return _skein_available[cache_key]
 
 
-_SHELL_EXPR_PATTERNS = [
-    (re.compile(r"\$\([^)]+\)"), "$(...)"),
-    (re.compile(r"`[^`]*\s[^`]*`"), "backtick expression"),
-    (re.compile(r"\$\{[^}]+\}"), "${...}"),
-]
-
-
-def _check_shell_expressions(prompt: str) -> Optional[str]:
-    """Return a warning message if the prompt contains unexpanded shell expressions, else None."""
-    found = []
-    examples = []
-    for pattern, label in _SHELL_EXPR_PATTERNS:
-        match = pattern.search(prompt)
-        if match:
-            found.append(label)
-            examples.append(match.group())
-    if not found:
-        return None
-    expr_list = ", ".join(examples)
-    return (
-        f"Warning: prompt contains what looks like unexpanded shell expressions: "
-        f"{expr_list}. Shell expressions are not expanded in MCP tool calls — "
-        f"read the file contents first and pass them directly."
-    )
-
-
 def _resolve_permission(permission: Optional[str], allowed_tools: Optional[str]) -> tuple[Optional[str], bool]:
     """
     Resolve permission profile to allowed_tools string and shard flag.
@@ -1367,7 +1341,6 @@ def _spin_sync(
     skeinless: bool,
     env: Optional[Dict[str, str]],
     base_branch: str = "master",
-    shell_expr_warning: Optional[str] = None,
 ) -> str:
     """Synchronous implementation of spin - runs in thread pool."""
     # Require working_dir - os.getcwd() returns MCP server dir, not caller's project
@@ -1553,7 +1526,6 @@ Your task:
         "pid": None,
         "error": None,
         "harness": "claude-code",
-        "shell_expr_warning": shell_expr_warning,
     }
 
     _write_spool(spool_id, spool)
@@ -1581,8 +1553,6 @@ Your task:
     monitor = threading.Thread(target=_monitor_spool, args=(spool_id,), daemon=True)
     monitor.start()
 
-    if shell_expr_warning:
-        return f"{spool_id}\n\n{shell_expr_warning}"
     return spool_id
 
 
@@ -1643,11 +1613,6 @@ async def spin(
         spool_id = spin("Fork from branch", permission="shard", base_branch="feature-x")
         result = unspool(spool_id)
     """
-    # Detect unexpanded shell expressions in the prompt (warn, don't block)
-    shell_expr_warning = _check_shell_expressions(prompt)
-    if shell_expr_warning:
-        logger.warning("Shell expression in spin() prompt: %s", shell_expr_warning)
-
     # Normalize harness parameter (case-insensitive)
     harness_lower = harness.lower() if harness else None
 
@@ -1686,7 +1651,6 @@ async def spin(
             shard=use_shard,
             base_branch=base_branch or _detect_default_branch(working_dir or os.getcwd()),
             skeinless=skeinless,
-            shell_expr_warning=shell_expr_warning,
         )
     elif harness_lower == "gemini":
         result = await asyncio.to_thread(
@@ -1698,7 +1662,6 @@ async def spin(
             timeout,
             tags,
             env,
-            shell_expr_warning=shell_expr_warning,
         )
     elif harness_lower == "kimi":
         result = await asyncio.to_thread(
@@ -1710,7 +1673,6 @@ async def spin(
             timeout,
             tags,
             env,
-            shell_expr_warning=shell_expr_warning,
         )
     else:
         # Default to Claude Code harness
@@ -1728,23 +1690,8 @@ async def spin(
             skeinless,
             env,
             base_branch=base_branch or _detect_default_branch(working_dir or os.getcwd()),
-            shell_expr_warning=shell_expr_warning,
         )
 
-    # For non-CC harnesses, append shell expression warning to return value
-    # (warning is already stored in spool by the harness-specific spin function)
-    if shell_expr_warning and not result.startswith("Error"):
-        spool_id = result.strip()
-        return f"{spool_id}\n\n{shell_expr_warning}"
-
-    return result
-
-
-def _prepend_shell_warning(spool: dict, result: str) -> str:
-    """Prepend shell expression warning to result if the spool has one."""
-    warning = spool.get("shell_expr_warning")
-    if warning:
-        return f"{warning}\n\n{result}"
     return result
 
 
@@ -1780,12 +1727,12 @@ def _unspool_sync(spool_id: str) -> str:
                 _check_and_finalize_spool(spool_id)
                 spool = _read_spool(spool_id)
                 if spool.get("status") == "complete":
-                    return _prepend_shell_warning(spool, spool.get("result", "No result"))
+                    return spool.get("result", "No result")
                 elif spool.get("status") == "error":
                     return f"Spool {spool_id} failed: {spool.get('error', 'Unknown error')}"
             return f"Spool {spool_id} still running: {spool.get('prompt', '')[:50]}..."
         elif status == "complete":
-            return _prepend_shell_warning(spool, spool.get("result", "No result"))
+            return spool.get("result", "No result")
         else:
             return f"Spool {spool_id} failed: {spool.get('error', 'Unknown error')}"
 
@@ -1938,7 +1885,7 @@ def _spin_wait_sync(
                     return json.dumps({"spool_id": spool_id, "error": f"Unknown spool_id '{spool_id}'"})
                 if spool.get("status") == "complete":
                     remaining = [s for s in ids if s != spool_id]
-                    result = _prepend_shell_warning(spool, spool.get("result", "No result"))
+                    result = spool.get("result", "No result")
                     return json.dumps(
                         {
                             "spool_id": spool_id,
@@ -1974,7 +1921,7 @@ def _spin_wait_sync(
                 if not spool:
                     return f"Error: Unknown spool_id '{spool_id}'"
                 if spool.get("status") == "complete":
-                    results[spool_id] = _prepend_shell_warning(spool, spool.get("result", "No result"))
+                    results[spool_id] = spool.get("result", "No result")
                     pending.remove(spool_id)
                 elif spool.get("status") == "error":
                     results[spool_id] = f"Error: {spool.get('error')}"
@@ -2200,7 +2147,7 @@ async def spin_wait(
                     return json.dumps({"spool_id": spool_id, "error": f"Unknown spool_id '{spool_id}'"})
                 if spool.get("status") == "complete":
                     remaining_ids = [s for s in ids if s != spool_id]
-                    result = _prepend_shell_warning(spool, spool.get("result", "No result"))
+                    result = spool.get("result", "No result")
                     return json.dumps(
                         {
                             "spool_id": spool_id,
@@ -2246,7 +2193,7 @@ async def spin_wait(
                 if not spool:
                     return f"Error: Unknown spool_id '{spool_id}'"
                 if spool.get("status") == "complete":
-                    results[spool_id] = _prepend_shell_warning(spool, spool.get("result", "No result"))
+                    results[spool_id] = spool.get("result", "No result")
                     pending.remove(spool_id)
                 elif spool.get("status") == "error":
                     results[spool_id] = f"Error: {spool.get('error')}"
@@ -2568,9 +2515,6 @@ async def spool_results(
         result_text = spool.get("result", "")
         if isinstance(result_text, dict):
             result_text = json.dumps(result_text)
-
-        if result_text:
-            result_text = _prepend_shell_warning(spool, result_text)
 
         results.append(
             {
@@ -3668,7 +3612,6 @@ def _codex_spin_sync(
     shard: bool = False,
     base_branch: str = "master",
     skeinless: bool = False,
-    shell_expr_warning: Optional[str] = None,
 ) -> str:
     """Synchronous implementation of codex_spin - runs Codex CLI in background."""
     # Require working_dir
@@ -3805,7 +3748,6 @@ Your task:
         "pid": None,
         "error": None,
         "harness": "codex",  # Mark as codex harness
-        "shell_expr_warning": shell_expr_warning,
     }
 
     _write_spool(spool_id, spool)
@@ -3852,12 +3794,12 @@ def _codex_unspool_sync(spool_id: str) -> str:
             _check_and_finalize_spool(spool_id)
             spool = _read_spool(spool_id)
             if spool.get("status") == "complete":
-                return _prepend_shell_warning(spool, spool.get("result", "No result"))
+                return spool.get("result", "No result")
             elif spool.get("status") == "error":
                 return f"Spool {spool_id} failed: {spool.get('error', 'Unknown error')}"
         return f"Spool {spool_id} still running: {spool.get('prompt', '')[:50]}..."
     elif status == "complete":
-        return _prepend_shell_warning(spool, spool.get("result", "No result"))
+        return spool.get("result", "No result")
     else:
         return f"Spool {spool_id} failed: {spool.get('error', 'Unknown error')}"
 
@@ -4046,7 +3988,6 @@ def _gemini_spin_sync(
     timeout: Optional[int],
     tags: Optional[str],
     env: Optional[Dict[str, str]],
-    shell_expr_warning: Optional[str] = None,
 ) -> str:
     """Synchronous implementation of gemini_spin - runs Gemini CLI in background."""
     # Require working_dir
@@ -4103,7 +4044,6 @@ def _gemini_spin_sync(
         "pid": None,
         "error": None,
         "harness": "gemini",
-        "shell_expr_warning": shell_expr_warning,
     }
 
     _write_spool(spool_id, spool)
@@ -4189,12 +4129,12 @@ def _gemini_unspool_sync(spool_id: str) -> str:
             _check_and_finalize_spool(spool_id)
             spool = _read_spool(spool_id)
             if spool.get("status") == "complete":
-                return _prepend_shell_warning(spool, spool.get("result", "No result"))
+                return spool.get("result", "No result")
             elif spool.get("status") == "error":
                 return f"Spool {spool_id} failed: {spool.get('error', 'Unknown error')}"
         return f"Spool {spool_id} still running: {spool.get('prompt', '')[:50]}..."
     elif status == "complete":
-        return _prepend_shell_warning(spool, spool.get("result", "No result"))
+        return spool.get("result", "No result")
     else:
         return f"Spool {spool_id} failed: {spool.get('error', 'Unknown error')}"
 
@@ -4207,7 +4147,6 @@ def _kimi_spin_sync(
     timeout: Optional[int],
     tags: Optional[str],
     env: Optional[Dict[str, str]],
-    shell_expr_warning: Optional[str] = None,
 ) -> str:
     """Synchronous implementation of kimi_spin - runs Kimi CLI in background."""
     # Require working_dir
@@ -4275,7 +4214,6 @@ def _kimi_spin_sync(
         "pid": None,
         "error": None,
         "harness": "kimi",
-        "shell_expr_warning": shell_expr_warning,
     }
 
     # Write spool to disk
@@ -4401,12 +4339,12 @@ def _kimi_unspool_sync(spool_id: str) -> str:
             _check_and_finalize_spool(spool_id)
             spool = _read_spool(spool_id)
             if spool.get("status") == "complete":
-                return _prepend_shell_warning(spool, spool.get("result", "No result"))
+                return spool.get("result", "No result")
             elif spool.get("status") == "error":
                 return f"Spool {spool_id} failed: {spool.get('error', 'Unknown error')}"
         return f"Spool {spool_id} still running: {spool.get('prompt', '')[:50]}..."
     elif status == "complete":
-        return _prepend_shell_warning(spool, spool.get("result", "No result"))
+        return spool.get("result", "No result")
     else:
         return f"Spool {spool_id} failed: {spool.get('error', 'Unknown error')}"
 
