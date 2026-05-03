@@ -234,12 +234,10 @@ def _spawn_shard(
                         worktree_path = line.split("Worktree:")[1].strip()
                         # Extract other info
                         branch_name = None
-                        shard_id = None
+                        shard_id = Path(worktree_path).name
                         for line in result.stdout.splitlines():
                             if "Branch:" in line:
                                 branch_name = line.split("Branch:")[1].strip()
-                            if "Spawned SHARD:" in line:
-                                shard_id = line.split("Spawned SHARD:")[1].strip()
                         return (
                             {
                                 "worktree_path": worktree_path,
@@ -1400,7 +1398,7 @@ def _spin_sync(
 
 Before starting work, orient yourself with SKEIN:
 1. Run: skein ignite --message "{prompt[:100]}..."
-2. Then: skein ready --name "spool-{spool_id}"
+2. Then: skein ready
 
 After completing work:
 1. Commit: git add -A && git commit -m "Your commit message"
@@ -3665,7 +3663,7 @@ def _codex_spin_sync(
 
 Before starting work, orient yourself with SKEIN:
 1. Run: skein ignite --message "{prompt[:100]}..."
-2. Then: skein ready --name "spool-{spool_id}"
+2. Then: skein ready
 
 After completing work:
 1. Commit: git add -A && git commit -m "Your commit message"
@@ -3707,6 +3705,9 @@ Your task:
     if sandbox and has_landlock:
         # Only apply sandbox flag if we have Landlock support
         codex_cmd.extend(["--sandbox", sandbox])
+
+    if shard_info:
+        codex_cmd.extend(["--cd", shard_info["worktree_path"]])
 
     # For shards, grant write access to main repo's .git for commits
     if shard_info and has_landlock:
@@ -3836,6 +3837,9 @@ def _codex_respin_sync(session_id: str, prompt: str) -> str:
     working_dir = original_spool.get("working_dir") if original_spool else os.getcwd()
     env = original_spool.get("env") if original_spool else None
     shard_info = original_spool.get("shard") if original_spool else None
+
+    if shard_info:
+        codex_cmd.extend(["--cd", shard_info["worktree_path"]])
 
     # For shards, grant write access to main repo's .git for commits.
     # Resolve .git via the worktree root (shard_info), not working_dir, since
