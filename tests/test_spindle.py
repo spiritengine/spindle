@@ -2032,6 +2032,8 @@ class TestCodexRespinPreservesGitAccess:
         cmd = captured_cmd[0]
         assert "--cd" in cmd, f"Expected --cd in codex respin command, got {cmd!r}"
         cd_idx = cmd.index("--cd")
+        resume_idx = cmd.index("resume")
+        assert cd_idx < resume_idx, f"Expected --cd before resume in codex respin command, got {cmd!r}"
         assert cmd[cd_idx + 1] == str(worktree_path)
 
 

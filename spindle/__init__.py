@@ -3817,29 +3817,31 @@ def _codex_respin_sync(session_id: str, prompt: str) -> str:
     if not success:
         return error_msg
 
-    # Build codex exec resume command
-    # Check for Landlock support and use appropriate flags
-    has_landlock = _has_landlock_support()
-
-    if has_landlock:
-        # Use --json for structured output, --full-auto for non-interactive
-        codex_cmd = ["codex", "exec", "resume", session_id, "--json", "--full-auto"]
-    else:
-        # Kernel lacks Landlock support - use bypass mode
-        import platform
-
-        kernel_version = platform.release()
-        print(f"[Spindle] Kernel {kernel_version} lacks Landlock support (needs 5.13+), using bypass mode for Codex")
-        codex_cmd = ["codex", "exec", "resume", session_id, "--json", "--dangerously-bypass-approvals-and-sandbox"]
-
     # Get working_dir, env, and shard info from original spool if possible
     original_spool = _find_spool_by_session(session_id)
     working_dir = original_spool.get("working_dir") if original_spool else os.getcwd()
     env = original_spool.get("env") if original_spool else None
     shard_info = original_spool.get("shard") if original_spool else None
 
+    # Build codex exec resume command
+    # Check for Landlock support and use appropriate flags
+    has_landlock = _has_landlock_support()
+    codex_cmd = ["codex", "exec"]
     if shard_info:
         codex_cmd.extend(["--cd", shard_info["worktree_path"]])
+
+    codex_cmd.extend(["resume", session_id, "--json"])
+
+    if has_landlock:
+        # Use --json for structured output, --full-auto for non-interactive
+        codex_cmd.append("--full-auto")
+    else:
+        # Kernel lacks Landlock support - use bypass mode
+        import platform
+
+        kernel_version = platform.release()
+        print(f"[Spindle] Kernel {kernel_version} lacks Landlock support (needs 5.13+), using bypass mode for Codex")
+        codex_cmd.append("--dangerously-bypass-approvals-and-sandbox")
 
     # For shards, grant write access to main repo's .git for commits.
     # Resolve .git via the worktree root (shard_info), not working_dir, since
