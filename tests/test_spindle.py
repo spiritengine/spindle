@@ -1749,6 +1749,85 @@ class TestSpinSyncShardCleanupOnFailure:
                                 mock_cleanup.assert_not_called()
 
 
+class TestShardSpawnPreamblesAndCodexCd:
+    def _make_fake_shard_info(self, path):
+        return {
+            "worktree_path": str(path),
+            "branch_name": "shard-codex-20260503-001",
+            "shard_id": Path(path).name,
+        }
+
+    def test_spin_sync_skein_preamble_omits_ready_name_flag(self, tmp_path):
+        fake_shard = self._make_fake_shard_info(tmp_path / "worktrees" / "codex-20260503-001")
+        captured_cmd = []
+
+        def fake_detached(spool_id, cmd, cwd, env=None):
+            captured_cmd.append(list(cmd))
+            return 99999
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle._count_running", return_value=0):
+                with patch("spindle._has_skein", return_value=True):
+                    with patch("spindle._spawn_shard", return_value=(fake_shard, None)):
+                        with patch("spindle._detect_existing_shard", return_value=None):
+                            with patch("spindle._spawn_detached", side_effect=fake_detached):
+                                _spin_sync(
+                                    "do shard work",
+                                    "careful",
+                                    True,
+                                    None,
+                                    str(tmp_path),
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    False,
+                                    None,
+                                )
+
+        assert len(captured_cmd) == 1
+        cmd = captured_cmd[0]
+        prompt = cmd[cmd.index("-p") + 1]
+        assert "skein ready --name" not in prompt
+        assert "2. Then: skein ready" in prompt
+
+    def test_codex_spin_sync_adds_cd_and_omits_ready_name_flag(self, tmp_path):
+        fake_shard_path = tmp_path / "worktrees" / "codex-20260503-001"
+        fake_shard = self._make_fake_shard_info(fake_shard_path)
+        captured_cmd = []
+
+        def fake_detached(spool_id, cmd, cwd, env=None):
+            captured_cmd.append(list(cmd))
+            return 99999
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle._count_running", return_value=0):
+                with patch("spindle._has_skein", return_value=True):
+                    with patch("spindle._has_landlock_support", return_value=False):
+                        with patch("spindle._spawn_shard", return_value=(fake_shard, None)):
+                            with patch("spindle._detect_existing_shard", return_value=None):
+                                with patch("spindle._spawn_detached", side_effect=fake_detached):
+                                    _codex_spin_sync(
+                                        "do codex shard work",
+                                        str(tmp_path),
+                                        None,
+                                        None,
+                                        None,
+                                        None,
+                                        None,
+                                        shard=True,
+                                    )
+
+        assert len(captured_cmd) == 1
+        cmd = captured_cmd[0]
+        assert "--cd" in cmd, f"Expected --cd in codex spin command, got {cmd!r}"
+        cd_idx = cmd.index("--cd")
+        assert cmd[cd_idx + 1] == str(fake_shard_path)
+        prompt = cmd[-1]
+        assert "skein ready --name" not in prompt
+        assert "2. Then: skein ready" in prompt
+
+
 class TestShardOpsBlockedBySubdirectorySpool:
     """Regression for round-3 fell finding A: shard_merge / shard_abandon must
     block when another running spool's working_dir is a *subdirectory* of the
@@ -1915,6 +1994,48 @@ class TestCodexRespinPreservesGitAccess:
             f"subdirectory cwd retains write access to sibling files; got {add_dirs!r}"
         )
 
+    def test_codex_respin_sets_cd_to_shard_worktree(self, tmp_path):
+        session_id = "codex-session-cd"
+        worktree_path = tmp_path / "worktrees" / "codex-respin-001"
+        worktree_path.mkdir(parents=True)
+
+        original_spool = {
+            "id": "codex-original-cd",
+            "status": "complete",
+            "session_id": session_id,
+            "working_dir": str(worktree_path / "nested"),
+            "shard": {
+                "worktree_path": str(worktree_path),
+                "branch_name": "shard-codex-respin-001",
+                "shard_id": "codex-respin-001",
+            },
+            "harness": "codex",
+            "tags": ["codex"],
+        }
+
+        captured_cmd = []
+
+        def fake_detached(spool_id, cmd, cwd, env=None):
+            captured_cmd.append(list(cmd))
+            return 99999
+
+        spindle_state = tmp_path / "spindle_state"
+        spindle_state.mkdir()
+        with patch("spindle.SPINDLE_DIR", spindle_state):
+            _write_spool(original_spool["id"], original_spool)
+            with patch("spindle._spawn_detached", side_effect=fake_detached):
+                with patch("spindle._count_running", return_value=0):
+                    with patch("spindle._has_landlock_support", return_value=False):
+                        _codex_respin_sync(session_id, "follow up")
+
+        assert len(captured_cmd) == 1, "Expected one spawn for codex respin"
+        cmd = captured_cmd[0]
+        assert "--cd" in cmd, f"Expected --cd in codex respin command, got {cmd!r}"
+        cd_idx = cmd.index("--cd")
+        resume_idx = cmd.index("resume")
+        assert cd_idx < resume_idx, f"Expected --cd before resume in codex respin command, got {cmd!r}"
+        assert cmd[cd_idx + 1] == str(worktree_path)
+
 
 class TestDetectDefaultBranch:
     """Tests for _detect_default_branch and improved shard error messages.
@@ -1988,6 +2109,27 @@ class TestDetectDefaultBranch:
         assert shard_error is None, f"Unexpected error: {shard_error}"
         assert shard_info is not None, "Shard creation failed on main-only repo"
         assert Path(shard_info["worktree_path"]).exists()
+
+    @patch("spindle.subprocess.run")
+    def test_spawn_shard_uses_worktree_name_for_shard_id(self, mock_run):
+        result = MagicMock()
+        result.returncode = 0
+        result.stdout = "\n".join(
+            [
+                "✓ Spawned SHARD: shard-codex-7d69d943-20260503-001",
+                "Branch: shard-codex-7d69d943-20260503-001",
+                "Worktree: /tmp/spindle/worktrees/codex-7d69d943-20260503-001",
+            ]
+        )
+        mock_run.return_value = result
+
+        with patch("spindle._has_skein", return_value=True):
+            shard_info, shard_error = _spawn_shard("codex-7d69d943", "/repo", base_branch="main")
+
+        assert shard_error is None
+        assert shard_info is not None
+        assert shard_info["shard_id"] == "codex-7d69d943-20260503-001"
+        assert shard_info["shard_id"] != "shard-codex-7d69d943-20260503-001"
 
     def test_spawn_shard_error_message_names_bad_branch(self, tmp_path):
         """When shard creation fails due to invalid base branch, error names it."""
