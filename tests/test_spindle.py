@@ -1944,6 +1944,7 @@ class TestDetectDefaultBranch:
     @patch("spindle.subprocess.run")
     def test_falls_back_to_local_main_when_no_origin_head(self, mock_run):
         """Falls back to local branch check when origin/HEAD is missing."""
+
         def side_effect(cmd, **kwargs):
             m = MagicMock()
             if "symbolic-ref" in cmd:
@@ -2081,8 +2082,7 @@ class TestDetectDefaultBranch:
             text=True,
         ).stdout.strip()
         assert head_sha == main_sha, (
-            f"Shard HEAD {head_sha} does not match main {main_sha} — "
-            f"shard was not forked from main"
+            f"Shard HEAD {head_sha} does not match main {main_sha} — shard was not forked from main"
         )
 
         # Spool record should have base_branch persisted as 'main' so retries

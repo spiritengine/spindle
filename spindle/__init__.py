@@ -187,7 +187,9 @@ def _detect_default_branch(working_dir: str) -> str:
     return "master"
 
 
-def _spawn_shard(agent_id: str, working_dir: str, base_branch: str = "master") -> Tuple[Optional[Dict[str, str]], Optional[str]]:
+def _spawn_shard(
+    agent_id: str, working_dir: str, base_branch: str = "master"
+) -> Tuple[Optional[Dict[str, str]], Optional[str]]:
     """
     Create an isolated git worktree (SHARD) for the agent.
 
@@ -4432,7 +4434,9 @@ def main():
     spin_parser.add_argument("--harness", help="Harness to use: claude-code (default), codex, gemini, or kimi")
     spin_parser.add_argument("--timeout", "-t", type=int, help="Kill spool after N seconds")
     spin_parser.add_argument("--skeinless", action="store_true", help="Skip SKEIN context injection for shard agents")
-    spin_parser.add_argument("--base-branch", default=None, help="Branch to fork shard from (default: auto-detected from repo)")
+    spin_parser.add_argument(
+        "--base-branch", default=None, help="Branch to fork shard from (default: auto-detected from repo)"
+    )
     spin_parser.add_argument("--human", action="store_true", help="Human-readable output instead of JSON")
 
     # unspool command - get result
