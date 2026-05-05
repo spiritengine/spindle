@@ -1861,7 +1861,16 @@ class TestShardSpawnPreamblesAndCodexCd:
         assert cmd[0] == "bwrap", f"Expected bwrap wrapper for shard, got {cmd[0]!r}"
         assert "--ro-bind" in cmd
         worktree_root = str(fake_shard_path)
-        assert worktree_root in cmd, f"Expected worktree bind in cmd: {cmd!r}"
+        # Verify the read-write bind for the worktree exists as a specific triple,
+        # not just that worktree_root appears somewhere (it also appears in --cd and --chdir).
+        rw_bind_found = any(
+            cmd[i] == "--bind" and cmd[i + 1] == worktree_root and cmd[i + 2] == worktree_root
+            for i in range(len(cmd) - 2)
+        )
+        assert rw_bind_found, f"Expected '--bind {worktree_root} {worktree_root}' triple in cmd: {cmd!r}"
+        assert "--dev" in cmd, f"Expected --dev in bwrap command: {cmd!r}"
+        assert "--proc" in cmd, f"Expected --proc in bwrap command: {cmd!r}"
+        assert "--chdir" in cmd, f"Expected --chdir in bwrap command: {cmd!r}"
         assert "codex" in cmd, f"Expected codex in bwrap-wrapped command: {cmd!r}"
 
     def test_codex_spin_sync_warns_when_bwrap_unavailable_for_shard(self, tmp_path, capsys):
