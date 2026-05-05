@@ -3601,6 +3601,62 @@ def _has_landlock_support() -> bool:
     return False
 
 
+def _codex_bwrap_wrap(codex_cmd: list, shard_info: dict, cwd: str) -> list:
+    """Wrap codex_cmd in bwrap for shard isolation.
+
+    Returns the (possibly bwrap-wrapped) command. If bwrap is not available,
+    logs a warning and returns codex_cmd unchanged.
+    """
+    if not shutil.which("bwrap"):
+        print(
+            "[Spindle] WARNING: bwrap not available — codex shard isolation is "
+            "advisory only (prompt-enforced, not OS-enforced). Install bwrap for enforcement."
+        )
+        return codex_cmd
+
+    home = str(Path.home())
+    worktree_root = shard_info["worktree_path"]
+    cmd = [
+        "bwrap",
+        "--ro-bind", "/", "/",
+        "--bind", worktree_root, worktree_root,
+        "--bind", "/tmp", "/tmp",
+        "--dev", "/dev",
+        "--proc", "/proc",
+        "--chdir", cwd,
+    ]
+    # Make git writable for commits inside the worktree
+    git_file = Path(worktree_root) / ".git"
+    if git_file.exists() and git_file.is_file():
+        git_content = git_file.read_text().strip()
+        if git_content.startswith("gitdir:"):
+            git_worktree_dir = git_content.split("gitdir:")[1].strip()
+            if Path(git_worktree_dir).exists():
+                cmd.extend(["--bind", git_worktree_dir, git_worktree_dir])
+                main_git = Path(git_worktree_dir).parent.parent
+                if main_git.exists() and main_git.name == ".git":
+                    objects_dir = main_git / "objects"
+                    if objects_dir.exists():
+                        cmd.extend(["--bind", str(objects_dir), str(objects_dir)])
+                    refs_heads = main_git / "refs" / "heads"
+                    if refs_heads.exists():
+                        cmd.extend(["--bind", str(refs_heads), str(refs_heads)])
+                    logs_refs_heads = main_git / "logs" / "refs" / "heads"
+                    if logs_refs_heads.exists():
+                        cmd.extend(
+                            ["--bind", str(logs_refs_heads), str(logs_refs_heads)]
+                        )
+    for config_item in [
+        ".claude", ".claude.json", ".anthropic", ".codex",
+        ".spindle", ".config", ".cache",
+    ]:
+        path = f"{home}/{config_item}"
+        if Path(path).exists():
+            cmd.extend(["--bind", path, path])
+    cmd.extend(codex_cmd)
+    return cmd
+
+
 def _codex_spin_sync(
     prompt: str,
     working_dir: Optional[str],
@@ -3729,53 +3785,9 @@ Your task:
 
     # Wrap in bwrap sandbox for shards - worktree writable, rest read-only.
     # When Landlock is also active, both layers run as defense-in-depth.
-    if shard_info and shutil.which("bwrap"):
-        home = str(Path.home())
-        worktree_root = shard_info["worktree_path"]
-        cmd = [
-            "bwrap",
-            "--ro-bind", "/", "/",
-            "--bind", worktree_root, worktree_root,
-            "--bind", "/tmp", "/tmp",
-            "--dev", "/dev",
-            "--proc", "/proc",
-            "--chdir", cwd,
-        ]
-        # Make git writable for commits inside the worktree
-        git_file = Path(worktree_root) / ".git"
-        if git_file.exists() and git_file.is_file():
-            git_content = git_file.read_text().strip()
-            if git_content.startswith("gitdir:"):
-                git_worktree_dir = git_content.split("gitdir:")[1].strip()
-                if Path(git_worktree_dir).exists():
-                    cmd.extend(["--bind", git_worktree_dir, git_worktree_dir])
-                    main_git = Path(git_worktree_dir).parent.parent
-                    if main_git.exists() and main_git.name == ".git":
-                        objects_dir = main_git / "objects"
-                        if objects_dir.exists():
-                            cmd.extend(["--bind", str(objects_dir), str(objects_dir)])
-                        refs_heads = main_git / "refs" / "heads"
-                        if refs_heads.exists():
-                            cmd.extend(["--bind", str(refs_heads), str(refs_heads)])
-                        logs_refs_heads = main_git / "logs" / "refs" / "heads"
-                        if logs_refs_heads.exists():
-                            cmd.extend(
-                                ["--bind", str(logs_refs_heads), str(logs_refs_heads)]
-                            )
-        for config_item in [
-            ".claude", ".claude.json", ".anthropic", ".codex",
-            ".spindle", ".config", ".cache",
-        ]:
-            path = f"{home}/{config_item}"
-            if Path(path).exists():
-                cmd.extend(["--bind", path, path])
-        cmd.extend(codex_cmd)
+    if shard_info:
+        cmd = _codex_bwrap_wrap(codex_cmd, shard_info, cwd)
     else:
-        if shard_info:
-            print(
-                "[Spindle] WARNING: bwrap not available — codex shard isolation is "
-                "advisory only (prompt-enforced, not OS-enforced). Install bwrap for enforcement."
-            )
         cmd = codex_cmd
 
     # Parse tags
@@ -3913,6 +3925,13 @@ def _codex_respin_sync(session_id: str, prompt: str) -> str:
     # The prompt is passed as additional argument to resume
     codex_cmd.append(prompt)
 
+    # Wrap in bwrap sandbox for shards - worktree writable, rest read-only.
+    # When Landlock is also active, both layers run as defense-in-depth.
+    if shard_info:
+        cmd = _codex_bwrap_wrap(codex_cmd, shard_info, working_dir)
+    else:
+        cmd = codex_cmd
+
     # Create spool record
     spool = {
         "id": spool_id,
@@ -3935,7 +3954,7 @@ def _codex_respin_sync(session_id: str, prompt: str) -> str:
 
     # Spawn detached process
     try:
-        pid = _spawn_detached(spool_id, codex_cmd, working_dir, env)
+        pid = _spawn_detached(spool_id, cmd, working_dir, env)
     except Exception as e:
         spool["status"] = "error"
         spool["error"] = f"spawn failed: {e}"
