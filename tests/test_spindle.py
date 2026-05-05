@@ -1827,6 +1827,79 @@ class TestShardSpawnPreamblesAndCodexCd:
         assert "skein ready --name" not in prompt
         assert "2. Then: skein ready" in prompt
 
+    def test_codex_spin_sync_wraps_in_bwrap_for_shard(self, tmp_path):
+        """bwrap should wrap codex commands for shards when bwrap is available."""
+        fake_shard_path = tmp_path / "worktrees" / "codex-20260503-bwrap"
+        fake_shard = self._make_fake_shard_info(fake_shard_path)
+        captured_cmd = []
+
+        def fake_detached(spool_id, cmd, cwd, env=None):
+            captured_cmd.append(list(cmd))
+            return 99999
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle._count_running", return_value=0):
+                with patch("spindle._has_skein", return_value=False):
+                    with patch("spindle._has_landlock_support", return_value=False):
+                        with patch("spindle._spawn_shard", return_value=(fake_shard, None)):
+                            with patch("spindle._detect_existing_shard", return_value=None):
+                                with patch("shutil.which", return_value="/usr/bin/bwrap"):
+                                    with patch("spindle._spawn_detached", side_effect=fake_detached):
+                                        _codex_spin_sync(
+                                            "do codex shard work",
+                                            str(tmp_path),
+                                            None,
+                                            None,
+                                            None,
+                                            None,
+                                            None,
+                                            shard=True,
+                                        )
+
+        assert len(captured_cmd) == 1
+        cmd = captured_cmd[0]
+        assert cmd[0] == "bwrap", f"Expected bwrap wrapper for shard, got {cmd[0]!r}"
+        assert "--ro-bind" in cmd
+        worktree_root = str(fake_shard_path)
+        assert worktree_root in cmd, f"Expected worktree bind in cmd: {cmd!r}"
+        assert "codex" in cmd, f"Expected codex in bwrap-wrapped command: {cmd!r}"
+
+    def test_codex_spin_sync_warns_when_bwrap_unavailable_for_shard(self, tmp_path, capsys):
+        """When bwrap is not available for a shard, log a warning and run without it."""
+        fake_shard_path = tmp_path / "worktrees" / "codex-20260503-nobwrap"
+        fake_shard = self._make_fake_shard_info(fake_shard_path)
+        captured_cmd = []
+
+        def fake_detached(spool_id, cmd, cwd, env=None):
+            captured_cmd.append(list(cmd))
+            return 99999
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle._count_running", return_value=0):
+                with patch("spindle._has_skein", return_value=False):
+                    with patch("spindle._has_landlock_support", return_value=False):
+                        with patch("spindle._spawn_shard", return_value=(fake_shard, None)):
+                            with patch("spindle._detect_existing_shard", return_value=None):
+                                with patch("shutil.which", return_value=None):
+                                    with patch("spindle._spawn_detached", side_effect=fake_detached):
+                                        _codex_spin_sync(
+                                            "do codex shard work",
+                                            str(tmp_path),
+                                            None,
+                                            None,
+                                            None,
+                                            None,
+                                            None,
+                                            shard=True,
+                                        )
+
+        assert len(captured_cmd) == 1
+        cmd = captured_cmd[0]
+        assert cmd[0] == "codex", f"Expected direct codex command when bwrap missing, got {cmd[0]!r}"
+        out = capsys.readouterr().out
+        assert "WARNING" in out, f"Expected WARNING in output when bwrap unavailable, got: {out!r}"
+        assert "bwrap" in out.lower(), f"Expected 'bwrap' in warning, got: {out!r}"
+
 
 class TestShardOpsBlockedBySubdirectorySpool:
     """Regression for round-3 fell finding A: shard_merge / shard_abandon must
