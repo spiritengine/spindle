@@ -12,14 +12,12 @@ from unittest.mock import MagicMock, patch
 
 # Import the module to test
 from spindle import (
-    CLAUDE_TASKS_DIR,
     DEFAULT_REVIEW_TIMEOUT,
     GEMINI_MODEL_ALIASES,
     KIMI_MODEL_ALIASES,
     MAX_CONCURRENT,
     PENDING_SPAWN_TIMEOUT,
     PERMISSION_PROFILES,
-    REVIEW_TAGS,
     _check_and_finalize_spool,
     _cleanup_shard,
     _codex_respin_sync,
