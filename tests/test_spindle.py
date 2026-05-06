@@ -34,10 +34,12 @@ from spindle import (
     _get_output_path,
     _get_spool_path,
     _is_pid_alive,
+    _is_review_tag,
     _kimi_respin_sync,
     _kimi_spin_sync,
     _kimi_unspool_sync,
     _list_spools,
+    _monitor_spool,
     _parse_duration,
     _read_spool,
     _recover_orphans,
@@ -2367,11 +2369,45 @@ class TestReviewTagTimeout:
             assert len(spools) == 1
             assert spools[0]["timeout"] == 300
 
-    def test_review_tags_constant_coverage(self):
-        """All expected review tag strings are in REVIEW_TAGS."""
-        assert "review" in REVIEW_TAGS
-        for i in range(1, 6):
-            assert f"fell-r{i}" in REVIEW_TAGS
+    def test_review_tag_detection(self):
+        """_is_review_tag matches 'review' and any fell-rN without a cap."""
+        assert _is_review_tag("review")
+        # All finite fell rounds match
+        for i in range(1, 8):  # includes 6 and 7 to confirm no cap at 5
+            assert _is_review_tag(f"fell-r{i}")
+        # Unrelated tags do not match
+        assert not _is_review_tag("batch-1")
+        assert not _is_review_tag("fell-notanumber")
+        assert not _is_review_tag("triage")
+
+    def test_monitor_spool_kills_timed_out_process(self, tmp_path):
+        """_monitor_spool sends SIGTERM to a process that exceeds its timeout."""
+        proc = subprocess.Popen(
+            ["sleep", "60"],
+            start_new_session=True,
+        )
+        spool_id = "test-timeout-kill"
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle.MONITOR_POLL_INTERVAL", 0.1):
+                # created_at is 5s in the past so the 1s timeout is already expired
+                spool = {
+                    "id": spool_id,
+                    "status": "running",
+                    "pid": proc.pid,
+                    "timeout": 1,
+                    "created_at": (datetime.now() - timedelta(seconds=5)).isoformat(),
+                    "prompt": "test",
+                }
+                _write_spool(spool_id, spool)
+                _monitor_spool(spool_id)
+
+                pid_alive_after = _is_pid_alive(proc.pid)
+                result = _read_spool(spool_id)
+
+        assert not pid_alive_after, "process should have been killed by _monitor_spool"
+        assert result["status"] == "timeout"
+        assert "Timeout" in result["error"]
 
 
 class TestCCBgTasks:

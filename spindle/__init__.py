@@ -73,8 +73,20 @@ MONITOR_POLL_INTERVAL = 2  # seconds
 # Tags that mark a spool as a review/fell pass. Review spools get a soft default
 # timeout (DEFAULT_REVIEW_TIMEOUT) when the caller didn't pass an explicit one.
 # Typical reviews finish in 10-30 min; 90 min caps runaway wedged spools.
-REVIEW_TAGS = {"review", "fell-r1", "fell-r2", "fell-r3", "fell-r4", "fell-r5"}
+# "review" is the literal tag; fell-rN rounds are matched by _is_review_tag()
+# so fell has no iteration cap (fell-r6+ spools are covered without enumeration).
+REVIEW_TAGS = {"review"}
 DEFAULT_REVIEW_TIMEOUT = int(os.environ.get("SPINDLE_REVIEW_TIMEOUT", str(90 * 60)))
+
+
+def _is_review_tag(tag: str) -> bool:
+    """Return True if tag marks a spool as a review/fell pass.
+
+    "review" is matched literally; "fell-rN" (any N) is matched by regex so
+    the fell process can iterate past r5 without losing the soft timeout.
+    """
+    return tag in REVIEW_TAGS or bool(re.match(r"^fell-r\d+$", tag))
+
 
 # Claude Code stores background-task state here: ~/.claude/tasks/<session_id>/<n>.json
 CLAUDE_TASKS_DIR = Path.home() / ".claude" / "tasks"
@@ -1539,7 +1551,7 @@ Your task:
     # Review-tagged spools get a soft default timeout when the caller didn't
     # specify one. Reviews typically finish in 10-30 min; this caps wedged
     # spools (e.g. a self-referential pgrep bg-task loop — see friction-20260505-b87l).
-    if timeout is None and any(t in REVIEW_TAGS for t in tag_list):
+    if timeout is None and any(_is_review_tag(t) for t in tag_list):
         timeout = DEFAULT_REVIEW_TIMEOUT
 
     # Create spool record
