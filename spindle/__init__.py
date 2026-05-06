@@ -70,6 +70,27 @@ PENDING_SPAWN_TIMEOUT = 60
 # Poll interval for monitoring detached processes
 MONITOR_POLL_INTERVAL = 2  # seconds
 
+# Tags that mark a spool as a review/fell pass. Review spools get a soft default
+# timeout (DEFAULT_REVIEW_TIMEOUT) when the caller didn't pass an explicit one.
+# Typical reviews finish in 10-30 min; 90 min caps runaway wedged spools.
+# "review" is the literal tag; fell-rN rounds are matched by _is_review_tag()
+# so fell has no iteration cap (fell-r6+ spools are covered without enumeration).
+REVIEW_TAGS = {"review"}
+DEFAULT_REVIEW_TIMEOUT = int(os.environ.get("SPINDLE_REVIEW_TIMEOUT", str(90 * 60)))
+
+
+def _is_review_tag(tag: str) -> bool:
+    """Return True if tag marks a spool as a review/fell pass.
+
+    "review" is matched literally; "fell-rN" (any N) is matched by regex so
+    the fell process can iterate past r5 without losing the soft timeout.
+    """
+    return tag in REVIEW_TAGS or bool(re.match(r"^fell-r\d+$", tag))
+
+
+# Claude Code stores background-task state here: ~/.claude/tasks/<session_id>/<n>.json
+CLAUDE_TASKS_DIR = Path.home() / ".claude" / "tasks"
+
 # Permission profiles for tool restrictions
 # These map to Claude Code's --allowedTools flag
 # Profiles ending with "+shard" auto-enable shard isolation
@@ -651,6 +672,29 @@ def _find_spool_by_session(session_id: str) -> Optional[dict]:
         if spool.get("session_id") == session_id:
             return spool
     return None
+
+
+def _get_cc_bg_tasks(session_id: str) -> list:
+    """
+    Read Claude Code background-task records for a session.
+
+    Claude Code stores Task tool state in ~/.claude/tasks/<session_id>/<n>.json.
+    Each file is a JSON object with at minimum: id, subject, status.
+
+    Returns a list of task dicts, empty if none found.
+    """
+    tasks_dir = CLAUDE_TASKS_DIR / session_id
+    if not tasks_dir.exists():
+        return []
+
+    tasks = []
+    for json_file in sorted(tasks_dir.glob("*.json")):
+        try:
+            data = json.loads(json_file.read_text())
+            tasks.append(data)
+        except (json.JSONDecodeError, IOError):
+            pass
+    return tasks
 
 
 def _count_running() -> int:
@@ -1504,6 +1548,12 @@ Your task:
     # Parse tags
     tag_list = [t.strip() for t in tags.split(",")] if tags else []
 
+    # Review-tagged spools get a soft default timeout when the caller didn't
+    # specify one. Reviews typically finish in 10-30 min; this caps wedged
+    # spools (e.g. a self-referential pgrep bg-task loop — see friction-20260505-b87l).
+    if timeout is None and any(_is_review_tag(t) for t in tag_list):
+        timeout = DEFAULT_REVIEW_TIMEOUT
+
     # Create spool record
     spool = {
         "id": spool_id,
@@ -1590,7 +1640,11 @@ async def spin(
                for Gemini: "flash", "pro", or full model names like "gemini-2.5-pro";
                for Kimi: "thinking", "thinking-turbo", "turbo", "latest", or full model names.
                Use spin_harnesses() to see all available models.
-        timeout: Kill spool after this many seconds (default: no timeout)
+        timeout: Kill spool after this many seconds (default: no timeout).
+                 Exception: spools tagged with a review marker ("review", "fell-r1"
+                 through "fell-r5") automatically get DEFAULT_REVIEW_TIMEOUT (default
+                 90 min) when this is not set. Override SPINDLE_REVIEW_TIMEOUT env var
+                 to change the default. Pass timeout=0 explicitly to disable.
         skeinless: Skip SKEIN context injection for shard agents (default: False)
         harness: Which harness to use - "claude-code" (default), "codex", "gemini", or "kimi".
                  Use spin_harnesses() to see available harnesses and their models.
@@ -2607,7 +2661,29 @@ async def spool_peek(spool_id: str, lines: int = 50) -> str:
         return f"Error: Unknown spool_id '{spool_id}'"
 
     stdout_path = _get_output_path(spool_id)
+
+    def _bg_task_summary() -> Optional[str]:
+        """Return a bg-task fallback string if tasks exist, else None."""
+        if spool.get("harness", "claude-code") != "claude-code":
+            return None
+        session_id = spool.get("session_id")
+        if not session_id:
+            return None
+        bg_tasks = _get_cc_bg_tasks(session_id)
+        if not bg_tasks:
+            return None
+        task_lines = [f"background tasks for session {session_id}:"]
+        for t in bg_tasks:
+            status_str = t.get("status", "unknown")
+            subject = t.get("subject", "")
+            active = t.get("activeForm", "")
+            task_lines.append(f"  task {t.get('id')}: {status_str} - {subject}" + (f" ({active})" if active and active != subject else ""))
+        return "[spool %s - main output empty, showing bg tasks]\n%s" % (spool_id, "\n".join(task_lines))
+
     if not stdout_path.exists():
+        fallback = _bg_task_summary()
+        if fallback:
+            return fallback
         return f"No output yet for spool {spool_id}"
 
     try:
@@ -2615,6 +2691,9 @@ async def spool_peek(spool_id: str, lines: int = 50) -> str:
             all_lines = f.readlines()
 
         if not all_lines:
+            fallback = _bg_task_summary()
+            if fallback:
+                return fallback
             return f"Output file exists but is empty for spool {spool_id}"
 
         # Get last N lines
@@ -3565,6 +3644,16 @@ async def spool_info(spool_id: str) -> str:
                     spool["_transcript_size"] = len(transcript_path.read_text())
                 except IOError:
                     spool["_transcript_size"] = "error"
+
+    # Surface Claude Code background-task state. Wedged bg tasks (e.g. a pgrep
+    # loop that matches the parent claude command line) keep a spool running
+    # indefinitely even after the agent has emitted its final output.
+    if spool.get("harness", "claude-code") == "claude-code" and spool.get("session_id"):
+        bg_tasks = _get_cc_bg_tasks(spool["session_id"])
+        if bg_tasks:
+            spool["_bg_tasks"] = bg_tasks
+            incomplete = [t for t in bg_tasks if t.get("status") != "completed"]
+            spool["_bg_tasks_incomplete"] = len(incomplete)
 
     return json.dumps(spool, indent=2)
 

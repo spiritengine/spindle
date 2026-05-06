@@ -12,6 +12,7 @@ from unittest.mock import MagicMock, patch
 
 # Import the module to test
 from spindle import (
+    DEFAULT_REVIEW_TIMEOUT,
     GEMINI_MODEL_ALIASES,
     KIMI_MODEL_ALIASES,
     MAX_CONCURRENT,
@@ -26,13 +27,17 @@ from spindle import (
     _detect_existing_shard,
     _gemini_spin_sync,
     _gemini_unspool_sync,
+    _get_cc_bg_tasks,
     _get_harnesses,
+    _get_output_path,
     _get_spool_path,
     _is_pid_alive,
+    _is_review_tag,
     _kimi_respin_sync,
     _kimi_spin_sync,
     _kimi_unspool_sync,
     _list_spools,
+    _monitor_spool,
     _parse_duration,
     _read_spool,
     _recover_orphans,
@@ -45,6 +50,8 @@ from spindle import (
     shard_abandon,
     shard_merge,
     spin,
+    spool_info,
+    spool_peek,
 )
 
 
@@ -2235,3 +2242,332 @@ class TestDetectDefaultBranch:
         assert spool.get("base_branch") == "main", (
             f"Expected spool.base_branch='main', got {spool.get('base_branch')!r}"
         )
+
+
+class TestReviewTagTimeout:
+    """Review-tagged spools get a soft default timeout (friction-20260505-b87l)."""
+
+    def test_review_tag_applies_soft_timeout(self, tmp_path):
+        """A spool tagged 'review' with no explicit timeout gets DEFAULT_REVIEW_TIMEOUT."""
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle._count_running", return_value=0):
+                with patch("spindle._spawn_detached", return_value=12345):
+                    with patch("spindle._monitor_spool"):
+                        _spin_sync(
+                            prompt="review task",
+                            permission="readonly",
+                            shard=False,
+                            system_prompt=None,
+                            working_dir="/tmp",
+                            allowed_tools=None,
+                            tags="review",
+                            model=None,
+                            timeout=None,
+                            skeinless=True,
+                            env=None,
+                        )
+
+            spools = _list_spools()
+            assert len(spools) == 1
+            assert spools[0]["timeout"] == DEFAULT_REVIEW_TIMEOUT
+
+    def test_fell_r1_tag_applies_soft_timeout(self, tmp_path):
+        """A spool tagged 'fell-r1' gets the review soft timeout."""
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle._count_running", return_value=0):
+                with patch("spindle._spawn_detached", return_value=12345):
+                    with patch("spindle._monitor_spool"):
+                        _spin_sync(
+                            prompt="fell review pass",
+                            permission="readonly",
+                            shard=False,
+                            system_prompt=None,
+                            working_dir="/tmp",
+                            allowed_tools=None,
+                            tags="fell-r1,batch-3",
+                            model=None,
+                            timeout=None,
+                            skeinless=True,
+                            env=None,
+                        )
+
+            spools = _list_spools()
+            assert len(spools) == 1
+            assert spools[0]["timeout"] == DEFAULT_REVIEW_TIMEOUT
+
+    def test_non_review_tag_no_soft_timeout(self, tmp_path):
+        """A spool tagged with something other than a review marker gets no default timeout."""
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle._count_running", return_value=0):
+                with patch("spindle._spawn_detached", return_value=12345):
+                    with patch("spindle._monitor_spool"):
+                        _spin_sync(
+                            prompt="regular task",
+                            permission=None,
+                            shard=False,
+                            system_prompt=None,
+                            working_dir="/tmp",
+                            allowed_tools=None,
+                            tags="batch-1,triage",
+                            model=None,
+                            timeout=None,
+                            skeinless=True,
+                            env=None,
+                        )
+
+            spools = _list_spools()
+            assert len(spools) == 1
+            assert spools[0]["timeout"] is None
+
+    def test_untagged_spool_no_timeout(self, tmp_path):
+        """A spool with no tags gets no default timeout."""
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle._count_running", return_value=0):
+                with patch("spindle._spawn_detached", return_value=12345):
+                    with patch("spindle._monitor_spool"):
+                        _spin_sync(
+                            prompt="plain task",
+                            permission=None,
+                            shard=False,
+                            system_prompt=None,
+                            working_dir="/tmp",
+                            allowed_tools=None,
+                            tags=None,
+                            model=None,
+                            timeout=None,
+                            skeinless=True,
+                            env=None,
+                        )
+
+            spools = _list_spools()
+            assert len(spools) == 1
+            assert spools[0]["timeout"] is None
+
+    def test_explicit_timeout_not_overridden_by_review_tag(self, tmp_path):
+        """An explicit timeout takes precedence over the review-tag soft default."""
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle._count_running", return_value=0):
+                with patch("spindle._spawn_detached", return_value=12345):
+                    with patch("spindle._monitor_spool"):
+                        _spin_sync(
+                            prompt="review with custom timeout",
+                            permission="readonly",
+                            shard=False,
+                            system_prompt=None,
+                            working_dir="/tmp",
+                            allowed_tools=None,
+                            tags="review",
+                            model=None,
+                            timeout=300,
+                            skeinless=True,
+                            env=None,
+                        )
+
+            spools = _list_spools()
+            assert len(spools) == 1
+            assert spools[0]["timeout"] == 300
+
+    def test_review_tag_detection(self):
+        """_is_review_tag matches 'review' and any fell-rN without a cap."""
+        assert _is_review_tag("review")
+        # All finite fell rounds match
+        for i in range(1, 8):  # includes 6 and 7 to confirm no cap at 5
+            assert _is_review_tag(f"fell-r{i}")
+        # Unrelated tags do not match
+        assert not _is_review_tag("batch-1")
+        assert not _is_review_tag("fell-notanumber")
+        assert not _is_review_tag("triage")
+
+    def test_monitor_spool_kills_timed_out_process(self, tmp_path):
+        """_monitor_spool sends SIGTERM to a process that exceeds its timeout."""
+        proc = subprocess.Popen(
+            ["sleep", "60"],
+            start_new_session=True,
+        )
+        spool_id = "test-timeout-kill"
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle.MONITOR_POLL_INTERVAL", 0.1):
+                # created_at is 5s in the past so the 1s timeout is already expired
+                spool = {
+                    "id": spool_id,
+                    "status": "running",
+                    "pid": proc.pid,
+                    "timeout": 1,
+                    "created_at": (datetime.now() - timedelta(seconds=5)).isoformat(),
+                    "prompt": "test",
+                }
+                _write_spool(spool_id, spool)
+                _monitor_spool(spool_id)
+
+                pid_alive_after = _is_pid_alive(proc.pid)
+                result = _read_spool(spool_id)
+
+        assert not pid_alive_after, "process should have been killed by _monitor_spool"
+        assert result["status"] == "timeout"
+        assert "Timeout" in result["error"]
+
+
+class TestCCBgTasks:
+    """Tests for _get_cc_bg_tasks and bg-task surfacing in spool_info/spool_peek."""
+
+    def test_get_cc_bg_tasks_no_directory(self, tmp_path):
+        """Returns empty list when the session tasks directory doesn't exist."""
+        with patch("spindle.CLAUDE_TASKS_DIR", tmp_path):
+            result = _get_cc_bg_tasks("nonexistent-session")
+        assert result == []
+
+    def test_get_cc_bg_tasks_empty_directory(self, tmp_path):
+        """Returns empty list for an empty session directory."""
+        (tmp_path / "sess1").mkdir()
+        with patch("spindle.CLAUDE_TASKS_DIR", tmp_path):
+            result = _get_cc_bg_tasks("sess1")
+        assert result == []
+
+    def test_get_cc_bg_tasks_reads_json_files(self, tmp_path):
+        """Returns parsed task dicts from numbered JSON files."""
+        sess_dir = tmp_path / "sess1"
+        sess_dir.mkdir()
+        (sess_dir / "1.json").write_text(json.dumps({"id": "1", "subject": "spin agents", "status": "completed"}))
+        (sess_dir / "2.json").write_text(json.dumps({"id": "2", "subject": "wait loop", "status": "running"}))
+
+        with patch("spindle.CLAUDE_TASKS_DIR", tmp_path):
+            result = _get_cc_bg_tasks("sess1")
+
+        assert len(result) == 2
+        assert result[0]["id"] == "1"
+        assert result[1]["status"] == "running"
+
+    def test_get_cc_bg_tasks_skips_invalid_json(self, tmp_path):
+        """Silently skips files that are not valid JSON."""
+        sess_dir = tmp_path / "sess2"
+        sess_dir.mkdir()
+        (sess_dir / "1.json").write_text("not json{{{")
+        (sess_dir / "2.json").write_text(json.dumps({"id": "2", "status": "completed"}))
+
+        with patch("spindle.CLAUDE_TASKS_DIR", tmp_path):
+            result = _get_cc_bg_tasks("sess2")
+
+        assert len(result) == 1
+        assert result[0]["id"] == "2"
+
+    async def test_spool_info_surfaces_bg_tasks(self, tmp_path):
+        """spool_info includes _bg_tasks when cc bg tasks exist."""
+        tasks_dir = tmp_path / "tasks"
+        tasks_dir.mkdir()
+        sess_dir = tasks_dir / "mysession"
+        sess_dir.mkdir()
+        (sess_dir / "1.json").write_text(json.dumps({"id": "1", "subject": "wait loop", "status": "running"}))
+
+        spool_data = {
+            "id": "abc123",
+            "status": "running",
+            "harness": "claude-code",
+            "session_id": "mysession",
+            "prompt": "test",
+        }
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool("abc123", spool_data)
+            with patch("spindle.CLAUDE_TASKS_DIR", tasks_dir):
+                result = await spool_info.fn("abc123")
+
+        data = json.loads(result)
+        assert "_bg_tasks" in data
+        assert len(data["_bg_tasks"]) == 1
+        assert data["_bg_tasks"][0]["subject"] == "wait loop"
+        assert data["_bg_tasks_incomplete"] == 1
+
+    async def test_spool_info_no_bg_tasks_key_when_none(self, tmp_path):
+        """spool_info does not include _bg_tasks when there are none."""
+        tasks_dir = tmp_path / "tasks"
+        tasks_dir.mkdir()
+
+        spool_data = {
+            "id": "abc124",
+            "status": "running",
+            "harness": "claude-code",
+            "session_id": "no-tasks-session",
+            "prompt": "test",
+        }
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool("abc124", spool_data)
+            with patch("spindle.CLAUDE_TASKS_DIR", tasks_dir):
+                result = await spool_info.fn("abc124")
+
+        data = json.loads(result)
+        assert "_bg_tasks" not in data
+
+    async def test_spool_peek_falls_back_to_bg_tasks_when_empty(self, tmp_path):
+        """spool_peek returns bg task info when stdout is empty and tasks exist."""
+        tasks_dir = tmp_path / "tasks"
+        tasks_dir.mkdir()
+        sess_dir = tasks_dir / "mysession"
+        sess_dir.mkdir()
+        (sess_dir / "1.json").write_text(json.dumps({"id": "1", "subject": "pgrep loop", "status": "running", "activeForm": "waiting for pytest"}))
+
+        spool_data = {
+            "id": "peek1",
+            "status": "running",
+            "harness": "claude-code",
+            "session_id": "mysession",
+            "prompt": "test",
+        }
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool("peek1", spool_data)
+            stdout_path = _get_output_path("peek1")
+            stdout_path.write_text("")
+            with patch("spindle.CLAUDE_TASKS_DIR", tasks_dir):
+                result = await spool_peek.fn("peek1")
+
+        assert "background tasks" in result
+        assert "pgrep loop" in result
+
+    async def test_spool_peek_falls_back_to_bg_tasks_when_no_stdout(self, tmp_path):
+        """spool_peek returns bg task info when stdout doesn't exist and tasks exist."""
+        tasks_dir = tmp_path / "tasks"
+        tasks_dir.mkdir()
+        sess_dir = tasks_dir / "mysession2"
+        sess_dir.mkdir()
+        (sess_dir / "1.json").write_text(json.dumps({"id": "1", "subject": "wait task", "status": "running"}))
+
+        spool_data = {
+            "id": "peek2",
+            "status": "running",
+            "harness": "claude-code",
+            "session_id": "mysession2",
+            "prompt": "test",
+        }
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool("peek2", spool_data)
+            with patch("spindle.CLAUDE_TASKS_DIR", tasks_dir):
+                result = await spool_peek.fn("peek2")
+
+        assert "background tasks" in result
+        assert "wait task" in result
+
+    async def test_spool_peek_normal_output_not_replaced(self, tmp_path):
+        """spool_peek returns normal stdout when output exists and is non-empty."""
+        tasks_dir = tmp_path / "tasks"
+        tasks_dir.mkdir()
+
+        spool_data = {
+            "id": "peek3",
+            "status": "running",
+            "harness": "claude-code",
+            "session_id": "sess3",
+            "prompt": "test",
+        }
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool("peek3", spool_data)
+            stdout_path = _get_output_path("peek3")
+            stdout_path.write_text("normal agent output line\n")
+            with patch("spindle.CLAUDE_TASKS_DIR", tasks_dir):
+                result = await spool_peek.fn("peek3")
+
+        assert "normal agent output line" in result
+        assert "background tasks" not in result
