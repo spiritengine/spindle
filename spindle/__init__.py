@@ -226,6 +226,8 @@ def _spawn_shard(
         with keys worktree_path/branch_name/shard_id and error_message is None.
         On failure shard_info is None and error_message describes the problem.
     """
+    skein_error: Optional[str] = None
+
     if _has_skein(working_dir):
         # Use SKEIN's shard spawn command
         try:
@@ -267,10 +269,14 @@ def _spawn_shard(
                             },
                             None,
                         )
+            else:
+                # Capture the SKEIN error; fall through to git fallback
+                skein_error = (result.stderr or result.stdout or "").strip() or "skein shard spawn failed"
         except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
             pass
 
     # Fallback: plain git worktree
+    git_error: Optional[str] = None
     try:
         # Create worktrees directory if needed
         worktrees_dir = Path(working_dir) / "worktrees"
@@ -301,16 +307,17 @@ def _spawn_shard(
                 },
                 None,
             )
-        # Surface branch-not-found errors explicitly so callers can report them
-        if result.returncode != 0 and "invalid reference" in result.stderr:
-            return (
-                None,
-                f"base branch '{base_branch}' not found in repo at {working_dir}. Try --base-branch <correct-name>.",
-            )
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-        pass
+        # Surface errors; use friendly message for the branch-not-found case
+        if "invalid reference" in result.stderr:
+            git_error = f"base branch '{base_branch}' not found in repo at {working_dir}. Try --base-branch <correct-name>."
+        else:
+            git_error = result.stderr.strip() or "git worktree add failed"
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
+        git_error = str(exc)
 
-    return (None, None)
+    if skein_error and git_error:
+        return (None, f"skein shard spawn failed ({skein_error}); git worktree also failed: {git_error}")
+    return (None, git_error or skein_error or "shard creation failed")
 
 
 def _detect_existing_shard(path: str) -> Optional[Dict[str, str]]:
