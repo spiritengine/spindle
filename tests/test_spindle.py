@@ -2244,6 +2244,160 @@ class TestDetectDefaultBranch:
         )
 
 
+class TestShardFailLoud:
+    """Shard creation failures must surface loudly — never silent fall-through.
+
+    Regression guard for friction-20260507-i39h: when worktree creation fails,
+    spindle was returning (None, None) from _spawn_shard and using a generic
+    error in _spin_sync instead of the underlying git/skein error. In the worst
+    case a SKEIN non-zero was silently swallowed so the git fallback ran with
+    the same bad branch and also failed, still with no useful message.
+    """
+
+    def test_spawn_shard_git_error_non_invalid_reference(self, tmp_path):
+        """When git worktree add fails for a reason other than 'invalid reference',
+        the full stderr is returned rather than (None, None)."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        for cmd in [
+            ["git", "init"],
+            ["git", "config", "user.email", "test@test.com"],
+            ["git", "config", "user.name", "Test User"],
+        ]:
+            subprocess.run(cmd, cwd=repo, capture_output=True)
+        (repo / "f.txt").write_text("x")
+        subprocess.run(["git", "add", "."], cwd=repo, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True)
+
+        def fake_run(cmd, **kwargs):
+            m = MagicMock()
+            if "worktree" in cmd and "add" in cmd:
+                m.returncode = 128
+                m.stderr = "fatal: something unexpected went wrong\n"
+                m.stdout = ""
+            else:
+                m.returncode = 0
+                m.stdout = ""
+                m.stderr = ""
+            return m
+
+        with patch("spindle._has_skein", return_value=False):
+            with patch("spindle.subprocess.run", side_effect=fake_run):
+                shard_info, shard_error = _spawn_shard("agent", str(repo), base_branch="master")
+
+        assert shard_info is None
+        assert shard_error is not None, "Expected an error message, got None"
+        assert "something unexpected went wrong" in shard_error
+
+    def test_spawn_shard_skein_fails_git_succeeds(self, tmp_path):
+        """When skein shard spawn returns non-zero, _spawn_shard falls through to git
+        and still creates the worktree successfully."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        for cmd in [
+            ["git", "init"],
+            ["git", "config", "user.email", "test@test.com"],
+            ["git", "config", "user.name", "Test User"],
+        ]:
+            subprocess.run(cmd, cwd=repo, capture_output=True)
+        (repo / "f.txt").write_text("x")
+        subprocess.run(["git", "add", "."], cwd=repo, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True)
+
+        real_run = subprocess.run
+
+        def fake_run(cmd, **kwargs):
+            if cmd[0] == "skein":
+                m = MagicMock()
+                m.returncode = 1
+                m.stderr = "skein: base branch not found\n"
+                m.stdout = ""
+                return m
+            return real_run(cmd, **kwargs)
+
+        with patch("spindle._has_skein", return_value=True):
+            with patch("spindle.subprocess.run", side_effect=fake_run):
+                shard_info, shard_error = _spawn_shard("agent", str(repo), base_branch="master")
+
+        assert shard_error is None, f"Expected no error, got: {shard_error}"
+        assert shard_info is not None, "Git fallback should have created the shard"
+        assert Path(shard_info["worktree_path"]).exists()
+
+    def test_spawn_shard_skein_and_git_both_fail_error_has_both(self, tmp_path):
+        """When both skein and git fail, the returned error message contains details
+        from both so the caller can diagnose the root cause."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        for cmd in [
+            ["git", "init"],
+            ["git", "config", "user.email", "test@test.com"],
+            ["git", "config", "user.name", "Test User"],
+        ]:
+            subprocess.run(cmd, cwd=repo, capture_output=True)
+        (repo / "f.txt").write_text("x")
+        subprocess.run(["git", "add", "."], cwd=repo, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True)
+
+        def fake_run(cmd, **kwargs):
+            m = MagicMock()
+            if cmd[0] == "skein":
+                m.returncode = 1
+                m.stderr = "skein spawn error detail\n"
+                m.stdout = ""
+            elif "worktree" in cmd:
+                m.returncode = 128
+                m.stderr = "git worktree error detail\n"
+                m.stdout = ""
+            else:
+                m.returncode = 0
+                m.stdout = ""
+                m.stderr = ""
+            return m
+
+        with patch("spindle._has_skein", return_value=True):
+            with patch("spindle.subprocess.run", side_effect=fake_run):
+                shard_info, shard_error = _spawn_shard("agent", str(repo), base_branch="master")
+
+        assert shard_info is None
+        assert shard_error is not None
+        assert "skein spawn error detail" in shard_error
+        assert "git worktree error detail" in shard_error
+
+    def test_spin_shard_failure_returns_error_not_success(self, tmp_path):
+        """When shard creation fails, spin() returns an Error: string and the agent
+        does NOT run. The spool must not be started on the main checkout."""
+        spool_dir = tmp_path / "spools"
+        spool_dir.mkdir()
+        spawn_called = []
+
+        def tracking_spawn(*args, **kwargs):
+            spawn_called.append(True)
+            return 99999
+
+        with patch("spindle.SPINDLE_DIR", spool_dir):
+            with patch("spindle._count_running", return_value=0):
+                with patch("spindle._has_skein", return_value=False):
+                    with patch("spindle._spawn_shard", return_value=(None, "worktree creation bombed")):
+                        with patch("spindle._spawn_detached", side_effect=tracking_spawn):
+                            result = _spin_sync(
+                                prompt="do work",
+                                permission="shard",
+                                shard=False,
+                                system_prompt=None,
+                                working_dir=str(tmp_path),
+                                allowed_tools=None,
+                                tags=None,
+                                model=None,
+                                timeout=None,
+                                skeinless=True,
+                                env=None,
+                            )
+
+        assert result.startswith("Error"), f"Expected Error: return, got: {result!r}"
+        assert "worktree creation bombed" in result
+        assert not spawn_called, "Agent was spawned despite shard creation failure — silent fall-through!"
+
+
 class TestReviewTagTimeout:
     """Review-tagged spools get a soft default timeout (friction-20260505-b87l)."""
 
