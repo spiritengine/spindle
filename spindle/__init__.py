@@ -155,16 +155,18 @@ def _resolve_permission(permission: Optional[str], allowed_tools: Optional[str])
     Returns:
         Tuple of (allowed_tools string or None, should_use_shard bool)
     """
-    # Explicit allowed_tools takes precedence (no auto-shard)
+    # Shard intent is determined solely by the permission profile, not by whether
+    # allowed_tools is set. Compute it first so the early return below preserves it.
+    effective_permission = permission or "careful"
+    use_shard = effective_permission == "shard" or effective_permission.endswith("+shard")
+
+    # Explicit allowed_tools overrides the tool allow-list but not shard intent
     if allowed_tools:
-        return allowed_tools, False
+        return allowed_tools, use_shard
 
     # If no permission specified, use "careful" as default
     if not permission:
         permission = "careful"
-
-    # Check if this is a shard profile
-    use_shard = permission == "shard" or permission.endswith("+shard")
 
     # Look up profile
     if permission in PERMISSION_PROFILES:
@@ -1439,6 +1441,14 @@ def _spin_sync(
             if shard_error:
                 return f"Error: Failed to create SHARD worktree — {shard_error}"
             return "Error: Failed to create SHARD worktree. Check git repo status."
+
+    # Defensive invariant: shard intent must be backed by an actual shard before launch.
+    # This catches future code paths that might reach here with use_shard=True but no worktree.
+    if use_shard and shard_info is None:
+        raise RuntimeError(
+            "Shard permission requested but no shard was created; refusing to launch in main repo. "
+            "This indicates a bug in `_resolve_permission()` or `_spawn_shard()`."
+        )
 
     # Inject SKEIN context for shard agents (unless skeinless=True)
     effective_prompt = prompt

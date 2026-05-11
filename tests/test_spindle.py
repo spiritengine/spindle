@@ -111,6 +111,34 @@ class TestPermissionProfiles:
         assert tools == PERMISSION_PROFILES["careful"]
         assert shard is False
 
+    # Regression tests for permission=shard + allowed_tools bug (finding-20260511-qsun)
+
+    def test_shard_permission_with_explicit_allowed_tools_sets_use_shard(self):
+        """permission='shard' plus explicit allowed_tools must still return use_shard=True."""
+        custom_tools = "Read,Grep,Glob,Edit,Write,Bash,WebFetch,WebSearch"
+        tools, shard = _resolve_permission("shard", custom_tools)
+        assert tools == custom_tools
+        assert shard is True
+
+    def test_careful_plus_shard_with_explicit_allowed_tools_sets_use_shard(self):
+        """permission='careful+shard' plus explicit allowed_tools must still return use_shard=True."""
+        custom_tools = "Read,Grep"
+        tools, shard = _resolve_permission("careful+shard", custom_tools)
+        assert tools == custom_tools
+        assert shard is True
+
+    def test_readonly_permission_with_allowed_tools_no_shard(self):
+        """permission='readonly' plus allowed_tools must return use_shard=False."""
+        custom_tools = "Read,Grep"
+        tools, shard = _resolve_permission("readonly", custom_tools)
+        assert tools == custom_tools
+        assert shard is False
+
+    def test_shard_permission_without_allowed_tools_still_sets_use_shard(self):
+        """permission='shard' without allowed_tools must return use_shard=True (existing behavior)."""
+        tools, shard = _resolve_permission("shard", None)
+        assert shard is True
+
 
 class TestSpoolStorage:
     """Test spool file storage operations."""
@@ -2396,6 +2424,83 @@ class TestShardFailLoud:
         assert result.startswith("Error"), f"Expected Error: return, got: {result!r}"
         assert "worktree creation bombed" in result
         assert not spawn_called, "Agent was spawned despite shard creation failure — silent fall-through!"
+
+    def test_shard_with_allowed_tools_uses_shard_not_main_repo(self, tmp_path):
+        """Regression for finding-20260511-qsun: permission='shard' + allowed_tools
+        must set use_shard=True so the agent gets an isolated worktree, not main repo.
+
+        Before the fix, _resolve_permission returned (allowed_tools, False) when
+        allowed_tools was set, silently bypassing shard creation.
+        """
+        spool_dir = tmp_path / "spools"
+        spool_dir.mkdir()
+        spawn_called = []
+
+        def tracking_spawn(*args, **kwargs):
+            spawn_called.append(True)
+            return 99999
+
+        with patch("spindle.SPINDLE_DIR", spool_dir):
+            with patch("spindle._count_running", return_value=0):
+                with patch("spindle._has_skein", return_value=False):
+                    with patch("spindle._detect_existing_shard", return_value=None):
+                        with patch("spindle._spawn_shard", return_value=(None, "shard bombed")):
+                            with patch("spindle._spawn_detached", side_effect=tracking_spawn):
+                                result = _spin_sync(
+                                    prompt="do work",
+                                    permission="shard",
+                                    shard=False,
+                                    system_prompt=None,
+                                    working_dir=str(tmp_path),
+                                    allowed_tools="Read,Grep,Glob,Edit,Write,Bash",
+                                    tags=None,
+                                    model=None,
+                                    timeout=None,
+                                    skeinless=True,
+                                    env=None,
+                                )
+
+        # With the fix, use_shard=True so _spawn_shard is called and its failure surfaces
+        assert result.startswith("Error"), f"Expected Error: return, got: {result!r}"
+        assert "SHARD" in result or "shard bombed" in result
+        assert not spawn_called, "Agent launched in main repo despite permission='shard'!"
+
+    def test_defensive_invariant_shard_none_no_error_no_launch(self, tmp_path):
+        """Defensive invariant: when use_shard=True but _spawn_shard returns (None, None),
+        _spin_sync must not silently launch the agent in the main repo.
+
+        This guards against future refactors that might bypass the error returns.
+        """
+        spool_dir = tmp_path / "spools"
+        spool_dir.mkdir()
+        spawn_called = []
+
+        def tracking_spawn(*args, **kwargs):
+            spawn_called.append(True)
+            return 99999
+
+        with patch("spindle.SPINDLE_DIR", spool_dir):
+            with patch("spindle._count_running", return_value=0):
+                with patch("spindle._has_skein", return_value=False):
+                    with patch("spindle._detect_existing_shard", return_value=None):
+                        with patch("spindle._spawn_shard", return_value=(None, None)):
+                            with patch("spindle._spawn_detached", side_effect=tracking_spawn):
+                                result = _spin_sync(
+                                    prompt="do work",
+                                    permission="shard",
+                                    shard=False,
+                                    system_prompt=None,
+                                    working_dir=str(tmp_path),
+                                    allowed_tools=None,
+                                    tags=None,
+                                    model=None,
+                                    timeout=None,
+                                    skeinless=True,
+                                    env=None,
+                                )
+
+        assert "SHARD" in result or "Error" in result, f"Expected shard error, got: {result!r}"
+        assert not spawn_called, "Agent launched in main repo when shard_info was None!"
 
 
 class TestReviewTagTimeout:
