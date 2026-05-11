@@ -172,8 +172,8 @@ def _resolve_permission(permission: Optional[str], allowed_tools: Optional[str])
     if permission in PERMISSION_PROFILES:
         return PERMISSION_PROFILES[permission], use_shard
 
-    # Unknown profile - use careful, no shard
-    return PERMISSION_PROFILES["careful"], False
+    # Unknown profile - use careful, preserve shard intent
+    return PERMISSION_PROFILES["careful"], use_shard
 
 
 def _detect_default_branch(working_dir: str) -> str:
@@ -1441,14 +1441,6 @@ def _spin_sync(
             if shard_error:
                 return f"Error: Failed to create SHARD worktree — {shard_error}"
             return "Error: Failed to create SHARD worktree. Check git repo status."
-
-    # Defensive invariant: shard intent must be backed by an actual shard before launch.
-    # This catches future code paths that might reach here with use_shard=True but no worktree.
-    if use_shard and shard_info is None:
-        raise RuntimeError(
-            "Shard permission requested but no shard was created; refusing to launch in main repo. "
-            "This indicates a bug in `_resolve_permission()` or `_spawn_shard()`."
-        )
 
     # Inject SKEIN context for shard agents (unless skeinless=True)
     effective_prompt = prompt

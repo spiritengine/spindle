@@ -2465,11 +2465,9 @@ class TestShardFailLoud:
         assert "SHARD" in result or "shard bombed" in result
         assert not spawn_called, "Agent launched in main repo despite permission='shard'!"
 
-    def test_defensive_invariant_shard_none_no_error_no_launch(self, tmp_path):
-        """Defensive invariant: when use_shard=True but _spawn_shard returns (None, None),
-        _spin_sync must not silently launch the agent in the main repo.
-
-        This guards against future refactors that might bypass the error returns.
+    def test_shard_none_handled_by_early_return(self, tmp_path):
+        """When _spawn_shard returns (None, None), _spin_sync returns an error string
+        via the early-return at the shard creation block and does not launch the agent.
         """
         spool_dir = tmp_path / "spools"
         spool_dir.mkdir()
