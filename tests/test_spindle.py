@@ -3003,9 +3003,80 @@ class TestRespinHandleResolution:
             )
             result = _respin_sync(spool_id, "continue")
 
-        assert "no resumable session yet" in result
+        assert "still running" in result
         assert "status=running" in result
         assert "No spool found" not in result
+
+    def test_respin_running_spool_with_session_id_set_distinct_error(self, tmp_path):
+        """A spool that is status=running but already has session_id set
+        (codex sets it mid-stream from the thread_id event while the original
+        process is still working) must NOT flow to the harness resume path -
+        that would be a concurrent resume of a live session. It must return
+        the distinct running error, and no harness resume fn may be called.
+        """
+        spool_id = "codex-runwithsess"
+        thread_id = "019e3e07-0ee2-7770-bebc-7acbf2b14542"
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool(
+                spool_id,
+                {
+                    "id": spool_id,
+                    "status": "running",
+                    "session_id": thread_id,
+                    "harness": "codex",
+                },
+            )
+            with patch("spindle._codex_respin_sync") as codex_resume, patch(
+                "spindle._gemini_respin_sync"
+            ) as gemini_resume, patch("spindle._kimi_respin_sync") as kimi_resume, patch(
+                "spindle._spawn_detached"
+            ) as spawn:
+                result = _respin_sync(spool_id, "continue")
+
+        assert "still running" in result
+        assert "status=running" in result
+        assert "No spool found" not in result
+        codex_resume.assert_not_called()
+        gemini_resume.assert_not_called()
+        kimi_resume.assert_not_called()
+        spawn.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "harness,patch_target",
+        [
+            ("codex", "spindle._codex_respin_sync"),
+            ("gemini", "spindle._gemini_respin_sync"),
+            ("kimi", "spindle._kimi_respin_sync"),
+        ],
+    )
+    def test_respin_terminal_spool_with_session_proceeds(self, tmp_path, harness, patch_target):
+        """Happy path not regressed by the status guard: a terminal spool
+        (status=complete) with a session_id resolves and reaches the harness
+        resume path normally."""
+        spool_id = f"{harness}-doneabcd"
+        real_session = f"{harness}-real-thread-uuid"
+        captured = {}
+
+        def fake(session_id, prompt, *rest):
+            captured["session_id"] = session_id
+            return f"{harness}-new"
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool(
+                spool_id,
+                {
+                    "id": spool_id,
+                    "status": "complete",
+                    "session_id": real_session,
+                    "harness": harness,
+                    "working_dir": str(tmp_path),
+                },
+            )
+            with patch(patch_target, side_effect=fake):
+                result = _respin_sync(spool_id, "go")
+
+        assert result == f"{harness}-new"
+        assert captured["session_id"] == real_session
 
     def test_respin_unknown_handle_error(self, tmp_path):
         with patch("spindle.SPINDLE_DIR", tmp_path):

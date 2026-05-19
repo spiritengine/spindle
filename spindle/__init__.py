@@ -2049,14 +2049,28 @@ def _respin_sync(handle: str, prompt: str) -> str:
     if not original_spool:
         return f"Error: No spool found for handle '{handle}'"
 
+    # respin proceeds only when the spool reached a terminal state with a
+    # usable session_id. A still-running spool may already have its
+    # session_id set - codex sets it mid-stream from the thread_id event
+    # while the original process is still working - so a `not session_id`
+    # check alone would let a running spool flow to `codex exec resume
+    # <thread-id>` while the original process still holds that session: a
+    # concurrent-resume hazard. Gate on terminal status first.
+    status = original_spool.get("status", "unknown")
+    if status not in ("complete", "error"):
+        return (
+            f"Spool '{original_spool.get('id', handle)}' is still running "
+            f"(status={status}); wait for it to complete before respin"
+        )
+
     # Always resume against the spool's real session_id, not the caller's
     # handle (which may be a spool_id). For codex/gemini/kimi this is the
     # opaque harness thread-id; for claude-code it's the claude session id.
     session_id = original_spool.get("session_id")
     if not session_id:
         return (
-            f"Spool '{original_spool.get('id', handle)}' has no resumable "
-            f"session yet (status={original_spool.get('status', 'unknown')})"
+            f"Spool '{original_spool.get('id', handle)}' completed without a "
+            f"resumable session (status={status})"
         )
 
     harness = original_spool.get("harness", "claude-code")
