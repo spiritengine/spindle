@@ -3003,7 +3003,7 @@ class TestRespinHandleResolution:
             )
             result = _respin_sync(spool_id, "continue")
 
-        assert "still running" in result
+        assert "not in a resumable state" in result
         assert "status=running" in result
         assert "No spool found" not in result
 
@@ -3033,13 +3033,78 @@ class TestRespinHandleResolution:
             ) as spawn:
                 result = _respin_sync(spool_id, "continue")
 
-        assert "still running" in result
+        assert "not in a resumable state" in result
         assert "status=running" in result
         assert "No spool found" not in result
         codex_resume.assert_not_called()
         gemini_resume.assert_not_called()
         kimi_resume.assert_not_called()
         spawn.assert_not_called()
+
+    def test_respin_timeout_spool_with_session_proceeds(self, tmp_path):
+        """Regression: _monitor_spool sets status='timeout' on a wall-clock
+        kill (terminal - process dead, completed_at set). codex/claude-code
+        commonly have session_id set mid-stream before that kill. The
+        deny-list guard `status not in ('complete', 'error')` misclassified
+        'timeout' as non-terminal and blocked the legitimate "my run timed
+        out, continue it" path. The non-terminal allow-list lets it through:
+        the harness resume fn MUST be called with the resolved session_id.
+
+        This FAILS against edb6d00 (blocked with the running error) and
+        PASSES after the allow-list inversion.
+        """
+        spool_id = "codex-timedout1"
+        thread_id = "019e3e07-0ee2-7770-bebc-7acbf2b14542"
+        captured = {}
+
+        def fake_codex_respin(session_id, prompt):
+            captured["session_id"] = session_id
+            captured["prompt"] = prompt
+            return "codex-resumed"
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool(
+                spool_id,
+                {
+                    "id": spool_id,
+                    "status": "timeout",
+                    "session_id": thread_id,
+                    "harness": "codex",
+                    "working_dir": str(tmp_path),
+                },
+            )
+            with patch("spindle._codex_respin_sync", side_effect=fake_codex_respin):
+                result = _respin_sync(spool_id, "continue after timeout")
+
+        assert result == "codex-resumed", result
+        assert captured["session_id"] == thread_id, (
+            f"a timed-out spool with a session must resume against its real "
+            f"session_id, got {captured.get('session_id')!r}"
+        )
+        assert captured["prompt"] == "continue after timeout"
+
+    def test_respin_timeout_spool_without_session_distinct_error(self, tmp_path):
+        """A timed-out spool with no session_id is terminal-but-unresumable:
+        it must fall through to the 'completed without a resumable session'
+        error (carrying status=timeout), not the non-terminal running error
+        and not 'No spool found'."""
+        spool_id = "codex-timedout2"
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool(
+                spool_id,
+                {
+                    "id": spool_id,
+                    "status": "timeout",
+                    "session_id": None,
+                    "harness": "codex",
+                },
+            )
+            result = _respin_sync(spool_id, "continue")
+
+        assert "completed without a resumable session" in result
+        assert "status=timeout" in result
+        assert "not in a resumable state" not in result
+        assert "No spool found" not in result
 
     @pytest.mark.parametrize(
         "harness,patch_target",

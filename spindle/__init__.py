@@ -2055,12 +2055,21 @@ def _respin_sync(handle: str, prompt: str) -> str:
     # while the original process is still working - so a `not session_id`
     # check alone would let a running spool flow to `codex exec resume
     # <thread-id>` while the original process still holds that session: a
-    # concurrent-resume hazard. Gate on terminal status first.
+    # concurrent-resume hazard. Gate on non-terminal status first.
+    #
+    # `pending` and `running` are the only non-terminal states; everything
+    # else - `complete`, `error`, `timeout` (wall-clock kill in
+    # _monitor_spool), and any future terminal status - falls through to the
+    # `not session_id` check, which resumes if a session exists or returns
+    # the accurate "no resumable session" error otherwise. An allow-list of
+    # non-terminal states (rather than a deny-list of terminal ones) keeps a
+    # timed-out-with-session spool resumable and avoids mislabeling unknown
+    # statuses as "still running".
     status = original_spool.get("status", "unknown")
-    if status not in ("complete", "error"):
+    if status in ("pending", "running"):
         return (
-            f"Spool '{original_spool.get('id', handle)}' is still running "
-            f"(status={status}); wait for it to complete before respin"
+            f"Spool '{original_spool.get('id', handle)}' is not in a resumable "
+            f"state (status={status}); wait for it to complete before respin"
         )
 
     # Always resume against the spool's real session_id, not the caller's
