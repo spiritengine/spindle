@@ -10,6 +10,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 # Import the module to test
 from spindle import (
     DEFAULT_REVIEW_TIMEOUT,
@@ -25,6 +27,7 @@ from spindle import (
     _count_running,
     _detect_default_branch,
     _detect_existing_shard,
+    _gemini_respin_sync,
     _gemini_spin_sync,
     _gemini_unspool_sync,
     _get_cc_bg_tasks,
@@ -42,6 +45,8 @@ from spindle import (
     _read_spool,
     _recover_orphans,
     _resolve_permission,
+    _resolve_spool_for_respin,
+    _respin_sync,
     _spawn_shard,
     _spin_sync,
     _spool_lock,
@@ -2828,3 +2833,181 @@ class TestCCBgTasks:
 
         assert "normal agent output line" in result
         assert "background tasks" not in result
+
+
+class TestRespinHandleResolution:
+    """Bug fix (brief-20260519-guj8): respin must accept the spool_id
+    returned by spin() (the natural handle every other entrypoint takes),
+    not only a raw session_id. The spool's real session_id must be what
+    flows down to the harness resume path - never the caller's raw handle,
+    which may be a spool_id that the harness resume command can't use.
+    """
+
+    # All four harnesses route through _respin_sync.
+    HARNESS_PARAMS = [
+        ("codex", "codex-abcd1234", "019e3e07-0ee2-7770-bebc-7acbf2b14542"),
+        ("gemini", "gemini-abcd1234", "gemini-thread-uuid-001"),
+        ("kimi", "kimi-abcd1234", "kimi-thread-uuid-001"),
+        ("claude-code", "ab12cd34", "claude-session-uuid-001"),
+    ]
+
+    @pytest.mark.parametrize("harness,spool_id,session_id", HARNESS_PARAMS)
+    def test_resolver_finds_by_session_id(self, tmp_path, harness, spool_id, session_id):
+        """Backward compat: resolving by raw session_id still works."""
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool(
+                spool_id,
+                {"id": spool_id, "status": "complete", "session_id": session_id, "harness": harness},
+            )
+            resolved = _resolve_spool_for_respin(session_id)
+        assert resolved is not None
+        assert resolved["id"] == spool_id
+
+    @pytest.mark.parametrize("harness,spool_id,session_id", HARNESS_PARAMS)
+    def test_resolver_finds_by_spool_id(self, tmp_path, harness, spool_id, session_id):
+        """New: resolving by the spool_id returned by spin() works."""
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool(
+                spool_id,
+                {"id": spool_id, "status": "complete", "session_id": session_id, "harness": harness},
+            )
+            resolved = _resolve_spool_for_respin(spool_id)
+        assert resolved is not None
+        assert resolved["id"] == spool_id
+        assert resolved["session_id"] == session_id
+
+    def test_resolver_returns_none_for_unknown_handle(self, tmp_path):
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            assert _resolve_spool_for_respin("does-not-exist") is None
+
+    def test_respin_codex_by_spool_id_passes_real_thread_id(self, tmp_path):
+        """The original reproduction: respin(<spool_id>) for a completed
+        codex spool must resolve, and the codex resume path must receive
+        the codex thread-uuid, not the spool_id."""
+        spool_id = "codex-3a3d2c48"
+        thread_id = "019e3e07-0ee2-7770-bebc-7acbf2b14542"
+        captured = {}
+
+        def fake_codex_respin(session_id, prompt):
+            captured["session_id"] = session_id
+            captured["prompt"] = prompt
+            return "codex-newspool"
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool(
+                spool_id,
+                {"id": spool_id, "status": "complete", "session_id": thread_id, "harness": "codex"},
+            )
+            with patch("spindle._codex_respin_sync", side_effect=fake_codex_respin):
+                result = _respin_sync(spool_id, "continue please")
+
+        assert result == "codex-newspool"
+        assert captured["session_id"] == thread_id, (
+            f"codex resume must receive the thread-uuid, got {captured['session_id']!r} "
+            f"(the spool_id {spool_id!r} would fail `codex exec resume`)"
+        )
+        assert captured["prompt"] == "continue please"
+
+    def test_respin_codex_by_session_id_backward_compat(self, tmp_path):
+        """Existing session_id callers must keep working unchanged."""
+        spool_id = "codex-3a3d2c48"
+        thread_id = "019e3e07-0ee2-7770-bebc-7acbf2b14542"
+        captured = {}
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool(
+                spool_id,
+                {"id": spool_id, "status": "complete", "session_id": thread_id, "harness": "codex"},
+            )
+            with patch(
+                "spindle._codex_respin_sync",
+                side_effect=lambda sid, p: captured.update(session_id=sid) or "codex-new",
+            ):
+                result = _respin_sync(thread_id, "more work")
+
+        assert result == "codex-new"
+        assert captured["session_id"] == thread_id
+
+    @pytest.mark.parametrize(
+        "harness,patch_target",
+        [
+            ("codex", "spindle._codex_respin_sync"),
+            ("gemini", "spindle._gemini_respin_sync"),
+            ("kimi", "spindle._kimi_respin_sync"),
+        ],
+    )
+    def test_respin_passes_resolved_session_to_each_harness(self, tmp_path, harness, patch_target):
+        spool_id = f"{harness}-abcd1234"
+        real_session = f"{harness}-real-thread-uuid"
+        captured = {}
+
+        def fake(session_id, prompt, *rest):
+            captured["session_id"] = session_id
+            return f"{harness}-new"
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool(
+                spool_id,
+                {
+                    "id": spool_id,
+                    "status": "complete",
+                    "session_id": real_session,
+                    "harness": harness,
+                    "working_dir": str(tmp_path),
+                },
+            )
+            with patch(patch_target, side_effect=fake):
+                result = _respin_sync(spool_id, "go")
+
+        assert result == f"{harness}-new"
+        assert captured["session_id"] == real_session
+
+    def test_respin_claude_code_resumes_with_resolved_session_id(self, tmp_path):
+        """claude-code branch is inline; the resolved session_id must reach
+        `claude --resume <session_id>`, not the spool_id handle."""
+        spool_id = "ab12cd34"
+        session_id = "claude-session-uuid-001"
+        captured_cmd = []
+
+        def fake_detached(sid, cmd, cwd, env=None):
+            captured_cmd.append(list(cmd))
+            return 4242
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool(
+                spool_id,
+                {"id": spool_id, "status": "complete", "session_id": session_id, "harness": "claude-code"},
+            )
+            with patch("spindle._spawn_detached", side_effect=fake_detached):
+                with patch("spindle._count_running", return_value=0):
+                    with patch("spindle._monitor_spool"):
+                        result = _respin_sync(spool_id, "keep going")
+
+        assert not result.startswith("Error"), result
+        assert len(captured_cmd) == 1
+        cmd = captured_cmd[0]
+        assert "--resume" in cmd
+        assert cmd[cmd.index("--resume") + 1] == session_id, (
+            f"claude resume must use the resolved session_id {session_id!r}, "
+            f"not the spool_id {spool_id!r}; got {cmd!r}"
+        )
+
+    def test_respin_running_spool_no_session_distinct_error(self, tmp_path):
+        """A running spool whose thread_id hasn't been parsed yet must give
+        a clear distinct error, not the misleading 'No spool found'."""
+        spool_id = "codex-running1"
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool(
+                spool_id,
+                {"id": spool_id, "status": "running", "session_id": None, "harness": "codex"},
+            )
+            result = _respin_sync(spool_id, "continue")
+
+        assert "no resumable session yet" in result
+        assert "status=running" in result
+        assert "No spool found" not in result
+
+    def test_respin_unknown_handle_error(self, tmp_path):
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            result = _respin_sync("totally-unknown", "hi")
+        assert "No spool found for handle" in result
