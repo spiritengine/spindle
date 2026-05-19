@@ -683,6 +683,25 @@ def _find_spool_by_session(session_id: str) -> Optional[dict]:
     return None
 
 
+def _resolve_spool_for_respin(handle: str) -> Optional[dict]:
+    """Resolve a respin handle to its spool.
+
+    `handle` may be either a raw session_id (the legacy respin contract) or
+    the spool_id returned by spin() (the natural handle every other spindle
+    entrypoint takes). Tries session_id first to preserve existing
+    session_id callers, then falls back to matching the spool's own id.
+
+    Returns the spool dict, or None if nothing matches.
+    """
+    spool = _find_spool_by_session(handle)
+    if spool:
+        return spool
+    for spool in _list_spools():
+        if spool.get("id") == handle:
+            return spool
+    return None
+
+
 def _get_cc_bg_tasks(session_id: str) -> list:
     """
     Read Claude Code background-task records for a session.
@@ -2016,12 +2035,52 @@ async def spools() -> str:
     return await asyncio.to_thread(_spools_sync)
 
 
-def _respin_sync(session_id: str, prompt: str) -> str:
-    """Synchronous implementation of respin - auto-detects harness."""
-    # Find the original spool to detect harness
-    original_spool = _find_spool_by_session(session_id)
+def _respin_sync(handle: str, prompt: str) -> str:
+    """Synchronous implementation of respin - auto-detects harness.
+
+    `handle` may be either the spool_id returned by spin() (preferred, and
+    consistent with every other spindle entrypoint) or a raw session_id
+    (legacy contract). It is resolved to the original spool, and the spool's
+    real session_id is what flows down to the harness resume path - never
+    the raw caller handle, which may be a spool_id.
+    """
+    # Resolve the original spool to detect harness (accepts spool_id or session_id)
+    original_spool = _resolve_spool_for_respin(handle)
     if not original_spool:
-        return f"Error: No spool found for session_id '{session_id}'"
+        return f"Error: No spool found for handle '{handle}'"
+
+    # respin proceeds only when the spool reached a terminal state with a
+    # usable session_id. A still-running spool may already have its
+    # session_id set - codex sets it mid-stream from the thread_id event
+    # while the original process is still working - so a `not session_id`
+    # check alone would let a running spool flow to `codex exec resume
+    # <thread-id>` while the original process still holds that session: a
+    # concurrent-resume hazard. Gate on non-terminal status first.
+    #
+    # `pending` and `running` are the only non-terminal states; everything
+    # else - `complete`, `error`, `timeout` (wall-clock kill in
+    # _monitor_spool), and any future terminal status - falls through to the
+    # `not session_id` check, which resumes if a session exists or returns
+    # the accurate "no resumable session" error otherwise. An allow-list of
+    # non-terminal states (rather than a deny-list of terminal ones) keeps a
+    # timed-out-with-session spool resumable and avoids mislabeling unknown
+    # statuses as "still running".
+    status = original_spool.get("status", "unknown")
+    if status in ("pending", "running"):
+        return (
+            f"Spool '{original_spool.get('id', handle)}' is not in a resumable "
+            f"state (status={status}); wait for it to complete before respin"
+        )
+
+    # Always resume against the spool's real session_id, not the caller's
+    # handle (which may be a spool_id). For codex/gemini/kimi this is the
+    # opaque harness thread-id; for claude-code it's the claude session id.
+    session_id = original_spool.get("session_id")
+    if not session_id:
+        return (
+            f"Spool '{original_spool.get('id', handle)}' completed without a "
+            f"resumable session (status={status})"
+        )
 
     harness = original_spool.get("harness", "claude-code")
 
@@ -2108,7 +2167,10 @@ async def respin(
     injection if the session has expired.
 
     Args:
-        session_id: The session ID to continue
+        session_id: The handle of the session to continue. Accepts the
+            spool_id returned by spin() (preferred - consistent with every
+            other spindle entrypoint) or a raw session_id (legacy). The
+            spool's real session_id is resolved internally before resuming.
         prompt: The follow-up message/task
 
     Returns:
