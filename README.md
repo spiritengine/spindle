@@ -79,7 +79,7 @@ spin("Update configs", permission="careful+shard")
 
 Profiles:
 - `readonly`: Read, Grep, Glob, safe bash (ls, cat, git status/log/diff)
-- `careful`: Read, Write, Edit, Grep, Glob, bash for git/build/test/lint/typecheck/python tooling plus basic Unix inspection
+- `careful`: Read, Write, Edit, Grep, Glob, bash for git/build/test/lint/typecheck/python+node tooling plus basic Unix inspection
 - `full`: No restrictions
 - `shard`: Full access + auto-creates isolated worktree
 - `careful+shard`: Careful permissions + auto-creates isolated worktree
