@@ -22,6 +22,7 @@ from spindle import (
     PERMISSION_PROFILES,
     _check_and_finalize_spool,
     _cleanup_shard,
+    _codex_bwrap_wrap,
     _codex_respin_sync,
     _codex_spin_sync,
     _count_running,
@@ -1867,6 +1868,88 @@ class TestShardSpawnPreamblesAndCodexCd:
         assert "skein ready --name" not in prompt
         assert "2. Then: skein ready" in prompt
 
+    def test_codex_spin_sync_wraps_in_bwrap_for_shard(self, tmp_path):
+        """bwrap should wrap codex commands for shards when bwrap is available."""
+        fake_shard_path = tmp_path / "worktrees" / "codex-20260503-bwrap"
+        fake_shard = self._make_fake_shard_info(fake_shard_path)
+        captured_cmd = []
+
+        def fake_detached(spool_id, cmd, cwd, env=None):
+            captured_cmd.append(list(cmd))
+            return 99999
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle._count_running", return_value=0):
+                with patch("spindle._has_skein", return_value=False):
+                    with patch("spindle._has_landlock_support", return_value=False):
+                        with patch("spindle._spawn_shard", return_value=(fake_shard, None)):
+                            with patch("spindle._detect_existing_shard", return_value=None):
+                                with patch("shutil.which", return_value="/usr/bin/bwrap"):
+                                    with patch("spindle._spawn_detached", side_effect=fake_detached):
+                                        _codex_spin_sync(
+                                            "do codex shard work",
+                                            str(tmp_path),
+                                            None,
+                                            None,
+                                            None,
+                                            None,
+                                            None,
+                                            shard=True,
+                                        )
+
+        assert len(captured_cmd) == 1
+        cmd = captured_cmd[0]
+        assert cmd[0] == "bwrap", f"Expected bwrap wrapper for shard, got {cmd[0]!r}"
+        assert "--ro-bind" in cmd
+        worktree_root = str(fake_shard_path)
+        # Verify the read-write bind for the worktree exists as a specific triple,
+        # not just that worktree_root appears somewhere (it also appears in --cd and --chdir).
+        rw_bind_found = any(
+            cmd[i] == "--bind" and cmd[i + 1] == worktree_root and cmd[i + 2] == worktree_root
+            for i in range(len(cmd) - 2)
+        )
+        assert rw_bind_found, f"Expected '--bind {worktree_root} {worktree_root}' triple in cmd: {cmd!r}"
+        assert "--dev" in cmd, f"Expected --dev in bwrap command: {cmd!r}"
+        assert "--proc" in cmd, f"Expected --proc in bwrap command: {cmd!r}"
+        assert "--chdir" in cmd, f"Expected --chdir in bwrap command: {cmd!r}"
+        assert "codex" in cmd, f"Expected codex in bwrap-wrapped command: {cmd!r}"
+
+    def test_codex_spin_sync_warns_when_bwrap_unavailable_for_shard(self, tmp_path, capsys):
+        """When bwrap is not available for a shard, log a warning and run without it."""
+        fake_shard_path = tmp_path / "worktrees" / "codex-20260503-nobwrap"
+        fake_shard = self._make_fake_shard_info(fake_shard_path)
+        captured_cmd = []
+
+        def fake_detached(spool_id, cmd, cwd, env=None):
+            captured_cmd.append(list(cmd))
+            return 99999
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle._count_running", return_value=0):
+                with patch("spindle._has_skein", return_value=False):
+                    with patch("spindle._has_landlock_support", return_value=False):
+                        with patch("spindle._spawn_shard", return_value=(fake_shard, None)):
+                            with patch("spindle._detect_existing_shard", return_value=None):
+                                with patch("shutil.which", return_value=None):
+                                    with patch("spindle._spawn_detached", side_effect=fake_detached):
+                                        _codex_spin_sync(
+                                            "do codex shard work",
+                                            str(tmp_path),
+                                            None,
+                                            None,
+                                            None,
+                                            None,
+                                            None,
+                                            shard=True,
+                                        )
+
+        assert len(captured_cmd) == 1
+        cmd = captured_cmd[0]
+        assert cmd[0] == "codex", f"Expected direct codex command when bwrap missing, got {cmd[0]!r}"
+        out = capsys.readouterr().out
+        assert "WARNING" in out, f"Expected WARNING in output when bwrap unavailable, got: {out!r}"
+        assert "bwrap" in out.lower(), f"Expected 'bwrap' in warning, got: {out!r}"
+
 
 class TestShardOpsBlockedBySubdirectorySpool:
     """Regression for round-3 fell finding A: shard_merge / shard_abandon must
@@ -2075,6 +2158,85 @@ class TestCodexRespinPreservesGitAccess:
         resume_idx = cmd.index("resume")
         assert cd_idx < resume_idx, f"Expected --cd before resume in codex respin command, got {cmd!r}"
         assert cmd[cd_idx + 1] == str(worktree_path)
+
+    def _make_respin_spool(self, tmp_path, session_id, worktree_path):
+        return {
+            "id": "codex-original",
+            "status": "complete",
+            "session_id": session_id,
+            "working_dir": str(worktree_path),
+            "shard": {
+                "worktree_path": str(worktree_path),
+                "branch_name": "shard-codex-respin-001",
+                "shard_id": "codex-respin-001",
+            },
+            "harness": "codex",
+            "tags": ["codex"],
+        }
+
+    def test_codex_respin_sync_wraps_in_bwrap_for_shard(self, tmp_path):
+        """bwrap wraps codex respin commands for shards when bwrap is available."""
+        worktree_path = tmp_path / "worktrees" / "codex-respin-bwrap"
+        worktree_path.mkdir(parents=True)
+        session_id = "codex-session-bwrap"
+        original_spool = self._make_respin_spool(tmp_path, session_id, worktree_path)
+        captured_cmd = []
+
+        def fake_detached(spool_id, cmd, cwd, env=None):
+            captured_cmd.append(list(cmd))
+            return 99999
+
+        spindle_state = tmp_path / "spindle_state"
+        spindle_state.mkdir()
+        with patch("spindle.SPINDLE_DIR", spindle_state):
+            _write_spool(original_spool["id"], original_spool)
+            with patch("spindle._has_landlock_support", return_value=False):
+                with patch("spindle._spawn_detached", side_effect=fake_detached):
+                    with patch("spindle._count_running", return_value=0):
+                        with patch("shutil.which", return_value="/usr/bin/bwrap"):
+                            _codex_respin_sync(session_id, "follow up")
+
+        assert len(captured_cmd) == 1, "Expected one spawn for codex respin"
+        cmd = captured_cmd[0]
+        assert cmd[0] == "bwrap", f"Expected bwrap wrapper for respin shard, got {cmd[0]!r}"
+        assert "--ro-bind" in cmd
+        worktree_root = str(worktree_path)
+        rw_bind_found = any(
+            cmd[i] == "--bind" and cmd[i + 1] == worktree_root and cmd[i + 2] == worktree_root
+            for i in range(len(cmd) - 2)
+        )
+        assert rw_bind_found, f"Expected '--bind {worktree_root} {worktree_root}' in respin cmd: {cmd!r}"
+        assert "--chdir" in cmd
+        assert "codex" in cmd
+
+    def test_codex_respin_sync_warns_when_bwrap_unavailable_for_shard(self, tmp_path, capsys):
+        """Warning is logged when bwrap is absent for a respin shard."""
+        worktree_path = tmp_path / "worktrees" / "codex-respin-nobwrap"
+        worktree_path.mkdir(parents=True)
+        session_id = "codex-session-nobwrap"
+        original_spool = self._make_respin_spool(tmp_path, session_id, worktree_path)
+        captured_cmd = []
+
+        def fake_detached(spool_id, cmd, cwd, env=None):
+            captured_cmd.append(list(cmd))
+            return 99999
+
+        spindle_state = tmp_path / "spindle_state"
+        spindle_state.mkdir()
+        with patch("spindle.SPINDLE_DIR", spindle_state):
+            _write_spool(original_spool["id"], original_spool)
+            with patch("spindle._has_landlock_support", return_value=False):
+                with patch("spindle._spawn_detached", side_effect=fake_detached):
+                    with patch("spindle._count_running", return_value=0):
+                        with patch("shutil.which", return_value=None):
+                            _codex_respin_sync(session_id, "follow up")
+
+        assert len(captured_cmd) == 1
+        cmd = captured_cmd[0]
+        assert cmd[0] == "codex", f"Expected direct codex respin when bwrap missing, got {cmd[0]!r}"
+        out = capsys.readouterr().out
+        assert "WARNING" in out
+        assert "bwrap" in out.lower()
 
 
 class TestDetectDefaultBranch:
