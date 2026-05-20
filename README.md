@@ -75,6 +75,9 @@ spin("Refactor the auth system", permission="shard")
 
 # Careful + shard: Limited tools but isolated
 spin("Update configs", permission="careful+shard")
+
+# Research: web/file research routed to a SKEIN site, a single file, or a directory
+spin("Research deepseek vs kimi", permission="research", research_target="site:spindle-development")
 ```
 
 Profiles:
@@ -83,6 +86,10 @@ Profiles:
 - `full`: No restrictions
 - `shard`: Full access + auto-creates isolated worktree
 - `careful+shard`: Careful permissions + auto-creates isolated worktree
+- `research`: Read, Grep, Glob, WebFetch, WebSearch, curl, jq, safe bash; no python/find; requires `research_target` (Write/Edit added when target is `file:` or `dir:`)
+- `research+shard`: research tools + auto-creates isolated worktree
+
+Web-egress work (WebFetch, WebSearch, curl) belongs in `research`, not `careful` — `careful` intentionally has no web access so it's safe for code review and code-modifying work.
 
 You can also pass explicit `allowed_tools` to override the profile.
 
@@ -318,7 +325,7 @@ See [docs/MULTI_HARNESS_GUIDE.md](docs/MULTI_HARNESS_GUIDE.md) and [docs/CODEX_S
 - `prompt` (required): The task for the agent
 - `harness` (optional): "claude-code" (default), "codex", "gemini", or "kimi"
 - `working_dir` (optional for Claude, required for Codex/Gemini/Kimi): Project directory
-- `permission` (optional): "readonly", "careful" (default), "full", "shard", "careful+shard"
+- `permission` (optional): "readonly", "careful" (default), "full", "shard", "careful+shard", "research", "research+shard"
 - `model` (optional): Model to use ("sonnet", "opus", "haiku" for Claude; "flash", "pro" for Gemini; "thinking", "turbo" for Kimi)
 - `timeout` (optional): Auto-kill after N seconds
 - `tags` (optional): Comma-separated tags for organization

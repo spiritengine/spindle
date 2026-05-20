@@ -163,7 +163,7 @@ spool_id = spin(
 - `tags` - Organization tags
 
 **Claude-specific parameters:**
-- `permission` - "readonly", "careful", "full", "shard"
+- `permission` - "readonly", "careful", "full", "shard", "careful+shard", "research", "research+shard"
 - `shard` - Auto-create git worktree
 - `system_prompt` - Custom system instructions
 - `allowed_tools` - Explicit tool permissions
@@ -357,12 +357,15 @@ Claude uses a tool-based permission system:
 - **full** - No restrictions
 - **shard** - Full permissions + isolated git worktree
 - **careful+shard** - Careful permissions + worktree
+- **research** - WebFetch/WebSearch/curl/jq enabled; no python/find/Write/Edit; requires `research_target` (site:, file:, or dir: prefix)
+- **research+shard** - research tools + isolated git worktree
 
 Example:
 ```python
 spin("Analyze code", permission="readonly")
 spin("Fix bug", permission="careful")  # Default
 spin("Refactor module", permission="shard")  # Isolated worktree
+spin("Research deepseek pricing", permission="research", research_target="site:spindle-development")
 ```
 
 ### Codex Sandbox Policies
@@ -373,6 +376,8 @@ Codex uses OpenAI's sandbox policies, mapped from Claude permissions:
 - `permission="careful"` → `--full-auto` (workspace-write + approvals)
 - `permission="full"` → `--dangerously-bypass-approvals-and-sandbox`
 - `permission="shard"` → `--dangerously-bypass-approvals-and-sandbox`
+- `permission="research"` → site target: `--sandbox read-only`; file/dir target: `--sandbox workspace-write` + `--add-dir` for the target path (no bwrap — plain research uses Codex native sandbox only)
+- `permission="research+shard"` → same conditional sandbox as `research` + isolated worktree; bwrap adds OS-level isolation on top when available
 
 The mapping happens automatically in `_codex_spin_sync()`.
 

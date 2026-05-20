@@ -1879,6 +1879,7 @@ async def spin(
         spool_id = spin("Analyze code", harness="kimi", model="thinking")  # Use Kimi
         spool_id = spin("Do something", env={"CC_THINKING_BOOST": "1"})
         spool_id = spin("Fork from branch", permission="shard", base_branch="feature-x")
+        spool_id = spin("Research deepseek vs kimi", permission="research", research_target="site:spindle-development")
         result = unspool(spool_id)
     """
     # Normalize harness parameter (case-insensitive)
@@ -5037,7 +5038,12 @@ def main():
     )
     spin_parser.add_argument(
         "--research-target",
-        help="Required for research permissions: site:<id>, file:<absolute-path>, or dir:<absolute-path>",
+        help=(
+            "Required when --permission is 'research' or 'research+shard'. "
+            "Three forms: site:<skein-site-id> (output via skein post, Write/Edit not added to profile), "
+            "file:<absolute-path> (single-file output, Write/Edit enabled), "
+            "dir:<absolute-path> (multi-file output within dir, Write/Edit enabled)."
+        ),
     )
     spin_parser.add_argument("--shard", "-s", action="store_true", help="Run in isolated git worktree")
     spin_parser.add_argument("--system-prompt", help="Optional system prompt")
