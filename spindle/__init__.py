@@ -95,12 +95,12 @@ CLAUDE_TASKS_DIR = Path.home() / ".claude" / "tasks"
 # These map to Claude Code's --allowedTools flag
 # Profiles ending with "+shard" auto-enable shard isolation
 PERMISSION_PROFILES = {
-    "readonly": "Read,Grep,Glob,Bash(ls:*),Bash(cat:*),Bash(head:*),Bash(tail:*),Bash(git status:*),Bash(git log:*),Bash(git diff:*),Bash(skein:*),Bash(python:*),Bash(find:*)",
-    "careful": "Read,Write,Edit,Grep,Glob,Bash(git:*),Bash(make:*),Bash(pytest:*),Bash(python:*),Bash(npm:*),Bash(skein:*),Bash(muster:*)",
+    "readonly": "Read,Grep,Glob,Bash(ls:*),Bash(cat:*),Bash(head:*),Bash(tail:*),Bash(git status:*),Bash(git log:*),Bash(git diff:*),Bash(skein:*)",
+    "careful": "Read,Write,Edit,Grep,Glob,Bash(git:*),Bash(make:*),Bash(pytest:*),Bash(python:*),Bash(python3:*),Bash(npm:*),Bash(npx:*),Bash(node:*),Bash(ruff:*),Bash(black:*),Bash(mypy:*),Bash(pip:*),Bash(uv:*),Bash(ls:*),Bash(cat:*),Bash(head:*),Bash(tail:*),Bash(wc:*),Bash(diff:*),Bash(skein:*),Bash(muster:*)",
     "full": None,  # None means no restrictions
     # Shard variants - same permissions but auto-enable worktree isolation
     "shard": None,  # Full permissions + shard isolation (common combo)
-    "careful+shard": "Read,Write,Edit,Grep,Glob,Bash(git:*),Bash(make:*),Bash(pytest:*),Bash(python:*),Bash(npm:*),Bash(skein:*),Bash(muster:*)",
+    "careful+shard": "Read,Write,Edit,Grep,Glob,Bash(git:*),Bash(make:*),Bash(pytest:*),Bash(python:*),Bash(python3:*),Bash(npm:*),Bash(npx:*),Bash(node:*),Bash(ruff:*),Bash(black:*),Bash(mypy:*),Bash(pip:*),Bash(uv:*),Bash(ls:*),Bash(cat:*),Bash(head:*),Bash(tail:*),Bash(wc:*),Bash(diff:*),Bash(skein:*),Bash(muster:*)",
 }
 
 # Cache for SKEIN availability check (per-directory)
