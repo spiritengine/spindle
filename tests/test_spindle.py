@@ -2557,6 +2557,22 @@ class TestCodexRespinPreservesGitAccess:
             f"subdirectory cwd retains write access to sibling files; got {add_dirs!r}"
         )
 
+        # Position guards: --add-dir and --cd are `codex exec` flags, not `codex exec
+        # resume` flags — they must appear before the `resume` subcommand keyword.
+        resume_idx = cmd.index("resume")
+        add_dir_indices = [i for i, tok in enumerate(cmd) if tok == "--add-dir"]
+        for idx in add_dir_indices:
+            assert idx < resume_idx, (
+                f"--add-dir at index {idx} must come before `resume` at index {resume_idx}; "
+                f"cmd={cmd!r}"
+            )
+        cd_idx = next((i for i, tok in enumerate(cmd) if tok == "--cd"), None)
+        assert cd_idx is not None, "--cd must be present in codex respin command"
+        assert cd_idx < resume_idx, (
+            f"--cd at index {cd_idx} must come before `resume` at index {resume_idx}; "
+            f"cmd={cmd!r}"
+        )
+
     def test_codex_respin_sets_cd_to_shard_worktree(self, tmp_path):
         session_id = "codex-session-cd"
         worktree_path = tmp_path / "worktrees" / "codex-respin-001"
