@@ -94,13 +94,16 @@ CLAUDE_TASKS_DIR = Path.home() / ".claude" / "tasks"
 # Permission profiles for tool restrictions
 # These map to Claude Code's --allowedTools flag
 # Profiles ending with "+shard" auto-enable shard isolation
+RESEARCH_TOOLS = "Read,Grep,Glob,WebFetch,WebSearch,Bash(ls:*),Bash(cat:*),Bash(head:*),Bash(tail:*),Bash(git status:*),Bash(git log:*),Bash(git diff:*),Bash(curl:*),Bash(jq:*),Bash(skein:*)"
 PERMISSION_PROFILES = {
     "readonly": "Read,Grep,Glob,Bash(ls:*),Bash(cat:*),Bash(head:*),Bash(tail:*),Bash(git status:*),Bash(git log:*),Bash(git diff:*),Bash(skein:*)",
     "careful": "Read,Write,Edit,Grep,Glob,Bash(git:*),Bash(make:*),Bash(pytest:*),Bash(python:*),Bash(python3:*),Bash(npm:*),Bash(npx:*),Bash(node:*),Bash(ruff:*),Bash(black:*),Bash(mypy:*),Bash(pip:*),Bash(uv:*),Bash(ls:*),Bash(cat:*),Bash(head:*),Bash(tail:*),Bash(wc:*),Bash(diff:*),Bash(skein:*),Bash(muster:*)",
+    "research": RESEARCH_TOOLS,
     "full": None,  # None means no restrictions
     # Shard variants - same permissions but auto-enable worktree isolation
     "shard": None,  # Full permissions + shard isolation (common combo)
     "careful+shard": "Read,Write,Edit,Grep,Glob,Bash(git:*),Bash(make:*),Bash(pytest:*),Bash(python:*),Bash(python3:*),Bash(npm:*),Bash(npx:*),Bash(node:*),Bash(ruff:*),Bash(black:*),Bash(mypy:*),Bash(pip:*),Bash(uv:*),Bash(ls:*),Bash(cat:*),Bash(head:*),Bash(tail:*),Bash(wc:*),Bash(diff:*),Bash(skein:*),Bash(muster:*)",
+    "research+shard": RESEARCH_TOOLS,
 }
 
 # Cache for SKEIN availability check (per-directory)
@@ -144,7 +147,147 @@ def _has_skein(working_dir: str) -> bool:
     return _skein_available[cache_key]
 
 
-def _resolve_permission(permission: Optional[str], allowed_tools: Optional[str]) -> tuple[Optional[str], bool]:
+def _parse_research_target(research_target: Optional[str]) -> Dict[str, str]:
+    if not research_target:
+        raise ValueError(
+            "research permission requires research_target (site:<id>, file:<path>, or dir:<path>)"
+        )
+    prefix, sep, value = research_target.partition(":")
+    if not sep:
+        raise ValueError(
+            f"unknown research_target prefix {research_target!r} (expected site:, file:, or dir:)"
+        )
+    if prefix not in {"site", "file", "dir"}:
+        raise ValueError(
+            f"unknown research_target prefix {prefix!r} (expected site:, file:, or dir:)"
+        )
+    if not value:
+        raise ValueError(f"research_target {prefix}: requires a value")
+    return {"type": prefix, "value": value, "raw": research_target}
+
+
+def _validate_research_target(research_target: Optional[str], working_dir: Optional[str]) -> Dict[str, str]:
+    target = _parse_research_target(research_target)
+    target_type = target["type"]
+    value = target["value"]
+
+    if target_type == "site":
+        try:
+            result = subprocess.run(
+                ["skein", "site", "get", value, "--json"],
+                cwd=working_dir or os.getcwd(),
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except (FileNotFoundError, OSError, subprocess.TimeoutExpired) as exc:
+            raise ValueError(f"research_target site:{value} could not be validated: {exc}") from exc
+        if result.returncode != 0:
+            raise ValueError(f"research_target site:{value} does not exist in this project")
+        return target
+
+    path = Path(value)
+    if not path.is_absolute():
+        raise ValueError(f"research_target {target_type}:{value} must be an absolute path")
+
+    if target_type == "file":
+        parent = path.parent
+        if not parent.exists() or not parent.is_dir() or not os.access(parent, os.W_OK):
+            raise ValueError(f"research_target file:{value} parent directory must exist and be writable")
+        target["path"] = str(path)
+        target["writable_bind"] = str(parent)
+        return target
+
+    if path.exists():
+        if not path.is_dir() or not os.access(path, os.W_OK):
+            raise ValueError(f"research_target dir:{value} must be an existing writable directory")
+    else:
+        parent = path.parent
+        if not parent.exists() or not parent.is_dir() or not os.access(parent, os.W_OK):
+            raise ValueError(f"research_target dir:{value} parent directory must exist and be writable")
+    target["path"] = str(path)
+    target["writable_bind"] = str(path)
+    return target
+
+
+def _research_target_preamble(target: Dict[str, str]) -> str:
+    target_type = target["type"]
+    value = target["value"]
+    if target_type == "site":
+        target_description = f"SKEIN site {value} (site:{value})"
+        target_instruction = (
+            f'File findings, notions, briefs via `skein post <type> {value} "..."`.\n'
+            "Do not write loose files."
+        )
+    elif target_type == "file":
+        target_description = f"file:{value}"
+        target_instruction = f"Write your final report to exactly {value}. Do not write anywhere else."
+    else:
+        target_description = f"dir:{value}"
+        target_instruction = f"Write artifacts within {value}. Do not write outside it."
+
+    return f"""You are a research agent.
+
+You can read from the world (files, web, repos) but you cannot run python,
+modify source code, or run dev tools (make, pytest, etc).
+
+Your output target is: {target_description}.
+
+{target_instruction}
+
+Your task:
+"""
+
+
+def _research_writable_path(target: Dict[str, str]) -> str:
+    if target["type"] == "file":
+        return str(Path(target["value"]).parent)
+    if target["type"] == "dir":
+        path = Path(target["value"])
+        path.mkdir(parents=True, exist_ok=True)
+        return str(path)
+    raise ValueError(f"research_target {target['raw']} does not have a writable path")
+
+
+def _research_target_is_file_or_dir(research_target: Optional[str]) -> bool:
+    if not research_target:
+        return False
+    try:
+        return _parse_research_target(research_target)["type"] in {"file", "dir"}
+    except ValueError:
+        return False
+
+
+def _research_omits_shard_commit_preamble(research_target_info: Optional[Dict[str, str]]) -> bool:
+    return bool(research_target_info and research_target_info["type"] in {"file", "dir"})
+
+
+def _codex_sandbox_for_permission(
+    permission: Optional[str],
+    research_target: Optional[str],
+    *,
+    cli_shard_full_access: bool = False,
+) -> str:
+    if permission in {"research", "research+shard"}:
+        # Verified with Codex CLI v0.125.0: --add-dir does not make a path
+        # writable under --sandbox read-only, so file/dir research uses
+        # workspace-write plus a narrow --add-dir grant for the output target.
+        if _research_target_is_file_or_dir(research_target):
+            return "workspace-write"
+        return "read-only"
+    if permission == "readonly":
+        return "read-only"
+    if permission == "full" or (cli_shard_full_access and permission == "shard"):
+        return "danger-full-access"
+    return "workspace-write"
+
+
+def _resolve_permission(
+    permission: Optional[str],
+    allowed_tools: Optional[str],
+    research_target: Optional[str] = None,
+    working_dir: Optional[str] = None,
+) -> tuple[Optional[str], bool]:
     """
     Resolve permission profile to allowed_tools string and shard flag.
 
@@ -160,6 +303,11 @@ def _resolve_permission(permission: Optional[str], allowed_tools: Optional[str])
     effective_permission = permission or "careful"
     use_shard = effective_permission == "shard" or effective_permission.endswith("+shard")
 
+    is_research = effective_permission in {"research", "research+shard"}
+    research_target_info = None
+    if is_research:
+        research_target_info = _validate_research_target(research_target, working_dir)
+
     # Explicit allowed_tools overrides the tool allow-list but not shard intent
     if allowed_tools:
         return allowed_tools, use_shard
@@ -170,7 +318,10 @@ def _resolve_permission(permission: Optional[str], allowed_tools: Optional[str])
 
     # Look up profile
     if permission in PERMISSION_PROFILES:
-        return PERMISSION_PROFILES[permission], use_shard
+        profile = PERMISSION_PROFILES[permission]
+        if research_target_info and research_target_info["type"] in {"file", "dir"}:
+            profile = f"{profile},Write,Edit"
+        return profile, use_shard
 
     # Unknown profile - use careful, preserve shard intent
     return PERMISSION_PROFILES["careful"], use_shard
@@ -1414,6 +1565,7 @@ def _spin_sync(
     skeinless: bool,
     env: Optional[Dict[str, str]],
     base_branch: Optional[str] = None,
+    research_target: Optional[str] = None,
 ) -> str:
     """Synchronous implementation of spin - runs in thread pool."""
     # Require working_dir - os.getcwd() returns MCP server dir, not caller's project
@@ -1424,7 +1576,23 @@ def _spin_sync(
     working_dir = str(Path(working_dir).resolve())
     base_branch = base_branch or _detect_default_branch(working_dir)
 
-    # Generate spool ID first
+    # Resolve permission to allowed_tools and check for auto-shard
+    try:
+        resolved_tools, auto_shard = _resolve_permission(
+            permission,
+            allowed_tools,
+            research_target=research_target,
+            working_dir=working_dir,
+        )
+        research_target_info = (
+            _parse_research_target(research_target)
+            if (permission or "careful") in {"research", "research+shard"}
+            else None
+        )
+    except ValueError as exc:
+        return f"Error: {exc}"
+
+    # Generate spool ID after validation so rejected research spins don't reserve slots.
     spool_id = str(uuid.uuid4())[:8]
 
     # Atomically check concurrency limit and create initial spool entry
@@ -1436,9 +1604,6 @@ def _spin_sync(
     # Slot reserved via spool creation - continue with setup
 
     cwd = working_dir
-
-    # Resolve permission to allowed_tools and check for auto-shard
-    resolved_tools, auto_shard = _resolve_permission(permission, allowed_tools)
 
     # Use shard if explicitly requested OR if permission profile enables it
     use_shard = shard or auto_shard
@@ -1463,9 +1628,14 @@ def _spin_sync(
                 return f"Error: Failed to create SHARD worktree — {shard_error}"
             return "Error: Failed to create SHARD worktree. Check git repo status."
 
-    # Inject SKEIN context for shard agents (unless skeinless=True)
+    # Inject research guidance and SKEIN context for shard agents (unless skeinless=True)
     effective_prompt = prompt
-    if _has_skein(working_dir) and shard_info and not skeinless:
+    if research_target_info:
+        effective_prompt = _research_target_preamble(research_target_info) + prompt
+
+    omit_shard_commit_preamble = _research_omits_shard_commit_preamble(research_target_info)
+
+    if _has_skein(working_dir) and shard_info and not skeinless and not omit_shard_commit_preamble:
         # Prepend SKEIN ignition instructions to the prompt
         worktree_name = shard_info.get("shard_id", spool_id)
         skein_preamble = f"""You are working in an isolated SHARD worktree.
@@ -1482,8 +1652,8 @@ After completing work:
 
 Your task:
 """
-        effective_prompt = skein_preamble + prompt
-    elif shard_info:
+        effective_prompt = skein_preamble + effective_prompt
+    elif shard_info and not omit_shard_commit_preamble:
         # Non-SKEIN shard - still need commit instructions
         shard_preamble = """You are working in an isolated SHARD worktree.
 
@@ -1492,7 +1662,7 @@ After completing work:
 
 Your task:
 """
-        effective_prompt = shard_preamble + prompt
+        effective_prompt = shard_preamble + effective_prompt
 
     claude_cmd = ["claude", "-p", effective_prompt, "--output-format", "json"]
 
@@ -1513,7 +1683,8 @@ Your task:
     if resolved_tools:
         claude_cmd.extend(["--allowedTools", resolved_tools])
 
-    # Wrap in bwrap sandbox for shards - worktree writable, rest read-only
+    # Wrap in bwrap sandbox for shards - worktree writable unless research output
+    # is explicitly routed to a file/dir target.
     if shard_info and shutil.which("bwrap"):
         home = str(Path.home())
         # Bind the full worktree (not just cwd) so subdirectory-cwd shards can
@@ -1524,19 +1695,25 @@ Your task:
             "--ro-bind",
             "/",
             "/",  # Root read-only
-            "--bind",
-            worktree_root,
-            worktree_root,  # Worktree writable
-            "--bind",
-            "/tmp",
-            "/tmp",  # Tmp writable
-            "--dev",
-            "/dev",
-            "--proc",
-            "/proc",
-            "--chdir",
-            cwd,
         ]
+        if research_target_info and research_target_info["type"] in {"file", "dir"}:
+            bind_path = _research_writable_path(research_target_info)
+            cmd.extend(["--bind", bind_path, bind_path])
+        else:
+            cmd.extend(["--bind", worktree_root, worktree_root])
+        cmd.extend(
+            [
+                "--bind",
+                "/tmp",
+                "/tmp",  # Tmp writable
+                "--dev",
+                "/dev",
+                "--proc",
+                "/proc",
+                "--chdir",
+                cwd,
+            ]
+        )
         # Make git writable for commits in worktrees
         # Worktrees need:
         #   .git/worktrees/<name>/ - index, HEAD, logs
@@ -1594,6 +1771,7 @@ Your task:
         "working_dir": cwd,
         "allowed_tools": resolved_tools,
         "permission": permission or "careful",
+        "research_target": research_target,
         "system_prompt": system_prompt,
         "tags": tag_list,
         "shard": shard_info,
@@ -1640,6 +1818,7 @@ Your task:
 async def spin(
     prompt: str,
     permission: Optional[str] = None,
+    research_target: Optional[str] = None,
     shard: bool = False,
     system_prompt: Optional[str] = None,
     working_dir: Optional[str] = None,
@@ -1661,8 +1840,11 @@ async def spin(
         prompt: The task/question for the agent
         permission: Permission profile. "readonly" for pure inspection/synthesis;
                     "careful" (default) for most code work including reviews/fells;
+                    "research" for web/file research with required research_target;
                     "full" for setup/install; "shard" or "careful+shard" for any
                     code-modifying work (adds isolated git worktree).
+        research_target: Required for permission="research" or "research+shard".
+                         Accepted forms: site:<id>, file:<absolute-path>, dir:<absolute-path>.
         shard: Run in isolated git worktree (SKEIN-aware with graceful fallback)
         system_prompt: Optional system prompt to configure behavior
         working_dir: Directory for the agent to work in (defaults to current)
@@ -1714,16 +1896,8 @@ async def spin(
     # Route to appropriate harness
     if harness_lower == "codex":
         # Map Claude Code parameters to Codex parameters
-        sandbox = None
         use_shard = shard or (permission and "shard" in permission)
-        if permission == "readonly":
-            sandbox = "read-only"
-        elif permission == "full":
-            sandbox = "danger-full-access"
-        else:
-            # "careful", "shard", "careful+shard" all get workspace-write
-            # Shards use --add-dir for git access rather than full filesystem
-            sandbox = "workspace-write"
+        sandbox = _codex_sandbox_for_permission(permission, research_target)
 
         result = await asyncio.to_thread(
             _codex_spin_sync,
@@ -1737,8 +1911,11 @@ async def spin(
             shard=use_shard,
             base_branch=base_branch or _detect_default_branch(working_dir or os.getcwd()),
             skeinless=skeinless,
+            research_target=research_target,
+            require_research_target=permission in {"research", "research+shard"},
         )
     elif harness_lower == "gemini":
+        use_shard = shard or (permission and "shard" in permission)
         result = await asyncio.to_thread(
             _gemini_spin_sync,
             prompt,
@@ -1748,8 +1925,15 @@ async def spin(
             timeout,
             tags,
             env,
+            permission=permission,
+            shard=use_shard,
+            base_branch=base_branch or _detect_default_branch(working_dir or os.getcwd()),
+            skeinless=skeinless,
+            research_target=research_target,
+            require_research_target=permission in {"research", "research+shard"},
         )
     elif harness_lower == "kimi":
+        use_shard = shard or (permission and "shard" in permission)
         result = await asyncio.to_thread(
             _kimi_spin_sync,
             prompt,
@@ -1759,6 +1943,12 @@ async def spin(
             timeout,
             tags,
             env,
+            permission=permission,
+            shard=use_shard,
+            base_branch=base_branch or _detect_default_branch(working_dir or os.getcwd()),
+            skeinless=skeinless,
+            research_target=research_target,
+            require_research_target=permission in {"research", "research+shard"},
         )
     else:
         # Default to Claude Code harness
@@ -1776,6 +1966,7 @@ async def spin(
             skeinless,
             env,
             base_branch=base_branch or _detect_default_branch(working_dir or os.getcwd()),
+            research_target=research_target,
         )
 
     return result
@@ -3765,7 +3956,12 @@ def _has_landlock_support() -> bool:
     return False
 
 
-def _codex_bwrap_wrap(codex_cmd: list, shard_info: dict, cwd: str) -> list:
+def _codex_bwrap_wrap(
+    codex_cmd: list,
+    shard_info: dict,
+    cwd: str,
+    research_target_info: Optional[Dict[str, str]] = None,
+) -> list:
     """Wrap codex_cmd in bwrap for shard isolation.
 
     Returns the (possibly bwrap-wrapped) command. If bwrap is not available,
@@ -3783,12 +3979,18 @@ def _codex_bwrap_wrap(codex_cmd: list, shard_info: dict, cwd: str) -> list:
     cmd = [
         "bwrap",
         "--ro-bind", "/", "/",
-        "--bind", worktree_root, worktree_root,
+    ]
+    if research_target_info and research_target_info["type"] in {"file", "dir"}:
+        bind_path = _research_writable_path(research_target_info)
+        cmd.extend(["--bind", bind_path, bind_path])
+    else:
+        cmd.extend(["--bind", worktree_root, worktree_root])
+    cmd.extend([
         "--bind", "/tmp", "/tmp",
         "--dev", "/dev",
         "--proc", "/proc",
         "--chdir", cwd,
-    ]
+    ])
     # Make git writable for commits inside the worktree
     git_file = Path(worktree_root) / ".git"
     if git_file.exists() and git_file.is_file():
@@ -3832,6 +4034,8 @@ def _codex_spin_sync(
     shard: bool = False,
     base_branch: Optional[str] = None,
     skeinless: bool = False,
+    research_target: Optional[str] = None,
+    require_research_target: bool = False,
 ) -> str:
     """Synchronous implementation of codex_spin - runs Codex CLI in background."""
     # Require working_dir
@@ -3840,6 +4044,15 @@ def _codex_spin_sync(
 
     # Resolve model alias
     resolved_model = CODEX_MODEL_ALIASES.get(model, model) if model else None
+
+    try:
+        research_target_info = (
+            _validate_research_target(research_target, working_dir)
+            if (research_target or require_research_target)
+            else None
+        )
+    except ValueError as exc:
+        return f"Error: {exc}"
 
     # Generate spool ID
     spool_id = "codex-" + str(uuid.uuid4())[:8]
@@ -3877,7 +4090,12 @@ def _codex_spin_sync(
 
     # Inject shard instructions into prompt
     effective_prompt = prompt
-    if shard_info:
+    if research_target_info:
+        effective_prompt = _research_target_preamble(research_target_info) + prompt
+
+    omit_shard_commit_preamble = _research_omits_shard_commit_preamble(research_target_info)
+
+    if shard_info and not omit_shard_commit_preamble:
         if _has_skein(working_dir) and not skeinless:
             worktree_name = shard_info.get("shard_id", spool_id)
             skein_preamble = f"""You are working in an isolated SHARD worktree.
@@ -3894,7 +4112,7 @@ After completing work:
 
 Your task:
 """
-            effective_prompt = skein_preamble + prompt
+            effective_prompt = skein_preamble + effective_prompt
         else:
             shard_preamble = """You are working in an isolated SHARD worktree.
 
@@ -3903,7 +4121,7 @@ After completing work:
 
 Your task:
 """
-            effective_prompt = shard_preamble + prompt
+            effective_prompt = shard_preamble + effective_prompt
 
     # Build codex exec command
     # Check for Landlock support and use appropriate flags
@@ -3930,20 +4148,24 @@ Your task:
     if shard_info:
         codex_cmd.extend(["--cd", shard_info["worktree_path"]])
 
+    if research_target_info and research_target_info["type"] in {"file", "dir"} and has_landlock:
+        codex_cmd.extend(["--add-dir", _research_writable_path(research_target_info)])
+
     # For shards, grant write access to main repo's .git for commits
     if shard_info and has_landlock:
         # Resolve .git via the worktree root, since cwd may be a subdirectory.
-        git_file = Path(shard_info["worktree_path"]) / ".git"
-        if git_file.exists() and git_file.is_file():
-            git_content = git_file.read_text().strip()
-            if git_content.startswith("gitdir:"):
-                git_worktree_dir = git_content.split("gitdir:")[1].strip()
-                main_git = Path(git_worktree_dir).parent.parent
-                if main_git.exists() and main_git.name == ".git":
-                    codex_cmd.extend(["--add-dir", str(main_git)])
-                    # Also grant write access to the worktree root so a
-                    # subdirectory cwd doesn't lock the agent out of sibling files.
-                    codex_cmd.extend(["--add-dir", shard_info["worktree_path"]])
+        if not (research_target_info and research_target_info["type"] in {"file", "dir"}):
+            git_file = Path(shard_info["worktree_path"]) / ".git"
+            if git_file.exists() and git_file.is_file():
+                git_content = git_file.read_text().strip()
+                if git_content.startswith("gitdir:"):
+                    git_worktree_dir = git_content.split("gitdir:")[1].strip()
+                    main_git = Path(git_worktree_dir).parent.parent
+                    if main_git.exists() and main_git.name == ".git":
+                        codex_cmd.extend(["--add-dir", str(main_git)])
+                        # Also grant write access to the worktree root so a
+                        # subdirectory cwd doesn't lock the agent out of sibling files.
+                        codex_cmd.extend(["--add-dir", shard_info["worktree_path"]])
 
     # Prompt goes last
     codex_cmd.append(effective_prompt)
@@ -3951,7 +4173,7 @@ Your task:
     # Wrap in bwrap sandbox for shards - worktree writable, rest read-only.
     # When Landlock is also active, both layers run as defense-in-depth.
     if shard_info:
-        cmd = _codex_bwrap_wrap(codex_cmd, shard_info, cwd)
+        cmd = _codex_bwrap_wrap(codex_cmd, shard_info, cwd, research_target_info=research_target_info)
     else:
         cmd = codex_cmd
 
@@ -3969,6 +4191,7 @@ Your task:
         "working_dir": cwd,
         "model": resolved_model or "default",
         "sandbox": sandbox or "workspace-write",
+        "research_target": research_target,
         "tags": tag_list,
         "timeout": timeout,
         "env": env,
@@ -4231,6 +4454,12 @@ def _gemini_spin_sync(
     timeout: Optional[int],
     tags: Optional[str],
     env: Optional[Dict[str, str]],
+    permission: Optional[str] = None,
+    shard: bool = False,
+    base_branch: Optional[str] = None,
+    skeinless: bool = False,
+    research_target: Optional[str] = None,
+    require_research_target: bool = False,
 ) -> str:
     """Synchronous implementation of gemini_spin - runs Gemini CLI in background."""
     # Require working_dir
@@ -4239,6 +4468,16 @@ def _gemini_spin_sync(
 
     # Resolve to absolute path to avoid cwd-dependent resolution
     working_dir = str(Path(working_dir).resolve())
+    base_branch = base_branch or _detect_default_branch(working_dir)
+
+    try:
+        research_target_info = (
+            _validate_research_target(research_target, working_dir)
+            if (research_target or require_research_target or permission in {"research", "research+shard"})
+            else None
+        )
+    except ValueError as exc:
+        return f"Error: {exc}"
 
     # Generate spool ID
     spool_id = "gemini-" + str(uuid.uuid4())[:8]
@@ -4248,13 +4487,65 @@ def _gemini_spin_sync(
     if not success:
         return error_msg
 
+    cwd = working_dir
+    shard_info = None
+    shard_error = None
+    shard_newly_created = False
+    if shard:
+        shard_info = _detect_existing_shard(cwd)
+        if shard_info is None:
+            shard_info, shard_error = _spawn_shard(spool_id, cwd, base_branch=base_branch)
+            shard_newly_created = shard_info is not None
+            if shard_info:
+                cwd = shard_info["worktree_path"]
+        if shard_info is None:
+            spool_path = SPINDLE_DIR / f"{spool_id}.json"
+            spool_path.unlink(missing_ok=True)
+            if shard_error:
+                return f"Error: Failed to create SHARD worktree — {shard_error}"
+            return "Error: Failed to create SHARD worktree. Check git repo status."
+
     # Resolve model aliases (default to pro if no model specified)
     resolved_model = GEMINI_MODEL_ALIASES.get(model, model) if model else "gemini-2.5-pro"
+
+    effective_prompt = prompt
+    if research_target_info:
+        effective_prompt = _research_target_preamble(research_target_info) + prompt
+
+    if shard_info and not _research_omits_shard_commit_preamble(research_target_info):
+        if _has_skein(working_dir) and not skeinless:
+            worktree_name = shard_info.get("shard_id", spool_id)
+            skein_preamble = f"""You are working in an isolated SHARD worktree.
+
+Before starting work, orient yourself with SKEIN:
+1. Run: skein ignite --message "{prompt[:100]}..."
+2. Then: skein ready
+
+After completing work:
+1. Commit: git add -A && git commit -m "Your commit message"
+2. Tender: skein shard tender {worktree_name} --summary "What you did" --confidence N
+   (confidence 1-10: 10=safe/isolated, 5=needs review, 1=risky)
+3. Retire: skein torch && skein complete
+
+Your task:
+"""
+            effective_prompt = skein_preamble + effective_prompt
+        else:
+            shard_preamble = """You are working in an isolated SHARD worktree.
+
+After completing work:
+1. Commit: git add -A && git commit -m "Your commit message"
+
+Your task:
+"""
+            effective_prompt = shard_preamble + effective_prompt
 
     # Build gemini command: headless mode with sandbox and JSON output
     # Note: -y (YOLO) is blocked by Google Workspace secureModeEnabled setting.
     # -s (sandbox) works and is sufficient for research-only spins.
-    gemini_cmd = ["gemini", "-p", prompt, "-s", "-o", "json"]
+    # Gemini has no allowedTools-equivalent; research restrictions are prompt-level,
+    # plus bwrap's filesystem boundary when running in shard mode.
+    gemini_cmd = ["gemini", "-p", effective_prompt, "-s", "-o", "json"]
 
     if resolved_model:
         gemini_cmd.extend(["-m", resolved_model])
@@ -4262,8 +4553,11 @@ def _gemini_spin_sync(
     if system_prompt:
         # Gemini CLI doesn't have a separate system prompt flag,
         # so prepend it to the prompt
-        combined_prompt = f"System instructions: {system_prompt}\n\n{prompt}"
+        combined_prompt = f"System instructions: {system_prompt}\n\n{effective_prompt}"
         gemini_cmd[2] = combined_prompt
+
+    if shard_info:
+        gemini_cmd = _codex_bwrap_wrap(gemini_cmd, shard_info, cwd, research_target_info=research_target_info)
 
     # Parse tags
     tag_list = [t.strip() for t in tags.split(",")] if tags else []
@@ -4282,6 +4576,9 @@ def _gemini_spin_sync(
         "tags": tag_list,
         "timeout": timeout,
         "env": env,
+        "research_target": research_target,
+        "shard": shard_info,
+        "base_branch": base_branch,
         "created_at": datetime.now().isoformat(),
         "completed_at": None,
         "pid": None,
@@ -4292,7 +4589,7 @@ def _gemini_spin_sync(
     _write_spool(spool_id, spool)
 
     # Spawn detached process
-    pid = _spawn_detached(spool_id, gemini_cmd, working_dir, env)
+    pid = _spawn_detached(spool_id, gemini_cmd, cwd, env)
 
     # Update spool with PID and status
     spool["pid"] = pid
@@ -4390,11 +4687,29 @@ def _kimi_spin_sync(
     timeout: Optional[int],
     tags: Optional[str],
     env: Optional[Dict[str, str]],
+    permission: Optional[str] = None,
+    shard: bool = False,
+    base_branch: Optional[str] = None,
+    skeinless: bool = False,
+    research_target: Optional[str] = None,
+    require_research_target: bool = False,
 ) -> str:
     """Synchronous implementation of kimi_spin - runs Kimi CLI in background."""
     # Require working_dir
     if not working_dir:
         return "Error: working_dir required. Pass the project directory."
+
+    working_dir = str(Path(working_dir).resolve())
+    base_branch = base_branch or _detect_default_branch(working_dir)
+
+    try:
+        research_target_info = (
+            _validate_research_target(research_target, working_dir)
+            if (research_target or require_research_target or permission in {"research", "research+shard"})
+            else None
+        )
+    except ValueError as exc:
+        return f"Error: {exc}"
 
     # Generate spool ID and session ID
     spool_id = "kimi-" + str(uuid.uuid4())[:8]
@@ -4405,10 +4720,62 @@ def _kimi_spin_sync(
     if not success:
         return error_msg
 
+    cwd = working_dir
+    shard_info = None
+    shard_error = None
+    shard_newly_created = False
+    if shard:
+        shard_info = _detect_existing_shard(cwd)
+        if shard_info is None:
+            shard_info, shard_error = _spawn_shard(spool_id, cwd, base_branch=base_branch)
+            shard_newly_created = shard_info is not None
+            if shard_info:
+                cwd = shard_info["worktree_path"]
+        if shard_info is None:
+            spool_path = SPINDLE_DIR / f"{spool_id}.json"
+            spool_path.unlink(missing_ok=True)
+            if shard_error:
+                return f"Error: Failed to create SHARD worktree — {shard_error}"
+            return "Error: Failed to create SHARD worktree. Check git repo status."
+
     # Resolve model aliases (default to kimi-k2-thinking if no model specified)
     resolved_model = KIMI_MODEL_ALIASES.get(model, model) if model else "moonshot-ai/kimi-k2-thinking"
 
+    effective_prompt = prompt
+    if research_target_info:
+        effective_prompt = _research_target_preamble(research_target_info) + prompt
+
+    if shard_info and not _research_omits_shard_commit_preamble(research_target_info):
+        if _has_skein(working_dir) and not skeinless:
+            worktree_name = shard_info.get("shard_id", spool_id)
+            skein_preamble = f"""You are working in an isolated SHARD worktree.
+
+Before starting work, orient yourself with SKEIN:
+1. Run: skein ignite --message "{prompt[:100]}..."
+2. Then: skein ready
+
+After completing work:
+1. Commit: git add -A && git commit -m "Your commit message"
+2. Tender: skein shard tender {worktree_name} --summary "What you did" --confidence N
+   (confidence 1-10: 10=safe/isolated, 5=needs review, 1=risky)
+3. Retire: skein torch && skein complete
+
+Your task:
+"""
+            effective_prompt = skein_preamble + effective_prompt
+        else:
+            shard_preamble = """You are working in an isolated SHARD worktree.
+
+After completing work:
+1. Commit: git add -A && git commit -m "Your commit message"
+
+Your task:
+"""
+            effective_prompt = shard_preamble + effective_prompt
+
     # Build kimi command: headless mode with auto-approve, stream-json output, and explicit session ID
+    # Kimi has no allowedTools-equivalent; research restrictions are prompt-level,
+    # plus bwrap's filesystem boundary when running in shard mode.
     kimi_cmd = [
         "kimi-cli",
         "--session",
@@ -4418,22 +4785,25 @@ def _kimi_spin_sync(
         "--output-format",
         "stream-json",
         "-p",
-        prompt,
+        effective_prompt,
     ]
 
     if resolved_model:
         kimi_cmd.extend(["-m", resolved_model])
 
-    if working_dir:
-        kimi_cmd.extend(["-w", working_dir])
+    if cwd:
+        kimi_cmd.extend(["-w", cwd])
 
     if system_prompt:
         # Kimi CLI doesn't have a separate system prompt flag,
         # so prepend it to the prompt
-        combined_prompt = f"System instructions: {system_prompt}\n\n{prompt}"
+        combined_prompt = f"System instructions: {system_prompt}\n\n{effective_prompt}"
         # Find and replace the prompt argument
         prompt_idx = kimi_cmd.index("-p") + 1
         kimi_cmd[prompt_idx] = combined_prompt
+
+    if shard_info:
+        kimi_cmd = _codex_bwrap_wrap(kimi_cmd, shard_info, cwd, research_target_info=research_target_info)
 
     # Parse tags
     tag_list = [t.strip() for t in tags.split(",")] if tags else []
@@ -4452,6 +4822,9 @@ def _kimi_spin_sync(
         "tags": tag_list,
         "timeout": timeout,
         "env": env,
+        "research_target": research_target,
+        "shard": shard_info,
+        "base_branch": base_branch,
         "created_at": datetime.now().isoformat(),
         "completed_at": None,
         "pid": None,
@@ -4464,7 +4837,7 @@ def _kimi_spin_sync(
 
     # Spawn the process detached
     try:
-        pid = _spawn_detached(spool_id, kimi_cmd, working_dir, env)
+        pid = _spawn_detached(spool_id, kimi_cmd, cwd, env)
     except Exception as e:
         # Spawn failed - mark spool as error so the slot is freed
         spool["status"] = "error"
@@ -4659,8 +5032,12 @@ def main():
     spin_parser.add_argument(
         "--permission",
         "-p",
-        choices=["readonly", "careful", "full", "shard", "careful+shard"],
+        choices=["readonly", "careful", "research", "full", "shard", "careful+shard", "research+shard"],
         help="Permission profile (default: careful)",
+    )
+    spin_parser.add_argument(
+        "--research-target",
+        help="Required for research permissions: site:<id>, file:<absolute-path>, or dir:<absolute-path>",
     )
     spin_parser.add_argument("--shard", "-s", action="store_true", help="Run in isolated git worktree")
     spin_parser.add_argument("--system-prompt", help="Optional system prompt")
@@ -4765,13 +5142,12 @@ def main():
         working_dir = os.path.abspath(args.working_dir or os.getcwd())
         harness_lower = args.harness.lower() if args.harness else None
         if harness_lower == "codex":
-            sandbox = None
-            if args.permission == "readonly":
-                sandbox = "read-only"
-            elif args.permission in ("full", "shard"):
-                sandbox = "danger-full-access"
-            else:
-                sandbox = "workspace-write"
+            sandbox = _codex_sandbox_for_permission(
+                args.permission,
+                args.research_target,
+                cli_shard_full_access=True,
+            )
+            use_shard = args.shard or (args.permission and "shard" in args.permission)
             result = _codex_spin_sync(
                 args.prompt,
                 working_dir,
@@ -4780,8 +5156,14 @@ def main():
                 args.timeout,
                 args.tags,
                 None,
+                shard=use_shard,
+                base_branch=args.base_branch or _detect_default_branch(working_dir),
+                skeinless=args.skeinless,
+                research_target=args.research_target,
+                require_research_target=args.permission in {"research", "research+shard"},
             )
         elif harness_lower == "gemini":
+            use_shard = args.shard or (args.permission and "shard" in args.permission)
             result = _gemini_spin_sync(
                 args.prompt,
                 working_dir,
@@ -4790,8 +5172,15 @@ def main():
                 args.timeout,
                 args.tags,
                 None,
+                permission=args.permission,
+                shard=use_shard,
+                base_branch=args.base_branch or _detect_default_branch(working_dir),
+                skeinless=args.skeinless,
+                research_target=args.research_target,
+                require_research_target=args.permission in {"research", "research+shard"},
             )
         elif harness_lower == "kimi":
+            use_shard = args.shard or (args.permission and "shard" in args.permission)
             result = _kimi_spin_sync(
                 args.prompt,
                 working_dir,
@@ -4800,6 +5189,12 @@ def main():
                 args.timeout,
                 args.tags,
                 None,
+                permission=args.permission,
+                shard=use_shard,
+                base_branch=args.base_branch or _detect_default_branch(working_dir),
+                skeinless=args.skeinless,
+                research_target=args.research_target,
+                require_research_target=args.permission in {"research", "research+shard"},
             )
         else:
             result = _spin_sync(
@@ -4814,6 +5209,7 @@ def main():
                 timeout=args.timeout,
                 skeinless=args.skeinless,
                 base_branch=args.base_branch or _detect_default_branch(working_dir),
+                research_target=args.research_target,
                 env=None,
             )
         if result.startswith("Error:"):
