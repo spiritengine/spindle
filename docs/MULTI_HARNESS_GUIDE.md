@@ -357,12 +357,15 @@ Claude uses a tool-based permission system:
 - **full** - No restrictions
 - **shard** - Full permissions + isolated git worktree
 - **careful+shard** - Careful permissions + worktree
+- **research** - WebFetch/WebSearch/curl/jq enabled; no python/find/Write/Edit; requires `research_target` (site:, file:, or dir: prefix)
+- **research+shard** - research tools + isolated git worktree
 
 Example:
 ```python
 spin("Analyze code", permission="readonly")
 spin("Fix bug", permission="careful")  # Default
 spin("Refactor module", permission="shard")  # Isolated worktree
+spin("Research deepseek pricing", permission="research", research_target="site:spindle-development")
 ```
 
 ### Codex Sandbox Policies
@@ -373,6 +376,8 @@ Codex uses OpenAI's sandbox policies, mapped from Claude permissions:
 - `permission="careful"` → `--full-auto` (workspace-write + approvals)
 - `permission="full"` → `--dangerously-bypass-approvals-and-sandbox`
 - `permission="shard"` → `--dangerously-bypass-approvals-and-sandbox`
+- `permission="research"` → `--sandbox read-only` (skein post writes to `~/.skein`; file/dir targets bind target path writable via bwrap)
+- `permission="research+shard"` → `--sandbox read-only` + isolated worktree
 
 The mapping happens automatically in `_codex_spin_sync()`.
 

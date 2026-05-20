@@ -75,6 +75,9 @@ spin("Refactor the auth system", permission="shard")
 
 # Careful + shard: Limited tools but isolated
 spin("Update configs", permission="careful+shard")
+
+# Research: web/file research routed to a SKEIN site, a single file, or a directory
+spin("Research deepseek vs kimi", permission="research", research_target="site:spindle-development")
 ```
 
 Profiles:
@@ -83,6 +86,10 @@ Profiles:
 - `full`: No restrictions
 - `shard`: Full access + auto-creates isolated worktree
 - `careful+shard`: Careful permissions + auto-creates isolated worktree
+- `research`: Read, Grep, Glob, WebFetch, WebSearch, curl, jq, safe bash; no python/find/Write/Edit; requires `research_target`
+- `research+shard`: research tools + auto-creates isolated worktree
+
+Web-egress work (WebFetch, WebSearch, curl) belongs in `research`, not `careful` — `careful` intentionally has no web access so it's safe for code review and code-modifying work.
 
 You can also pass explicit `allowed_tools` to override the profile.
 
