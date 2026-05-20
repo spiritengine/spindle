@@ -1262,6 +1262,36 @@ class TestGeminiHarness:
             result = _gemini_unspool_sync("gemini-nonexistent")
             assert "Unknown spool_id" in result
 
+    def test_gemini_shard_bwrap_binds_gemini_dir(self, tmp_path):
+        """bwrap shard should bind ~/.gemini when it exists."""
+        fake_home = tmp_path / "home"
+        gemini_dir = fake_home / ".gemini"
+        gemini_dir.mkdir(parents=True)
+
+        worktree_path = tmp_path / "worktrees" / "gemini-bwrap-test"
+        worktree_path.mkdir(parents=True)
+        shard_info = {
+            "worktree_path": str(worktree_path),
+            "branch_name": "shard-gemini-bwrap-test",
+            "shard_id": "gemini-bwrap-test",
+        }
+
+        with patch("shutil.which", return_value="/usr/bin/bwrap"):
+            with patch.object(Path, "home", return_value=fake_home):
+                cmd = _codex_bwrap_wrap(
+                    ["gemini", "-p", "test", "-s", "-o", "json"],
+                    shard_info,
+                    str(worktree_path),
+                )
+
+        gemini_dir_str = str(gemini_dir)
+        bind_triple_found = any(
+            cmd[i] == "--bind" and cmd[i + 1] == gemini_dir_str and cmd[i + 2] == gemini_dir_str
+            for i in range(len(cmd) - 2)
+        )
+        assert cmd[0] == "bwrap", f"Expected bwrap wrapper, got {cmd[0]!r}"
+        assert bind_triple_found, f"Expected '--bind {gemini_dir_str} {gemini_dir_str}' in bwrap cmd: {cmd!r}"
+
 
 class TestKimiHarness:
     """Test Kimi CLI harness implementation."""

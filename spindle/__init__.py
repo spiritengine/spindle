@@ -4013,7 +4013,7 @@ def _codex_bwrap_wrap(
                             ["--bind", str(logs_refs_heads), str(logs_refs_heads)]
                         )
     for config_item in [
-        ".claude", ".claude.json", ".anthropic", ".codex",
+        ".claude", ".claude.json", ".anthropic", ".codex", ".gemini",
         ".spindle", ".config", ".cache",
     ]:
         path = f"{home}/{config_item}"
