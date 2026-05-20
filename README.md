@@ -67,8 +67,8 @@ spin("Analyze the codebase", permission="readonly")
 # Careful (default): Can read/write but limited bash
 spin("Fix this bug", permission="careful")
 
-# Full access: No restrictions
-spin("Implement the feature", permission="full")
+# Full access: for initial setup, dependency installs, environment provisioning
+spin("Set up a new Python project with dependencies", permission="full")
 
 # Shard: Full access + auto-isolated worktree (common for risky work)
 spin("Refactor the auth system", permission="shard")
