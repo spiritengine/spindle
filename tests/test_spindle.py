@@ -272,6 +272,58 @@ class TestPermissionProfileContents:
         assert "Bash(python:*)" in careful
         assert "Bash(npm:*)" in careful
 
+    def test_readonly_excludes_python_bash(self):
+        """Readonly must not allow Bash(python:*) — it is an arbitrary-execution escape hatch."""
+        assert "Bash(python:" not in PERMISSION_PROFILES["readonly"]
+
+    def test_readonly_excludes_find_bash(self):
+        """Readonly must not allow Bash(find:*) — find -exec is an arbitrary-execution escape hatch."""
+        assert "Bash(find:" not in PERMISSION_PROFILES["readonly"]
+
+    def test_readonly_still_includes_inspection_tools(self):
+        """Readonly must still contain all genuine inspection tools."""
+        readonly = PERMISSION_PROFILES["readonly"]
+        for tool in ["Read", "Grep", "Glob", "Bash(git status:*)", "Bash(ls:*)", "Bash(skein:*)"]:
+            assert tool in readonly, f"readonly is missing inspection tool: {tool}"
+
+    @pytest.mark.parametrize("tool", [
+        "Bash(python3:*)",
+        "Bash(npx:*)",
+        "Bash(node:*)",
+        "Bash(ruff:*)",
+        "Bash(black:*)",
+        "Bash(mypy:*)",
+        "Bash(pip:*)",
+        "Bash(uv:*)",
+    ])
+    def test_careful_includes_new_dev_tools(self, tool):
+        """Careful and careful+shard must include common dev tools."""
+        assert tool in PERMISSION_PROFILES["careful"], f"careful missing: {tool}"
+        assert tool in PERMISSION_PROFILES["careful+shard"], f"careful+shard missing: {tool}"
+
+    @pytest.mark.parametrize("tool", [
+        "Bash(ls:*)",
+        "Bash(cat:*)",
+        "Bash(head:*)",
+        "Bash(tail:*)",
+        "Bash(wc:*)",
+        "Bash(diff:*)",
+    ])
+    def test_careful_includes_basic_unix_tools(self, tool):
+        """Careful and careful+shard must include basic Unix inspection tools."""
+        assert tool in PERMISSION_PROFILES["careful"], f"careful missing: {tool}"
+        assert tool in PERMISSION_PROFILES["careful+shard"], f"careful+shard missing: {tool}"
+
+    def test_careful_includes_python3(self):
+        """Careful and careful+shard must include python3 (most invocations use python3 explicitly)."""
+        assert "Bash(python3:*)" in PERMISSION_PROFILES["careful"]
+        assert "Bash(python3:*)" in PERMISSION_PROFILES["careful+shard"]
+
+    def test_full_and_shard_unchanged_none(self):
+        """Full and shard profiles must remain None (unrestricted)."""
+        assert PERMISSION_PROFILES["full"] is None
+        assert PERMISSION_PROFILES["shard"] is None
+
 
 class TestParseDuration:
     """Test duration parsing for spin_sleep."""
