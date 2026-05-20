@@ -163,7 +163,7 @@ spool_id = spin(
 - `tags` - Organization tags
 
 **Claude-specific parameters:**
-- `permission` - "readonly", "careful", "full", "shard"
+- `permission` - "readonly", "careful", "full", "shard", "careful+shard", "research", "research+shard"
 - `shard` - Auto-create git worktree
 - `system_prompt` - Custom system instructions
 - `allowed_tools` - Explicit tool permissions
@@ -376,8 +376,8 @@ Codex uses OpenAI's sandbox policies, mapped from Claude permissions:
 - `permission="careful"` → `--full-auto` (workspace-write + approvals)
 - `permission="full"` → `--dangerously-bypass-approvals-and-sandbox`
 - `permission="shard"` → `--dangerously-bypass-approvals-and-sandbox`
-- `permission="research"` → `--sandbox read-only` (skein post writes to `~/.skein`; file/dir targets bind target path writable via bwrap)
-- `permission="research+shard"` → `--sandbox read-only` + isolated worktree
+- `permission="research"` → site target: `--sandbox read-only`; file/dir target: `--sandbox workspace-write` + `--add-dir` for the target path (no bwrap — plain research uses Codex native sandbox only)
+- `permission="research+shard"` → same conditional sandbox as `research` + isolated worktree; bwrap adds OS-level isolation on top when available
 
 The mapping happens automatically in `_codex_spin_sync()`.
 

@@ -100,8 +100,10 @@ When Landlock is available, Spindle maps permission levels to Codex sandbox poli
 | `careful` (default) | `workspace-write` | Can read/write in workspace |
 | `full` | `danger-full-access` | Full filesystem access |
 | `shard` | `danger-full-access` | Full access (for isolated worktrees) |
-| `research` | `read-only` | Web research; no code writes; file/dir targets bind the target path writable |
-| `research+shard` | `read-only` | research + isolated worktree |
+| `research` (site target) | `read-only` | Web research against a site; no writes |
+| `research` (file/dir target) | `workspace-write` | Adds `--add-dir` for the writable target path |
+| `research+shard` (site target) | `read-only` | research + isolated worktree; no writes |
+| `research+shard` (file/dir target) | `workspace-write` | Adds `--add-dir` for the writable target path + isolated worktree |
 
 **Without Landlock:** All permissions use `--dangerously-bypass-approvals-and-sandbox`
 
