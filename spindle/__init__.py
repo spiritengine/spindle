@@ -4281,22 +4281,9 @@ def _codex_respin_sync(session_id: str, prompt: str) -> str:
     if shard_info:
         codex_cmd.extend(["--cd", shard_info["worktree_path"]])
 
-    codex_cmd.extend(["resume", session_id, "--json"])
-
-    if has_landlock:
-        # Use --json for structured output, --full-auto for non-interactive
-        codex_cmd.append("--full-auto")
-    else:
-        # Kernel lacks Landlock support - use bypass mode
-        import platform
-
-        kernel_version = platform.release()
-        print(f"[Spindle] Kernel {kernel_version} lacks Landlock support (needs 5.13+), using bypass mode for Codex")
-        codex_cmd.append("--dangerously-bypass-approvals-and-sandbox")
-
-    # For shards, grant write access to main repo's .git for commits.
-    # Resolve .git via the worktree root (shard_info), not working_dir, since
-    # working_dir may be a subdirectory inside the worktree.
+    # --add-dir is a `codex exec` flag, not `codex exec resume` — must come before the
+    # `resume` subcommand. Resolve .git via the worktree root (shard_info), not
+    # working_dir, since working_dir may be a subdirectory inside the worktree.
     if shard_info and has_landlock:
         git_file = Path(shard_info["worktree_path"]) / ".git"
         if git_file.exists() and git_file.is_file():
@@ -4309,6 +4296,19 @@ def _codex_respin_sync(session_id: str, prompt: str) -> str:
                     # Also grant write access to the worktree root so a
                     # subdirectory cwd doesn't lock the agent out of sibling files.
                     codex_cmd.extend(["--add-dir", shard_info["worktree_path"]])
+
+    codex_cmd.extend(["resume", session_id, "--json"])
+
+    if has_landlock:
+        # Use --json for structured output, --full-auto for non-interactive
+        codex_cmd.append("--full-auto")
+    else:
+        # Kernel lacks Landlock support - use bypass mode
+        import platform
+
+        kernel_version = platform.release()
+        print(f"[Spindle] Kernel {kernel_version} lacks Landlock support (needs 5.13+), using bypass mode for Codex")
+        codex_cmd.append("--dangerously-bypass-approvals-and-sandbox")
 
     # The prompt is passed as additional argument to resume
     codex_cmd.append(prompt)
