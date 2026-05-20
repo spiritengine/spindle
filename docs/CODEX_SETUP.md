@@ -402,7 +402,7 @@ When using `--dangerously-bypass-approvals-and-sandbox`:
 ⚠️ **Full system access** - Use only in trusted environments
 
 **Mitigations:**
-1. Use `permission="readonly"` when possible (limits to read operations)
+1. Use `permission="careful"` for most tasks; use `readonly` only for pure inspection or synthesis where no code execution is needed
 2. Run in isolated environments (containers, VMs)
 3. Use `timeout` to limit execution time
 4. Review changes before merging (use shards when supported)

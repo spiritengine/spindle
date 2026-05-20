@@ -1657,8 +1657,10 @@ async def spin(
 
     Args:
         prompt: The task/question for the agent
-        permission: Permission profile - "readonly", "careful" (default), "full",
-                    "shard" (full + isolation), or "careful+shard"
+        permission: Permission profile. "readonly" for pure inspection/synthesis;
+                    "careful" (default) for most code work including reviews/fells;
+                    "full" for setup/install; "shard" or "careful+shard" for any
+                    code-modifying work (adds isolated git worktree).
         shard: Run in isolated git worktree (SKEIN-aware with graceful fallback)
         system_prompt: Optional system prompt to configure behavior
         working_dir: Directory for the agent to work in (defaults to current)
