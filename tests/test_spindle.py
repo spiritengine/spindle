@@ -1,6 +1,7 @@
 """Tests for Spindle MCP server."""
 
 import asyncio
+import inspect
 import json
 import multiprocessing
 import os
@@ -3361,3 +3362,91 @@ class TestRespinHandleResolution:
         with patch("spindle.SPINDLE_DIR", tmp_path):
             result = _respin_sync("totally-unknown", "hi")
         assert "No spool found for handle" in result
+
+
+class TestBaseBranchDefaultIsNone:
+    """Regression guard for brief-20260520-2wfo: three functions that previously
+    defaulted base_branch to 'master' now default to None and auto-detect inside.
+
+    Each signature test FAILS against an inversion where the default is 'master'
+    (inspect reports a str default, not None). Each behaviour test FAILS against
+    an inversion where the function ignores the None default and uses 'master'
+    literally (main-only fixture repo would raise an error because 'master'
+    doesn't exist).
+    """
+
+    def test_spawn_shard_default_param_is_none(self):
+        sig = inspect.signature(_spawn_shard)
+        default = sig.parameters["base_branch"].default
+        assert default is None, (
+            f"_spawn_shard base_branch default must be None, got {default!r}"
+        )
+
+    def test_spin_sync_default_param_is_none(self):
+        sig = inspect.signature(_spin_sync)
+        default = sig.parameters["base_branch"].default
+        assert default is None, (
+            f"_spin_sync base_branch default must be None, got {default!r}"
+        )
+
+    def test_codex_spin_sync_default_param_is_none(self):
+        sig = inspect.signature(_codex_spin_sync)
+        default = sig.parameters["base_branch"].default
+        assert default is None, (
+            f"_codex_spin_sync base_branch default must be None, got {default!r}"
+        )
+
+    def test_spawn_shard_falls_back_to_detect(self, tmp_path):
+        """Calling _spawn_shard without base_branch on a main-only repo succeeds.
+
+        Fails against inversion: if default stayed 'master', git worktree add
+        would fail (master deleted) and shard_error would be non-None.
+        """
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        for cmd in [
+            ["git", "init"],
+            ["git", "config", "user.email", "test@test.com"],
+            ["git", "config", "user.name", "Test User"],
+        ]:
+            subprocess.run(cmd, cwd=repo, capture_output=True)
+        (repo / "f.txt").write_text("x")
+        subprocess.run(["git", "add", "."], cwd=repo, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True)
+        subprocess.run(["git", "branch", "-M", "main"], cwd=repo, capture_output=True)
+        subprocess.run(["git", "branch", "-D", "master"], cwd=repo, capture_output=True)
+
+        with patch("spindle._has_skein", return_value=False):
+            shard_info, shard_error = _spawn_shard("test-agent", str(repo))
+
+        assert shard_error is None, f"Expected no error, got: {shard_error}"
+        assert shard_info is not None, "Shard creation should succeed on main-only repo"
+        assert Path(shard_info["worktree_path"]).exists()
+
+    def test_worktree_creation_error_names_branch(self, tmp_path):
+        """When git worktree add fails due to a missing branch, error names the branch.
+
+        Fails against inversion: if the error message didn't include the branch
+        name, the assertion on the branch string would fail.
+        """
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        for cmd in [
+            ["git", "init"],
+            ["git", "config", "user.email", "test@test.com"],
+            ["git", "config", "user.name", "Test User"],
+        ]:
+            subprocess.run(cmd, cwd=repo, capture_output=True)
+        (repo / "f.txt").write_text("x")
+        subprocess.run(["git", "add", "."], cwd=repo, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True)
+
+        with patch("spindle._has_skein", return_value=False):
+            shard_info, shard_error = _spawn_shard(
+                "test-agent", str(repo), base_branch="nonexistent-branch-abc"
+            )
+
+        assert shard_info is None
+        assert shard_error is not None
+        assert "nonexistent-branch-abc" in shard_error
+        assert "--base-branch" in shard_error

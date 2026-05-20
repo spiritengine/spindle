@@ -211,7 +211,7 @@ def _detect_default_branch(working_dir: str) -> str:
 
 
 def _spawn_shard(
-    agent_id: str, working_dir: str, base_branch: str = "master"
+    agent_id: str, working_dir: str, base_branch: Optional[str] = None
 ) -> Tuple[Optional[Dict[str, str]], Optional[str]]:
     """
     Create an isolated git worktree (SHARD) for the agent.
@@ -228,6 +228,7 @@ def _spawn_shard(
         with keys worktree_path/branch_name/shard_id and error_message is None.
         On failure shard_info is None and error_message describes the problem.
     """
+    base_branch = base_branch or _detect_default_branch(working_dir)
     skein_error: Optional[str] = None
 
     if _has_skein(working_dir):
@@ -1412,7 +1413,7 @@ def _spin_sync(
     timeout: Optional[int],
     skeinless: bool,
     env: Optional[Dict[str, str]],
-    base_branch: str = "master",
+    base_branch: Optional[str] = None,
 ) -> str:
     """Synchronous implementation of spin - runs in thread pool."""
     # Require working_dir - os.getcwd() returns MCP server dir, not caller's project
@@ -1421,6 +1422,7 @@ def _spin_sync(
 
     # Resolve to absolute path to avoid cwd-dependent resolution
     working_dir = str(Path(working_dir).resolve())
+    base_branch = base_branch or _detect_default_branch(working_dir)
 
     # Generate spool ID first
     spool_id = str(uuid.uuid4())[:8]
@@ -3828,7 +3830,7 @@ def _codex_spin_sync(
     tags: Optional[str],
     env: Optional[Dict[str, str]],
     shard: bool = False,
-    base_branch: str = "master",
+    base_branch: Optional[str] = None,
     skeinless: bool = False,
 ) -> str:
     """Synchronous implementation of codex_spin - runs Codex CLI in background."""
@@ -3848,6 +3850,7 @@ def _codex_spin_sync(
         return error_msg
 
     cwd = working_dir
+    base_branch = base_branch or _detect_default_branch(working_dir)
 
     # Handle shard creation
     shard_info = None
