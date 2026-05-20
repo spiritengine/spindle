@@ -146,6 +146,119 @@ class TestPermissionProfiles:
         tools, shard = _resolve_permission("shard", None)
         assert shard is True
 
+    def test_research_requires_target(self, tmp_path):
+        """spin with research permission must reject missing research_target before spawning."""
+        _spin = spin.fn if hasattr(spin, "fn") else spin
+        result = asyncio.run(
+            _spin("research a topic", permission="research", working_dir=str(tmp_path), skeinless=True)
+        )
+        assert "Error:" in result
+        assert "research_target" in result
+
+    def test_research_target_site_validates_existence(self, tmp_path):
+        """site targets must be confirmed through skein before spawn."""
+        completed = subprocess.CompletedProcess(["skein"], 1, stdout="", stderr="missing")
+        with patch("subprocess.run", return_value=completed):
+            with pytest.raises(ValueError, match="does not exist"):
+                _resolve_permission(
+                    "research",
+                    None,
+                    research_target="site:not-a-site",
+                    working_dir=str(tmp_path),
+                )
+
+    def test_research_target_file_validates_parent(self, tmp_path):
+        """file targets require an existing writable parent directory."""
+        bad_target = tmp_path / "missing" / "report.md"
+        with pytest.raises(ValueError, match="parent directory"):
+            _resolve_permission(
+                "research",
+                None,
+                research_target=f"file:{bad_target}",
+                working_dir=str(tmp_path),
+            )
+
+    def test_research_target_dir_validates_path(self, tmp_path):
+        """dir targets require the directory or parent directory to exist."""
+        bad_target = tmp_path / "missing" / "nested" / "reports"
+        with pytest.raises(ValueError, match="parent directory"):
+            _resolve_permission(
+                "research",
+                None,
+                research_target=f"dir:{bad_target}",
+                working_dir=str(tmp_path),
+            )
+
+    def test_research_target_unknown_prefix_errors(self, tmp_path):
+        """unknown research_target prefixes must be named in the error."""
+        with pytest.raises(ValueError, match="memo"):
+            _resolve_permission(
+                "research",
+                None,
+                research_target="memo:abc123",
+                working_dir=str(tmp_path),
+            )
+
+    def test_research_file_variant_adds_write_to_allowlist(self, tmp_path):
+        """file research targets add Write/Edit to the base research profile."""
+        tools, shard = _resolve_permission(
+            "research",
+            None,
+            research_target=f"file:{tmp_path / 'report.md'}",
+            working_dir=str(tmp_path),
+        )
+        assert shard is False
+        assert "Write" in tools
+        assert "Edit" in tools
+
+    def test_research_site_variant_does_not_add_write(self, tmp_path):
+        """site research targets keep the no-Write base profile."""
+        completed = subprocess.CompletedProcess(["skein"], 0, stdout="{}", stderr="")
+        with patch("subprocess.run", return_value=completed):
+            tools, shard = _resolve_permission(
+                "research",
+                None,
+                research_target="site:research-inbox",
+                working_dir=str(tmp_path),
+            )
+        assert shard is False
+        assert "Write" not in tools
+        assert "Edit" not in tools
+
+    def test_research_preamble_mentions_target(self, tmp_path):
+        """spawned research prompts must include the explicit target instructions."""
+        target = tmp_path / "report.md"
+        captured_cmd = []
+
+        def fake_detached(spool_id, cmd, cwd, env=None):
+            captured_cmd.append(list(cmd))
+            raise OSError("stop after capture")
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle._count_running", return_value=0):
+                with patch("spindle._spawn_detached", side_effect=fake_detached):
+                    _spin_sync(
+                        prompt="research this",
+                        permission="research",
+                        shard=False,
+                        system_prompt=None,
+                        working_dir=str(tmp_path),
+                        allowed_tools=None,
+                        tags=None,
+                        model=None,
+                        timeout=None,
+                        skeinless=True,
+                        env=None,
+                        research_target=f"file:{target}",
+                    )
+
+        assert len(captured_cmd) == 1
+        cmd = captured_cmd[0]
+        prompt = cmd[cmd.index("-p") + 1]
+        assert "You are a research agent." in prompt
+        assert f"Your output target is: file:{target}." in prompt
+        assert f"Write your final report to exactly {target}" in prompt
+
 
 class TestSpoolStorage:
     """Test spool file storage operations."""
@@ -324,6 +437,26 @@ class TestPermissionProfileContents:
         """Full and shard profiles must remain None (unrestricted)."""
         assert PERMISSION_PROFILES["full"] is None
         assert PERMISSION_PROFILES["shard"] is None
+
+    def test_research_profile_contains_web_tools(self):
+        """Research must include web and narrow parsing tools."""
+        research = PERMISSION_PROFILES["research"]
+        for tool in ["WebFetch", "WebSearch", "Bash(curl:*)", "Bash(jq:*)"]:
+            assert tool in research, f"research missing: {tool}"
+            assert tool in PERMISSION_PROFILES["research+shard"], f"research+shard missing: {tool}"
+
+    def test_research_profile_excludes_python_and_find(self):
+        """Research must not include arbitrary execution escape hatches."""
+        research = PERMISSION_PROFILES["research"]
+        assert "Bash(python:" not in research
+        assert "Bash(python3:" not in research
+        assert "Bash(find:" not in research
+
+    def test_research_profile_excludes_write_edit_at_base(self):
+        """Base research profile routes output through research_target, not Write/Edit."""
+        research = PERMISSION_PROFILES["research"]
+        assert "Write" not in research
+        assert "Edit" not in research
 
 
 class TestParseDuration:
@@ -1275,6 +1408,31 @@ class TestSpinHarnesses:
         assert "error" in parsed
         assert "bogus" in parsed["error"]
         assert "claude-code" in parsed["error"]
+
+    def test_codex_research_permission_maps_to_read_only_sandbox(self, tmp_path):
+        """Codex research spins must use the read-only sandbox."""
+        _spin = spin.fn if hasattr(spin, "fn") else spin
+        captured = {}
+
+        def fake_codex(prompt, working_dir, model, sandbox, timeout, tags, env, **kwargs):
+            captured["sandbox"] = sandbox
+            captured["kwargs"] = kwargs
+            return "codex-research"
+
+        with patch("spindle._codex_spin_sync", side_effect=fake_codex):
+            result = asyncio.run(
+                _spin(
+                    "research a topic",
+                    harness="codex",
+                    permission="research",
+                    research_target=f"file:{tmp_path / 'report.md'}",
+                    working_dir=str(tmp_path),
+                )
+            )
+
+        assert result == "codex-research"
+        assert captured["sandbox"] == "read-only"
+        assert captured["kwargs"]["require_research_target"] is True
 
 
 class TestSpawnFailureRecovery:
