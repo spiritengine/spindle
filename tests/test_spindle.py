@@ -54,6 +54,7 @@ from spindle import (
     _spool_lock,
     _try_reserve_slot_and_create,
     _write_spool,
+    main,
     shard_abandon,
     shard_merge,
     spin,
@@ -433,6 +434,37 @@ class TestPermissionProfiles:
                         skeinless=True,
                         env=None,
                     )
+
+        assert len(captured_cmd) == 1
+        assert "--allowedTools" not in captured_cmd[0]
+
+    def test_auto_plus_shard_no_allowedtools_flag(self, tmp_path):
+        """permission='auto+shard' must not pass --allowedTools (classifier governs dynamically)."""
+        captured_cmd = []
+        shard_info = {"worktree_path": str(tmp_path), "shard_id": "shard-test"}
+
+        def fake_detached(spool_id, cmd, cwd, env=None):
+            captured_cmd.append(list(cmd))
+            raise OSError("stop after capture")
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle._count_running", return_value=0):
+                with patch("spindle._detect_existing_shard", return_value=shard_info):
+                    with patch("spindle._has_skein", return_value=True):
+                        with patch("spindle._spawn_detached", side_effect=fake_detached):
+                            _spin_sync(
+                                prompt="autonomous shard task",
+                                permission="auto+shard",
+                                shard=False,
+                                system_prompt=None,
+                                working_dir=str(tmp_path),
+                                allowed_tools=None,
+                                tags=None,
+                                model=None,
+                                timeout=None,
+                                skeinless=True,
+                                env=None,
+                            )
 
         assert len(captured_cmd) == 1
         assert "--allowedTools" not in captured_cmd[0]
@@ -1799,6 +1831,51 @@ class TestSpinHarnesses:
         assert result == "codex-research"
         assert captured["sandbox"] == "workspace-write"
         assert captured["kwargs"]["require_research_target"] is True
+
+    def test_auto_permission_on_codex_returns_error(self):
+        """permission='auto' on codex must return an error, not silently degrade."""
+        _spin = spin.fn if hasattr(spin, "fn") else spin
+        result = asyncio.run(_spin("autonomous task", harness="codex", permission="auto"))
+        parsed = json.loads(result)
+        assert "error" in parsed
+        assert "codex" in parsed["error"]
+        assert "claude-code" in parsed["error"]
+
+    def test_auto_plus_shard_permission_on_codex_returns_error(self):
+        """permission='auto+shard' on codex must return an error, not silently degrade."""
+        _spin = spin.fn if hasattr(spin, "fn") else spin
+        result = asyncio.run(_spin("autonomous task", harness="codex", permission="auto+shard"))
+        parsed = json.loads(result)
+        assert "error" in parsed
+        assert "codex" in parsed["error"]
+        assert "claude-code" in parsed["error"]
+
+    def test_auto_permission_on_gemini_returns_error(self):
+        """permission='auto' on gemini must return an error, not silently degrade."""
+        _spin = spin.fn if hasattr(spin, "fn") else spin
+        result = asyncio.run(_spin("autonomous task", harness="gemini", permission="auto"))
+        parsed = json.loads(result)
+        assert "error" in parsed
+        assert "gemini" in parsed["error"]
+        assert "claude-code" in parsed["error"]
+
+    def test_auto_permission_on_kimi_returns_error(self):
+        """permission='auto' on kimi must return an error, not silently degrade."""
+        _spin = spin.fn if hasattr(spin, "fn") else spin
+        result = asyncio.run(_spin("autonomous task", harness="kimi", permission="auto"))
+        parsed = json.loads(result)
+        assert "error" in parsed
+        assert "kimi" in parsed["error"]
+        assert "claude-code" in parsed["error"]
+
+    def test_auto_permission_does_not_spawn_on_non_cc_harness(self):
+        """Verifies the error is returned before any spawn attempt on codex."""
+        _spin = spin.fn if hasattr(spin, "fn") else spin
+        with patch("spindle._codex_spin_sync") as mock_codex:
+            result = asyncio.run(_spin("autonomous task", harness="codex", permission="auto"))
+        parsed = json.loads(result)
+        assert "error" in parsed
+        mock_codex.assert_not_called()
 
 
 class TestSpawnFailureRecovery:
@@ -3990,3 +4067,49 @@ class TestBaseBranchDefaultIsNone:
         assert shard_error is not None
         assert "nonexistent-branch-abc" in shard_error
         assert "--base-branch" in shard_error
+
+
+class TestCLIArgparse:
+    """Test CLI argument parsing for permission profiles."""
+
+    def test_permission_auto_accepted_by_argparse(self, capsys):
+        """'auto' must be a valid --permission choice (argparse must not reject it)."""
+        with patch("sys.argv", ["spindle", "spin", "--permission", "auto", "test prompt"]):
+            with patch("spindle._spin_sync", return_value="spool-abc123"):
+                with pytest.raises(SystemExit) as exc:
+                    main()
+        assert exc.value.code != 2, "argparse rejected 'auto' as invalid --permission choice"
+
+    def test_permission_auto_plus_shard_accepted_by_argparse(self, capsys):
+        """'auto+shard' must be a valid --permission choice (argparse must not reject it)."""
+        with patch("sys.argv", ["spindle", "spin", "--permission", "auto+shard", "test prompt"]):
+            with patch("spindle._spin_sync", return_value="spool-abc123"):
+                with pytest.raises(SystemExit) as exc:
+                    main()
+        assert exc.value.code != 2, "argparse rejected 'auto+shard' as invalid --permission choice"
+
+    def test_auto_permission_on_codex_cli_exits_nonzero(self, capsys):
+        """CLI: --permission auto --harness codex must exit 1 with an error message."""
+        with patch("sys.argv", ["spindle", "spin", "--permission", "auto", "--harness", "codex", "test"]):
+            with pytest.raises(SystemExit) as exc:
+                main()
+        assert exc.value.code == 1
+
+    def test_auto_permission_on_codex_cli_prints_error(self, capsys):
+        """CLI: --permission auto --harness codex must print an error mentioning codex and claude-code."""
+        with patch("sys.argv", ["spindle", "spin", "--permission", "auto", "--harness", "codex", "test"]):
+            with pytest.raises(SystemExit):
+                main()
+        out = capsys.readouterr().out
+        parsed = json.loads(out)
+        assert "error" in parsed
+        assert "codex" in parsed["error"]
+        assert "claude-code" in parsed["error"]
+
+    def test_auto_permission_on_codex_cli_does_not_spawn(self, capsys):
+        """CLI: --permission auto --harness codex must not invoke _codex_spin_sync."""
+        with patch("sys.argv", ["spindle", "spin", "--permission", "auto", "--harness", "codex", "test"]):
+            with patch("spindle._codex_spin_sync") as mock_codex:
+                with pytest.raises(SystemExit):
+                    main()
+        mock_codex.assert_not_called()

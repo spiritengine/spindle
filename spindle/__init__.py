@@ -1903,6 +1903,14 @@ async def spin(
             }
         )
 
+    # auto/auto+shard is CC-specific; non-CC harnesses have no classifier-vetted mode
+    if permission and permission.startswith("auto") and harness_lower and harness_lower != "claude-code":
+        return json.dumps(
+            {
+                "error": f"permission={permission!r} requires harness='claude-code'; {harness_lower!r} has no classifier-vetted mode.",
+            }
+        )
+
     # Route to appropriate harness
     if harness_lower == "codex":
         # Map Claude Code parameters to Codex parameters
@@ -5156,6 +5164,13 @@ def main():
     elif args.command == "spin":
         working_dir = os.path.abspath(args.working_dir or os.getcwd())
         harness_lower = args.harness.lower() if args.harness else None
+        if args.permission and args.permission.startswith("auto") and harness_lower and harness_lower != "claude-code":
+            error_msg = f"permission={args.permission!r} requires harness='claude-code'; {harness_lower!r} has no classifier-vetted mode."
+            if args.human:
+                print(f"Error: {error_msg}", file=sys.stderr)
+            else:
+                print(json.dumps({"error": error_msg}))
+            sys.exit(1)
         if harness_lower == "codex":
             sandbox = _codex_sandbox_for_permission(
                 args.permission,
