@@ -330,6 +330,113 @@ class TestPermissionProfiles:
         assert "git commit" in prompt
         assert "skein shard tender" in prompt
 
+    def test_auto_permission_resolves_to_none_tools_no_shard(self):
+        """auto permission: no allowlist (classifier governs), no shard."""
+        tools, shard = _resolve_permission("auto", None)
+        assert tools is None
+        assert shard is False
+
+    def test_auto_plus_shard_resolves_to_none_tools_with_shard(self):
+        """auto+shard permission: no allowlist, shard=True."""
+        tools, shard = _resolve_permission("auto+shard", None)
+        assert tools is None
+        assert shard is True
+
+    def test_auto_permission_mode_in_command(self, tmp_path):
+        """permission='auto' must produce --permission-mode auto, not bypassPermissions/acceptEdits."""
+        captured_cmd = []
+
+        def fake_detached(spool_id, cmd, cwd, env=None):
+            captured_cmd.append(list(cmd))
+            raise OSError("stop after capture")
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle._count_running", return_value=0):
+                with patch("spindle._spawn_detached", side_effect=fake_detached):
+                    _spin_sync(
+                        prompt="autonomous task",
+                        permission="auto",
+                        shard=False,
+                        system_prompt=None,
+                        working_dir=str(tmp_path),
+                        allowed_tools=None,
+                        tags=None,
+                        model=None,
+                        timeout=None,
+                        skeinless=True,
+                        env=None,
+                    )
+
+        assert len(captured_cmd) == 1
+        cmd = captured_cmd[0]
+        pm_idx = cmd.index("--permission-mode")
+        assert cmd[pm_idx + 1] == "auto"
+        assert "bypassPermissions" not in cmd
+        assert "acceptEdits" not in cmd
+
+    def test_auto_plus_shard_permission_mode_in_command(self, tmp_path):
+        """permission='auto+shard' must produce --permission-mode auto and use shard."""
+        captured_cmd = []
+        shard_info = {"worktree_path": str(tmp_path), "shard_id": "shard-test"}
+
+        def fake_detached(spool_id, cmd, cwd, env=None):
+            captured_cmd.append(list(cmd))
+            raise OSError("stop after capture")
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle._count_running", return_value=0):
+                with patch("spindle._detect_existing_shard", return_value=shard_info):
+                    with patch("spindle._has_skein", return_value=True):
+                        with patch("spindle._spawn_detached", side_effect=fake_detached):
+                            _spin_sync(
+                                prompt="autonomous task with shard",
+                                permission="auto+shard",
+                                shard=False,
+                                system_prompt=None,
+                                working_dir=str(tmp_path),
+                                allowed_tools=None,
+                                tags=None,
+                                model=None,
+                                timeout=None,
+                                skeinless=True,
+                                env=None,
+                            )
+
+        assert len(captured_cmd) == 1
+        cmd = captured_cmd[0]
+        pm_idx = cmd.index("--permission-mode")
+        assert cmd[pm_idx + 1] == "auto"
+        assert "bypassPermissions" not in cmd
+        assert "acceptEdits" not in cmd
+
+    def test_auto_no_allowedtools_flag(self, tmp_path):
+        """permission='auto' must not pass --allowedTools (classifier governs dynamically)."""
+        captured_cmd = []
+
+        def fake_detached(spool_id, cmd, cwd, env=None):
+            captured_cmd.append(list(cmd))
+            raise OSError("stop after capture")
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle._count_running", return_value=0):
+                with patch("spindle._spawn_detached", side_effect=fake_detached):
+                    _spin_sync(
+                        prompt="autonomous task",
+                        permission="auto",
+                        shard=False,
+                        system_prompt=None,
+                        working_dir=str(tmp_path),
+                        allowed_tools=None,
+                        tags=None,
+                        model=None,
+                        timeout=None,
+                        skeinless=True,
+                        env=None,
+                    )
+
+        assert len(captured_cmd) == 1
+        assert "--allowedTools" not in captured_cmd[0]
+
 
 class TestSpoolStorage:
     """Test spool file storage operations."""

@@ -104,6 +104,10 @@ PERMISSION_PROFILES = {
     "shard": None,  # Full permissions + shard isolation (common combo)
     "careful+shard": "Read,Write,Edit,Grep,Glob,Bash(git:*),Bash(make:*),Bash(pytest:*),Bash(python:*),Bash(python3:*),Bash(npm:*),Bash(npx:*),Bash(node:*),Bash(ruff:*),Bash(black:*),Bash(mypy:*),Bash(pip:*),Bash(uv:*),Bash(ls:*),Bash(cat:*),Bash(head:*),Bash(tail:*),Bash(wc:*),Bash(diff:*),Bash(skein:*),Bash(muster:*)",
     "research+shard": RESEARCH_TOOLS,
+    # Classifier-vetted autonomous mode — CC vets each tool call server-side.
+    # No allowedTools restriction: the classifier governs calls dynamically.
+    "auto": None,
+    "auto+shard": None,  # Same + worktree isolation
 }
 
 # Cache for SKEIN availability check (per-directory)
@@ -1671,8 +1675,11 @@ Your task:
         claude_cmd.extend(["--model", resolved_model])
 
     # Auto-accept edits for non-interactive execution
-    # Use acceptEdits for careful mode, bypassPermissions for full/shard
-    if permission in ("full", "shard") or (permission and "+shard" in permission):
+    # Use acceptEdits for careful mode, bypassPermissions for full/shard,
+    # and auto for classifier-vetted autonomous mode (no allowedTools restriction).
+    if permission and permission.startswith("auto"):
+        claude_cmd.extend(["--permission-mode", "auto"])
+    elif permission in ("full", "shard") or (permission and "+shard" in permission):
         claude_cmd.extend(["--permission-mode", "bypassPermissions"])
     else:
         claude_cmd.extend(["--permission-mode", "acceptEdits"])
@@ -1842,7 +1849,9 @@ async def spin(
                     "careful" (default) for most code work including reviews/fells;
                     "research" for web/file research with required research_target;
                     "full" for setup/install; "shard" or "careful+shard" for any
-                    code-modifying work (adds isolated git worktree).
+                    code-modifying work (adds isolated git worktree);
+                    "auto" for classifier-vetted autonomous mode (CC vets each tool
+                    call server-side, no allowlist); "auto+shard" adds worktree isolation.
         research_target: Required for permission="research" or "research+shard".
                          Accepted forms: site:<id>, file:<absolute-path>, dir:<absolute-path>.
         shard: Run in isolated git worktree (SKEIN-aware with graceful fallback)
@@ -5033,7 +5042,7 @@ def main():
     spin_parser.add_argument(
         "--permission",
         "-p",
-        choices=["readonly", "careful", "research", "full", "shard", "careful+shard", "research+shard"],
+        choices=["readonly", "careful", "research", "full", "shard", "careful+shard", "research+shard", "auto", "auto+shard"],
         help="Permission profile (default: careful)",
     )
     spin_parser.add_argument(
