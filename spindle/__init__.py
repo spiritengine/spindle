@@ -1755,6 +1755,25 @@ Your task:
             path = f"{home}/{config_item}"
             if Path(path).exists():
                 cmd.extend(["--bind", path, path])
+        # Extra caller-specified writable bind mounts (SPINDLE_SHARD_WRITABLE_BINDS=path1:path2:...)
+        extra_binds_raw = os.environ.get("SPINDLE_SHARD_WRITABLE_BINDS", "")
+        for raw in extra_binds_raw.split(":") if extra_binds_raw else []:
+            raw = raw.strip()
+            if not raw:
+                continue
+            if not os.path.isabs(raw):
+                print(
+                    f"spindle: SPINDLE_SHARD_WRITABLE_BINDS: skipping non-absolute path: {raw!r}",
+                    file=sys.stderr,
+                )
+                continue
+            if not Path(raw).exists():
+                print(
+                    f"spindle: SPINDLE_SHARD_WRITABLE_BINDS: skipping non-existent path: {raw!r}",
+                    file=sys.stderr,
+                )
+                continue
+            cmd.extend(["--bind", raw, raw])
         cmd.extend(claude_cmd)
     else:
         cmd = claude_cmd

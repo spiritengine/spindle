@@ -4113,3 +4113,147 @@ class TestCLIArgparse:
                 with pytest.raises(SystemExit):
                     main()
         mock_codex.assert_not_called()
+
+
+class TestShardWritableBinds:
+    """Tests for SPINDLE_SHARD_WRITABLE_BINDS extra bind mounts in the bwrap sandbox."""
+
+    def _run_shard_spin(self, tmp_path, monkeypatch, extra_env=None):
+        """Spin a shard and capture the bwrap command. Returns the captured cmd list."""
+        captured_cmd = []
+        shard_info = {"worktree_path": str(tmp_path), "shard_id": "shard-test"}
+
+        def fake_detached(spool_id, cmd, cwd, env=None):
+            captured_cmd.append(list(cmd))
+            raise OSError("stop after capture")
+
+        if extra_env:
+            for k, v in extra_env.items():
+                monkeypatch.setenv(k, v)
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle._count_running", return_value=0):
+                with patch("spindle._detect_existing_shard", return_value=shard_info):
+                    with patch("spindle._has_skein", return_value=True):
+                        with patch("shutil.which", return_value="/usr/bin/bwrap"):
+                            with patch("spindle._spawn_detached", side_effect=fake_detached):
+                                _spin_sync(
+                                    prompt="test task",
+                                    permission="shard",
+                                    shard=False,
+                                    system_prompt=None,
+                                    working_dir=str(tmp_path),
+                                    allowed_tools=None,
+                                    tags=None,
+                                    model=None,
+                                    timeout=None,
+                                    skeinless=True,
+                                    env=None,
+                                )
+
+        assert len(captured_cmd) == 1
+        return captured_cmd[0]
+
+    def test_existing_dir_is_bound_writable(self, tmp_path, monkeypatch):
+        """A valid absolute existing path in SPINDLE_SHARD_WRITABLE_BINDS gets --bind <p> <p>."""
+        target = tmp_path / "output"
+        target.mkdir()
+        cmd = self._run_shard_spin(
+            tmp_path,
+            monkeypatch,
+            extra_env={"SPINDLE_SHARD_WRITABLE_BINDS": str(target)},
+        )
+        assert cmd[0] == "bwrap"
+        found = any(
+            cmd[i] == "--bind" and cmd[i + 1] == str(target) and cmd[i + 2] == str(target)
+            for i in range(len(cmd) - 2)
+        )
+        assert found, f"Expected --bind {target} {target} in bwrap cmd: {cmd!r}"
+
+    def test_multiple_paths_all_bound(self, tmp_path, monkeypatch):
+        """Multiple colon-separated existing paths are each bound read-write."""
+        dir_a = tmp_path / "a"
+        dir_b = tmp_path / "b"
+        dir_a.mkdir()
+        dir_b.mkdir()
+        cmd = self._run_shard_spin(
+            tmp_path,
+            monkeypatch,
+            extra_env={"SPINDLE_SHARD_WRITABLE_BINDS": f"{dir_a}:{dir_b}"},
+        )
+        for d in (dir_a, dir_b):
+            found = any(
+                cmd[i] == "--bind" and cmd[i + 1] == str(d) and cmd[i + 2] == str(d)
+                for i in range(len(cmd) - 2)
+            )
+            assert found, f"Expected --bind {d} {d} in bwrap cmd: {cmd!r}"
+
+    def test_nonexistent_path_is_skipped(self, tmp_path, monkeypatch):
+        """A non-existent path in SPINDLE_SHARD_WRITABLE_BINDS is silently skipped (no crash)."""
+        ghost = str(tmp_path / "does-not-exist")
+        cmd = self._run_shard_spin(
+            tmp_path,
+            monkeypatch,
+            extra_env={"SPINDLE_SHARD_WRITABLE_BINDS": ghost},
+        )
+        assert cmd[0] == "bwrap"
+        assert ghost not in cmd
+
+    def test_relative_path_is_skipped(self, tmp_path, monkeypatch):
+        """A relative path in SPINDLE_SHARD_WRITABLE_BINDS is silently skipped (no crash)."""
+        cmd = self._run_shard_spin(
+            tmp_path,
+            monkeypatch,
+            extra_env={"SPINDLE_SHARD_WRITABLE_BINDS": "relative/path"},
+        )
+        assert cmd[0] == "bwrap"
+        assert "relative/path" not in cmd
+
+    def test_env_unset_no_extra_binds(self, tmp_path, monkeypatch):
+        """With SPINDLE_SHARD_WRITABLE_BINDS unset, bwrap wraps normally."""
+        monkeypatch.delenv("SPINDLE_SHARD_WRITABLE_BINDS", raising=False)
+        cmd = self._run_shard_spin(tmp_path, monkeypatch)
+        assert cmd[0] == "bwrap"
+
+    def test_nonexistent_path_warns_to_stderr(self, tmp_path, monkeypatch, capsys):
+        """A non-existent path generates a warning on stderr."""
+        ghost = str(tmp_path / "does-not-exist")
+        self._run_shard_spin(
+            tmp_path,
+            monkeypatch,
+            extra_env={"SPINDLE_SHARD_WRITABLE_BINDS": ghost},
+        )
+        err = capsys.readouterr().err
+        assert "SPINDLE_SHARD_WRITABLE_BINDS" in err
+        assert ghost in err
+
+    def test_relative_path_warns_to_stderr(self, tmp_path, monkeypatch, capsys):
+        """A relative path generates a warning on stderr."""
+        self._run_shard_spin(
+            tmp_path,
+            monkeypatch,
+            extra_env={"SPINDLE_SHARD_WRITABLE_BINDS": "relative/path"},
+        )
+        err = capsys.readouterr().err
+        assert "SPINDLE_SHARD_WRITABLE_BINDS" in err
+        assert "relative/path" in err
+
+    def test_mixed_valid_invalid_only_valid_bound(self, tmp_path, monkeypatch):
+        """With a mix of valid and invalid paths, only valid ones get --bind entries."""
+        valid_dir = tmp_path / "valid"
+        valid_dir.mkdir()
+        ghost = str(tmp_path / "ghost")
+        cmd = self._run_shard_spin(
+            tmp_path,
+            monkeypatch,
+            extra_env={
+                "SPINDLE_SHARD_WRITABLE_BINDS": f"{valid_dir}:{ghost}:relative/bad"
+            },
+        )
+        found_valid = any(
+            cmd[i] == "--bind" and cmd[i + 1] == str(valid_dir) and cmd[i + 2] == str(valid_dir)
+            for i in range(len(cmd) - 2)
+        )
+        assert found_valid, f"Expected valid dir bound in: {cmd!r}"
+        assert ghost not in cmd
+        assert "relative/bad" not in cmd
