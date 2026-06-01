@@ -1880,7 +1880,7 @@ async def spin(
         tags: Comma-separated tags for organizing spools (e.g. "batch-1,triage")
         model: Model to use - for Claude: "haiku", "sonnet", "opus";
                for Gemini: "flash", "pro", or full model names like "gemini-2.5-pro";
-               for Kimi: "thinking", "thinking-turbo", "turbo", "latest", or full model names.
+               for Kimi: "thinking" (k2.6 in thinking mode), "k2.6", "k2.5", "latest", or full model names.
                Use spin_harnesses() to see all available models.
         timeout: Kill spool after this many seconds (default: no timeout).
                  Exception: spools tagged with a review marker ("review", "fell-r1"
@@ -3476,7 +3476,7 @@ def _get_harnesses() -> dict:
         },
         "kimi": {
             "models": KIMI_MODEL_ALIASES,
-            "default_model": "moonshot-ai/kimi-k2-thinking",
+            "default_model": KIMI_DEFAULT_MODEL,
             "requires": "kimi-cli",
         },
     }
@@ -4470,17 +4470,81 @@ GEMINI_MODEL_ALIASES = {
 }
 
 # Source of truth: MoonshotAI/kimi-cli; aliases use the kimi-cli managed-provider
-# key format ("moonshot-ai/<model>"). The local kimi config must register these
-# under [models.…] (see ~/.kimi/config.toml). Run `kimi /setup` to refresh if
-# a newer model isn't yet in the local config.
+# key format ("moonshot-ai/<model>"). Every value here MUST be registered under
+# [models.…] in the local kimi config (see ~/.kimi/config.toml) — kimi-cli silently
+# ignores an unknown -m model, falls back to an empty LLM, and reports "LLM not set"
+# (see _kimi_registered_models below, which guards against this).
+#
+# The moonshot-ai managed provider no longer ships standalone "kimi-k2-thinking" /
+# "kimi-k2-turbo-preview" models; thinking is now a capability of kimi-k2.5/kimi-k2.6
+# toggled with kimi-cli's --thinking flag. The "thinking" alias therefore resolves to
+# kimi-k2.6 and runs it in thinking mode (see KIMI_THINKING_ALIASES). Run `kimi /setup`
+# if a newer model isn't yet in the local config.
+KIMI_DEFAULT_MODEL = "moonshot-ai/kimi-k2.6"
 KIMI_MODEL_ALIASES = {
-    "thinking": "moonshot-ai/kimi-k2-thinking",
-    "thinking-turbo": "moonshot-ai/kimi-k2-thinking-turbo",
-    "turbo": "moonshot-ai/kimi-k2-turbo-preview",
-    "k2.5": "moonshot-ai/kimi-k2.5",
-    "k2.6": "moonshot-ai/kimi-k2.6",
+    "thinking": "moonshot-ai/kimi-k2.6",
     "latest": "moonshot-ai/kimi-k2.6",
+    "k2.6": "moonshot-ai/kimi-k2.6",
+    "k2.5": "moonshot-ai/kimi-k2.5",
 }
+# Aliases whose resolved model should run with kimi-cli thinking mode enabled.
+KIMI_THINKING_ALIASES = {"thinking"}
+
+
+def _kimi_config_path() -> Path:
+    """Path to the kimi-cli config, mirroring kimi-cli's own resolution.
+
+    kimi-cli reads ~/.kimi/config.toml unless overridden by --config-file; we honor
+    the same KIMI_CONFIG_FILE env override that kimi-cli respects for headless runs.
+    """
+    override = os.environ.get("KIMI_CONFIG_FILE")
+    if override:
+        return Path(override).expanduser()
+    return Path.home() / ".kimi" / "config.toml"
+
+
+def _kimi_registered_models() -> Optional[set]:
+    """Model keys registered under [models.*] in the kimi config.
+
+    Returns None (skip validation) when the config can't be read or parsed — e.g.
+    Python <3.11 without tomllib, or a missing/malformed config. Returning None means
+    "don't block"; an empty set means "config readable, but no models registered".
+    """
+    try:
+        import tomllib
+    except ImportError:
+        return None
+    try:
+        with open(_kimi_config_path(), "rb") as f:
+            data = tomllib.load(f)
+    except (OSError, ValueError):
+        return None
+    models = data.get("models")
+    if not isinstance(models, dict):
+        return None
+    return set(models.keys())
+
+
+def _kimi_validate_model(resolved_model: Optional[str]) -> Optional[str]:
+    """Return an error string if resolved_model isn't registered in the kimi config.
+
+    Guards against kimi-cli's silent fallback: an unknown -m model produces an empty
+    LLM and the opaque "LLM not set" message with no agent output. We surface a clear,
+    actionable error instead. Best-effort — returns None (allow) when the config can't
+    be inspected (see _kimi_registered_models).
+    """
+    if not resolved_model:
+        return None
+    registered = _kimi_registered_models()
+    if registered is None or resolved_model in registered:
+        return None
+    available = ", ".join(sorted(registered)) if registered else "(none)"
+    return (
+        f"Error: Kimi model '{resolved_model}' is not registered in the kimi config "
+        f"({_kimi_config_path()}). kimi-cli would silently fall back to an empty LLM "
+        f"and report 'LLM not set'. Available models: {available}. "
+        f"Run `kimi /setup` to refresh managed models, or add the model to the config."
+    )
 
 
 def _gemini_spin_sync(
@@ -4748,6 +4812,16 @@ def _kimi_spin_sync(
     except ValueError as exc:
         return f"Error: {exc}"
 
+    # Resolve model aliases (default to kimi-k2.6 if no model specified) and decide
+    # whether to run kimi-cli in thinking mode. Validate the resolved model against the
+    # kimi config BEFORE reserving a slot or creating a shard: an unregistered model makes
+    # kimi-cli silently fall back to an empty LLM and emit only "LLM not set".
+    resolved_model = KIMI_MODEL_ALIASES.get(model, model) if model else KIMI_DEFAULT_MODEL
+    enable_thinking = bool(model) and model in KIMI_THINKING_ALIASES
+    model_error = _kimi_validate_model(resolved_model)
+    if model_error:
+        return model_error
+
     # Generate spool ID and session ID
     spool_id = "kimi-" + str(uuid.uuid4())[:8]
     session_id = str(uuid.uuid4())  # Generate our own session ID
@@ -4774,9 +4848,6 @@ def _kimi_spin_sync(
             if shard_error:
                 return f"Error: Failed to create SHARD worktree — {shard_error}"
             return "Error: Failed to create SHARD worktree. Check git repo status."
-
-    # Resolve model aliases (default to kimi-k2-thinking if no model specified)
-    resolved_model = KIMI_MODEL_ALIASES.get(model, model) if model else "moonshot-ai/kimi-k2-thinking"
 
     effective_prompt = prompt
     if research_target_info:
@@ -4828,6 +4899,9 @@ Your task:
     if resolved_model:
         kimi_cmd.extend(["-m", resolved_model])
 
+    if enable_thinking:
+        kimi_cmd.append("--thinking")
+
     if cwd:
         kimi_cmd.extend(["-w", cwd])
 
@@ -4855,6 +4929,7 @@ Your task:
         "session_id": session_id,  # Store our generated session ID
         "working_dir": working_dir,
         "model": resolved_model or "auto",
+        "thinking": enable_thinking,
         "system_prompt": system_prompt,
         "tags": tag_list,
         "timeout": timeout,
@@ -4904,6 +4979,19 @@ def _kimi_respin_sync(
     if not working_dir:
         return "Error: original spool missing working_dir"
 
+    # Inherit model from original spool. The stored model is already a resolved
+    # "moonshot-ai/<model>" key (or "auto"); validate it before reserving a slot so a
+    # stale model fails cleanly rather than as kimi-cli's opaque "LLM not set".
+    model = original_spool.get("model")
+    if model == "auto":
+        model = None  # Let CLI choose
+    model_error = _kimi_validate_model(model)
+    if model_error:
+        return model_error
+
+    # Inherit thinking mode from the original spool.
+    enable_thinking = bool(original_spool.get("thinking"))
+
     # Generate new spool ID
     spool_id = "kimi-" + str(uuid.uuid4())[:8]
 
@@ -4911,11 +4999,6 @@ def _kimi_respin_sync(
     success, error_msg = _try_reserve_slot_and_create(spool_id, initial_status="pending")
     if not success:
         return error_msg
-
-    # Inherit model from original spool
-    model = original_spool.get("model")
-    if model == "auto":
-        model = None  # Let CLI choose
 
     # Build kimi resume command: use explicit session ID
     kimi_cmd = [
@@ -4933,6 +5016,9 @@ def _kimi_respin_sync(
     if model:
         kimi_cmd.extend(["-m", model])
 
+    if enable_thinking:
+        kimi_cmd.append("--thinking")
+
     if working_dir:
         kimi_cmd.extend(["-w", working_dir])
 
@@ -4948,6 +5034,7 @@ def _kimi_respin_sync(
         "session_id": session_id,  # Keep reference to original
         "working_dir": working_dir,
         "model": model or "auto",
+        "thinking": enable_thinking,
         "system_prompt": None,
         "tags": tag_list,
         "timeout": original_spool.get("timeout"),
@@ -5089,7 +5176,7 @@ def main():
     spin_parser.add_argument(
         "--model",
         "-m",
-        help="Model to use (e.g. haiku/sonnet/opus for Claude, flash/pro for Gemini, thinking/turbo for Kimi)",
+        help="Model to use (e.g. haiku/sonnet/opus for Claude, flash/pro for Gemini, thinking/k2.6/k2.5 for Kimi)",
     )
     spin_parser.add_argument("--harness", help="Harness to use: claude-code (default), codex, gemini, or kimi")
     spin_parser.add_argument("--timeout", "-t", type=int, help="Kill spool after N seconds")
