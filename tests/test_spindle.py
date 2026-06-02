@@ -17,6 +17,7 @@ import pytest
 from spindle import (
     DEFAULT_REVIEW_TIMEOUT,
     GEMINI_MODEL_ALIASES,
+    KIMI_DEFAULT_MODEL,
     KIMI_MODEL_ALIASES,
     MAX_CONCURRENT,
     PENDING_SPAWN_TIMEOUT,
@@ -1435,15 +1436,28 @@ class TestGeminiHarness:
 class TestKimiHarness:
     """Test Kimi CLI harness implementation."""
 
+    @pytest.fixture(autouse=True)
+    def _skip_model_validation(self):
+        """Disable model-config validation by default so command-construction tests
+        don't depend on the machine's ~/.kimi/config.toml. Validation-specific tests
+        re-patch _kimi_registered_models with an explicit set."""
+        with patch("spindle._kimi_registered_models", return_value=None):
+            yield
+
     def test_kimi_model_aliases(self):
-        """Model aliases should resolve to full model names."""
-        assert KIMI_MODEL_ALIASES["thinking"] == "moonshot-ai/kimi-k2-thinking"
-        assert KIMI_MODEL_ALIASES["thinking-turbo"] == "moonshot-ai/kimi-k2-thinking-turbo"
-        assert KIMI_MODEL_ALIASES["turbo"] == "moonshot-ai/kimi-k2-turbo-preview"
+        """Aliases should resolve only to models the managed provider actually serves."""
+        assert KIMI_MODEL_ALIASES["thinking"] == "moonshot-ai/kimi-k2.6"
+        assert KIMI_MODEL_ALIASES["k2.6"] == "moonshot-ai/kimi-k2.6"
+        assert KIMI_MODEL_ALIASES["k2.5"] == "moonshot-ai/kimi-k2.5"
         assert KIMI_MODEL_ALIASES["latest"] == "moonshot-ai/kimi-k2.6"
+        # The retired standalone thinking/turbo models must not reappear as alias targets.
+        assert "moonshot-ai/kimi-k2-thinking" not in KIMI_MODEL_ALIASES.values()
+        assert "moonshot-ai/kimi-k2-turbo-preview" not in KIMI_MODEL_ALIASES.values()
+        # Default model must be a real, registerable model (regression: was kimi-k2-thinking).
+        assert KIMI_DEFAULT_MODEL == "moonshot-ai/kimi-k2.6"
 
     def test_kimi_spin_resolves_alias(self, tmp_path):
-        """Kimi spin should resolve model aliases in the CLI command."""
+        """The 'thinking' alias resolves to kimi-k2.6 and enables thinking mode."""
         captured_cmd = []
 
         def fake_spawn(spool_id, cmd, cwd, env=None):
@@ -1463,7 +1477,100 @@ class TestKimiHarness:
                         env=None,
                     )
 
-        assert "moonshot-ai/kimi-k2-thinking" in captured_cmd
+        assert "moonshot-ai/kimi-k2.6" in captured_cmd
+        assert "--thinking" in captured_cmd
+
+    def test_kimi_spin_full_model_no_thinking_flag(self, tmp_path):
+        """A full model name (not the 'thinking' alias) must not force thinking mode."""
+        captured_cmd = []
+
+        def fake_spawn(spool_id, cmd, cwd, env=None):
+            captured_cmd.extend(cmd)
+            return 12345
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle._spawn_detached", side_effect=fake_spawn):
+                with patch("spindle._count_running", return_value=0):
+                    _kimi_spin_sync(
+                        prompt="Test",
+                        working_dir=str(tmp_path),
+                        model="moonshot-ai/kimi-k2.6",
+                        system_prompt=None,
+                        timeout=None,
+                        tags=None,
+                        env=None,
+                    )
+
+        assert "moonshot-ai/kimi-k2.6" in captured_cmd
+        assert "--thinking" not in captured_cmd
+
+    def test_kimi_spin_default_model(self, tmp_path):
+        """No model specified defaults to kimi-k2.6 (regression: was the unregistered
+        kimi-k2-thinking, which made kimi-cli report 'LLM not set')."""
+        captured_cmd = []
+
+        def fake_spawn(spool_id, cmd, cwd, env=None):
+            captured_cmd.extend(cmd)
+            return 12345
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle._spawn_detached", side_effect=fake_spawn):
+                with patch("spindle._count_running", return_value=0):
+                    _kimi_spin_sync(
+                        prompt="Test",
+                        working_dir=str(tmp_path),
+                        model=None,
+                        system_prompt=None,
+                        timeout=None,
+                        tags=None,
+                        env=None,
+                    )
+
+        m_idx = captured_cmd.index("-m")
+        assert captured_cmd[m_idx + 1] == "moonshot-ai/kimi-k2.6"
+        assert "--thinking" not in captured_cmd
+
+    def test_kimi_spin_rejects_unregistered_model(self, tmp_path):
+        """An unregistered model is rejected up front with a clear error instead of
+        letting kimi-cli silently fall back and emit only 'LLM not set'."""
+        spawned = []
+
+        def fake_spawn(spool_id, cmd, cwd, env=None):
+            spawned.append(cmd)
+            return 12345
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle._spawn_detached", side_effect=fake_spawn):
+                with patch("spindle._count_running", return_value=0):
+                    # Only k2.6 is registered; the retired kimi-k2-thinking is not.
+                    with patch(
+                        "spindle._kimi_registered_models",
+                        return_value={"moonshot-ai/kimi-k2.6"},
+                    ):
+                        result = _kimi_spin_sync(
+                            prompt="Test",
+                            working_dir=str(tmp_path),
+                            model="moonshot-ai/kimi-k2-thinking",
+                            system_prompt=None,
+                            timeout=None,
+                            tags=None,
+                            env=None,
+                        )
+
+        assert result.startswith("Error:")
+        assert "moonshot-ai/kimi-k2-thinking" in result
+        assert "LLM not set" in result
+        # No process spawned and no spool slot left behind.
+        assert spawned == []
+        assert list(tmp_path.glob("kimi-*.json")) == []
+
+    def test_kimi_registered_models_unknown_when_no_config(self, tmp_path):
+        """Validation degrades to 'allow' (None) when the config can't be read."""
+        import spindle
+
+        missing = tmp_path / "nope" / "config.toml"
+        with patch("spindle._kimi_config_path", return_value=missing):
+            assert spindle._kimi_registered_models() is None
 
     def test_kimi_spin_requires_working_dir(self, tmp_path):
         """Kimi spin should require working_dir."""
@@ -1527,7 +1634,7 @@ class TestKimiHarness:
                     _kimi_spin_sync(
                         prompt="Explain this code",
                         working_dir=str(tmp_path),
-                        model="moonshot-ai/kimi-k2-thinking-turbo",
+                        model="moonshot-ai/kimi-k2.6",
                         system_prompt=None,
                         timeout=None,
                         tags=None,
@@ -1542,7 +1649,7 @@ class TestKimiHarness:
         assert "stream-json" in captured_cmd
         assert "-p" in captured_cmd
         assert "-m" in captured_cmd
-        assert "moonshot-ai/kimi-k2-thinking-turbo" in captured_cmd
+        assert "moonshot-ai/kimi-k2.6" in captured_cmd
         assert "-w" in captured_cmd
 
     def test_kimi_spin_system_prompt_prepended(self, tmp_path):
@@ -1708,6 +1815,62 @@ class TestKimiHarness:
         assert "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee" in captured_cmd
         assert "--print" in captured_cmd
         assert "Follow up question" in captured_cmd
+
+    def test_kimi_respin_inherits_thinking_flag(self, tmp_path):
+        """Respinning a spool whose stored state has thinking=True re-appends --thinking."""
+        captured_cmd = []
+
+        def fake_spawn(spool_id, cmd, cwd, env=None):
+            captured_cmd.extend(cmd)
+            return 12345
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle._spawn_detached", side_effect=fake_spawn):
+                with patch("spindle._count_running", return_value=0):
+                    original_spool = {
+                        "id": "kimi-original",
+                        "session_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                        "working_dir": str(tmp_path),
+                        "model": "moonshot-ai/kimi-k2.6",
+                        "thinking": True,
+                        "env": None,
+                    }
+
+                    _kimi_respin_sync(
+                        session_id="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                        prompt="Follow up question",
+                        original_spool=original_spool,
+                    )
+
+        assert "--thinking" in captured_cmd
+
+    def test_kimi_respin_without_thinking_omits_flag(self, tmp_path):
+        """Respinning a spool whose stored state lacks thinking must not add --thinking."""
+        captured_cmd = []
+
+        def fake_spawn(spool_id, cmd, cwd, env=None):
+            captured_cmd.extend(cmd)
+            return 12345
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle._spawn_detached", side_effect=fake_spawn):
+                with patch("spindle._count_running", return_value=0):
+                    original_spool = {
+                        "id": "kimi-original",
+                        "session_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                        "working_dir": str(tmp_path),
+                        "model": "moonshot-ai/kimi-k2.6",
+                        "thinking": False,
+                        "env": None,
+                    }
+
+                    _kimi_respin_sync(
+                        session_id="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                        prompt="Follow up question",
+                        original_spool=original_spool,
+                    )
+
+        assert "--thinking" not in captured_cmd
 
 
 class TestSpinHarnesses:
