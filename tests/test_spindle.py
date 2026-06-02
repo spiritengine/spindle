@@ -1816,6 +1816,62 @@ class TestKimiHarness:
         assert "--print" in captured_cmd
         assert "Follow up question" in captured_cmd
 
+    def test_kimi_respin_inherits_thinking_flag(self, tmp_path):
+        """Respinning a spool whose stored state has thinking=True re-appends --thinking."""
+        captured_cmd = []
+
+        def fake_spawn(spool_id, cmd, cwd, env=None):
+            captured_cmd.extend(cmd)
+            return 12345
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle._spawn_detached", side_effect=fake_spawn):
+                with patch("spindle._count_running", return_value=0):
+                    original_spool = {
+                        "id": "kimi-original",
+                        "session_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                        "working_dir": str(tmp_path),
+                        "model": "moonshot-ai/kimi-k2.6",
+                        "thinking": True,
+                        "env": None,
+                    }
+
+                    _kimi_respin_sync(
+                        session_id="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                        prompt="Follow up question",
+                        original_spool=original_spool,
+                    )
+
+        assert "--thinking" in captured_cmd
+
+    def test_kimi_respin_without_thinking_omits_flag(self, tmp_path):
+        """Respinning a spool whose stored state lacks thinking must not add --thinking."""
+        captured_cmd = []
+
+        def fake_spawn(spool_id, cmd, cwd, env=None):
+            captured_cmd.extend(cmd)
+            return 12345
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle._spawn_detached", side_effect=fake_spawn):
+                with patch("spindle._count_running", return_value=0):
+                    original_spool = {
+                        "id": "kimi-original",
+                        "session_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                        "working_dir": str(tmp_path),
+                        "model": "moonshot-ai/kimi-k2.6",
+                        "thinking": False,
+                        "env": None,
+                    }
+
+                    _kimi_respin_sync(
+                        session_id="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                        prompt="Follow up question",
+                        original_spool=original_spool,
+                    )
+
+        assert "--thinking" not in captured_cmd
+
 
 class TestSpinHarnesses:
     """Test the spin_harnesses discovery tool."""

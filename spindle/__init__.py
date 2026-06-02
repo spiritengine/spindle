@@ -4507,8 +4507,10 @@ def _kimi_registered_models() -> Optional[set]:
     """Model keys registered under [models.*] in the kimi config.
 
     Returns None (skip validation) when the config can't be read or parsed — e.g.
-    Python <3.11 without tomllib, or a missing/malformed config. Returning None means
-    "don't block"; an empty set means "config readable, but no models registered".
+    Python <3.11 without tomllib, a missing/malformed config, or a config with no
+    [models] table at all. Returning None means "don't block". Only an explicitly
+    present-but-empty [models] table yields the empty set ("config readable, models
+    table present, but no models registered").
     """
     try:
         import tomllib
