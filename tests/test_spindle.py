@@ -13,6 +13,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+import spindle
+
 # Import the module to test
 from spindle import (
     DEFAULT_REVIEW_TIMEOUT,
@@ -22,6 +24,10 @@ from spindle import (
     MAX_CONCURRENT,
     PENDING_SPAWN_TIMEOUT,
     PERMISSION_PROFILES,
+    UNSPOOL_HEAD_CHARS,
+    UNSPOOL_MAX_CHARS,
+    UNSPOOL_TAIL_CHARS,
+    _budget_result,
     _check_and_finalize_spool,
     _cleanup_shard,
     _codex_bwrap_wrap,
@@ -515,6 +521,193 @@ class TestSpoolStorage:
         with patch("spindle.SPINDLE_DIR", spindle_dir):
             _write_spool("test", {"id": "test"})
             assert spindle_dir.exists()
+
+
+class TestResultBudgeting:
+    """Test head/tail truncation and paging of large unspool results."""
+
+    def test_small_result_unchanged(self):
+        text = "x" * 100
+        assert _budget_result(text, "id1") == text
+
+    def test_result_at_threshold_unchanged(self):
+        text = "x" * UNSPOOL_MAX_CHARS
+        assert _budget_result(text, "id1") == text
+
+    def test_large_result_truncated_with_head_and_tail(self):
+        head = "H" * UNSPOOL_HEAD_CHARS
+        tail = "T" * UNSPOOL_TAIL_CHARS
+        text = head + ("M" * 40000) + tail
+        out = _budget_result(text, "spool-xyz")
+        assert len(out) < len(text)
+        assert out.startswith("H" * 200)
+        assert out.endswith("T" * 200)
+        assert "M" * 200 not in out  # middle elided
+
+    def test_breadcrumb_mentions_all_retrieval_paths(self):
+        text = "z" * (UNSPOOL_MAX_CHARS + 50000)
+        out = _budget_result(text, "spool-abc")
+        assert 'unspool("spool-abc", full=True)' in out
+        assert "offset=" in out
+        assert "spool_export" in out
+        assert 'spool_grep("<pattern>", spool_id="spool-abc")' in out
+
+    def test_overlapping_windows_return_whole_text(self):
+        # If HEAD+TAIL >= len(text), there is nothing to elide: return as-is
+        # rather than emit a negative count or duplicate the middle.
+        text = "a" * (UNSPOOL_MAX_CHARS + 100)
+        with patch("spindle.UNSPOOL_HEAD_CHARS", len(text)), patch(
+            "spindle.UNSPOOL_TAIL_CHARS", len(text)
+        ):
+            assert _budget_result(text, "id1") == text
+
+    def test_zero_tail_does_not_duplicate_text(self):
+        # text[-0:] is the whole string; with TAIL=0 the tail must be empty so
+        # output stays head + crumb, never head + crumb + full text.
+        text = "b" * (UNSPOOL_MAX_CHARS + 50000)
+        with patch("spindle.UNSPOOL_HEAD_CHARS", 100), patch("spindle.UNSPOOL_TAIL_CHARS", 0):
+            out = _budget_result(text, "id1")
+            assert len(out) < len(text)
+            assert out.startswith("b" * 100)
+
+    def test_unspool_full_bypasses_budget(self, tmp_path):
+        big = "q" * (UNSPOOL_MAX_CHARS + 30000)
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool("sp1", {"id": "sp1", "status": "complete", "result": big})
+            full = asyncio.run(spindle.unspool.fn("sp1", full=True))
+            assert full == big
+            budgeted = asyncio.run(spindle.unspool.fn("sp1"))
+            assert len(budgeted) < len(big)
+            assert "full=True" in budgeted
+
+    def test_unspool_paging_returns_slice_with_markers(self, tmp_path):
+        big = "abcdefghij" * 10000  # 100k chars
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool("sp2", {"id": "sp2", "status": "complete", "result": big})
+            page = asyncio.run(spindle.unspool.fn("sp2", offset=12000, limit=5000))
+            lines = page.split("\n")
+            assert lines[0].startswith("[chars 12,000-17,000 of 100,000]")
+            assert "[more:" in page
+            assert big[12000:17000] in page
+
+    def test_unspool_paging_last_slice_has_no_more_crumb(self, tmp_path):
+        big = "y" * 60000
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool("sp3", {"id": "sp3", "status": "complete", "result": big})
+            page = asyncio.run(spindle.unspool.fn("sp3", offset=55000))
+            assert "[more:" not in page
+
+    def test_output_never_longer_than_input(self):
+        # elided positive but smaller than the breadcrumb: truncating would grow
+        # the output, so _budget_result must return the text unchanged.
+        text = "c" * 50001
+        with patch("spindle.UNSPOOL_MAX_CHARS", 50000), patch(
+            "spindle.UNSPOOL_HEAD_CHARS", 25000
+        ), patch("spindle.UNSPOOL_TAIL_CHARS", 24999):
+            assert _budget_result(text, "id1") == text
+
+    def test_head_zero_uses_tail_only(self):
+        text = "d" * (UNSPOOL_MAX_CHARS + 50000)
+        with patch("spindle.UNSPOOL_HEAD_CHARS", 0), patch("spindle.UNSPOOL_TAIL_CHARS", 100):
+            out = _budget_result(text, "id1")
+            assert len(out) < len(text)
+            assert out.endswith("d" * 100)
+
+    def test_unspool_paging_invalid_limit(self, tmp_path):
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool("p1", {"id": "p1", "status": "complete", "result": "z" * 200})
+            for bad in (-5, 0):
+                out = asyncio.run(spindle.unspool.fn("p1", limit=bad))
+                assert "invalid limit" in out
+                assert "[chars" not in out
+                assert "[more:" not in out
+
+    def test_unspool_paging_offset_past_end(self, tmp_path):
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool("p2", {"id": "p2", "status": "complete", "result": "z" * 100})
+            out = asyncio.run(spindle.unspool.fn("p2", offset=500))
+            assert out.splitlines()[0] == "[chars 100-100 of 100]"
+            assert "[more:" not in out
+
+    def test_paging_non_complete_returns_sentinel(self, tmp_path):
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool("p3", {"id": "p3", "status": "pending", "result": None})
+            out = asyncio.run(spindle.unspool.fn("p3", offset=0, limit=50))
+            assert "pending" in out
+            assert "[chars" not in out
+
+    def test_unspool_coerces_non_string_result(self, tmp_path):
+        # A structured result must not crash paging or budgeting.
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool("p4", {"id": "p4", "status": "complete", "result": {"k": "v"}})
+            out = asyncio.run(spindle.unspool.fn("p4", offset=0, limit=100))
+            assert '"k": "v"' in out
+            assert out.splitlines()[0].startswith("[chars 0-")
+            # budgeting path on a structured result also must not raise
+            assert asyncio.run(spindle.unspool.fn("p4")) == json.dumps({"k": "v"}, indent=2)
+
+
+class TestSingleSpoolGrep:
+    """Test single-spool line-level grep with context."""
+
+    def test_unknown_spool(self, tmp_path):
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            out = asyncio.run(spindle.spool_grep.fn("x", spool_id="nope"))
+            assert "Unknown spool_id" in out
+
+    def test_matching_lines_with_context(self, tmp_path):
+        result = "alpha\nbeta\nERROR here\ndelta\nepsilon\n"
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool("g1", {"id": "g1", "status": "complete", "result": result})
+            out = asyncio.run(spindle.spool_grep.fn("ERROR", spool_id="g1", context=1))
+            assert "matching line(s)" in out.splitlines()[0]
+            assert "beta" in out  # context before
+            assert "ERROR here" in out
+            assert "delta" in out  # context after
+            assert "epsilon" not in out  # outside context window
+
+    def test_no_match(self, tmp_path):
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool("g2", {"id": "g2", "status": "complete", "result": "nothing\n"})
+            out = asyncio.run(spindle.spool_grep.fn("zzz", spool_id="g2"))
+            assert "No lines" in out
+
+    def test_dict_result_searched_as_json(self, tmp_path):
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool("g3", {"id": "g3", "status": "complete", "result": {"finding": "ERROR in auth"}})
+            out = asyncio.run(spindle.spool_grep.fn("ERROR", spool_id="g3"))
+            assert "ERROR in auth" in out
+
+    def test_list_result_searched_as_json(self, tmp_path):
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool("g3b", {"id": "g3b", "status": "complete", "result": ["alpha", "ERROR beta"]})
+            out = asyncio.run(spindle.spool_grep.fn("ERROR", spool_id="g3b"))
+            assert "ERROR beta" in out
+
+    def test_context_zero_shows_only_hits(self, tmp_path):
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool("g4", {"id": "g4", "status": "complete", "result": "a\nMATCH\nb\n"})
+            out = asyncio.run(spindle.spool_grep.fn("MATCH", spool_id="g4", context=0))
+            assert "2: MATCH" in out
+            assert "1  a" not in out  # no context line shown
+
+    def test_negative_context_treated_as_zero(self, tmp_path):
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool("g4b", {"id": "g4b", "status": "complete", "result": "a\nMATCH\nb\n"})
+            out = asyncio.run(spindle.spool_grep.fn("MATCH", spool_id="g4b", context=-1))
+            assert "2: MATCH" in out  # hit line still shown, not dropped
+
+    def test_window_merge_separator(self, tmp_path):
+        lines = ["L0 hit", "L1", "L2", "L3", "L4", "L5", "L6 hit", "L7"]
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool("g5", {"id": "g5", "status": "complete", "result": "\n".join(lines)})
+            out = asyncio.run(spindle.spool_grep.fn("hit", spool_id="g5", context=1))
+            assert "--" in out  # gap between the two windows
+            # adjacent matches with overlapping windows should NOT show a separator
+            close = ["A hit", "B", "C hit", "D"]
+            _write_spool("g6", {"id": "g6", "status": "complete", "result": "\n".join(close)})
+            out2 = asyncio.run(spindle.spool_grep.fn("hit", spool_id="g6", context=1))
+            assert "--" not in out2  # windows merge into one contiguous block
 
 
 class TestCodexResultExtraction:

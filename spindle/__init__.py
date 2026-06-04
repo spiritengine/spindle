@@ -64,6 +64,16 @@ SPINDLE_DIR = Path.home() / ".spindle" / "spools"
 # Concurrency limit (configurable via env var)
 MAX_CONCURRENT = int(os.environ.get("SPINDLE_MAX_CONCURRENT", "15"))
 
+# Result-size budgeting for unspool. Spool results are bimodal: most are small
+# (~6KB median) but a long tail runs 130KB-280KB and would flood the caller's
+# context. When a result exceeds UNSPOOL_MAX_CHARS, unspool() returns the head
+# and tail with a breadcrumb explaining how to pull the full text, page through
+# it, write it to a file, or search it. Full text always stays in the spool JSON;
+# this only affects the default read. full=True / offset / limit bypass it.
+UNSPOOL_MAX_CHARS = int(os.environ.get("SPINDLE_UNSPOOL_MAX_CHARS", "50000"))
+UNSPOOL_HEAD_CHARS = int(os.environ.get("SPINDLE_UNSPOOL_HEAD_CHARS", "12000"))
+UNSPOOL_TAIL_CHARS = int(os.environ.get("SPINDLE_UNSPOOL_TAIL_CHARS", "12000"))
+
 # Timeout for pending spools that never got a PID (seconds)
 PENDING_SPAWN_TIMEOUT = 60
 
@@ -2073,6 +2083,42 @@ async def spin(
     return result
 
 
+def _budget_result(text: str, spool_id: str) -> str:
+    """Truncate very long results to head+tail with a breadcrumb.
+
+    Returns text unchanged if under UNSPOOL_MAX_CHARS. Otherwise returns the
+    first UNSPOOL_HEAD_CHARS and last UNSPOOL_TAIL_CHARS joined by a marker that
+    tells the caller how to retrieve the rest. The full text remains in the
+    spool JSON; this only shapes the default unspool read.
+    """
+    if len(text) <= UNSPOOL_MAX_CHARS:
+        return text
+
+    # Guard TAIL=0: text[-0:] is the whole string, not "", which would duplicate
+    # the entire result after the head.
+    head = text[:UNSPOOL_HEAD_CHARS]
+    tail = text[-UNSPOOL_TAIL_CHARS:] if UNSPOOL_TAIL_CHARS else ""
+    # Compute elided from the actual slice lengths (honest even when the windows
+    # overlap or run past the text), not from the raw env constants.
+    elided = len(text) - len(head) - len(tail)
+    crumb = (
+        f"\n\n[... {elided:,} of {len(text):,} chars elided "
+        f"(showing first {len(head):,} and last {len(tail):,}) ...]\n"
+        f"[full:   unspool(\"{spool_id}\", full=True)]\n"
+        f"[page:   unspool(\"{spool_id}\", offset={len(head)}, limit=20000)]\n"
+        f"[file:   spool_export(\"{spool_id}\", format=\"md\", output_path=\"/tmp/{spool_id}.md\")]\n"
+        f"[search: spool_grep(\"<pattern>\", spool_id=\"{spool_id}\")]\n\n"
+    )
+    truncated = head + crumb + tail
+    # Only truncate when it actually saves space. If the windows overlap or the
+    # elided slice is smaller than the breadcrumb (both only reachable via env
+    # misconfig), the "truncated" form would be >= the original - return as-is
+    # rather than emit a longer output with a misleading elided count.
+    if len(truncated) >= len(text):
+        return text
+    return truncated
+
+
 def _unspool_sync(spool_id: str) -> str:
     """Synchronous implementation of unspool - auto-detects harness."""
     # Auto-detect harness from spool metadata
@@ -2116,13 +2162,71 @@ def _unspool_sync(spool_id: str) -> str:
 
 
 @mcp.tool()
-async def unspool(spool_id: str) -> str:
+async def unspool(
+    spool_id: str,
+    full: bool = False,
+    offset: Optional[int] = None,
+    limit: Optional[int] = None,
+) -> str:
     """
     Get the result of a background spin task.
+
+    Very long results (over ~50K chars) are truncated by default to their head
+    and tail with a breadcrumb showing how to pull the rest. Most results are
+    small and return whole.
+
+    Args:
+        spool_id: The spool to read.
+        full: Return the entire result with no truncation.
+        offset: Start returning the result at this character index (paging).
+        limit: Max characters to return when paging (default: to end).
+
+    Example:
+        unspool("abc123")                      # budgeted (head+tail if huge)
+        unspool("abc123", full=True)           # entire result
+        unspool("abc123", offset=12000, limit=20000)  # page a slice
     """
     import asyncio
 
-    return await asyncio.to_thread(_unspool_sync, spool_id)
+    raw = await asyncio.to_thread(_unspool_sync, spool_id)
+
+    # Paging and budgeting only apply to a materialized result. For a spool that
+    # isn't complete, _unspool_sync returns a short status/error sentinel
+    # ("pending", "still running", "failed: ...") - return it verbatim rather
+    # than slicing or head/tail-wrapping a sentinel string.
+    spool = _read_spool(spool_id)
+    if not spool or spool.get("status") != "complete":
+        return raw
+
+    # Results are normally strings, but coerce defensively so paging's slicing
+    # and budgeting's len() never hit a dict/list (parity with spool_grep).
+    if not isinstance(raw, str):
+        raw = json.dumps(raw, indent=2)
+
+    # Paging: return an explicit slice with position markers.
+    if offset is not None or limit is not None:
+        if limit is not None and limit <= 0:
+            return (
+                f"[invalid limit {limit}: must be positive] result is "
+                f'{len(raw):,} chars; page with unspool("{spool_id}", offset=N, '
+                f'limit=M) using M>0, or unspool("{spool_id}", full=True)'
+            )
+        start = min(max(0, offset or 0), len(raw))
+        end = start + limit if limit is not None else len(raw)
+        chunk = raw[start:end]
+        shown_end = min(end, len(raw))
+        header = f"[chars {start:,}-{shown_end:,} of {len(raw):,}]\n"
+        footer = ""
+        if shown_end < len(raw):
+            # Reachable only when limit is not None (a None limit pages to the
+            # end, so shown_end == len(raw) and no footer fires).
+            footer = f'\n[more: unspool("{spool_id}", offset={shown_end}, limit={limit})]'
+        return header + chunk + footer
+
+    if full:
+        return raw
+
+    return _budget_result(raw, spool_id)
 
 
 def _spools_sync() -> str:
@@ -2955,24 +3059,68 @@ async def spool_results(
 
 
 @mcp.tool()
-async def spool_grep(pattern: str) -> str:
+async def spool_grep(pattern: str, spool_id: Optional[str] = None, context: int = 2) -> str:
     """
-    Regex search through all spool results.
+    Regex search through spool results.
+
+    Without spool_id, sweeps all spools and reports which ones match (the match
+    strings plus a count) - good for "which spool mentioned X". With spool_id,
+    searches that one result and returns matching lines with surrounding context
+    - the way to dig into a single huge result without pulling the whole thing.
 
     Args:
-        pattern: Regular expression pattern to search for
+        pattern: Regular expression pattern to search for (case-insensitive).
+        spool_id: Limit the search to one spool and return line-level context.
+        context: Lines of context to show around each match (single-spool mode).
 
     Returns:
-        Matching spool IDs with matched text
+        Cross-spool: matching spool IDs with matched strings.
+        Single-spool: matching lines with context and line numbers.
 
     Example:
-        spool_grep("friction-[0-9]+-[a-z]+")    # find friction IDs in results
-        spool_grep("error|failed|exception")    # find error-related text
+        spool_grep("friction-[0-9]+-[a-z]+")           # which spools mention it
+        spool_grep("error|failed", spool_id="abc123")  # find lines in one result
     """
     try:
         regex = re.compile(pattern, re.IGNORECASE)
     except re.error as e:
         return f"Invalid regex pattern: {e}"
+
+    # Single-spool mode: line-level matches with context.
+    if spool_id:
+        # Finalize first so a just-finished spool reports its result, matching
+        # unspool's behavior.
+        _check_and_finalize_spool(spool_id)
+        spool = _read_spool(spool_id)
+        if not spool:
+            return f"Error: Unknown spool_id '{spool_id}'"
+        result = spool.get("result", "") or ""
+        if isinstance(result, (dict, list)):
+            result = json.dumps(result, indent=2)
+        if not result:
+            return f"No result for spool {spool_id} (status: {spool.get('status')})"
+
+        context = max(0, context)
+        lines = result.splitlines()
+        hit_idxs = [i for i, line in enumerate(lines) if regex.search(line)]
+        if not hit_idxs:
+            return f"No lines in spool {spool_id} matching '{pattern}'"
+
+        # Build context windows, merging overlapping ranges.
+        wanted = set()
+        for i in hit_idxs:
+            for j in range(max(0, i - context), min(len(lines), i + context + 1)):
+                wanted.add(j)
+
+        out = [f"[spool {spool_id} - {len(hit_idxs)} matching line(s) of {len(lines)} total]"]
+        prev = None
+        for j in sorted(wanted):
+            if prev is not None and j != prev + 1:
+                out.append("--")
+            marker = ":" if j in hit_idxs else " "
+            out.append(f"{j + 1}{marker} {lines[j]}")
+            prev = j
+        return "\n".join(out)
 
     all_spools = _list_spools()
     matches = []

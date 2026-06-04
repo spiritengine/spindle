@@ -191,6 +191,30 @@ spin_drop(spool_id)
 spools()
 ```
 
+### Large results
+
+Most results are small and return whole. Very long results (over ~50K chars)
+are truncated by `unspool()` to their head and tail, with a breadcrumb showing
+how to retrieve the rest. The full text always stays in the spool; truncation
+only shapes the default read.
+
+```
+# Default read - budgeted (head + tail if the result is huge)
+unspool(spool_id)
+
+# Get the entire result, no truncation
+unspool(spool_id, full=True)
+
+# Page through a slice
+unspool(spool_id, offset=12000, limit=20000)
+
+# Write the full result to a file (agent-driven, not automatic)
+spool_export(spool_id, format="md", output_path="/tmp/result.md")
+```
+
+Tune the thresholds with `SPINDLE_UNSPOOL_MAX_CHARS` (default 50000),
+`SPINDLE_UNSPOOL_HEAD_CHARS` (12000), and `SPINDLE_UNSPOOL_TAIL_CHARS` (12000).
+
 ### Search and filter
 
 ```
@@ -200,8 +224,11 @@ spool_search("authentication")
 # Filter by status and time
 spool_results(status="error", since="1h")
 
-# Regex search results
+# Regex search across all spool results
 spool_grep("error|failed|exception")
+
+# Dig into one huge result - matching lines with context, no full pull
+spool_grep("error|failed", spool_id="abc123", context=3)
 
 # Get statistics
 spool_stats()
@@ -318,7 +345,7 @@ See [docs/MULTI_HARNESS_GUIDE.md](docs/MULTI_HARNESS_GUIDE.md) and [docs/CODEX_S
 | Tool | Purpose |
 |------|---------|
 | `spin(prompt, permission?, shard?, system_prompt?, working_dir?, allowed_tools?, tags?, model?, timeout?, harness?)` | Spawn agent, return spool_id |
-| `unspool(spool_id)` | Get result (auto-detects harness, non-blocking) |
+| `unspool(spool_id, full?, offset?, limit?)` | Get result (auto-detects harness, non-blocking; truncates huge results to head+tail by default) |
 | `respin(session_id, prompt)` | Continue session (auto-detects harness) |
 
 **spin() parameters:**
@@ -343,7 +370,7 @@ See [docs/MULTI_HARNESS_GUIDE.md](docs/MULTI_HARNESS_GUIDE.md) and [docs/CODEX_S
 | `spin_drop(spool_id)` | Cancel by killing process |
 | `spool_search(query, field?)` | Search prompts/results |
 | `spool_results(status?, since?, limit?)` | Bulk fetch with filters |
-| `spool_grep(pattern)` | Regex search results |
+| `spool_grep(pattern, spool_id?, context?)` | Regex search results; pass spool_id for line-level matches with context in one result |
 | `spool_retry(spool_id)` | Re-run with same params |
 | `spool_peek(spool_id, lines?)` | See partial output while running |
 | `spool_dashboard()` | Overview of running/complete/needs-attention |
@@ -432,6 +459,9 @@ Environment variables:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `SPINDLE_MAX_CONCURRENT` | `15` | Maximum concurrent spools |
+| `SPINDLE_UNSPOOL_MAX_CHARS` | `50000` | Results longer than this are truncated to head+tail by `unspool()` |
+| `SPINDLE_UNSPOOL_HEAD_CHARS` | `12000` | Chars kept from the start of a truncated result |
+| `SPINDLE_UNSPOOL_TAIL_CHARS` | `12000` | Chars kept from the end of a truncated result |
 
 Storage location: `~/.spindle/spools/`
 
