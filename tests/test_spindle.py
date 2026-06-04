@@ -30,6 +30,8 @@ from spindle import (
     _count_running,
     _detect_default_branch,
     _detect_existing_shard,
+    _extract_codex_result,
+    _extract_kimi_result,
     _gemini_respin_sync,
     _gemini_spin_sync,
     _gemini_unspool_sync,
@@ -37,6 +39,7 @@ from spindle import (
     _get_harnesses,
     _get_output_path,
     _get_spool_path,
+    _get_transcript_path,
     _is_pid_alive,
     _is_review_tag,
     _kimi_respin_sync,
@@ -512,6 +515,234 @@ class TestSpoolStorage:
         with patch("spindle.SPINDLE_DIR", spindle_dir):
             _write_spool("test", {"id": "test"})
             assert spindle_dir.exists()
+
+
+class TestCodexResultExtraction:
+    """Codex results should store the agent's prose, not the raw event stream."""
+
+    def _stream(self):
+        # A realistic codex stream: messages plus a huge command-output item.
+        big_output = "LOG LINE\n" * 5000
+        events = [
+            {"type": "thread.started", "thread_id": "thread-abc"},
+            {"type": "turn.started"},
+            {"type": "item.completed", "item": {"id": "i0", "type": "agent_message", "text": "Planning the review."}},
+            {"type": "item.completed", "item": {"id": "i1", "type": "command_execution", "command": "ls", "aggregated_output": big_output}},
+            {"type": "item.completed", "item": {"id": "i2", "type": "agent_message", "text": "Final verdict: clean."}},
+            {"type": "turn.completed", "usage": {"input_tokens": 100, "output_tokens": 20}},
+        ]
+        return "\n".join(json.dumps(e) for e in events), big_output
+
+    def test_extract_joins_agent_messages(self):
+        stream, _ = self._stream()
+        out = _extract_codex_result(stream)
+        assert out == "Planning the review.\n\nFinal verdict: clean."
+
+    def test_extract_excludes_command_output(self):
+        stream, big_output = self._stream()
+        out = _extract_codex_result(stream)
+        assert "LOG LINE" not in out
+        assert len(out) < len(big_output)
+
+    def test_extract_returns_none_without_messages(self):
+        events = [
+            {"type": "thread.started", "thread_id": "t"},
+            {"type": "item.completed", "item": {"type": "command_execution", "aggregated_output": "x"}},
+            {"type": "turn.completed", "usage": {}},
+        ]
+        stream = "\n".join(json.dumps(e) for e in events)
+        assert _extract_codex_result(stream) is None
+
+    def test_extract_empty_and_whitespace_stream(self):
+        assert _extract_codex_result("") is None
+        assert _extract_codex_result("   \n  \n") is None
+
+    def test_extract_tolerates_malformed_and_non_dict_lines(self):
+        # Interleave a non-JSON line, a bare scalar, and a JSON array among
+        # valid events. None should raise; the agent messages still come out.
+        lines = [
+            "not json at all",
+            "42",
+            "[1, 2, 3]",
+            json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "Hello"}}),
+            "true",
+            json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "World"}}),
+        ]
+        out = _extract_codex_result("\n".join(lines))
+        assert out == "Hello\n\nWorld"
+
+    def test_extract_multiple_turns(self):
+        events = [
+            {"type": "turn.started"},
+            {"type": "item.completed", "item": {"type": "agent_message", "text": "Turn one."}},
+            {"type": "turn.completed", "usage": {}},
+            {"type": "turn.started"},
+            {"type": "item.completed", "item": {"type": "agent_message", "text": "Turn two."}},
+            {"type": "turn.completed", "usage": {}},
+        ]
+        stream = "\n".join(json.dumps(e) for e in events)
+        assert _extract_codex_result(stream) == "Turn one.\n\nTurn two."
+
+    def test_finalize_falls_back_to_raw_stream_when_no_messages(self, tmp_path):
+        # No agent_message items, but valid session/cost events and a non-dict
+        # line that must not break session_id extraction.
+        lines = [
+            json.dumps({"type": "thread.started", "thread_id": "thread-xyz"}),
+            "99",  # non-dict line - must be skipped, not abort the loop
+            json.dumps({"type": "item.completed", "item": {"type": "command_execution", "aggregated_output": "OUT"}}),
+            json.dumps({"type": "turn.completed", "usage": {"output_tokens": 7}}),
+        ]
+        stream = "\n".join(lines)
+        spool_id = "codex-fin2"
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool(spool_id, {
+                "id": spool_id,
+                "status": "running",
+                "harness": "codex",
+                "prompt": "x",
+                "pid": 999999999,
+                "created_at": datetime.now().isoformat(),
+            })
+            _get_output_path(spool_id).write_text(stream)
+            assert _check_and_finalize_spool(spool_id) is True
+            spool = _read_spool(spool_id)
+            assert spool["status"] == "complete"
+            # No agent messages -> result falls back to the raw stream
+            assert spool["result"] == stream
+            # session_id and cost still extracted despite the non-dict line
+            assert spool["session_id"] == "thread-xyz"
+            assert spool["cost"]["output_tokens"] == 7
+
+    def test_finalize_stores_prose_keeps_stream_in_transcript(self, tmp_path):
+        stream, big_output = self._stream()
+        spool_id = "codex-fin1"
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool(spool_id, {
+                "id": spool_id,
+                "status": "running",
+                "harness": "codex",
+                "prompt": "review",
+                "pid": 999999999,  # dead → finalize proceeds
+                "created_at": datetime.now().isoformat(),
+            })
+            _get_output_path(spool_id).write_text(stream)
+
+            assert _check_and_finalize_spool(spool_id) is True
+
+            spool = _read_spool(spool_id)
+            assert spool["status"] == "complete"
+            assert spool["result"] == "Planning the review.\n\nFinal verdict: clean."
+            assert "LOG LINE" not in spool["result"]
+            assert spool["session_id"] == "thread-abc"
+            assert spool["cost"]["output_tokens"] == 20
+
+            # Full event stream (including command output) preserved in transcript
+            transcript = _get_transcript_path(spool_id).read_text()
+            assert "LOG LINE" in transcript
+            assert "command_execution" in transcript
+
+
+class TestKimiResultExtraction:
+    """Kimi results should store the assistant's prose, not the raw JSONL stream.
+
+    The stream embeds role:"tool" lines with full file/command output, and the
+    final assistant content is a list (thinking mode) or a plain string
+    (non-thinking, the default). Both must extract cleanly.
+    """
+
+    def test_string_content_non_thinking(self):
+        # The default/non-thinking case the old extractor missed.
+        events = [
+            {"role": "tool", "content": "     1\t# README\n" + ("X" * 19000)},
+            {"role": "assistant", "content": "Spindle is an MCP server."},
+        ]
+        stream = "\n".join(json.dumps(e) for e in events)
+        out = _extract_kimi_result(stream)
+        assert out == "Spindle is an MCP server."
+        assert "X" * 100 not in out  # tool output excluded
+
+    def test_list_content_thinking_skips_think_block(self):
+        events = [
+            {"role": "assistant", "content": [
+                {"type": "think", "text": "internal reasoning"},
+                {"type": "text", "text": "Final answer."},
+            ]},
+        ]
+        out = _extract_kimi_result("\n".join(json.dumps(e) for e in events))
+        assert out == "Final answer."
+        assert "internal reasoning" not in out
+
+    def test_tool_lines_never_picked_up(self):
+        events = [{"role": "tool", "content": "huge file dump"}]
+        assert _extract_kimi_result("\n".join(json.dumps(e) for e in events)) is None
+
+    def test_last_assistant_message_wins(self):
+        events = [
+            {"role": "assistant", "content": "first"},
+            {"role": "tool", "content": "x"},
+            {"role": "assistant", "content": "second"},
+        ]
+        assert _extract_kimi_result("\n".join(json.dumps(e) for e in events)) == "second"
+
+    def test_tolerates_malformed_and_non_dict_lines(self):
+        lines = [
+            "not json",
+            "42",
+            json.dumps({"role": "assistant", "content": "answer"}),
+        ]
+        assert _extract_kimi_result("\n".join(lines)) == "answer"
+
+    def test_empty_returns_none(self):
+        assert _extract_kimi_result("") is None
+
+    def test_finalize_extracts_prose_keeps_stream_in_transcript(self, tmp_path):
+        big_tool = "FILEDUMP\n" * 3000
+        events = [
+            {"role": "tool", "content": big_tool},
+            {"role": "assistant", "content": "The answer is 42."},
+        ]
+        stream = "\n".join(json.dumps(e) for e in events)
+        spool_id = "kimi-fin1"
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool(spool_id, {
+                "id": spool_id,
+                "status": "running",
+                "harness": "kimi",
+                "prompt": "q",
+                "session_id": "kimi-sess",  # kimi sets this at creation
+                "pid": 999999999,
+                "created_at": datetime.now().isoformat(),
+            })
+            _get_output_path(spool_id).write_text(stream)
+            assert _check_and_finalize_spool(spool_id) is True
+            spool = _read_spool(spool_id)
+            assert spool["status"] == "complete"
+            assert spool["result"] == "The answer is 42."
+            assert "FILEDUMP" not in spool["result"]
+            # Full stream (with tool output) preserved in transcript
+            transcript = _get_transcript_path(spool_id).read_text()
+            assert "FILEDUMP" in transcript
+
+    def test_finalize_falls_back_to_raw_when_no_assistant_text(self, tmp_path):
+        stream = "\n".join(json.dumps(e) for e in [
+            {"role": "tool", "content": "only tool output"},
+        ])
+        spool_id = "kimi-fin2"
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool(spool_id, {
+                "id": spool_id,
+                "status": "running",
+                "harness": "kimi",
+                "prompt": "q",
+                "session_id": "s2",
+                "pid": 999999999,
+                "created_at": datetime.now().isoformat(),
+            })
+            _get_output_path(spool_id).write_text(stream)
+            assert _check_and_finalize_spool(spool_id) is True
+            spool = _read_spool(spool_id)
+            assert spool["status"] == "complete"
+            assert spool["result"] == stream  # last-resort fallback
 
 
 class TestProcessUtils:

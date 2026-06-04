@@ -1009,6 +1009,83 @@ def _extract_cc_result(data) -> Optional[dict]:
     return None
 
 
+def _extract_codex_result(stdout: str) -> Optional[str]:
+    """Extract the agent's prose from Codex's newline-delimited JSON stream.
+
+    Codex emits an event per line: agent_message items (the agent's actual text),
+    command_execution items (shell commands plus their full captured output),
+    reasoning, etc. The command output dominates by volume - a typical result is
+    95% command logs - so storing the raw stream as the result floods the caller's
+    context. This pulls just the agent_message texts, joined in order. The full
+    event stream is preserved separately in the transcript file.
+
+    Returns the joined agent messages, or None if none were found (caller should
+    fall back to the raw stdout so nothing is silently dropped).
+    """
+    messages = []
+    for line in stdout.strip().split("\n"):
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        if event.get("type") == "item.completed":
+            item = event.get("item", {})
+            if isinstance(item, dict) and item.get("type") == "agent_message":
+                text = item.get("text", "")
+                if text:
+                    messages.append(text)
+    if not messages:
+        return None
+    return "\n\n".join(messages)
+
+
+def _extract_kimi_result(stdout: str) -> Optional[str]:
+    """Extract the agent's prose from Kimi's stream-json (JSONL) output.
+
+    Kimi emits an event per line. The final answer is in a line with
+    role == "assistant"; its `content` is version/mode-dependent:
+      - thinking mode: a list of items like [{"type":"think"}, {"type":"text"}]
+      - non-thinking mode: a plain string
+    The old extractor only handled the list shape, so non-thinking spools (the
+    default) fell through to storing the raw JSONL - which embeds role == "tool"
+    lines carrying full file/command output, the same bloat Codex had. This
+    handles both shapes and keeps the last assistant message with real text,
+    never role == "tool" lines. The full stream is preserved in the transcript.
+
+    Returns the assistant prose, or None if none was found (caller should fall
+    back to raw stdout as a last resort).
+    """
+    result_text = None
+    for line in stdout.strip().split("\n"):
+        if not line.strip():
+            continue
+        try:
+            data = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(data, dict):
+            continue
+        if data.get("role") != "assistant" or "content" not in data:
+            continue
+        content = data.get("content")
+        if isinstance(content, str):
+            if content.strip():
+                result_text = content
+        elif isinstance(content, list):
+            texts = [
+                item.get("text", "")
+                for item in content
+                if isinstance(item, dict) and item.get("type") == "text" and item.get("text")
+            ]
+            if texts:
+                result_text = "\n".join(texts)
+    return result_text
+
+
 def _is_pid_alive(pid: int) -> bool:
     """Check if a process is still running (not a zombie)."""
     try:
@@ -1182,11 +1259,11 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
                         for line in content.strip().split("\n"):
                             try:
                                 event = json.loads(line)
-                                if event.get("type") == "turn.completed":
-                                    output_complete = True
-                                    break
                             except json.JSONDecodeError:
                                 continue
+                            if isinstance(event, dict) and event.get("type") == "turn.completed":
+                                output_complete = True
+                                break
                     else:
                         # Claude Code / Gemini output
                         data = json.loads(content)
@@ -1238,19 +1315,26 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
             # Parse Codex newline-delimited JSON format
             try:
                 if stdout.strip():
-                    spool["result"] = stdout
+                    # Store the agent's prose as the result, not the full event
+                    # stream (which is mostly captured command output). The raw
+                    # stream is preserved in the transcript. Fall back to stdout
+                    # if no agent messages were found, so nothing is dropped.
+                    extracted = _extract_codex_result(stdout)
+                    spool["result"] = extracted if extracted is not None else stdout
 
                     for line in stdout.strip().split("\n"):
                         try:
                             event = json.loads(line)
-                            if event.get("type") == "thread.started":
-                                spool["session_id"] = event.get("thread_id")
-                            elif event.get("type") == "turn.completed":
-                                usage = event.get("usage", {})
-                                if usage:
-                                    spool["cost"] = usage
                         except json.JSONDecodeError:
                             continue
+                        if not isinstance(event, dict):
+                            continue
+                        if event.get("type") == "thread.started":
+                            spool["session_id"] = event.get("thread_id")
+                        elif event.get("type") == "turn.completed":
+                            usage = event.get("usage", {})
+                            if usage:
+                                spool["cost"] = usage
 
                     spool["status"] = "complete"
                 elif stderr.strip():
@@ -1272,8 +1356,12 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
             if stdout.strip():
                 try:
                     data = json.loads(stdout)
-                    spool["result"] = data.get("response", stdout)
-                    spool["session_id"] = data.get("session_id")
+                    if isinstance(data, dict):
+                        spool["result"] = data.get("response", stdout)
+                        spool["session_id"] = data.get("session_id")
+                    else:
+                        # Valid JSON but not the expected object - keep raw output
+                        spool["result"] = stdout
                     spool["status"] = "complete"
                 except json.JSONDecodeError:
                     spool["result"] = stdout
@@ -1297,40 +1385,16 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
                 spool["error"] = "Process exited with no output"
 
         elif harness_type == "kimi":
-            # Kimi CLI: JSONL output (one JSON per line) to stdout
-            # Final response is in the last line with role:"assistant" and type:"text"
+            # Kimi CLI: JSONL (stream-json) output, one event per line. Store the
+            # assistant's prose, not the raw stream (which embeds role:"tool"
+            # lines carrying full file/command output). The full stream is kept
+            # in the transcript. Fall back to raw stdout only if no assistant
+            # text was found, so nothing is silently dropped.
             if stdout.strip():
-                try:
-                    # Parse JSONL - split by lines and parse each JSON object
-                    lines = stdout.strip().split("\n")
-                    result_text = None
-
-                    # Process lines to find final assistant text response
-                    for line in lines:
-                        if not line.strip():
-                            continue
-                        try:
-                            data = json.loads(line)
-                            if data.get("role") == "assistant" and "content" in data:
-                                # Extract text from content array
-                                for item in data.get("content", []):
-                                    if isinstance(item, dict) and item.get("type") == "text":
-                                        result_text = item.get("text", "")
-                        except json.JSONDecodeError:
-                            continue
-
-                    if result_text:
-                        spool["result"] = result_text
-                        spool["status"] = "complete"
-                        # session_id already set when spool was created
-                    else:
-                        # Fallback to raw output if no text found
-                        spool["result"] = stdout
-                        spool["status"] = "complete"
-                        # session_id already set when spool was created
-                except Exception:
-                    spool["result"] = stdout
-                    spool["status"] = "complete"
+                result_text = _extract_kimi_result(stdout)
+                spool["result"] = result_text if result_text else stdout
+                spool["status"] = "complete"
+                # session_id already set when spool was created
             elif stderr.strip():
                 # Kimi errors might be in stderr
                 spool["status"] = "error"
