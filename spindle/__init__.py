@@ -58,8 +58,14 @@ async def health_check(request: Request) -> JSONResponse:
     )
 
 
-# Storage directory
-SPINDLE_DIR = Path.home() / ".spindle" / "spools"
+# Storage directory. SPINDLE_HOME is honored (like the other config env vars
+# below) so tests can redirect the whole store to a tmp dir before import and
+# never touch the real ~/.spindle, even from an escaped monitor thread.
+SPINDLE_DIR = Path(os.environ.get("SPINDLE_HOME", str(Path.home() / ".spindle"))) / "spools"
+
+# Live subprocess handles keyed by spool_id, populated by _spawn_detached so
+# finalization can capture the child's exit code. Process-local; not persisted.
+_PROC_HANDLES: Dict[str, "subprocess.Popen"] = {}
 
 # Concurrency limit (configurable via env var)
 MAX_CONCURRENT = int(os.environ.get("SPINDLE_MAX_CONCURRENT", "15"))
@@ -800,8 +806,10 @@ def _spool_lock(spool_id: str, blocking: bool = True) -> Generator[bool, None, N
     Yields:
         True if lock acquired, False if non-blocking and lock unavailable.
     """
-    SPINDLE_DIR.mkdir(parents=True, exist_ok=True)
+    # Resolve the lock path once and create its parent, so the lock file and the
+    # directory we create can't diverge if SPINDLE_DIR changes underneath us.
     lock_path = _get_lock_path(spool_id)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
 
     lock_fd = None
     acquired = False
@@ -1318,6 +1326,20 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
             except IOError:
                 pass
 
+        # Capture (and reap) the child's exit code if we still hold its handle.
+        # poll() returns None if the process hasn't actually exited yet (e.g.
+        # output is complete but the CLI lingers); that's fine - exit_code stays
+        # unknown for that case. None when there's no handle (orphan recovery).
+        proc = _PROC_HANDLES.pop(spool_id, None)
+        exit_code = proc.poll() if proc is not None else None
+        if exit_code is not None:
+            spool["exit_code"] = exit_code
+        # Suffix for the "no output" fallbacks so a silent failure reports the
+        # code (distinguishes a kill/exec-failure from a clean but silent exit).
+        no_output = "Process exited with no output" + (
+            f" (exit code {exit_code})" if exit_code is not None else ""
+        )
+
         # Parse result based on harness type
         harness_type = spool.get("harness", "claude-code")
 
@@ -1352,7 +1374,7 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
                     spool["error"] = stderr[:500]
                 else:
                     spool["status"] = "error"
-                    spool["error"] = "Process exited with no output"
+                    spool["error"] = no_output
             except Exception:
                 if stdout.strip():
                     spool["result"] = stdout
@@ -1392,7 +1414,7 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
                     spool["error"] = stderr[:500]
             else:
                 spool["status"] = "error"
-                spool["error"] = "Process exited with no output"
+                spool["error"] = no_output
 
         elif harness_type == "kimi":
             # Kimi CLI: JSONL (stream-json) output, one event per line. Store the
@@ -1411,7 +1433,7 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
                 spool["error"] = stderr[:500]
             else:
                 spool["status"] = "error"
-                spool["error"] = "Process exited with no output"
+                spool["error"] = no_output
 
         else:
             # Claude Code: JSON object or JSON array of events
@@ -1439,7 +1461,7 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
                     spool["error"] = stderr[:500]
                 else:
                     spool["status"] = "error"
-                    spool["error"] = "Process exited with no output"
+                    spool["error"] = no_output
 
         spool["completed_at"] = datetime.now().isoformat()
         _write_spool(spool_id, spool)
@@ -1573,6 +1595,7 @@ def _monitor_spool(spool_id: str) -> None:
                 spool["error"] = f"Timeout after {spool['timeout']}s"
                 spool["completed_at"] = datetime.now().isoformat()
                 _write_spool(spool_id, spool)
+                _PROC_HANDLES.pop(spool_id, None)
                 break
 
         # For respin spools, check for "session not found" error early
@@ -1622,6 +1645,10 @@ def _spawn_detached(spool_id: str, cmd: list, cwd: str, env: Optional[Dict[str, 
             start_new_session=True,  # Detach from parent
         )
 
+    # Keep the handle so finalize can read the exit code (and reap the child
+    # rather than leaving a zombie). Only valid within this server process; an
+    # orphan recovered after a restart simply has no handle and no exit code.
+    _PROC_HANDLES[spool_id] = proc
     return proc.pid
 
 
@@ -2279,6 +2306,7 @@ def _spin_drop_sync(spool_id: str) -> str:
     spool["error"] = "Cancelled by user"
     spool["completed_at"] = datetime.now().isoformat()
     _write_spool(spool_id, spool)
+    _PROC_HANDLES.pop(spool_id, None)
 
     # Clean up output files
     stdout_path = _get_output_path(spool_id)
@@ -2892,6 +2920,7 @@ async def spin_drop(spool_id: str) -> str:
     spool["error"] = "Cancelled by user"
     spool["completed_at"] = datetime.now().isoformat()
     _write_spool(spool_id, spool)
+    _PROC_HANDLES.pop(spool_id, None)
 
     # Clean up output files
     stdout_path = _get_output_path(spool_id)

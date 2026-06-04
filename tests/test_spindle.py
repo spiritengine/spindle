@@ -938,6 +938,71 @@ class TestKimiResultExtraction:
             assert spool["result"] == stream  # last-resort fallback
 
 
+class TestStoreIsolation:
+    """The test store must never resolve to the real ~/.spindle (conftest)."""
+
+    def test_autouse_points_at_per_test_tmp(self, tmp_path):
+        assert spindle.SPINDLE_DIR == tmp_path / "spindle-spools"
+
+    def test_spindle_home_env_is_set(self):
+        assert os.environ.get("SPINDLE_HOME")
+
+    def test_spindle_home_honored_at_import(self, tmp_path):
+        # Genuinely exercise the import-time computation in a fresh process:
+        # SPINDLE_HOME must steer SPINDLE_DIR to <home>/spools.
+        import subprocess
+        import sys
+
+        home = tmp_path / "alt-home"
+        result = subprocess.run(
+            [sys.executable, "-c", "import spindle; print(spindle.SPINDLE_DIR)"],
+            capture_output=True,
+            text=True,
+            env={**os.environ, "SPINDLE_HOME": str(home)},
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == str(home / "spools")
+
+
+class TestExitCodeCapture:
+    """Finalization captures the child's exit code via the process handle."""
+
+    class _FakeProc:
+        def __init__(self, code):
+            self._code = code
+
+        def poll(self):
+            return self._code
+
+    def test_no_output_includes_exit_code(self, tmp_path):
+        sid = "ec1"
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            spindle._PROC_HANDLES[sid] = self._FakeProc(3)
+            _write_spool(sid, {
+                "id": sid, "status": "running", "prompt": "x",
+                "pid": 999999999, "created_at": datetime.now().isoformat(),
+            })
+            assert _check_and_finalize_spool(sid) is True
+            spool = _read_spool(sid)
+            assert spool["status"] == "error"
+            assert spool["exit_code"] == 3
+            assert "exit code 3" in spool["error"]
+            assert sid not in spindle._PROC_HANDLES  # handle reaped/popped
+
+    def test_no_output_without_handle_omits_code(self, tmp_path):
+        sid = "ec2"
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool(sid, {
+                "id": sid, "status": "running", "prompt": "x",
+                "pid": 999999999, "created_at": datetime.now().isoformat(),
+            })
+            assert _check_and_finalize_spool(sid) is True
+            spool = _read_spool(sid)
+            assert spool["status"] == "error"
+            assert spool["error"] == "Process exited with no output"
+            assert "exit_code" not in spool
+
+
 class TestProcessUtils:
     """Test process utility functions."""
 
