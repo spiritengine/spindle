@@ -5579,7 +5579,9 @@ def main():
         if not args.force:
             active = _count_running()
             if active:
-                print(f"Draining: waiting for {active} spool(s) to finish (--force to restart now)...")
+                # flush: this is the last output before a potentially long block,
+                # and stdout is block-buffered when redirected (not a tty).
+                print(f"Draining: waiting for {active} spool(s) to finish (--force to restart now)...", flush=True)
             _wait_until_idle()
         proc = subprocess.run(["systemctl", "--user", "restart", "spindle"], capture_output=True, text=True)
         if proc.returncode == 0:
