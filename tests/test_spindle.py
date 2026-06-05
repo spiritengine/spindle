@@ -1003,6 +1003,116 @@ class TestExitCodeCapture:
             assert "exit_code" not in spool
 
 
+class TestReloadDrain:
+    """spindle_reload drains the queue by default; force=True restarts now."""
+
+    @staticmethod
+    def _fake_systemctl(restart_evt, present=True, active=True):
+        def run(cmd, *a, **k):
+            m = MagicMock()
+            m.returncode = 0
+            if "list-unit-files" in cmd:
+                m.stdout = "spindle.service enabled" if present else ""
+            elif "is-active" in cmd:
+                m.returncode = 0 if active else 3
+            elif "restart" in cmd or "start" in cmd:
+                restart_evt.set()
+            return m
+        return run
+
+    def test_missing_service_errors(self):
+        import threading as _t
+        evt = _t.Event()
+        with patch("spindle.subprocess.run", self._fake_systemctl(evt, present=False)):
+            out = asyncio.run(spindle.spindle_reload.fn())
+        assert "not found" in out
+        assert not evt.is_set()
+
+    def test_force_restarts_immediately(self):
+        import threading as _t
+        evt = _t.Event()
+        with patch("spindle.subprocess.run", self._fake_systemctl(evt)), \
+                patch("spindle.time.sleep", lambda *_: None):
+            out = asyncio.run(spindle.spindle_reload.fn(force=True))
+            assert "force" in out.lower()
+            assert evt.wait(2), "force should restart without draining"
+
+    def test_default_idle_restarts(self):
+        # Empty store -> queue already idle -> restarts promptly.
+        import threading as _t
+        evt = _t.Event()
+        with patch("spindle.subprocess.run", self._fake_systemctl(evt)), \
+                patch("spindle.time.sleep", lambda *_: None):
+            out = asyncio.run(spindle.spindle_reload.fn())
+            assert "No spools active" in out
+            assert evt.wait(2)
+
+    def test_default_active_reports_draining_then_restarts(self):
+        import threading as _t
+        evt = _t.Event()
+        with patch("spindle.subprocess.run", self._fake_systemctl(evt)), \
+                patch("spindle.time.sleep", lambda *_: None), \
+                patch("spindle._count_running", return_value=2), \
+                patch("spindle._wait_until_idle", lambda *a, **k: None):
+            out = asyncio.run(spindle.spindle_reload.fn())
+            assert "Draining: 2 spool(s)" in out
+            assert evt.wait(2), "should restart after draining"
+
+    def test_reload_already_pending_does_not_stack(self):
+        import threading as _t
+        evt = _t.Event()
+        spindle._reload_pending = True
+        try:
+            with patch("spindle.subprocess.run", self._fake_systemctl(evt)), \
+                    patch("spindle._count_running", return_value=1):
+                out = asyncio.run(spindle.spindle_reload.fn())
+            assert "already pending" in out
+            assert not evt.is_set()
+        finally:
+            spindle._reload_pending = False
+
+
+class TestWaitUntilIdle:
+    """_wait_until_idle / _spools_idle drain semantics."""
+
+    def test_wait_loops_until_idle(self):
+        with patch("spindle._spools_idle", side_effect=[False, False, True]) as si, \
+                patch("spindle.time.sleep") as sl:
+            spindle._wait_until_idle(poll_interval=0.01)
+        assert si.call_count == 3
+        assert sl.call_count == 2  # slept after each non-idle check
+
+    def test_spools_idle_finalizes_dead_running_spool(self, tmp_path):
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool("d1", {
+                "id": "d1", "status": "running", "prompt": "x",
+                "pid": 999999999, "created_at": datetime.now().isoformat(),
+            })
+            # dead pid, no output -> finalize flips it off "running" -> idle
+            assert spindle._spools_idle() is True
+            assert _read_spool("d1")["status"] != "running"
+
+    def test_spools_idle_false_when_pending(self, tmp_path):
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool("d2", {
+                "id": "d2", "status": "pending", "prompt": "x",
+                "created_at": datetime.now().isoformat(),
+            })
+            assert spindle._spools_idle() is False
+
+    def test_spools_idle_clears_stuck_pending(self, tmp_path):
+        # A pending spool that never got a PID and aged past the spawn timeout
+        # must not wedge the drain - _recover_orphans times it out.
+        old = (datetime.now() - timedelta(seconds=spindle.PENDING_SPAWN_TIMEOUT + 10)).isoformat()
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool("d3", {
+                "id": "d3", "status": "pending", "prompt": "x",
+                "pid": None, "created_at": old,
+            })
+            assert spindle._spools_idle() is True
+            assert _read_spool("d3")["status"] == "error"
+
+
 class TestProcessUtils:
     """Test process utility functions."""
 

@@ -62,6 +62,7 @@ def _isolate_spindle_store(tmp_path, monkeypatch):
     # Start each test with an empty process-handle registry so a handle written
     # by one test can never bleed into the next.
     spindle._PROC_HANDLES.clear()
+    spindle._reload_pending = False
 
     # Don't let *_spin_sync spawn a real background monitor thread: with the
     # subprocess mocked there's nothing to monitor, and a daemon thread that

@@ -67,6 +67,13 @@ SPINDLE_DIR = Path(os.environ.get("SPINDLE_HOME", str(Path.home() / ".spindle"))
 # finalization can capture the child's exit code. Process-local; not persisted.
 _PROC_HANDLES: Dict[str, "subprocess.Popen"] = {}
 
+# Set while a drain-then-restart is queued (spindle_reload without force), so a
+# second reload call doesn't stack another waiter. Process-local. The check-then-
+# set in spindle_reload is race-free only because the tool has no await between
+# reading and setting this; keep it that way (don't make the systemctl calls
+# awaitable) or two waiters could be spawned.
+_reload_pending = False
+
 # Concurrency limit (configurable via env var)
 MAX_CONCURRENT = int(os.environ.get("SPINDLE_MAX_CONCURRENT", "15"))
 
@@ -85,6 +92,9 @@ PENDING_SPAWN_TIMEOUT = 60
 
 # Poll interval for monitoring detached processes
 MONITOR_POLL_INTERVAL = 2  # seconds
+
+# Poll interval for draining the queue before a reload (spindle_reload)
+RELOAD_DRAIN_POLL_INTERVAL = 5  # seconds
 
 # Tags that mark a spool as a review/fell pass. Review spools get a soft default
 # timeout (DEFAULT_REVIEW_TIMEOUT) when the caller didn't pass an explicit one.
@@ -908,6 +918,23 @@ def _count_running() -> int:
     This prevents TOCTOU race in concurrency limit enforcement.
     """
     return sum(1 for s in _list_spools() if s.get("status") in ("running", "pending"))
+
+
+def _spools_idle() -> bool:
+    """Finalize any finished-but-unmarked spools, then report whether the queue
+    is empty (no running or pending spools). Uses _recover_orphans so that both
+    a dead-but-unmarked running spool and a stuck pending one (silent spawn
+    failure, cleared after PENDING_SPAWN_TIMEOUT) are cleaned - otherwise either
+    could hold the queue open and wedge a drain forever."""
+    _recover_orphans()
+    return _count_running() == 0
+
+
+def _wait_until_idle(poll_interval: float = RELOAD_DRAIN_POLL_INTERVAL) -> None:
+    """Block until no spools are running or pending. New spins are allowed during
+    the wait, so this returns at the next moment the queue happens to be empty."""
+    while not _spools_idle():
+        time.sleep(poll_interval)
 
 
 def _try_reserve_slot_and_create(spool_id: str, initial_status: str = "pending") -> tuple[bool, Optional[str]]:
@@ -5333,15 +5360,27 @@ def _kimi_unspool_sync(spool_id: str) -> str:
 
 
 @mcp.tool()
-async def spindle_reload() -> str:
+async def spindle_reload(force: bool = False) -> str:
     """
     Restart spindle to pick up code changes.
 
-    Uses systemctl --user restart spindle. Requires spindle systemd service.
+    By default this drains first: it returns immediately and a background thread
+    waits until no spools are running or pending, then restarts - so in-flight
+    agents finish cleanly instead of being orphaned. New spins are still accepted
+    while draining; the restart simply happens at the next moment the queue is
+    empty (which is the point - let normal work proceed and reload when it can).
+
+    force=True restarts immediately without waiting, which may interrupt in-flight
+    spools and leave them to orphan recovery on the next boot. This is the old
+    behavior.
+
+    Uses systemctl --user restart spindle. Requires the spindle systemd service.
 
     Returns:
         Status message
     """
+    global _reload_pending
+
     # Check if systemd service exists (even if not running)
     result = subprocess.run(
         ["systemctl", "--user", "list-unit-files", "spindle.service"], capture_output=True, text=True
@@ -5353,17 +5392,48 @@ async def spindle_reload() -> str:
     # Check if currently active
     is_active = subprocess.run(["systemctl", "--user", "is-active", "spindle"], capture_output=True).returncode == 0
 
-    def delayed_restart():
-        time.sleep(0.5)  # Give time for response to be sent
-        if is_active:
-            subprocess.run(["systemctl", "--user", "restart", "spindle"])
-        else:
-            subprocess.run(["systemctl", "--user", "start", "spindle"])
+    def _do_restart():
+        action = "restart" if is_active else "start"
+        # We've already returned to the caller, so surface a failed restart to
+        # the server log rather than letting it vanish in the daemon thread.
+        proc = subprocess.run(["systemctl", "--user", action, "spindle"], capture_output=True, text=True)
+        if proc.returncode != 0:
+            print(
+                f"[spindle] reload {action} failed (exit {proc.returncode}): {proc.stderr.strip()}",
+                file=sys.stderr,
+            )
 
-    restart_thread = threading.Thread(target=delayed_restart, daemon=True)
-    restart_thread.start()
+    if force:
+        def immediate():
+            time.sleep(0.5)  # Give time for response to be sent
+            _do_restart()
 
-    return "Restarting via systemd..." if is_active else "Starting via systemd..."
+        threading.Thread(target=immediate, daemon=True).start()
+        return "Restarting now via systemd (force)..." if is_active else "Starting via systemd..."
+
+    if _reload_pending:
+        return f"Reload already pending; will restart when idle ({_count_running()} spool(s) active)."
+
+    _reload_pending = True
+
+    def drain_and_restart():
+        global _reload_pending
+        try:
+            _wait_until_idle()
+            time.sleep(0.5)  # Give time for response to be sent
+            _do_restart()
+        finally:
+            _reload_pending = False
+
+    threading.Thread(target=drain_and_restart, daemon=True).start()
+
+    active = _count_running()
+    if active == 0:
+        return "No spools active; restarting via systemd..." if is_active else "Starting via systemd..."
+    return (
+        f"Draining: {active} spool(s) active. Will restart via systemd when the queue is empty. "
+        "Use force=True to restart now."
+    )
 
 
 def main():
@@ -5385,6 +5455,11 @@ def main():
 
     # reload command - restart spindle
     _reload_parser = subparsers.add_parser("reload", help="Reload spindle to pick up code changes")
+    _reload_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Restart immediately instead of draining (may interrupt in-flight spools)",
+    )
 
     # status command
     _status_parser = subparsers.add_parser("status", help="Check spindle status")
@@ -5495,12 +5570,23 @@ def main():
         result = subprocess.run(
             ["systemctl", "--user", "list-unit-files", "spindle.service"], capture_output=True, text=True
         )
-        if "spindle.service" in result.stdout:
-            subprocess.run(["systemctl", "--user", "restart", "spindle"])
-            print("Restarted via systemd")
-        else:
+        if "spindle.service" not in result.stdout:
             print("No systemd service. Kill and run: spindle start")
-        sys.exit(0)
+            sys.exit(0)
+        # Drain by default: wait for the queue to empty so in-flight spools
+        # aren't interrupted. --force skips the wait. New spins are still
+        # allowed during the wait, so this restarts at the next idle moment.
+        if not args.force:
+            active = _count_running()
+            if active:
+                print(f"Draining: waiting for {active} spool(s) to finish (--force to restart now)...")
+            _wait_until_idle()
+        proc = subprocess.run(["systemctl", "--user", "restart", "spindle"], capture_output=True, text=True)
+        if proc.returncode == 0:
+            print("Restarted via systemd")
+            sys.exit(0)
+        print(f"Restart failed (exit {proc.returncode}): {proc.stderr.strip()}", file=sys.stderr)
+        sys.exit(1)
 
     elif args.command == "status":
         result = subprocess.run(["curl", "-s", "http://127.0.0.1:8002/health"], capture_output=True, text=True)

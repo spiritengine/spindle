@@ -411,7 +411,8 @@ Spools persist to `~/.spindle/spools/{spool_id}.json`:
 ```bash
 spindle install-service  # Install background service (Linux/macOS)
 spindle start            # Start via systemd (or background if no service)
-spindle reload           # Restart via systemd to pick up code changes
+spindle reload           # Drain (wait for spools to finish), then restart
+spindle reload --force    # Restart immediately, interrupting in-flight spools
 spindle status           # Check if running (hits /health endpoint)
 spindle serve --http     # Run MCP server directly
 ```
@@ -450,7 +451,12 @@ In WSL2 with systemd enabled, `spindle install-service` works like native Linux.
 
 ### Hot Reload (MCP tool)
 
-From within Claude Code, call `spindle_reload()` to restart the server and pick up code changes.
+From within Claude Code, call `spindle_reload()` to pick up code changes. By
+default it drains first: it returns immediately and restarts in the background
+once no spools are running or pending, so in-flight agents finish cleanly. New
+spins are still accepted while draining; the restart happens at the next idle
+moment. Pass `force=True` to restart immediately (the old behavior), which may
+interrupt in-flight spools and leave them to orphan recovery on the next boot.
 
 ## Configuration
 
