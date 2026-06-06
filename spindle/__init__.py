@@ -1263,6 +1263,22 @@ def _cleanup_old_spools() -> None:
         except Exception:
             pass
 
+    # Sweep orphaned lock files. _spool_lock never unlinks its file, and spools
+    # removed via other paths (shard cleanup, etc.) leave their lock behind; the
+    # json loop above only covers spools it removes itself, so without this the
+    # locks accumulate without bound. Skip the shared .concurrency.lock and any
+    # lock still fresh, to avoid racing a spool whose json isn't written yet.
+    for lock_path in SPINDLE_DIR.glob("*.lock"):
+        if lock_path.name.startswith("."):
+            continue  # e.g. .concurrency.lock - a shared lock, not a per-spool one
+        if (SPINDLE_DIR / f"{lock_path.stem}.json").exists():
+            continue  # still has a spool record
+        try:
+            if datetime.fromtimestamp(lock_path.stat().st_mtime) < cutoff:
+                lock_path.unlink()
+        except (OSError, ValueError):
+            pass
+
 
 def _check_and_finalize_spool(spool_id: str) -> bool:
     """

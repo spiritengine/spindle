@@ -1113,6 +1113,41 @@ class TestWaitUntilIdle:
             assert _read_spool("d3")["status"] == "error"
 
 
+class TestOrphanedLockSweep:
+    """_cleanup_old_spools sweeps orphaned per-spool locks but spares the rest."""
+
+    def test_sweeps_only_old_orphaned_per_spool_locks(self, tmp_path):
+        import time as _time
+
+        old = _time.time() - 25 * 3600  # past the 24h cutoff
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            orphan = tmp_path / "deadspool.lock"
+            orphan.write_text("")
+            os.utime(orphan, (old, old))
+
+            fresh = tmp_path / "newspool.lock"  # orphaned but recent -> keep (race)
+            fresh.write_text("")
+
+            conc = tmp_path / ".concurrency.lock"  # shared lock -> keep (dotfile)
+            conc.write_text("")
+            os.utime(conc, (old, old))
+
+            live = tmp_path / "alive.lock"  # has a live json -> keep
+            live.write_text("")
+            os.utime(live, (old, old))
+            _write_spool("alive", {
+                "id": "alive", "status": "complete",
+                "created_at": datetime.now().isoformat(),
+            })
+
+            spindle._cleanup_old_spools()
+
+            assert not orphan.exists()  # swept
+            assert fresh.exists()       # too fresh to be safe
+            assert conc.exists()        # shared concurrency lock spared
+            assert live.exists()        # spool json still present
+
+
 class TestProcessUtils:
     """Test process utility functions."""
 
