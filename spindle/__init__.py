@@ -2022,7 +2022,7 @@ async def spin(
         working_dir: Directory for the agent to work in (defaults to current)
         allowed_tools: Override permission profile with explicit tool list
         tags: Comma-separated tags for organizing spools (e.g. "batch-1,triage")
-        model: Model to use - for Claude: "haiku", "sonnet", "opus";
+        model: Model to use - for Claude: "haiku", "sonnet", "opus", "fable" (claude-fable-5, access ends 2026-06-22), or versioned aliases like "opus-4.8";
                for Gemini: "flash", "pro", or full model names like "gemini-2.5-pro";
                for Kimi: "thinking" (k2.6 in thinking mode), "k2.6", "k2.5", "latest", or full model names.
                Use spin_harnesses() to see all available models.
@@ -4695,6 +4695,11 @@ CLAUDE_MODEL_ALIASES = {
     "sonnet-4.6": "claude-sonnet-4-6",
     "opus-4.6": "claude-opus-4-6",
     "opus-4.7": "claude-opus-4-7",
+    "opus-4.8": "claude-opus-4-8",
+    # Fable access sunsets 2026-06-22; after that the claude CLI will reject
+    # the model (the alias itself stays harmless — unknowns pass through).
+    "fable": "claude-fable-5",
+    "fable-5": "claude-fable-5",
     # Opus 4.7 already has 1M context at standard pricing; the [1m] suffix
     # is preserved for explicit-context callers and back-compat.
     "opus-4.7-1m": "claude-opus-4-7[1m]",
@@ -5510,7 +5515,7 @@ def main():
     spin_parser.add_argument(
         "--model",
         "-m",
-        help="Model to use (e.g. haiku/sonnet/opus for Claude, flash/pro for Gemini, thinking/k2.6/k2.5 for Kimi)",
+        help="Model to use (e.g. haiku/sonnet/opus/fable for Claude, flash/pro for Gemini, thinking/k2.6/k2.5 for Kimi)",
     )
     spin_parser.add_argument("--harness", help="Harness to use: claude-code (default), codex, gemini, or kimi")
     spin_parser.add_argument("--timeout", "-t", type=int, help="Kill spool after N seconds")

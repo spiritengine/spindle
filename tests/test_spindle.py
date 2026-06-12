@@ -17,6 +17,7 @@ import spindle
 
 # Import the module to test
 from spindle import (
+    CLAUDE_MODEL_ALIASES,
     DEFAULT_REVIEW_TIMEOUT,
     GEMINI_MODEL_ALIASES,
     KIMI_DEFAULT_MODEL,
@@ -2537,6 +2538,24 @@ class TestSpinHarnesses:
         """Claude Code should at least list the plain haiku/sonnet/opus aliases."""
         result = _get_harnesses()
         assert {"haiku", "sonnet", "opus"} <= set(result["claude-code"]["models"].keys())
+
+    def test_claude_code_models_match_aliases(self):
+        """Claude Code models in harnesses should match CLAUDE_MODEL_ALIASES."""
+        result = _get_harnesses()
+        assert result["claude-code"]["models"] == CLAUDE_MODEL_ALIASES
+
+    def test_claude_code_advertises_frontier_aliases(self):
+        """spin_harnesses should advertise the fable and opus-4.8 aliases."""
+        result = _get_harnesses()
+        models = result["claude-code"]["models"]
+        assert models["fable"] == "claude-fable-5"
+        assert models["fable-5"] == "claude-fable-5"
+        assert models["opus-4.8"] == "claude-opus-4-8"
+
+    def test_claude_code_default_model_unchanged(self):
+        """Adding frontier aliases must not change the claude-code default."""
+        result = _get_harnesses()
+        assert result["claude-code"]["default_model"] == "sonnet"
 
     def test_unknown_harness_returns_error(self):
         """spin() should return error JSON for unknown harness names."""
