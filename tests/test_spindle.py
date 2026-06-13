@@ -37,6 +37,7 @@ from spindle import (
     _count_running,
     _detect_default_branch,
     _detect_existing_shard,
+    _discover_profiles,
     _extract_codex_result,
     _extract_kimi_result,
     _format_spool_failure,
@@ -47,18 +48,24 @@ from spindle import (
     _get_output_path,
     _get_spool_path,
     _get_transcript_path,
+    _handle_expired_session,
     _is_pid_alive,
     _is_review_tag,
     _kimi_respin_sync,
     _kimi_spin_sync,
     _kimi_unspool_sync,
     _list_spools,
+    _load_profile,
     _monitor_spool,
+    _op_inject,
     _parse_duration,
+    _profile_spawn_env,
     _read_spool,
     _recover_orphans,
     _refusal_category,
     _resolve_permission,
+    _resolve_profile_overrides,
+    _resolve_profile_value,
     _resolve_spool_for_respin,
     _respin_sync,
     _spawn_shard,
@@ -73,6 +80,7 @@ from spindle import (
     spin,
     spool_info,
     spool_peek,
+    spool_retry,
 )
 
 
@@ -1995,17 +2003,17 @@ class TestConcurrencyLimit:
             failure_count = len(results["failure"])
 
             # All threads should have completed
-            assert success_count + failure_count == num_threads, (
-                f"Expected {num_threads} results, got {success_count + failure_count}"
-            )
+            assert (
+                success_count + failure_count == num_threads
+            ), f"Expected {num_threads} results, got {success_count + failure_count}"
 
             # We started with initial_running, so only (MAX_CONCURRENT - initial_running)
             # new slots should be available
             max_new_slots = MAX_CONCURRENT - initial_running
 
-            assert success_count == max_new_slots, (
-                f"Expected exactly {max_new_slots} successful reservations, got {success_count}"
-            )
+            assert (
+                success_count == max_new_slots
+            ), f"Expected exactly {max_new_slots} successful reservations, got {success_count}"
 
             # The rest should have been rejected
             expected_failures = num_threads - max_new_slots
@@ -2014,9 +2022,9 @@ class TestConcurrencyLimit:
             # Verify we never exceeded the limit by checking total running
             all_spools = _list_spools()
             running_count = sum(1 for s in all_spools if s.get("status") == "running")
-            assert running_count == MAX_CONCURRENT, (
-                f"Expected exactly {MAX_CONCURRENT} running spools, got {running_count}"
-            )
+            assert (
+                running_count == MAX_CONCURRENT
+            ), f"Expected exactly {MAX_CONCURRENT} running spools, got {running_count}"
 
     def test_lock_file_created(self, tmp_path):
         """Lock file should be created during reservation."""
@@ -2173,9 +2181,9 @@ class TestWorktreeNameUniqueness:
         assert shard1_id != shard2_id, f"Shard IDs collided: {shard1_id} == {shard2_id}"
 
         # Branch names should also be different
-        assert shard1["branch_name"] != shard2["branch_name"], (
-            f"Branch names collided: {shard1['branch_name']} == {shard2['branch_name']}"
-        )
+        assert (
+            shard1["branch_name"] != shard2["branch_name"]
+        ), f"Branch names collided: {shard1['branch_name']} == {shard2['branch_name']}"
 
         # Verify both worktrees exist
         assert Path(shard1["worktree_path"]).exists(), f"Worktree 1 doesn't exist: {shard1['worktree_path']}"
@@ -3392,15 +3400,15 @@ class TestDetectExistingShard:
                             )
 
         # _spawn_shard must NOT have been called — the existing shard was reused
-        assert len(spawned) == 0, (
-            f"_spawn_shard was called {len(spawned)} time(s); should be 0 when working_dir is already a shard worktree"
-        )
+        assert (
+            len(spawned) == 0
+        ), f"_spawn_shard was called {len(spawned)} time(s); should be 0 when working_dir is already a shard worktree"
 
         # The agent's cwd should be the existing worktree, not a new one
         assert len(captured_cwd) == 1
-        assert str(Path(wt_path).resolve()) == str(Path(captured_cwd[0]).resolve()), (
-            f"Agent cwd {captured_cwd[0]!r} does not match existing shard {wt_path!r}"
-        )
+        assert str(Path(wt_path).resolve()) == str(
+            Path(captured_cwd[0]).resolve()
+        ), f"Agent cwd {captured_cwd[0]!r} does not match existing shard {wt_path!r}"
 
     def test_returns_none_for_worktrees_in_path_but_not_under_repo_root(self, tmp_path):
         """
@@ -3533,9 +3541,9 @@ class TestDetectExistingShard:
 
         # Agent lands in the subdirectory the user pointed at
         assert len(captured_cwd) == 1
-        assert Path(captured_cwd[0]).resolve() == subdir.resolve(), (
-            f"Agent cwd {captured_cwd[0]!r} should be the requested subdir {str(subdir)!r}"
-        )
+        assert (
+            Path(captured_cwd[0]).resolve() == subdir.resolve()
+        ), f"Agent cwd {captured_cwd[0]!r} should be the requested subdir {str(subdir)!r}"
 
         # shard_info['worktree_path'] is the worktree ROOT, not the subdir
         assert spool is not None
@@ -3548,9 +3556,9 @@ class TestDetectExistingShard:
 
         # Verify merge/drop's main_repo derivation (worktrees/<name> -> repo)
         main_repo = Path(shard_info["worktree_path"]).parent.parent
-        assert main_repo.resolve() == Path(repo).resolve(), (
-            f"main_repo derived via .parent.parent {main_repo!r} must match the actual repo root {repo!r}"
-        )
+        assert (
+            main_repo.resolve() == Path(repo).resolve()
+        ), f"main_repo derived via .parent.parent {main_repo!r} must match the actual repo root {repo!r}"
 
     def test_codex_spin_sync_reuses_existing_shard(self, tmp_path):
         """
@@ -3596,9 +3604,9 @@ class TestDetectExistingShard:
             f"shard worktree"
         )
         assert len(captured_cwd) == 1
-        assert str(Path(wt_path).resolve()) == str(Path(captured_cwd[0]).resolve()), (
-            f"Codex agent cwd {captured_cwd[0]!r} does not match existing shard {wt_path!r}"
-        )
+        assert str(Path(wt_path).resolve()) == str(
+            Path(captured_cwd[0]).resolve()
+        ), f"Codex agent cwd {captured_cwd[0]!r} does not match existing shard {wt_path!r}"
 
 
 class TestSpinSyncShardCleanupOnFailure:
@@ -3983,9 +3991,9 @@ class TestCodexRespinPreservesGitAccess:
         resolved = {str(Path(d).resolve()) for d in add_dirs}
 
         main_git = (repo / ".git").resolve()
-        assert str(main_git) in resolved, (
-            f"codex respin must --add-dir the main repo's .git ({main_git}); got {add_dirs!r}"
-        )
+        assert (
+            str(main_git) in resolved
+        ), f"codex respin must --add-dir the main repo's .git ({main_git}); got {add_dirs!r}"
         assert str(wt_path.resolve()) in resolved, (
             f"codex respin must --add-dir the worktree root ({wt_path}) so a "
             f"subdirectory cwd retains write access to sibling files; got {add_dirs!r}"
@@ -3996,14 +4004,14 @@ class TestCodexRespinPreservesGitAccess:
         resume_idx = cmd.index("resume")
         add_dir_indices = [i for i, tok in enumerate(cmd) if tok == "--add-dir"]
         for idx in add_dir_indices:
-            assert idx < resume_idx, (
-                f"--add-dir at index {idx} must come before `resume` at index {resume_idx}; cmd={cmd!r}"
-            )
+            assert (
+                idx < resume_idx
+            ), f"--add-dir at index {idx} must come before `resume` at index {resume_idx}; cmd={cmd!r}"
         cd_idx = next((i for i, tok in enumerate(cmd) if tok == "--cd"), None)
         assert cd_idx is not None, "--cd must be present in codex respin command"
-        assert cd_idx < resume_idx, (
-            f"--cd at index {cd_idx} must come before `resume` at index {resume_idx}; cmd={cmd!r}"
-        )
+        assert (
+            cd_idx < resume_idx
+        ), f"--cd at index {cd_idx} must come before `resume` at index {resume_idx}; cmd={cmd!r}"
 
     def test_codex_respin_sets_cd_to_shard_worktree(self, tmp_path):
         session_id = "codex-session-cd"
@@ -4313,18 +4321,18 @@ class TestDetectDefaultBranch:
             capture_output=True,
             text=True,
         ).stdout.strip()
-        assert head_sha == main_sha, (
-            f"Shard HEAD {head_sha} does not match main {main_sha} — shard was not forked from main"
-        )
+        assert (
+            head_sha == main_sha
+        ), f"Shard HEAD {head_sha} does not match main {main_sha} — shard was not forked from main"
 
         # Spool record should have base_branch persisted as 'main' so retries
         # don't fall back to literal 'master'.
         spool_path = spool_dir / f"{spool_id}.json"
         assert spool_path.exists()
         spool = json.loads(spool_path.read_text())
-        assert spool.get("base_branch") == "main", (
-            f"Expected spool.base_branch='main', got {spool.get('base_branch')!r}"
-        )
+        assert (
+            spool.get("base_branch") == "main"
+        ), f"Expected spool.base_branch='main', got {spool.get('base_branch')!r}"
 
 
 class TestShardFailLoud:
@@ -5039,9 +5047,9 @@ class TestRespinHandleResolution:
         assert len(captured_cmd) == 1
         cmd = captured_cmd[0]
         assert "--resume" in cmd
-        assert cmd[cmd.index("--resume") + 1] == session_id, (
-            f"claude resume must use the resolved session_id {session_id!r}, not the spool_id {spool_id!r}; got {cmd!r}"
-        )
+        assert (
+            cmd[cmd.index("--resume") + 1] == session_id
+        ), f"claude resume must use the resolved session_id {session_id!r}, not the spool_id {spool_id!r}; got {cmd!r}"
 
     def test_respin_running_spool_no_session_distinct_error(self, tmp_path):
         """A running spool whose thread_id hasn't been parsed yet must give
@@ -5465,3 +5473,838 @@ class TestShardWritableBinds:
         assert found_valid, f"Expected valid dir bound in: {cmd!r}"
         assert ghost not in cmd
         assert "relative/bad" not in cmd
+
+
+def _make_profile(root, name, config):
+    """Create <root>/<name>/profile.json with the given config dict."""
+    pdir = root / name
+    pdir.mkdir(parents=True, exist_ok=True)
+    (pdir / "profile.json").write_text(json.dumps(config))
+    return pdir
+
+
+class TestProfiles:
+    """Tests for the lodged-profile feature (base harness + overrides)."""
+
+    @pytest.fixture
+    def profiles_root(self, tmp_path, monkeypatch):
+        """Isolate the canonical profiles root to a per-test tmp dir.
+
+        Also chdir into tmp_path so the cwd-relative ``./profiles`` scan in
+        _profile_roots() resolves to the same path as SPINDLE_PROFILES_DIR and
+        is deduped away. Without this, a test could read a developer's real
+        (gitignored) ./profiles/<name>/ and become nondeterministic.
+        """
+        root = tmp_path / "profiles"
+        root.mkdir()
+        monkeypatch.setattr(spindle, "SPINDLE_PROFILES_DIR", root)
+        monkeypatch.chdir(tmp_path)
+        return root
+
+    # --- discovery ---------------------------------------------------------
+
+    def test_discovery_and_load(self, profiles_root):
+        _make_profile(profiles_root, "alt", {"description": "an alt endpoint", "model": "m1"})
+        profiles = _discover_profiles()
+        assert "alt" in profiles
+        assert profiles["alt"]["description"] == "an alt endpoint"
+        assert profiles["alt"]["_name"] == "alt"
+        assert profiles["alt"]["_source"].endswith("alt/profile.json")
+        assert _load_profile("alt") is not None
+        assert _load_profile("nonexistent") is None
+
+    def test_malformed_profile_skipped(self, profiles_root):
+        _make_profile(profiles_root, "good", {"model": "ok"})
+        bad = profiles_root / "bad"
+        bad.mkdir()
+        (bad / "profile.json").write_text("{ this is not json")
+        # A non-object profile.json is also skipped.
+        arr = profiles_root / "arr"
+        arr.mkdir()
+        (arr / "profile.json").write_text("[1, 2, 3]")
+
+        profiles = _discover_profiles()
+        assert "good" in profiles
+        assert "bad" not in profiles
+        assert "arr" not in profiles
+
+    def test_profile_appears_in_harnesses(self, profiles_root):
+        _make_profile(
+            profiles_root,
+            "alt",
+            {"description": "alt endpoint", "harness": "claude-code", "model": "big"},
+        )
+        harnesses = _get_harnesses()
+        # Built-ins still present.
+        assert {"claude-code", "codex", "gemini", "kimi"} <= set(harnesses.keys())
+        assert "alt" in harnesses
+        entry = harnesses["alt"]
+        assert entry["type"] == "profile"
+        assert entry["base_harness"] == "claude-code"
+        assert entry["default_model"] == "big"
+        assert entry["description"] == "alt endpoint"
+        assert entry["source"].endswith("alt/profile.json")
+
+    # --- value resolution --------------------------------------------------
+
+    def test_resolve_env_var_set(self, monkeypatch):
+        monkeypatch.setenv("MY_TOKEN", "secret-123")
+        assert _resolve_profile_value("${MY_TOKEN}", "p") == "secret-123"
+        assert _resolve_profile_value("prefix-${MY_TOKEN}-suffix", "p") == "prefix-secret-123-suffix"
+
+    def test_resolve_env_var_unset_left_literal(self, monkeypatch):
+        monkeypatch.delenv("DEFINITELY_UNSET_VAR", raising=False)
+        assert _resolve_profile_value("${DEFINITELY_UNSET_VAR}", "p") == "${DEFINITELY_UNSET_VAR}"
+
+    def test_resolve_non_string_passthrough(self):
+        assert _resolve_profile_value(42, "p") == 42
+        assert _resolve_profile_value(None, "p") is None
+
+    def test_op_inject_resolved_with_mock(self, monkeypatch):
+        # strongbox on PATH, returns the resolved secret on stdout.
+        monkeypatch.setattr(spindle.shutil, "which", lambda tool: "/usr/bin/strongbox" if tool == "strongbox" else None)
+
+        calls = {}
+
+        def fake_run(cmd, input=None, capture_output=None, text=None, timeout=None):
+            calls["cmd"] = cmd
+            calls["input"] = input
+            return MagicMock(returncode=0, stdout="resolved-secret", stderr="")
+
+        monkeypatch.setattr(spindle.subprocess, "run", fake_run)
+        out = _resolve_profile_value("op://Private/key/field", "p")
+        assert out == "resolved-secret"
+        assert calls["cmd"] == ["strongbox", "inject"]
+        assert calls["input"] == "op://Private/key/field"
+
+    def test_op_inject_falls_back_to_op(self, monkeypatch):
+        monkeypatch.setattr(spindle.shutil, "which", lambda tool: "/usr/bin/op" if tool == "op" else None)
+
+        def fake_run(cmd, input=None, **kwargs):
+            return MagicMock(returncode=0, stdout="from-op", stderr="")
+
+        monkeypatch.setattr(spindle.subprocess, "run", fake_run)
+        assert _op_inject("op://x/y/z", "p") == "from-op"
+
+    def test_op_inject_no_tool_left_literal(self, monkeypatch):
+        monkeypatch.setattr(spindle.shutil, "which", lambda tool: None)
+        val = "op://Private/key/field"
+        assert _resolve_profile_value(val, "p") == val
+
+    # --- override assembly -------------------------------------------------
+
+    def test_overrides_assemble_env(self, profiles_root, monkeypatch):
+        monkeypatch.setenv("ALT_KEY", "key-abc")
+        _make_profile(
+            profiles_root,
+            "alt",
+            {
+                "harness": "claude-code",
+                "base_url": "https://api.example.com/anthropic",
+                "api_key": "${ALT_KEY}",
+                "env": {"EXTRA_TAG": "tag-1"},
+                "extra_args": ["--verbose"],
+                "model": "big",
+            },
+        )
+        ov = _resolve_profile_overrides(_load_profile("alt"))
+        assert ov["base_harness"] == "claude-code"
+        assert ov["env"]["ANTHROPIC_BASE_URL"] == "https://api.example.com/anthropic"
+        assert ov["env"]["ANTHROPIC_API_KEY"] == "key-abc"
+        assert ov["env"]["EXTRA_TAG"] == "tag-1"
+        # base_url with no config_dir => isolated default, created under the root.
+        cfg = ov["env"]["CLAUDE_CONFIG_DIR"]
+        assert cfg == str(profiles_root / "alt" / "claude-config")
+        assert Path(cfg).is_dir()
+        assert ov["extra_args"] == ["--verbose"]
+        assert ov["model"] == "big"
+
+    def test_same_endpoint_profile_no_config_dir(self, profiles_root):
+        _make_profile(profiles_root, "flagsonly", {"extra_args": ["--verbose"]})
+        ov = _resolve_profile_overrides(_load_profile("flagsonly"))
+        assert "CLAUDE_CONFIG_DIR" not in ov["env"]
+        assert "ANTHROPIC_BASE_URL" not in ov["env"]
+
+    def test_base_url_non_claude_raises(self, profiles_root):
+        _make_profile(profiles_root, "weird", {"harness": "codex", "base_url": "https://x"})
+        with pytest.raises(ValueError) as exc:
+            _resolve_profile_overrides(_load_profile("weird"))
+        assert "base_url" in str(exc.value)
+        assert "claude-code" in str(exc.value)
+
+    def test_non_claude_base_raises(self, profiles_root):
+        _make_profile(profiles_root, "cdx", {"harness": "codex", "model": "5.5"})
+        with pytest.raises(ValueError) as exc:
+            _resolve_profile_overrides(_load_profile("cdx"))
+        assert "codex" in str(exc.value)
+
+    # --- spin() wiring -----------------------------------------------------
+
+    def _spin(self):
+        return spin.fn if hasattr(spin, "fn") else spin
+
+    def test_spin_injects_env_to_spawn(self, profiles_root, tmp_path, monkeypatch):
+        monkeypatch.setenv("ALT_KEY", "key-xyz")
+        _make_profile(
+            profiles_root,
+            "alt",
+            {
+                "harness": "claude-code",
+                "base_url": "https://api.example.com/anthropic",
+                "api_key": "${ALT_KEY}",
+                "env": {"EXTRA_TAG": "tag-2"},
+                "model": "big",
+            },
+        )
+        captured = {}
+
+        def fake_spawn(spool_id, cmd, cwd, env=None):
+            captured["env"] = env
+            captured["cmd"] = cmd
+            return 4321
+
+        with patch("spindle._spawn_detached", side_effect=fake_spawn):
+            with patch("spindle._count_running", return_value=0):
+                spool_id = asyncio.run(self._spin()("do a thing", harness="alt", working_dir=str(tmp_path)))
+
+        env = captured["env"]
+        assert env["ANTHROPIC_BASE_URL"] == "https://api.example.com/anthropic"
+        assert env["ANTHROPIC_API_KEY"] == "key-xyz"
+        assert env["CLAUDE_CONFIG_DIR"] == str(profiles_root / "alt" / "claude-config")
+        assert env["EXTRA_TAG"] == "tag-2"
+        # Default model from the profile flows to --model.
+        assert "--model" in captured["cmd"]
+        assert captured["cmd"][captured["cmd"].index("--model") + 1] == "big"
+
+        # Profile name persisted on the spool.
+        spool = _read_spool(spool_id)
+        assert spool["profile"] == "alt"
+        assert spool["harness"] == "claude-code"
+
+    def test_spin_caller_model_wins(self, profiles_root, tmp_path):
+        _make_profile(profiles_root, "alt", {"model": "big"})
+        captured = {}
+
+        def fake_spawn(spool_id, cmd, cwd, env=None):
+            captured["cmd"] = cmd
+            return 1
+
+        with patch("spindle._spawn_detached", side_effect=fake_spawn):
+            with patch("spindle._count_running", return_value=0):
+                asyncio.run(self._spin()("x", harness="alt", model="opus", working_dir=str(tmp_path)))
+        assert captured["cmd"][captured["cmd"].index("--model") + 1] == "opus"
+
+    def test_spin_profile_model_alias(self, profiles_root, tmp_path):
+        _make_profile(
+            profiles_root,
+            "alt",
+            {"model": "big", "model_aliases": {"fast": "small-model"}},
+        )
+        captured = {}
+
+        def fake_spawn(spool_id, cmd, cwd, env=None):
+            captured["cmd"] = cmd
+            return 1
+
+        with patch("spindle._spawn_detached", side_effect=fake_spawn):
+            with patch("spindle._count_running", return_value=0):
+                asyncio.run(self._spin()("x", harness="alt", model="fast", working_dir=str(tmp_path)))
+        assert captured["cmd"][captured["cmd"].index("--model") + 1] == "small-model"
+
+    def test_spin_appends_extra_args(self, profiles_root, tmp_path):
+        _make_profile(profiles_root, "alt", {"extra_args": ["--verbose"]})
+        captured = {}
+
+        def fake_spawn(spool_id, cmd, cwd, env=None):
+            captured["cmd"] = cmd
+            return 1
+
+        with patch("spindle._spawn_detached", side_effect=fake_spawn):
+            with patch("spindle._count_running", return_value=0):
+                asyncio.run(self._spin()("x", harness="alt", working_dir=str(tmp_path)))
+        assert "--verbose" in captured["cmd"]
+
+    def test_unknown_profile_errors(self, profiles_root, tmp_path):
+        result = asyncio.run(self._spin()("x", harness="ghost-profile", working_dir=str(tmp_path)))
+        parsed = json.loads(result)
+        assert "error" in parsed
+        assert "ghost-profile" in parsed["error"]
+
+    def test_base_url_non_claude_spin_errors(self, profiles_root, tmp_path):
+        _make_profile(profiles_root, "weird", {"harness": "codex", "base_url": "https://x"})
+        result = asyncio.run(self._spin()("x", harness="weird", working_dir=str(tmp_path)))
+        parsed = json.loads(result)
+        assert "error" in parsed
+        assert "base_url" in parsed["error"]
+
+    def test_builtin_wins_collision(self, profiles_root, tmp_path, caplog):
+        # A profile named like a built-in must not shadow it.
+        _make_profile(
+            profiles_root,
+            "claude-code",
+            {"base_url": "https://should-not-be-used.example.com/anthropic", "api_key": "nope"},
+        )
+        captured = {}
+
+        def fake_spawn(spool_id, cmd, cwd, env=None):
+            captured["env"] = env
+            return 1
+
+        import logging
+
+        with caplog.at_level(logging.WARNING):
+            with patch("spindle._spawn_detached", side_effect=fake_spawn):
+                with patch("spindle._count_running", return_value=0):
+                    asyncio.run(self._spin()("x", harness="claude-code", working_dir=str(tmp_path)))
+
+        # Built-in path: no profile env injected.
+        assert captured["env"] is None or "ANTHROPIC_BASE_URL" not in (captured["env"] or {})
+        assert "shadows built-in" in caplog.text
+
+    # --- respin re-injection ----------------------------------------------
+
+    def test_respin_reinjects_env_and_args(self, profiles_root, monkeypatch):
+        monkeypatch.setenv("ALT_KEY", "rotated-key")
+        _make_profile(
+            profiles_root,
+            "alt",
+            {
+                "harness": "claude-code",
+                "base_url": "https://api.example.com/anthropic",
+                "api_key": "${ALT_KEY}",
+                "extra_args": ["--verbose"],
+            },
+        )
+        # An original completed spool that used the profile. The persisted env is
+        # the caller's explicit (non-secret) override only — secrets were never
+        # written to disk.
+        _write_spool(
+            "orig1",
+            {
+                "id": "orig1",
+                "status": "complete",
+                "result": "done",
+                "session_id": "sess-abc",
+                "model": "big",
+                "profile": "alt",
+                "env": {"CALLER_TAG": "from-caller"},
+                "harness": "claude-code",
+                "created_at": datetime.now().isoformat(),
+            },
+        )
+        captured = {}
+
+        def fake_spawn(spool_id, cmd, cwd, env=None):
+            captured["env"] = env
+            captured["cmd"] = cmd
+            return 9999
+
+        with patch("spindle._spawn_detached", side_effect=fake_spawn):
+            with patch("spindle._count_running", return_value=0):
+                _respin_sync("sess-abc", "continue please")
+
+        env = captured["env"]
+        # Secret re-resolved fresh: rotated key is injected at spawn.
+        assert env["ANTHROPIC_API_KEY"] == "rotated-key"
+        assert env["ANTHROPIC_BASE_URL"] == "https://api.example.com/anthropic"
+        # Caller's non-secret env override is reapplied on top of the profile env.
+        assert env["CALLER_TAG"] == "from-caller"
+        cmd = captured["cmd"]
+        assert "--resume" in cmd and "sess-abc" in cmd
+        assert "--model" in cmd and cmd[cmd.index("--model") + 1] == "big"
+        assert "--verbose" in cmd
+
+    def test_respin_non_profile_unchanged(self, monkeypatch):
+        # A normal (non-profile) spool resumes with stored env and no --model.
+        _write_spool(
+            "orig2",
+            {
+                "id": "orig2",
+                "status": "complete",
+                "result": "done",
+                "session_id": "sess-def",
+                "model": "opus",
+                "profile": None,
+                "env": {"SOME_VAR": "v"},
+                "harness": "claude-code",
+                "created_at": datetime.now().isoformat(),
+            },
+        )
+        captured = {}
+
+        def fake_spawn(spool_id, cmd, cwd, env=None):
+            captured["env"] = env
+            captured["cmd"] = cmd
+            return 1
+
+        with patch("spindle._spawn_detached", side_effect=fake_spawn):
+            with patch("spindle._count_running", return_value=0):
+                _respin_sync("sess-def", "more")
+
+        assert captured["env"] == {"SOME_VAR": "v"}
+        # Non-profile respin does not re-specify --model (legacy behavior).
+        assert "--model" not in captured["cmd"]
+
+    # --- secret handling ---------------------------------------------------
+
+    def test_resolved_secret_never_persisted(self, profiles_root, tmp_path, monkeypatch):
+        """A profile-resolved secret reaches the spawned child but is never
+        written to the spool JSON, nor surfaced via spool_info / spool_export."""
+        sentinel = "SENTINEL-SECRET-DO-NOT-PERSIST-9f3a2b"
+        monkeypatch.setenv("ALT_KEY", sentinel)
+        _make_profile(
+            profiles_root,
+            "alt",
+            {
+                "harness": "claude-code",
+                "base_url": "https://api.example.com/anthropic",
+                "api_key": "${ALT_KEY}",
+                "model": "big",
+            },
+        )
+        captured = {}
+
+        def fake_spawn(spool_id, cmd, cwd, env=None):
+            captured["env"] = env
+            return 4321
+
+        with patch("spindle._spawn_detached", side_effect=fake_spawn):
+            with patch("spindle._count_running", return_value=0):
+                spool_id = asyncio.run(self._spin()("do a thing", harness="alt", working_dir=str(tmp_path)))
+
+        # The resolved secret IS passed to the spawned child.
+        assert captured["env"]["ANTHROPIC_API_KEY"] == sentinel
+
+        # The secret is NOT written to the on-disk spool JSON.
+        on_disk = _get_spool_path(spool_id).read_text()
+        assert sentinel not in on_disk
+
+        # The persisted env carries no profile-resolved values at all.
+        spool = _read_spool(spool_id)
+        assert spool["profile"] == "alt"
+        assert spool.get("env") in (None, {})
+
+        # The secret is NOT surfaced via spool_info.
+        info = asyncio.run(spindle.spool_info.fn(spool_id))
+        assert sentinel not in info
+
+        # The secret is NOT surfaced via spool_export(format="json").
+        export_path = tmp_path / "export.json"
+        asyncio.run(spindle.spool_export.fn(spool_id, format="json", output_path=str(export_path)))
+        assert sentinel not in export_path.read_text()
+
+    def test_caller_env_persisted_secret_resolved_separately(self, profiles_root, tmp_path, monkeypatch):
+        """The caller's explicit non-secret env is persisted; the profile secret
+        is overlaid only into the spawn env."""
+        sentinel = "SENTINEL-CALLER-TEST-7c1d"
+        monkeypatch.setenv("ALT_KEY", sentinel)
+        _make_profile(
+            profiles_root,
+            "alt",
+            {"base_url": "https://api.example.com/anthropic", "api_key": "${ALT_KEY}"},
+        )
+        captured = {}
+
+        def fake_spawn(spool_id, cmd, cwd, env=None):
+            captured["env"] = env
+            return 1
+
+        with patch("spindle._spawn_detached", side_effect=fake_spawn):
+            with patch("spindle._count_running", return_value=0):
+                spool_id = asyncio.run(
+                    self._spin()(
+                        "x",
+                        harness="alt",
+                        env={"CALLER_TAG": "from-caller"},
+                        working_dir=str(tmp_path),
+                    )
+                )
+
+        # Spawn env has both the resolved secret and the caller override.
+        assert captured["env"]["ANTHROPIC_API_KEY"] == sentinel
+        assert captured["env"]["CALLER_TAG"] == "from-caller"
+
+        # Persisted env is the caller's explicit env only — no secret.
+        spool = _read_spool(spool_id)
+        assert spool["env"] == {"CALLER_TAG": "from-caller"}
+        assert sentinel not in _get_spool_path(spool_id).read_text()
+
+    # --- shared spawn-env helper ------------------------------------------
+
+    def test_profile_spawn_env_resolves_overlays_and_degrades(self, profiles_root, monkeypatch):
+        """The shared helper re-resolves a profile fresh, overlays caller env,
+        and degrades to caller env alone when the profile is gone."""
+        monkeypatch.setenv("ALT_KEY", "key-fresh")
+        _make_profile(
+            profiles_root,
+            "alt",
+            {
+                "base_url": "https://api.example.com/anthropic",
+                "api_key": "${ALT_KEY}",
+                "extra_args": ["--verbose"],
+                "model": "big",
+                "model_aliases": {"fast": "small-model"},
+            },
+        )
+
+        # Valid profile: secrets resolved into spawn env, caller env overlaid,
+        # profile default model + extra_args returned, resolved=True.
+        spawn_env, model, extra_args, resolved = _profile_spawn_env("alt", {"CALLER": "c"})
+        assert resolved is True
+        assert spawn_env["ANTHROPIC_BASE_URL"] == "https://api.example.com/anthropic"
+        assert spawn_env["ANTHROPIC_API_KEY"] == "key-fresh"
+        assert spawn_env["CALLER"] == "c"
+        assert model == "big"
+        assert extra_args == ["--verbose"]
+
+        # A caller model matching a profile alias is mapped; an unrelated one passes through.
+        _, mapped, _, _ = _profile_spawn_env("alt", None, model="fast")
+        assert mapped == "small-model"
+        _, passthru, _, _ = _profile_spawn_env("alt", None, model="opus")
+        assert passthru == "opus"
+
+        # Missing profile degrades to caller env alone, resolved=False — no alt endpoint.
+        se, m, ea, r = _profile_spawn_env("ghost", {"CALLER": "c"}, model="opus")
+        assert (se, m, ea, r) == ({"CALLER": "c"}, "opus", [], False)
+
+        # No profile name is a no-op passthrough.
+        assert _profile_spawn_env(None, {"X": "y"}, model="m") == ({"X": "y"}, "m", [], False)
+
+    def test_profile_spawn_env_strict_raises_on_missing(self, profiles_root):
+        """strict=True surfaces a missing/malformed profile as ValueError (spin path)."""
+        with pytest.raises(ValueError):
+            _profile_spawn_env("ghost", None, strict=True)
+        _make_profile(profiles_root, "bad", {"env": "not-a-dict"})
+        with pytest.raises(ValueError):
+            _profile_spawn_env("bad", None, strict=True)
+
+    def test_all_profile_spawn_paths_route_through_helper(self, profiles_root, tmp_path, monkeypatch):
+        """spin, respin, retry, and the expired-session fallback all reconstruct
+        the profile spawn env through the one shared helper."""
+        monkeypatch.setenv("ALT_KEY", "k")
+        _make_profile(
+            profiles_root,
+            "alt",
+            {"base_url": "https://api.example.com/anthropic", "api_key": "${ALT_KEY}", "model": "big"},
+        )
+
+        def fake_spawn(spool_id, cmd, cwd, env=None):
+            return 1
+
+        # Distinct originals per path so _find_spool_by_session stays unambiguous.
+        _write_spool(
+            "route-respin",
+            {
+                "id": "route-respin",
+                "status": "complete",
+                "session_id": "sess-respin",
+                "model": "big",
+                "profile": "alt",
+                "env": None,
+                "working_dir": str(tmp_path),
+                "harness": "claude-code",
+                "created_at": datetime.now().isoformat(),
+            },
+        )
+        _write_spool(
+            "route-retry",
+            {
+                "id": "route-retry",
+                "status": "error",
+                "prompt": "do it",
+                "permission": "careful",
+                "model": "big",
+                "profile": "alt",
+                "env": None,
+                "working_dir": str(tmp_path),
+                "harness": "claude-code",
+                "tags": [],
+                "created_at": datetime.now().isoformat(),
+            },
+        )
+        _write_spool(
+            "route-exp-orig",
+            {
+                "id": "route-exp-orig",
+                "status": "complete",
+                "session_id": "sess-exp-route",
+                "model": "big",
+                "profile": "alt",
+                "env": None,
+                "working_dir": str(tmp_path),
+                "harness": "claude-code",
+                "created_at": datetime.now().isoformat(),
+            },
+        )
+        exp_transcript = _get_transcript_path("route-exp-orig")
+        exp_transcript.parent.mkdir(parents=True, exist_ok=True)
+        exp_transcript.write_text("prior transcript")
+        failing = {
+            "id": "route-exp-fail",
+            "status": "running",
+            "session_id": "sess-exp-route",
+            "prompt": "Continue sess-exp-route: keep going",
+            "profile": "alt",
+            "env": None,
+            "working_dir": str(tmp_path),
+            "pid": None,
+        }
+
+        wrapped = MagicMock(side_effect=_profile_spawn_env)
+        with patch("spindle._profile_spawn_env", wrapped):
+            with patch("spindle._spawn_detached", side_effect=fake_spawn):
+                with patch("spindle._count_running", return_value=0):
+                    asyncio.run(self._spin()("x", harness="alt", working_dir=str(tmp_path)))  # 1. spin
+                    _respin_sync("sess-respin", "again")  # 2. respin
+                    asyncio.run(spool_retry.fn("route-retry"))  # 3. retry
+                    assert _handle_expired_session("route-exp-fail", failing) is True  # 4. expired
+
+        called_profiles = [c.args[0] for c in wrapped.call_args_list]
+        # Every path asked the helper to reconstruct the "alt" profile spawn env.
+        assert called_profiles.count("alt") == 4
+
+    # --- retry / expired-session profile re-resolution --------------------
+
+    def test_retry_reresolves_profile_secret_not_persisted(self, profiles_root, tmp_path, monkeypatch):
+        """Retrying a profile spool re-resolves the alt endpoint/key/model/extra_args
+        and applies the caller overlay, while the secret never hits disk."""
+        sentinel = "SENTINEL-RETRY-3e9a"
+        monkeypatch.setenv("ALT_KEY", sentinel)
+        _make_profile(
+            profiles_root,
+            "alt",
+            {
+                "base_url": "https://api.example.com/anthropic",
+                "api_key": "${ALT_KEY}",
+                "extra_args": ["--verbose"],
+                "model": "big",
+            },
+        )
+        # A failed profile spool: persisted env is caller-only (no secret).
+        _write_spool(
+            "retry-orig",
+            {
+                "id": "retry-orig",
+                "status": "error",
+                "prompt": "do the thing",
+                "permission": "careful",
+                "model": "big",
+                "profile": "alt",
+                "env": {"CALLER_TAG": "from-caller"},
+                "working_dir": str(tmp_path),
+                "harness": "claude-code",
+                "tags": [],
+                "created_at": datetime.now().isoformat(),
+            },
+        )
+        captured = {}
+
+        def fake_spawn(spool_id, cmd, cwd, env=None):
+            captured["env"] = env
+            captured["cmd"] = cmd
+            return 4321
+
+        with patch("spindle._spawn_detached", side_effect=fake_spawn):
+            with patch("spindle._count_running", return_value=0):
+                new_id = asyncio.run(spool_retry.fn("retry-orig"))
+
+        # The retried spawn re-resolves the alt endpoint, key, model, and extra_args.
+        env = captured["env"]
+        assert env["ANTHROPIC_BASE_URL"] == "https://api.example.com/anthropic"
+        assert env["ANTHROPIC_API_KEY"] == sentinel
+        assert env["CALLER_TAG"] == "from-caller"
+        cmd = captured["cmd"]
+        assert "--model" in cmd and cmd[cmd.index("--model") + 1] == "big"
+        assert "--verbose" in cmd
+
+        # The re-resolved secret is never persisted on the retried spool.
+        assert sentinel not in _get_spool_path(new_id).read_text()
+        new_spool = _read_spool(new_id)
+        assert new_spool["profile"] == "alt"
+        assert new_spool["env"] == {"CALLER_TAG": "from-caller"}
+        info = asyncio.run(spindle.spool_info.fn(new_id))
+        assert sentinel not in info
+        export_path = tmp_path / "retry-export.json"
+        asyncio.run(spindle.spool_export.fn(new_id, format="json", output_path=str(export_path)))
+        assert sentinel not in export_path.read_text()
+
+    def test_retry_non_profile_uses_stored_env(self, tmp_path):
+        """A non-profile retry spawns with the stored caller env and no profile injection."""
+        _write_spool(
+            "retry-plain",
+            {
+                "id": "retry-plain",
+                "status": "error",
+                "prompt": "plain task",
+                "permission": "careful",
+                "model": "opus",
+                "profile": None,
+                "env": {"SOME_VAR": "v"},
+                "working_dir": str(tmp_path),
+                "harness": "claude-code",
+                "tags": [],
+                "created_at": datetime.now().isoformat(),
+            },
+        )
+        captured = {}
+
+        def fake_spawn(spool_id, cmd, cwd, env=None):
+            captured["env"] = env
+            return 1
+
+        with patch("spindle._spawn_detached", side_effect=fake_spawn):
+            with patch("spindle._count_running", return_value=0):
+                asyncio.run(spool_retry.fn("retry-plain"))
+
+        assert captured["env"] == {"SOME_VAR": "v"}
+        assert "ANTHROPIC_BASE_URL" not in captured["env"]
+
+    def test_expired_session_reresolves_profile_secret_not_persisted(self, profiles_root, tmp_path, monkeypatch):
+        """The transcript-fallback respin of a profile spool rebuilds the alt
+        endpoint/key/model rather than running against the default endpoint."""
+        sentinel = "SENTINEL-EXPIRED-b71c"
+        monkeypatch.setenv("ALT_KEY", sentinel)
+        _make_profile(
+            profiles_root,
+            "alt",
+            {
+                "base_url": "https://api.example.com/anthropic",
+                "api_key": "${ALT_KEY}",
+                "extra_args": ["--verbose"],
+                "model": "big",
+            },
+        )
+        # The original (resumable) spool carries the effective model + profile.
+        _write_spool(
+            "exp-orig",
+            {
+                "id": "exp-orig",
+                "status": "complete",
+                "session_id": "sess-exp",
+                "model": "big",
+                "profile": "alt",
+                "env": {"CALLER_TAG": "from-caller"},
+                "working_dir": str(tmp_path),
+                "harness": "claude-code",
+                "created_at": datetime.now().isoformat(),
+            },
+        )
+        transcript = _get_transcript_path("exp-orig")
+        transcript.parent.mkdir(parents=True, exist_ok=True)
+        transcript.write_text("prior conversation")
+
+        # The failing respin spool (session expired) carries the caller env + profile.
+        failing = {
+            "id": "exp-fail",
+            "status": "running",
+            "session_id": "sess-exp",
+            "prompt": "Continue sess-exp: keep going",
+            "profile": "alt",
+            "env": {"CALLER_TAG": "from-caller"},
+            "working_dir": str(tmp_path),
+            "pid": None,
+        }
+        captured = {}
+
+        def fake_spawn(spool_id, cmd, cwd, env=None):
+            captured["env"] = env
+            captured["cmd"] = cmd
+            return 7777
+
+        with patch("spindle._spawn_detached", side_effect=fake_spawn):
+            assert _handle_expired_session("exp-fail", failing) is True
+
+        # The fallback spawn hits the alt endpoint with the re-resolved key.
+        env = captured["env"]
+        assert env["ANTHROPIC_BASE_URL"] == "https://api.example.com/anthropic"
+        assert env["ANTHROPIC_API_KEY"] == sentinel
+        assert env["CALLER_TAG"] == "from-caller"
+        cmd = captured["cmd"]
+        # Re-injected recorded model + extra_args; no --resume on a transcript fallback.
+        assert "--model" in cmd and cmd[cmd.index("--model") + 1] == "big"
+        assert "--verbose" in cmd
+        assert "--resume" not in cmd
+
+        # The fallback never persists the secret on the spool record.
+        assert sentinel not in _get_spool_path("exp-fail").read_text()
+
+    def test_expired_session_non_profile_unchanged(self, tmp_path):
+        """A non-profile expired-session fallback keeps the stored env and adds no --model."""
+        _write_spool(
+            "exp-orig2",
+            {
+                "id": "exp-orig2",
+                "status": "complete",
+                "session_id": "sess-exp2",
+                "model": "opus",
+                "profile": None,
+                "env": {"SOME_VAR": "v"},
+                "working_dir": str(tmp_path),
+                "harness": "claude-code",
+                "created_at": datetime.now().isoformat(),
+            },
+        )
+        transcript = _get_transcript_path("exp-orig2")
+        transcript.parent.mkdir(parents=True, exist_ok=True)
+        transcript.write_text("prior")
+        failing = {
+            "id": "exp-fail2",
+            "status": "running",
+            "session_id": "sess-exp2",
+            "prompt": "Continue sess-exp2: go",
+            "profile": None,
+            "env": {"SOME_VAR": "v"},
+            "working_dir": str(tmp_path),
+            "pid": None,
+        }
+        captured = {}
+
+        def fake_spawn(spool_id, cmd, cwd, env=None):
+            captured["env"] = env
+            captured["cmd"] = cmd
+            return 1
+
+        with patch("spindle._spawn_detached", side_effect=fake_spawn):
+            assert _handle_expired_session("exp-fail2", failing) is True
+
+        assert captured["env"] == {"SOME_VAR": "v"}
+        assert "--model" not in captured["cmd"]
+
+    # --- malformed profile fields -----------------------------------------
+
+    def test_malformed_env_type_clean_spin_error(self, profiles_root, tmp_path):
+        """A non-object env produces a clean spin error, not an uncaught crash."""
+        _make_profile(profiles_root, "bad", {"env": "not-a-dict"})
+        result = asyncio.run(self._spin()("x", harness="bad", working_dir=str(tmp_path)))
+        parsed = json.loads(result)
+        assert "error" in parsed
+        assert "env" in parsed["error"]
+        assert "bad" in parsed["error"]
+
+    def test_malformed_extra_args_type_clean_spin_error(self, profiles_root, tmp_path):
+        """A non-list extra_args produces a clean spin error, not a crash."""
+        _make_profile(profiles_root, "bad", {"extra_args": 5})
+        result = asyncio.run(self._spin()("x", harness="bad", working_dir=str(tmp_path)))
+        parsed = json.loads(result)
+        assert "error" in parsed
+        assert "extra_args" in parsed["error"]
+
+    def test_malformed_extra_args_non_string_items_clean_error(self, profiles_root, tmp_path):
+        """extra_args with non-string items also produces a clean spin error."""
+        _make_profile(profiles_root, "bad", {"extra_args": ["--ok", 7]})
+        result = asyncio.run(self._spin()("x", harness="bad", working_dir=str(tmp_path)))
+        parsed = json.loads(result)
+        assert "error" in parsed
+        assert "extra_args" in parsed["error"]
+
+    def test_malformed_field_types_raise_value_error(self, profiles_root):
+        """_resolve_profile_overrides raises ValueError on bad field types."""
+        _make_profile(profiles_root, "p1", {"env": "x"})
+        with pytest.raises(ValueError):
+            _resolve_profile_overrides(_load_profile("p1"))
+        _make_profile(profiles_root, "p2", {"extra_args": 5})
+        with pytest.raises(ValueError):
+            _resolve_profile_overrides(_load_profile("p2"))
+        _make_profile(profiles_root, "p3", {"model": 42})
+        with pytest.raises(ValueError):
+            _resolve_profile_overrides(_load_profile("p3"))

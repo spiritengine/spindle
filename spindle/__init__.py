@@ -63,6 +63,14 @@ async def health_check(request: Request) -> JSONResponse:
 # never touch the real ~/.spindle, even from an escaped monitor thread.
 SPINDLE_DIR = Path(os.environ.get("SPINDLE_HOME", str(Path.home() / ".spindle"))) / "spools"
 
+# Canonical location for lodged profiles (folder-per-profile, each holding a
+# profile.json). Sits beside the spool store and honors SPINDLE_HOME the same
+# way, so tests redirect both with one env var and never read real profiles.
+SPINDLE_PROFILES_DIR = Path(os.environ.get("SPINDLE_HOME", str(Path.home() / ".spindle"))) / "profiles"
+
+# Built-in harness names. These always win over a same-named lodged profile.
+BUILTIN_HARNESSES = {"claude-code", "codex", "gemini", "kimi"}
+
 # Live subprocess handles keyed by spool_id, populated by _spawn_detached so
 # finalization can capture the child's exit code. Process-local; not persisted.
 _PROC_HANDLES: Dict[str, "subprocess.Popen"] = {}
@@ -881,6 +889,312 @@ def _resolve_spool_for_respin(handle: str) -> Optional[dict]:
     return None
 
 
+# ---------------------------------------------------------------------------
+# Profiles
+#
+# A profile is a named, lodged configuration: a base harness plus a set of
+# overrides (model, alt endpoint env, extra CLI flags). It lives in a folder
+# (folder name == profile name == the value passed as `harness`) holding a
+# single profile.json. Profiles let a user point the Claude Code harness at any
+# Anthropic-compatible endpoint by injecting ANTHROPIC_BASE_URL / API key /
+# CLAUDE_CONFIG_DIR into the spawned child, without changing spindle's parsing,
+# unspool, or respin paths.
+# ---------------------------------------------------------------------------
+
+# Match ${VAR} references for environment expansion in profile values.
+_PROFILE_ENV_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+def _profile_roots() -> list:
+    """Return the directories scanned for profiles, lowest precedence first.
+
+    1. Canonical: ``SPINDLE_PROFILES_DIR`` (~/.spindle/profiles) — where real,
+       private profiles live, physically outside any repo.
+    2. Dev convenience: ``./profiles`` relative to the current working dir, if
+       it exists and differs from the canonical root. Gitignored; lets a
+       developer drop a throwaway profile beside the code.
+    """
+    roots = [SPINDLE_PROFILES_DIR]
+    repo_local = Path.cwd() / "profiles"
+    if repo_local.resolve() != SPINDLE_PROFILES_DIR.resolve():
+        roots.append(repo_local)
+    return roots
+
+
+def _discover_profiles() -> dict:
+    """Discover all lodged profiles, keyed by name.
+
+    Later roots override earlier ones on name collision (repo-local shadows
+    canonical), matching the documented load order. A profile whose
+    profile.json is missing, unreadable, or not a JSON object is skipped with a
+    logged warning — discovery never crashes on a single bad profile.
+
+    Each returned value is the parsed profile.json with two synthetic keys
+    added: ``_name`` (folder name) and ``_source`` (path to the profile.json).
+    """
+    profiles: dict = {}
+    for root in _profile_roots():
+        try:
+            if not root.is_dir():
+                continue
+            entries = sorted(root.iterdir())
+        except OSError as exc:
+            logger.warning("spindle: cannot scan profile root %s: %s", root, exc)
+            continue
+        for entry in entries:
+            if not entry.is_dir():
+                continue
+            profile_json = entry / "profile.json"
+            if not profile_json.is_file():
+                continue
+            try:
+                with open(profile_json) as f:
+                    data = json.load(f)
+                if not isinstance(data, dict):
+                    raise ValueError("profile.json must contain a JSON object")
+            except (json.JSONDecodeError, OSError, ValueError) as exc:
+                logger.warning("spindle: skipping malformed profile %s: %s", profile_json, exc)
+                continue
+            profiles[entry.name] = {**data, "_name": entry.name, "_source": str(profile_json)}
+    return profiles
+
+
+def _load_profile(name: str) -> Optional[dict]:
+    """Return the lodged profile with this name, or None if none exists."""
+    if not name:
+        return None
+    return _discover_profiles().get(name)
+
+
+def _op_inject(value: str, name: str) -> str:
+    """Resolve op:// references in ``value`` via strongbox/op inject.
+
+    Uses ``strongbox inject`` if the binary is on PATH, else ``op inject``. The
+    value is piped in as a template; stdout is the resolved result. If neither
+    tool exists, or the call fails, the literal value is returned and a warning
+    is logged — keeping 1Password/strongbox an optional local convenience.
+    """
+    if shutil.which("strongbox"):
+        tool = ["strongbox", "inject"]
+    elif shutil.which("op"):
+        tool = ["op", "inject"]
+    else:
+        logger.warning(
+            "spindle: profile %s: value contains op:// but neither strongbox nor op is on PATH; leaving literal",
+            name,
+        )
+        return value
+    try:
+        proc = subprocess.run(tool, input=value, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning("spindle: profile %s: %s failed (%s); leaving literal", name, tool[0], exc)
+        return value
+    if proc.returncode != 0:
+        logger.warning(
+            "spindle: profile %s: %s exited %s (%s); leaving literal",
+            name,
+            tool[0],
+            proc.returncode,
+            (proc.stderr or "").strip(),
+        )
+        return value
+    return proc.stdout
+
+
+def _resolve_profile_value(value, name: str = "<profile>"):
+    """Resolve a single profile string value at spawn time.
+
+    1. Expand every ``${ENV_VAR}`` from os.environ. An unset var is left as the
+       literal ``${VAR}`` and a warning is logged (never crashes).
+    2. If the (expanded) value contains ``op://``, resolve it via
+       ``strongbox``/``op`` inject; if neither is installed, leave it literal.
+
+    Non-string values pass through unchanged.
+    """
+    if not isinstance(value, str):
+        return value
+
+    def _expand(match: "re.Match") -> str:
+        var = match.group(1)
+        if var in os.environ:
+            return os.environ[var]
+        logger.warning(
+            "spindle: profile %s: env var %s is unset; leaving ${%s} literal",
+            name,
+            var,
+            var,
+        )
+        return match.group(0)
+
+    resolved = _PROFILE_ENV_RE.sub(_expand, value)
+    if "op://" in resolved:
+        resolved = _op_inject(resolved, name)
+    return resolved
+
+
+def _resolve_profile_overrides(profile: dict) -> dict:
+    """Resolve a loaded profile into concrete spawn-time overrides.
+
+    Returns a dict with: ``base_harness``, ``env`` (the child env to inject),
+    ``extra_args`` (resolved CLI flags), ``model`` (profile default model, may
+    be None), ``model_aliases`` (profile-scoped alias map), and ``config_dir``.
+
+    Secrets are resolved fresh on every call (so rotated keys take effect on
+    respin). Raises ValueError for unsupported base-harness / base_url combos.
+    """
+    name = profile.get("_name", "<profile>")
+    base = profile.get("harness") or "claude-code"
+
+    # Validate field types up front so a malformed profile raises a clean
+    # ValueError (caught by spin and surfaced as a spin error) instead of an
+    # AttributeError/TypeError deep in resolution. Discovery only guarantees the
+    # top level is a JSON object; individual fields are still untrusted.
+    for field in ("harness", "model", "base_url", "api_key", "config_dir"):
+        val = profile.get(field)
+        if val is not None and not isinstance(val, str):
+            raise ValueError(f"profile {name!r}: {field!r} must be a string, got {type(val).__name__}")
+    env_raw = profile.get("env")
+    if env_raw is not None and not isinstance(env_raw, dict):
+        raise ValueError(f"profile {name!r}: 'env' must be an object, got {type(env_raw).__name__}")
+    extra_args_raw = profile.get("extra_args")
+    if extra_args_raw is not None and (
+        not isinstance(extra_args_raw, list) or not all(isinstance(a, str) for a in extra_args_raw)
+    ):
+        raise ValueError(f"profile {name!r}: 'extra_args' must be a list of strings")
+    aliases_raw = profile.get("model_aliases")
+    if aliases_raw is not None and not isinstance(aliases_raw, dict):
+        raise ValueError(f"profile {name!r}: 'model_aliases' must be an object, got {type(aliases_raw).__name__}")
+
+    base_url = profile.get("base_url")
+    config_dir = profile.get("config_dir")
+    api_key = profile.get("api_key")
+    env_spec = profile.get("env") or {}
+    extra_args = profile.get("extra_args") or []
+    model = profile.get("model")
+    model_aliases = profile.get("model_aliases") or {}
+
+    # v1 only the Claude Code path supports endpoint/flag injection.
+    if base != "claude-code":
+        if base_url:
+            raise ValueError(f"profile {name!r}: base_url requires base harness 'claude-code', got {base!r}")
+        raise ValueError(f"profile {name!r}: base harness {base!r} is not supported; only 'claude-code'")
+
+    # Alt-endpoint profiles are isolated by default: if base_url is set without
+    # an explicit config_dir, point CLAUDE_CONFIG_DIR at a per-profile dir so
+    # the child does not inherit the user's real ~/.claude MCP servers/CLAUDE.md.
+    if base_url and not config_dir:
+        config_dir = str(SPINDLE_PROFILES_DIR / name / "claude-config")
+
+    def _r(v):
+        return _resolve_profile_value(v, name)
+
+    env: Dict[str, str] = {}
+    if base_url:
+        env["ANTHROPIC_BASE_URL"] = _r(base_url)
+    if api_key:
+        env["ANTHROPIC_API_KEY"] = _r(api_key)
+    if config_dir:
+        resolved_cfg = os.path.expanduser(_r(config_dir))
+        env["CLAUDE_CONFIG_DIR"] = resolved_cfg
+        try:
+            Path(resolved_cfg).mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            logger.warning("spindle: profile %s: could not create config_dir %s: %s", name, resolved_cfg, exc)
+    for key, val in env_spec.items():
+        env[key] = _r(val)
+
+    resolved_extra_args = [_r(arg) for arg in extra_args]
+
+    return {
+        "base_harness": base,
+        "env": env,
+        "extra_args": resolved_extra_args,
+        "model": model,
+        "model_aliases": model_aliases,
+        "config_dir": config_dir,
+    }
+
+
+def _profile_spawn_env(
+    profile_name: Optional[str],
+    caller_env: Optional[Dict[str, str]],
+    model: Optional[str] = None,
+    *,
+    strict: bool = False,
+) -> Tuple[Optional[Dict[str, str]], Optional[str], list, bool]:
+    """Reconstruct a profile spool's child spawn env, model, and extra args.
+
+    Every profile spawn path — the fresh spin, ``_respin_sync``,
+    ``spool_retry``, and ``_handle_expired_session``'s transcript fallback —
+    routes through here so the alt endpoint / key / model / extra_args are
+    rebuilt identically at every spawn. Before this helper existed, two of
+    those four paths read the (deliberately secret-stripped) persisted env and
+    silently ran the profile spool against the default api.anthropic.com
+    endpoint; centralizing the reconstruction keeps a future spawn path from
+    regressing the same way.
+
+    The profile is re-resolved fresh on every call: ``${ENV}`` and ``op://``
+    secrets are re-expanded (so rotated keys take effect) into ``spawn_env``,
+    the caller's persisted non-secret env is overlaid on top (caller wins), and
+    ``spawn_env`` is returned for the child process ONLY. The resolved secrets
+    are never part of the persisted record — callers persist ``caller_env``.
+
+    ``model`` is the caller-supplied (fresh spin) or recorded (resume) model to
+    honor: ``None`` falls back to the profile's default model; a value matching
+    a profile-scoped alias is mapped; any other value is kept as-is.
+
+    ``strict`` True re-raises a missing/malformed profile's ``ValueError`` so
+    the fresh-spin path can surface it to the caller. ``strict`` False (the
+    resume/retry default) logs and degrades to the caller env alone — a
+    deleted/corrupted profile loses the alt endpoint on resume rather than
+    crashing the recovery.
+
+    Returns ``(spawn_env, model, extra_args, resolved)``. ``resolved`` is True
+    only when the profile loaded and resolved; resume paths gate re-injecting
+    ``--model``/extra_args on it so a degraded resume matches its pre-profile
+    behavior.
+    """
+    if not profile_name:
+        return caller_env, model, [], False
+
+    prof = _load_profile(profile_name)
+    if prof is None:
+        if strict:
+            raise ValueError(f"profile {profile_name!r} is not lodged")
+        logger.warning(
+            "spindle: profile %r no longer lodged; reusing stored env (alt endpoint lost on resume)",
+            profile_name,
+        )
+        return caller_env, model, [], False
+
+    try:
+        overrides = _resolve_profile_overrides(prof)
+    except ValueError as exc:
+        if strict:
+            raise
+        logger.warning(
+            "spindle: profile %r failed to resolve (%s); reusing stored env (alt endpoint lost on resume)",
+            profile_name,
+            exc,
+        )
+        return caller_env, model, [], False
+
+    # Spawn env: profile-injected env (fresh secrets) is the base; the caller's
+    # persisted non-secret env wins on top. Child process only — never persisted.
+    spawn_env = dict(overrides["env"])
+    if caller_env:
+        spawn_env.update(caller_env)
+
+    # Model: None -> profile default; a profile-scoped alias is mapped;
+    # otherwise the caller/recorded model passes through unchanged.
+    if model is None:
+        model = overrides["model"]
+    elif model in overrides["model_aliases"]:
+        model = overrides["model_aliases"][model]
+
+    return spawn_env, model, overrides["extra_args"], True
+
+
 def _get_cc_bg_tasks(session_id: str) -> list:
     """
     Read Claude Code background-task records for a session.
@@ -1687,10 +2001,25 @@ Continue from above. New message: {spool["prompt"].split(": ", 1)[-1]}"""
     # Spawn new process without --resume flag, with transcript as context
     cmd = ["claude", "-p", context_prompt, "--output-format", "json"]
 
+    # Profile spools: rebuild the alt endpoint/key spawn env fresh and re-inject
+    # --model/extra_args so the transcript fallback hits the same endpoint as the
+    # original spin instead of the default api.anthropic.com. The recorded
+    # effective model lives on the original spool (the failing respin spool does
+    # not persist a model). caller_env (the only persisted env) is overlaid and
+    # remains the only env written to disk.
+    profile_name = spool.get("profile")
+    caller_env = spool.get("env")
+    spawn_env, eff_model, profile_extra_args, resolved = _profile_spawn_env(
+        profile_name, caller_env, model=original_spool.get("model")
+    )
+    if resolved:
+        if eff_model:
+            cmd.extend(["--model", CLAUDE_MODEL_ALIASES.get(eff_model, eff_model)])
+        if profile_extra_args:
+            cmd.extend(profile_extra_args)
+
     try:
-        # Inherit env from spool if available
-        env = spool.get("env")
-        new_pid = _spawn_detached(spool_id, cmd, spool["working_dir"], env)
+        new_pid = _spawn_detached(spool_id, cmd, spool["working_dir"], spawn_env)
 
         # Update spool with new PID and mark as using transcript fallback
         spool["pid"] = new_pid
@@ -1804,8 +2133,21 @@ def _spin_sync(
     env: Optional[Dict[str, str]],
     base_branch: Optional[str] = None,
     research_target: Optional[str] = None,
+    extra_args: Optional[list] = None,
+    profile: Optional[str] = None,
+    spawn_env: Optional[Dict[str, str]] = None,
 ) -> str:
-    """Synchronous implementation of spin - runs in thread pool."""
+    """Synchronous implementation of spin - runs in thread pool.
+
+    ``env`` is the caller's explicit env and is the ONLY env persisted on the
+    spool record. ``spawn_env`` (defaulting to ``env``) is what is actually
+    injected into the child process; for profile spools it carries freshly
+    resolved secrets that must never be written to disk.
+    """
+    # Env injected into the child; falls back to the persisted caller env when
+    # no separate spawn env (i.e. no profile) was supplied.
+    if spawn_env is None:
+        spawn_env = env
     # Require working_dir - os.getcwd() returns MCP server dir, not caller's project
     if not working_dir:
         return "Error: working_dir required. Pass the project directory."
@@ -1924,6 +2266,10 @@ Your task:
     if resolved_tools:
         claude_cmd.extend(["--allowedTools", resolved_tools])
 
+    # Profile extra_args are appended verbatim to the claude invocation.
+    if extra_args:
+        claude_cmd.extend(extra_args)
+
     # Wrap in bwrap sandbox for shards - worktree writable unless research output
     # is explicitly routed to a file/dir target.
     if shard_info and shutil.which("bwrap"):
@@ -2039,6 +2385,7 @@ Your task:
         "model": model,
         "timeout": timeout,
         "env": env,
+        "profile": profile,
         "created_at": datetime.now().isoformat(),
         "completed_at": None,
         "pid": None,
@@ -2048,9 +2395,9 @@ Your task:
 
     _write_spool(spool_id, spool)
 
-    # Spawn detached process
+    # Spawn detached process (spawn_env carries any profile secrets; never persisted)
     try:
-        pid = _spawn_detached(spool_id, cmd, cwd, env)
+        pid = _spawn_detached(spool_id, cmd, cwd, spawn_env)
     except Exception as e:
         # Spawn failed - mark spool as error so the slot is freed
         spool["status"] = "error"
@@ -2122,8 +2469,10 @@ async def spin(
                  90 min) when this is not set. Override SPINDLE_REVIEW_TIMEOUT env var
                  to change the default. Pass timeout=0 explicitly to disable.
         skeinless: Skip SKEIN context injection for shard agents (default: False)
-        harness: Which harness to use - "claude-code" (default), "codex", "gemini", or "kimi".
-                 Use spin_harnesses() to see available harnesses and their models.
+        harness: Which harness to use - "claude-code" (default), "codex", "gemini", "kimi",
+                 or the name of a lodged profile. A profile resolves to a base harness plus
+                 overrides (model, alt-endpoint env, extra CLI flags); built-in names win
+                 over a same-named profile. Use spin_harnesses() to see what's available.
         env: Optional dict of environment variables to set in spawned agent
         base_branch: Branch to fork shard from (default: auto-detected from repo). Only used with shard or careful+shard permissions.
 
@@ -2147,14 +2496,56 @@ async def spin(
     # Normalize harness parameter (case-insensitive)
     harness_lower = harness.lower() if harness else None
 
-    # Validate harness name
-    valid_harnesses = set(_get_harnesses().keys())
-    if harness_lower and harness_lower not in valid_harnesses:
-        return json.dumps(
-            {
-                "error": f"Unknown harness: {harness!r}. Valid harnesses: {', '.join(sorted(valid_harnesses))}. Use spin_harnesses() to see details.",
-            }
-        )
+    # Resolve harness against built-ins and lodged profiles. Built-in names win
+    # over a same-named profile (with a warning); otherwise a non-built-in name
+    # must match a lodged profile or it's an error.
+    profile = None
+    profile_extra_args = None
+    profile_name = None
+    if harness:
+        if harness_lower in BUILTIN_HARNESSES:
+            if _load_profile(harness) is not None:
+                logger.warning(
+                    "spindle: profile %r shadows built-in harness %r; using the built-in",
+                    harness,
+                    harness_lower,
+                )
+        else:
+            profile = _load_profile(harness)
+            if profile is None:
+                valid = sorted(BUILTIN_HARNESSES | set(_discover_profiles().keys()))
+                return json.dumps(
+                    {
+                        "error": f"Unknown harness or profile: {harness!r}. Valid: {', '.join(valid)}. Use spin_harnesses() to see details.",
+                    }
+                )
+
+    # The caller's explicit env is the only env safe to persist on the spool
+    # record. Profile-resolved env (which carries ANTHROPIC_API_KEY and any
+    # op://-resolved secrets) must never hit disk, so it is built into a
+    # separate spawn_env that goes only to the child process.
+    caller_env = env
+    spawn_env = env
+
+    # Apply profile overrides: resolve its base harness, build the injected env,
+    # fold in the profile-scoped model alias / default model, and capture its
+    # extra CLI args. base harness is enforced to claude-code in v1, so a
+    # resolved profile always routes through the Claude Code path below.
+    if profile is not None:
+        profile_name = profile["_name"]
+        # Reconstruct the child spawn env (carrying fresh secrets), effective
+        # model (caller model wins / alias-mapped / profile default), and extra
+        # CLI args. strict=True surfaces a malformed profile to the caller
+        # instead of silently degrading. caller_env stays the only persisted env.
+        try:
+            spawn_env, model, profile_extra_args, _ = _profile_spawn_env(
+                profile_name, caller_env, model=model, strict=True
+            )
+        except ValueError as exc:
+            return json.dumps({"error": str(exc)})
+        # base harness is enforced to claude-code in v1 (_resolve_profile_overrides
+        # raises otherwise), so a resolved profile always routes through CC.
+        harness_lower = "claude-code"
 
     # auto/auto+shard is CC-specific; non-CC harnesses have no classifier-vetted mode
     if permission and permission.startswith("auto") and harness_lower and harness_lower != "claude-code":
@@ -2235,9 +2626,12 @@ async def spin(
             model,
             timeout,
             skeinless,
-            env,
+            caller_env,
             base_branch=base_branch or _detect_default_branch(working_dir or os.getcwd()),
             research_target=research_target,
+            extra_args=profile_extra_args,
+            profile=profile_name,
+            spawn_env=spawn_env,
         )
 
     return result
@@ -2673,8 +3067,39 @@ def _respin_sync(handle: str, prompt: str) -> str:
             transcript_path = _get_transcript_path(original_spool["id"])
             transcript_available = transcript_path.exists()
 
-        # Inherit env from original spool
-        env = original_spool.get("env") if original_spool else None
+        # The caller's explicit env is all that was persisted on the original
+        # spool (profile secrets are never written to disk). It is what we
+        # persist again and what we overlay on a re-resolved profile env.
+        caller_env = original_spool.get("env") if original_spool else None
+        spawn_env = caller_env
+
+        # Profile spools: re-resolve the profile fresh so the resume hits the
+        # same endpoint/config_dir (and picks up any rotated secrets), and
+        # re-inject the model + extra_args — a --resume against an alt
+        # ANTHROPIC_BASE_URL still needs --model specified explicitly. The
+        # re-resolved env carries secrets, so it goes only into spawn_env; the
+        # caller's non-secret env overrides are reapplied on top of it.
+        #
+        # If the profile was deleted or has gone malformed since the original
+        # spin, _profile_spawn_env logs and returns resolved=False: we degrade
+        # to the persisted caller env, which no longer carries the alt
+        # base_url/api_key, so the resume loses the alt endpoint. We skip
+        # re-injecting --model/extra_args in that case (matching a non-profile
+        # resume) rather than forcing an alt-endpoint model onto the default
+        # endpoint.
+        profile_name = original_spool.get("profile") if original_spool else None
+        # resume_model is the effective model recorded at spin. When it is None
+        # (profile sets no default and no caller model was given) we deliberately
+        # omit --model and let the alt endpoint use its own default — matching
+        # the original spin.
+        spawn_env, resume_model, profile_extra_args, resolved = _profile_spawn_env(
+            profile_name, caller_env, model=original_spool.get("model")
+        )
+        if resolved:
+            if resume_model:
+                cmd.extend(["--model", CLAUDE_MODEL_ALIASES.get(resume_model, resume_model)])
+            if profile_extra_args:
+                cmd.extend(profile_extra_args)
 
         spool = {
             "id": spool_id,
@@ -2686,7 +3111,8 @@ def _respin_sync(handle: str, prompt: str) -> str:
             "allowed_tools": None,
             "system_prompt": None,
             "transcript_fallback_available": transcript_available,
-            "env": env,
+            "env": caller_env,
+            "profile": profile_name,
             "created_at": datetime.now().isoformat(),
             "completed_at": None,
             "pid": None,
@@ -2697,8 +3123,8 @@ def _respin_sync(handle: str, prompt: str) -> str:
 
         _write_spool(spool_id, spool)
 
-        # Spawn detached process
-        pid = _spawn_detached(spool_id, cmd, cwd, env)
+        # Spawn detached process (spawn_env carries any profile secrets; never persisted)
+        pid = _spawn_detached(spool_id, cmd, cwd, spawn_env)
 
         spool["pid"] = pid
         spool["status"] = "running"
@@ -3453,6 +3879,16 @@ async def spool_retry(spool_id: str) -> str:
         # Default to Claude Code harness
         retry_working_dir = spool.get("working_dir")
         retry_base_branch = spool.get("base_branch") or _detect_default_branch(retry_working_dir or os.getcwd())
+        # Profile spools: re-resolve the profile fresh so the retry hits the same
+        # alt endpoint/key with the recorded model + extra_args. The persisted
+        # env is caller-only (secrets are never written to disk), so reading it
+        # back without re-resolving would silently retry against the default
+        # endpoint. caller_env stays the only env persisted on the new spool.
+        caller_env = spool.get("env")
+        profile_name = spool.get("profile")
+        spawn_env, retry_model, profile_extra_args, _ = _profile_spawn_env(
+            profile_name, caller_env, model=spool.get("model")
+        )
         return await asyncio.to_thread(
             _spin_sync,
             spool.get("prompt", ""),  # prompt
@@ -3462,11 +3898,14 @@ async def spool_retry(spool_id: str) -> str:
             retry_working_dir,  # working_dir
             spool.get("allowed_tools"),  # allowed_tools
             tags_str,  # tags
-            spool.get("model"),  # model
+            retry_model,  # model
             spool.get("timeout"),  # timeout
             False,  # skeinless
-            spool.get("env"),  # env
+            caller_env,  # env (persisted; caller-only, no secrets)
             retry_base_branch,  # base_branch
+            extra_args=profile_extra_args,
+            profile=profile_name,
+            spawn_env=spawn_env,
         )
 
 
@@ -3829,8 +4268,13 @@ async def spool_stats() -> str:
 
 
 def _get_harnesses() -> dict:
-    """Return harness metadata. Separate function so tests can import it."""
-    return {
+    """Return harness metadata. Separate function so tests can import it.
+
+    Built-in harnesses are listed first, then any lodged profiles (keyed by
+    profile name) so an agent querying "what's available" sees both. A profile
+    that shadows a built-in name is omitted (the built-in wins).
+    """
+    harnesses = {
         "claude-code": {
             "models": CLAUDE_MODEL_ALIASES,
             "default_model": "sonnet",
@@ -3854,6 +4298,17 @@ def _get_harnesses() -> dict:
             "requires": "kimi-cli",
         },
     }
+    for name, prof in _discover_profiles().items():
+        if name in harnesses:
+            continue  # built-in wins on collision
+        harnesses[name] = {
+            "type": "profile",
+            "base_harness": prof.get("harness") or "claude-code",
+            "default_model": prof.get("model"),
+            "description": prof.get("description", ""),
+            "source": prof.get("_source"),
+        }
+    return harnesses
 
 
 @mcp.tool()
