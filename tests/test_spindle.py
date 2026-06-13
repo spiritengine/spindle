@@ -5485,10 +5485,17 @@ class TestProfiles:
 
     @pytest.fixture
     def profiles_root(self, tmp_path, monkeypatch):
-        """Isolate the canonical profiles root to a per-test tmp dir."""
+        """Isolate the canonical profiles root to a per-test tmp dir.
+
+        Also chdir into tmp_path so the cwd-relative ``./profiles`` scan in
+        _profile_roots() resolves to the same path as SPINDLE_PROFILES_DIR and
+        is deduped away. Without this, a test could read a developer's real
+        (gitignored) ./profiles/<name>/ and become nondeterministic.
+        """
         root = tmp_path / "profiles"
         root.mkdir()
         monkeypatch.setattr(spindle, "SPINDLE_PROFILES_DIR", root)
+        monkeypatch.chdir(tmp_path)
         return root
 
     # --- discovery ---------------------------------------------------------
@@ -5765,7 +5772,9 @@ class TestProfiles:
                 "extra_args": ["--verbose"],
             },
         )
-        # An original completed spool that used the profile.
+        # An original completed spool that used the profile. The persisted env is
+        # the caller's explicit (non-secret) override only — secrets were never
+        # written to disk.
         _write_spool(
             "orig1",
             {
@@ -5775,7 +5784,7 @@ class TestProfiles:
                 "session_id": "sess-abc",
                 "model": "big",
                 "profile": "alt",
-                "env": {"ANTHROPIC_BASE_URL": "https://stale", "ANTHROPIC_API_KEY": "stale-key"},
+                "env": {"CALLER_TAG": "from-caller"},
                 "harness": "claude-code",
                 "created_at": datetime.now().isoformat(),
             },
@@ -5792,9 +5801,11 @@ class TestProfiles:
                 _respin_sync("sess-abc", "continue please")
 
         env = captured["env"]
-        # Re-resolved fresh: rotated key wins over the stale stored value.
+        # Secret re-resolved fresh: rotated key is injected at spawn.
         assert env["ANTHROPIC_API_KEY"] == "rotated-key"
         assert env["ANTHROPIC_BASE_URL"] == "https://api.example.com/anthropic"
+        # Caller's non-secret env override is reapplied on top of the profile env.
+        assert env["CALLER_TAG"] == "from-caller"
         cmd = captured["cmd"]
         assert "--resume" in cmd and "sess-abc" in cmd
         assert "--model" in cmd and cmd[cmd.index("--model") + 1] == "big"
@@ -5830,3 +5841,126 @@ class TestProfiles:
         assert captured["env"] == {"SOME_VAR": "v"}
         # Non-profile respin does not re-specify --model (legacy behavior).
         assert "--model" not in captured["cmd"]
+
+    # --- secret handling ---------------------------------------------------
+
+    def test_resolved_secret_never_persisted(self, profiles_root, tmp_path, monkeypatch):
+        """A profile-resolved secret reaches the spawned child but is never
+        written to the spool JSON, nor surfaced via spool_info / spool_export."""
+        sentinel = "SENTINEL-SECRET-DO-NOT-PERSIST-9f3a2b"
+        monkeypatch.setenv("ALT_KEY", sentinel)
+        _make_profile(
+            profiles_root,
+            "alt",
+            {
+                "harness": "claude-code",
+                "base_url": "https://api.example.com/anthropic",
+                "api_key": "${ALT_KEY}",
+                "model": "big",
+            },
+        )
+        captured = {}
+
+        def fake_spawn(spool_id, cmd, cwd, env=None):
+            captured["env"] = env
+            return 4321
+
+        with patch("spindle._spawn_detached", side_effect=fake_spawn):
+            with patch("spindle._count_running", return_value=0):
+                spool_id = asyncio.run(self._spin()("do a thing", harness="alt", working_dir=str(tmp_path)))
+
+        # The resolved secret IS passed to the spawned child.
+        assert captured["env"]["ANTHROPIC_API_KEY"] == sentinel
+
+        # The secret is NOT written to the on-disk spool JSON.
+        on_disk = _get_spool_path(spool_id).read_text()
+        assert sentinel not in on_disk
+
+        # The persisted env carries no profile-resolved values at all.
+        spool = _read_spool(spool_id)
+        assert spool["profile"] == "alt"
+        assert spool.get("env") in (None, {})
+
+        # The secret is NOT surfaced via spool_info.
+        info = asyncio.run(spindle.spool_info.fn(spool_id))
+        assert sentinel not in info
+
+        # The secret is NOT surfaced via spool_export(format="json").
+        export_path = tmp_path / "export.json"
+        asyncio.run(spindle.spool_export.fn(spool_id, format="json", output_path=str(export_path)))
+        assert sentinel not in export_path.read_text()
+
+    def test_caller_env_persisted_secret_resolved_separately(self, profiles_root, tmp_path, monkeypatch):
+        """The caller's explicit non-secret env is persisted; the profile secret
+        is overlaid only into the spawn env."""
+        sentinel = "SENTINEL-CALLER-TEST-7c1d"
+        monkeypatch.setenv("ALT_KEY", sentinel)
+        _make_profile(
+            profiles_root,
+            "alt",
+            {"base_url": "https://api.example.com/anthropic", "api_key": "${ALT_KEY}"},
+        )
+        captured = {}
+
+        def fake_spawn(spool_id, cmd, cwd, env=None):
+            captured["env"] = env
+            return 1
+
+        with patch("spindle._spawn_detached", side_effect=fake_spawn):
+            with patch("spindle._count_running", return_value=0):
+                spool_id = asyncio.run(
+                    self._spin()(
+                        "x",
+                        harness="alt",
+                        env={"CALLER_TAG": "from-caller"},
+                        working_dir=str(tmp_path),
+                    )
+                )
+
+        # Spawn env has both the resolved secret and the caller override.
+        assert captured["env"]["ANTHROPIC_API_KEY"] == sentinel
+        assert captured["env"]["CALLER_TAG"] == "from-caller"
+
+        # Persisted env is the caller's explicit env only — no secret.
+        spool = _read_spool(spool_id)
+        assert spool["env"] == {"CALLER_TAG": "from-caller"}
+        assert sentinel not in _get_spool_path(spool_id).read_text()
+
+    # --- malformed profile fields -----------------------------------------
+
+    def test_malformed_env_type_clean_spin_error(self, profiles_root, tmp_path):
+        """A non-object env produces a clean spin error, not an uncaught crash."""
+        _make_profile(profiles_root, "bad", {"env": "not-a-dict"})
+        result = asyncio.run(self._spin()("x", harness="bad", working_dir=str(tmp_path)))
+        parsed = json.loads(result)
+        assert "error" in parsed
+        assert "env" in parsed["error"]
+        assert "bad" in parsed["error"]
+
+    def test_malformed_extra_args_type_clean_spin_error(self, profiles_root, tmp_path):
+        """A non-list extra_args produces a clean spin error, not a crash."""
+        _make_profile(profiles_root, "bad", {"extra_args": 5})
+        result = asyncio.run(self._spin()("x", harness="bad", working_dir=str(tmp_path)))
+        parsed = json.loads(result)
+        assert "error" in parsed
+        assert "extra_args" in parsed["error"]
+
+    def test_malformed_extra_args_non_string_items_clean_error(self, profiles_root, tmp_path):
+        """extra_args with non-string items also produces a clean spin error."""
+        _make_profile(profiles_root, "bad", {"extra_args": ["--ok", 7]})
+        result = asyncio.run(self._spin()("x", harness="bad", working_dir=str(tmp_path)))
+        parsed = json.loads(result)
+        assert "error" in parsed
+        assert "extra_args" in parsed["error"]
+
+    def test_malformed_field_types_raise_value_error(self, profiles_root):
+        """_resolve_profile_overrides raises ValueError on bad field types."""
+        _make_profile(profiles_root, "p1", {"env": "x"})
+        with pytest.raises(ValueError):
+            _resolve_profile_overrides(_load_profile("p1"))
+        _make_profile(profiles_root, "p2", {"extra_args": 5})
+        with pytest.raises(ValueError):
+            _resolve_profile_overrides(_load_profile("p2"))
+        _make_profile(profiles_root, "p3", {"model": 42})
+        with pytest.raises(ValueError):
+            _resolve_profile_overrides(_load_profile("p3"))

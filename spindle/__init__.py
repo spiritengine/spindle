@@ -1044,6 +1044,27 @@ def _resolve_profile_overrides(profile: dict) -> dict:
     """
     name = profile.get("_name", "<profile>")
     base = profile.get("harness") or "claude-code"
+
+    # Validate field types up front so a malformed profile raises a clean
+    # ValueError (caught by spin and surfaced as a spin error) instead of an
+    # AttributeError/TypeError deep in resolution. Discovery only guarantees the
+    # top level is a JSON object; individual fields are still untrusted.
+    for field in ("harness", "model", "base_url", "api_key", "config_dir"):
+        val = profile.get(field)
+        if val is not None and not isinstance(val, str):
+            raise ValueError(f"profile {name!r}: {field!r} must be a string, got {type(val).__name__}")
+    env_raw = profile.get("env")
+    if env_raw is not None and not isinstance(env_raw, dict):
+        raise ValueError(f"profile {name!r}: 'env' must be an object, got {type(env_raw).__name__}")
+    extra_args_raw = profile.get("extra_args")
+    if extra_args_raw is not None and (
+        not isinstance(extra_args_raw, list) or not all(isinstance(a, str) for a in extra_args_raw)
+    ):
+        raise ValueError(f"profile {name!r}: 'extra_args' must be a list of strings")
+    aliases_raw = profile.get("model_aliases")
+    if aliases_raw is not None and not isinstance(aliases_raw, dict):
+        raise ValueError(f"profile {name!r}: 'model_aliases' must be an object, got {type(aliases_raw).__name__}")
+
     base_url = profile.get("base_url")
     config_dir = profile.get("config_dir")
     api_key = profile.get("api_key")
@@ -2019,8 +2040,19 @@ def _spin_sync(
     research_target: Optional[str] = None,
     extra_args: Optional[list] = None,
     profile: Optional[str] = None,
+    spawn_env: Optional[Dict[str, str]] = None,
 ) -> str:
-    """Synchronous implementation of spin - runs in thread pool."""
+    """Synchronous implementation of spin - runs in thread pool.
+
+    ``env`` is the caller's explicit env and is the ONLY env persisted on the
+    spool record. ``spawn_env`` (defaulting to ``env``) is what is actually
+    injected into the child process; for profile spools it carries freshly
+    resolved secrets that must never be written to disk.
+    """
+    # Env injected into the child; falls back to the persisted caller env when
+    # no separate spawn env (i.e. no profile) was supplied.
+    if spawn_env is None:
+        spawn_env = env
     # Require working_dir - os.getcwd() returns MCP server dir, not caller's project
     if not working_dir:
         return "Error: working_dir required. Pass the project directory."
@@ -2268,9 +2300,9 @@ Your task:
 
     _write_spool(spool_id, spool)
 
-    # Spawn detached process
+    # Spawn detached process (spawn_env carries any profile secrets; never persisted)
     try:
-        pid = _spawn_detached(spool_id, cmd, cwd, env)
+        pid = _spawn_detached(spool_id, cmd, cwd, spawn_env)
     except Exception as e:
         # Spawn failed - mark spool as error so the slot is freed
         spool["status"] = "error"
@@ -2393,6 +2425,13 @@ async def spin(
                     }
                 )
 
+    # The caller's explicit env is the only env safe to persist on the spool
+    # record. Profile-resolved env (which carries ANTHROPIC_API_KEY and any
+    # op://-resolved secrets) must never hit disk, so it is built into a
+    # separate spawn_env that goes only to the child process.
+    caller_env = env
+    spawn_env = env
+
     # Apply profile overrides: resolve its base harness, build the injected env,
     # fold in the profile-scoped model alias / default model, and capture its
     # extra CLI args. base harness is enforced to claude-code in v1, so a
@@ -2409,11 +2448,12 @@ async def spin(
             model = overrides["model"]
         elif model in overrides["model_aliases"]:
             model = overrides["model_aliases"][model]
-        # Env: profile-injected env is the base; explicit caller env wins.
-        merged_env = dict(overrides["env"])
-        if env:
-            merged_env.update(env)
-        env = merged_env
+        # Spawn env: profile-injected env (fresh secrets) is the base; the
+        # caller's explicit env wins on top. This is passed to the child only;
+        # the persisted record keeps caller_env (no secrets).
+        spawn_env = dict(overrides["env"])
+        if caller_env:
+            spawn_env.update(caller_env)
         profile_extra_args = overrides["extra_args"]
         # Route through the base harness (claude-code in v1).
         harness_lower = overrides["base_harness"]
@@ -2497,11 +2537,12 @@ async def spin(
             model,
             timeout,
             skeinless,
-            env,
+            caller_env,
             base_branch=base_branch or _detect_default_branch(working_dir or os.getcwd()),
             research_target=research_target,
             extra_args=profile_extra_args,
             profile=profile_name,
+            spawn_env=spawn_env,
         )
 
     return result
@@ -2937,13 +2978,18 @@ def _respin_sync(handle: str, prompt: str) -> str:
             transcript_path = _get_transcript_path(original_spool["id"])
             transcript_available = transcript_path.exists()
 
-        # Inherit env from original spool by default.
-        env = original_spool.get("env") if original_spool else None
+        # The caller's explicit env is all that was persisted on the original
+        # spool (profile secrets are never written to disk). It is what we
+        # persist again and what we overlay on a re-resolved profile env.
+        caller_env = original_spool.get("env") if original_spool else None
+        spawn_env = caller_env
 
         # Profile spools: re-resolve the profile fresh so the resume hits the
         # same endpoint/config_dir (and picks up any rotated secrets), and
         # re-inject the model + extra_args — a --resume against an alt
-        # ANTHROPIC_BASE_URL still needs --model specified explicitly.
+        # ANTHROPIC_BASE_URL still needs --model specified explicitly. The
+        # re-resolved env carries secrets, so it goes only into spawn_env; the
+        # caller's non-secret env overrides are reapplied on top of it.
         profile_name = original_spool.get("profile") if original_spool else None
         if profile_name:
             prof = _load_profile(profile_name)
@@ -2957,7 +3003,13 @@ def _respin_sync(handle: str, prompt: str) -> str:
                         exc,
                     )
                 else:
-                    env = overrides["env"]
+                    spawn_env = dict(overrides["env"])
+                    if caller_env:
+                        spawn_env.update(caller_env)
+                    # resume_model is the effective model recorded at spin. When
+                    # it is None (profile sets no default and no caller model was
+                    # given) we deliberately omit --model and let the alt
+                    # endpoint use its own default — matching the original spin.
                     resume_model = original_spool.get("model")
                     if resume_model:
                         cmd.extend(["--model", CLAUDE_MODEL_ALIASES.get(resume_model, resume_model)])
@@ -2979,7 +3031,7 @@ def _respin_sync(handle: str, prompt: str) -> str:
             "allowed_tools": None,
             "system_prompt": None,
             "transcript_fallback_available": transcript_available,
-            "env": env,
+            "env": caller_env,
             "profile": profile_name,
             "created_at": datetime.now().isoformat(),
             "completed_at": None,
@@ -2991,8 +3043,8 @@ def _respin_sync(handle: str, prompt: str) -> str:
 
         _write_spool(spool_id, spool)
 
-        # Spawn detached process
-        pid = _spawn_detached(spool_id, cmd, cwd, env)
+        # Spawn detached process (spawn_env carries any profile secrets; never persisted)
+        pid = _spawn_detached(spool_id, cmd, cwd, spawn_env)
 
         spool["pid"] = pid
         spool["status"] = "running"
