@@ -39,6 +39,7 @@ from spindle import (
     _detect_existing_shard,
     _extract_codex_result,
     _extract_kimi_result,
+    _format_spool_failure,
     _gemini_spin_sync,
     _gemini_unspool_sync,
     _get_cc_bg_tasks,
@@ -56,6 +57,7 @@ from spindle import (
     _parse_duration,
     _read_spool,
     _recover_orphans,
+    _refusal_category,
     _resolve_permission,
     _resolve_spool_for_respin,
     _respin_sync,
@@ -63,6 +65,7 @@ from spindle import (
     _spin_sync,
     _spool_lock,
     _try_reserve_slot_and_create,
+    _unspool_sync,
     _write_spool,
     main,
     shard_abandon,
@@ -1034,6 +1037,341 @@ class TestExitCodeCapture:
             assert spool["status"] == "error"
             assert spool["error"] == "Process exited with no output"
             assert "exit_code" not in spool
+
+
+class TestFableGateRefusal:
+    """Fable's bio/cyber safety gate surfaces as a distinct, agent-readable state.
+
+    A gate refusal is a successful HTTP 200 with stop_reason "refusal" that the
+    CLI reports as an API Error. It is not a task failure — the right response is
+    to re-route to another model — so it must be distinguishable from a generic
+    error for agents, triage, and skein.
+    """
+
+    @staticmethod
+    def _cc_refusal_stream(category, message="API Error: Fable 5 has safety measures ...", is_error=True):
+        # stop_reason lives ONLY on the result event (where the code reads it).
+        # The assistant message carries stop_details (where the category lives)
+        # but no stop_reason, so a regression that read message.stop_reason would
+        # fail to detect the refusal.
+        return json.dumps(
+            [
+                {
+                    "type": "assistant",
+                    "message": {
+                        "role": "assistant",
+                        "stop_details": {"type": "refusal", "category": category, "explanation": None},
+                        "content": [],
+                    },
+                },
+                {
+                    "type": "result",
+                    "subtype": "success",
+                    "is_error": is_error,
+                    "stop_reason": "refusal",
+                    "result": message,
+                    "session_id": "sess-gate",
+                    "total_cost_usd": 1.23,
+                },
+            ]
+        )
+
+    def test_finalize_marks_gate_refusal_with_category(self, tmp_path):
+        spool_id = "gate-bio"
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool(
+                spool_id,
+                {
+                    "id": spool_id,
+                    "status": "running",
+                    "harness": "claude-code",
+                    "prompt": "deprescribing synth",
+                    "pid": 999999999,
+                    "tags": ["review"],
+                    "created_at": datetime.now().isoformat(),
+                },
+            )
+            _get_output_path(spool_id).write_text(self._cc_refusal_stream("bio"))
+            assert _check_and_finalize_spool(spool_id) is True
+            spool = _read_spool(spool_id)
+            assert spool["status"] == "error"
+            assert spool["error_kind"] == "fable_gate"
+            assert spool["gate_category"] == "bio"
+            # Existing tags preserved; marker appended, not duplicated.
+            assert spool["tags"] == ["review", "fable-gate"]
+
+    def test_finalize_unknown_category_when_gate_unnamed(self, tmp_path):
+        spool_id = "gate-null"
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool(
+                spool_id,
+                {
+                    "id": spool_id,
+                    "status": "running",
+                    "harness": "claude-code",
+                    "prompt": "x",
+                    "pid": 999999999,
+                    "created_at": datetime.now().isoformat(),
+                },
+            )
+            _get_output_path(spool_id).write_text(self._cc_refusal_stream(None))
+            assert _check_and_finalize_spool(spool_id) is True
+            spool = _read_spool(spool_id)
+            assert spool["error_kind"] == "fable_gate"
+            assert spool["gate_category"] == "unknown"
+            assert "fable-gate" in spool["tags"]
+
+    def test_ordinary_cc_error_is_not_marked_as_gate(self, tmp_path):
+        spool_id = "plain-err"
+        stream = json.dumps(
+            [
+                {
+                    "type": "result",
+                    "subtype": "error",
+                    "is_error": True,
+                    "result": "You've hit your session limit",
+                    "session_id": "s",
+                },
+            ]
+        )
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool(
+                spool_id,
+                {
+                    "id": spool_id,
+                    "status": "running",
+                    "harness": "claude-code",
+                    "prompt": "x",
+                    "pid": 999999999,
+                    "created_at": datetime.now().isoformat(),
+                },
+            )
+            _get_output_path(spool_id).write_text(stream)
+            assert _check_and_finalize_spool(spool_id) is True
+            spool = _read_spool(spool_id)
+            assert spool["status"] == "error"
+            assert "error_kind" not in spool
+            assert "fable-gate" not in (spool.get("tags") or [])
+
+    def test_refusal_category_scans_assistant_events(self):
+        data = [
+            {"type": "assistant", "message": {"stop_details": {"type": "refusal", "category": None}}},
+            {"type": "assistant", "message": {"stop_details": {"type": "refusal", "category": "cyber"}}},
+            {"type": "result", "stop_reason": "refusal"},
+        ]
+        assert _refusal_category(data) == "cyber"
+
+    def test_refusal_category_defaults_unknown(self):
+        assert _refusal_category([{"type": "result", "stop_reason": "refusal"}]) == "unknown"
+        assert _refusal_category("not-a-list") == "unknown"
+
+    def test_format_failure_calls_out_gate(self):
+        msg = _format_spool_failure(
+            "g1",
+            {
+                "error": "API Error: Fable 5 has safety measures ...",
+                "error_kind": "fable_gate",
+                "gate_category": "bio",
+            },
+        )
+        assert "FABLE SAFETY GATE (bio)" in msg
+        assert "re-route" in msg
+        assert "API Error: Fable 5" in msg
+
+    def test_format_failure_plain_error_unchanged(self):
+        assert _format_spool_failure("g2", {"error": "boom"}) == "Spool g2 failed: boom"
+
+    def test_unspool_surfaces_gate_to_agent(self, tmp_path):
+        spool_id = "gate-unspool"
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool(
+                spool_id,
+                {
+                    "id": spool_id,
+                    "status": "running",
+                    "harness": "claude-code",
+                    "prompt": "x",
+                    "pid": 999999999,
+                    "created_at": datetime.now().isoformat(),
+                },
+            )
+            _get_output_path(spool_id).write_text(self._cc_refusal_stream("bio"))
+            out = _unspool_sync(spool_id)
+            assert "FABLE SAFETY GATE (bio)" in out
+            assert "re-route to a different model" in out
+
+    def test_fable_detected_via_model_when_gate_text_absent(self, tmp_path):
+        # Model is Fable, but the refusal text doesn't echo the CLI gate string.
+        # Detection must still attribute it to Fable via the model alias.
+        spool_id = "gate-bymodel"
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool(
+                spool_id,
+                {
+                    "id": spool_id,
+                    "status": "running",
+                    "harness": "claude-code",
+                    "model": "fable",
+                    "prompt": "x",
+                    "pid": 999999999,
+                    "created_at": datetime.now().isoformat(),
+                },
+            )
+            _get_output_path(spool_id).write_text(self._cc_refusal_stream("cyber", message="declined"))
+            assert _check_and_finalize_spool(spool_id) is True
+            spool = _read_spool(spool_id)
+            assert spool["error_kind"] == "fable_gate"
+            assert spool["gate_category"] == "cyber"
+
+    def test_respin_without_model_detected_via_gate_text(self, tmp_path):
+        # Continues/respins don't record a model; the Fable gate text is the
+        # only signal, and it must be enough.
+        spool_id = "gate-respin"
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool(
+                spool_id,
+                {
+                    "id": spool_id,
+                    "status": "running",
+                    "harness": "claude-code",
+                    "prompt": "x",
+                    "pid": 999999999,
+                    "created_at": datetime.now().isoformat(),
+                },
+            )
+            msg = "API Error: Fable 5 has measures that flagged something in this session"
+            _get_output_path(spool_id).write_text(self._cc_refusal_stream(None, message=msg))
+            assert _check_and_finalize_spool(spool_id) is True
+            spool = _read_spool(spool_id)
+            assert spool["error_kind"] == "fable_gate"
+
+    def test_non_fable_refusal_marked_safety_refusal_not_gate(self, tmp_path):
+        # A genuine refusal from another model must NOT be attributed to Fable.
+        spool_id = "refuse-opus"
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool(
+                spool_id,
+                {
+                    "id": spool_id,
+                    "status": "running",
+                    "harness": "claude-code",
+                    "model": "opus",
+                    "prompt": "x",
+                    "pid": 999999999,
+                    "created_at": datetime.now().isoformat(),
+                },
+            )
+            _get_output_path(spool_id).write_text(self._cc_refusal_stream(None, message="I can't help with that."))
+            assert _check_and_finalize_spool(spool_id) is True
+            spool = _read_spool(spool_id)
+            assert spool["status"] == "error"
+            assert spool["error_kind"] == "safety_refusal"
+            assert "fable-gate" not in (spool.get("tags") or [])
+            assert "gate_category" not in spool
+
+    def test_non_fable_model_ignores_gate_text(self, tmp_path):
+        # A recorded non-Fable model is trusted: even if the refusal text quotes
+        # "Fable 5", it must NOT be attributed to Fable's gate.
+        spool_id = "refuse-textquote"
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool(
+                spool_id,
+                {
+                    "id": spool_id,
+                    "status": "running",
+                    "harness": "claude-code",
+                    "model": "opus",
+                    "prompt": "x",
+                    "pid": 999999999,
+                    "created_at": datetime.now().isoformat(),
+                },
+            )
+            _get_output_path(spool_id).write_text(
+                self._cc_refusal_stream(None, message="I can't help write about Fable 5 exploits.")
+            )
+            assert _check_and_finalize_spool(spool_id) is True
+            spool = _read_spool(spool_id)
+            assert spool["error_kind"] == "safety_refusal"
+            assert "fable-gate" not in (spool.get("tags") or [])
+
+    def test_gate_tag_not_duplicated(self, tmp_path):
+        spool_id = "gate-dupe"
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool(
+                spool_id,
+                {
+                    "id": spool_id,
+                    "status": "running",
+                    "harness": "claude-code",
+                    "model": "fable",
+                    "prompt": "x",
+                    "pid": 999999999,
+                    "tags": ["fable-gate"],
+                    "created_at": datetime.now().isoformat(),
+                },
+            )
+            _get_output_path(spool_id).write_text(self._cc_refusal_stream("bio"))
+            assert _check_and_finalize_spool(spool_id) is True
+            spool = _read_spool(spool_id)
+            assert spool["tags"] == ["fable-gate"]
+
+    def test_refusal_sets_error_when_is_error_absent(self, tmp_path):
+        # Defensive: even if a future refusal arrives without is_error, the
+        # refusal text must land in spool["error"] so rendering isn't blank.
+        spool_id = "gate-noerr"
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool(
+                spool_id,
+                {
+                    "id": spool_id,
+                    "status": "running",
+                    "harness": "claude-code",
+                    "model": "fable",
+                    "prompt": "x",
+                    "pid": 999999999,
+                    "created_at": datetime.now().isoformat(),
+                },
+            )
+            msg = "API Error: Fable 5 has safety measures ..."
+            _get_output_path(spool_id).write_text(self._cc_refusal_stream("bio", message=msg, is_error=False))
+            assert _check_and_finalize_spool(spool_id) is True
+            spool = _read_spool(spool_id)
+            assert spool["status"] == "error"
+            assert spool["error_kind"] == "fable_gate"
+            assert spool["error"] == msg
+
+    def test_refusal_category_single_dict_old_format(self):
+        # Old single-object CC format carrying stop_details on the event itself.
+        assert _refusal_category({"type": "result", "stop_details": {"type": "refusal", "category": "bio"}}) == "bio"
+        # And on a nested message.
+        nested = {"type": "assistant", "message": {"stop_details": {"type": "refusal", "category": "cyber"}}}
+        assert _refusal_category(nested) == "cyber"
+
+    def test_format_failure_safety_refusal(self):
+        msg = _format_spool_failure("s1", {"error": "I can't help", "error_kind": "safety_refusal"})
+        assert "SAFETY REFUSAL" in msg
+        assert "FABLE" not in msg
+        assert "I can't help" in msg
+
+    def test_unspool_surfaces_safety_refusal(self, tmp_path):
+        spool_id = "refuse-unspool"
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool(
+                spool_id,
+                {
+                    "id": spool_id,
+                    "status": "running",
+                    "harness": "claude-code",
+                    "model": "opus",
+                    "prompt": "x",
+                    "pid": 999999999,
+                    "created_at": datetime.now().isoformat(),
+                },
+            )
+            _get_output_path(spool_id).write_text(self._cc_refusal_stream(None, message="declined"))
+            out = _unspool_sync(spool_id)
+            assert "SAFETY REFUSAL" in out
+            assert "FABLE" not in out
 
 
 class TestReloadDrain:

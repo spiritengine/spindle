@@ -1049,6 +1049,79 @@ def _extract_cc_result(data) -> Optional[dict]:
     return None
 
 
+def _refusal_category(data) -> str:
+    """Pull the safety-classifier category from a Claude Code refusal stream.
+
+    When Fable's bio/cyber gate declines a session, the result event carries
+    stop_reason == "refusal" but no category; the category ("bio", "cyber", ...)
+    lives on an assistant message's stop_details. Returns the category, or
+    "unknown" when the gate fired without naming one — common, two of the first
+    three observed refusals had a null category.
+    """
+    events = data if isinstance(data, list) else [data]
+    for item in events:
+        if not isinstance(item, dict):
+            continue
+        msg = item.get("message")
+        # Category lives on the assistant message's stop_details, or — in the
+        # old single-object CC format — on the event's own stop_details.
+        candidates = []
+        if isinstance(msg, dict):
+            candidates.append(msg.get("stop_details"))
+        candidates.append(item.get("stop_details"))
+        for details in candidates:
+            if isinstance(details, dict) and details.get("type") == "refusal":
+                category = details.get("category")
+                if category:
+                    return category
+    return "unknown"
+
+
+def _is_fable_gate(model, text) -> bool:
+    """True when a Claude safety refusal is specifically Fable's bio/cyber gate.
+
+    ``stop_reason == "refusal"`` is the generic Anthropic safety-refusal signal —
+    any model can emit it, so it alone must not be attributed to Fable. When a
+    model was recorded, trust it: the gate is Fable's iff the model resolves to
+    claude-fable-5; any other model's refusal is not Fable's, even if the task
+    text happens to mention "Fable 5". Only when no model was recorded (respins
+    and continues, which don't carry one) do we fall back to the CLI's
+    Fable-specific gate text. The separate "issue with the selected model
+    (claude-fable-5)" unavailability error never reaches here — it carries
+    stop_reason "stop_sequence", not "refusal".
+    """
+    if isinstance(model, str) and model.strip():
+        return CLAUDE_MODEL_ALIASES.get(model, model) == "claude-fable-5"
+    return isinstance(text, str) and "Fable 5" in text
+
+
+def _format_spool_failure(spool_id: str, spool: dict) -> str:
+    """Render a failed spool's status line, calling out the Fable safety gate.
+
+    A gate refusal is not a task failure — Fable's bio/cybersecurity classifier
+    declined the session and the right response is to re-route to another model,
+    not to debug the work. Surface that distinctly so an orchestrating agent can
+    branch on it instead of parsing the generic error prose.
+    """
+    err = spool.get("error", "Unknown error")
+    kind = spool.get("error_kind")
+    if kind == "fable_gate":
+        category = spool.get("gate_category", "unknown")
+        return (
+            f"Spool {spool_id} FABLE SAFETY GATE ({category}): Fable's "
+            f"bio/cybersecurity classifier declined this session. This is NOT a "
+            f"task failure — re-route to a different model (e.g. opus) and respin. "
+            f"Original message:\n{err}"
+        )
+    if kind == "safety_refusal":
+        return (
+            f"Spool {spool_id} SAFETY REFUSAL: the model declined this request on "
+            f"safety grounds (not a task failure). Consider rephrasing or trying a "
+            f"different model. Original message:\n{err}"
+        )
+    return f"Spool {spool_id} failed: {err}"
+
+
 def _extract_codex_result(stdout: str) -> Optional[str]:
     """Extract the agent's prose from Codex's newline-delimited JSON stream.
 
@@ -1484,6 +1557,30 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
                     if cc_result.get("is_error"):
                         spool["status"] = "error"
                         spool["error"] = cc_result.get("result", "Unknown error")
+                    if cc_result.get("stop_reason") == "refusal":
+                        # A safety classifier declined the session (HTTP 200 +
+                        # stop_reason refusal, surfaced by the CLI as an API
+                        # Error). Not a task failure — the caller should re-route
+                        # or rephrase. Mark it distinctly so agents, triage, and
+                        # skein recognize it instead of an undifferentiated error.
+                        spool["status"] = "error"
+                        refusal_text = cc_result.get("result") or spool.get("error") or ""
+                        if not spool.get("error"):
+                            spool["error"] = refusal_text or "Model declined the request (safety refusal)"
+                        if _is_fable_gate(spool.get("model"), refusal_text):
+                            # Fable's bio/cyber gate specifically — categorize and
+                            # tag so orchestrators can route around it.
+                            spool["error_kind"] = "fable_gate"
+                            spool["gate_category"] = _refusal_category(data)
+                            tags = spool.get("tags") or []
+                            if "fable-gate" not in tags:
+                                tags.append("fable-gate")
+                            spool["tags"] = tags
+                        else:
+                            # Generic safety refusal from some other model — flag
+                            # it, but don't attribute it to Fable or advise a
+                            # re-route that may not help.
+                            spool["error_kind"] = "safety_refusal"
                 else:
                     # Parsed JSON but no recognizable result structure
                     spool["result"] = stdout
@@ -2216,12 +2313,12 @@ def _unspool_sync(spool_id: str) -> str:
                 if spool.get("status") == "complete":
                     return spool.get("result", "No result")
                 elif spool.get("status") == "error":
-                    return f"Spool {spool_id} failed: {spool.get('error', 'Unknown error')}"
+                    return _format_spool_failure(spool_id, spool)
             return f"Spool {spool_id} still running: {spool.get('prompt', '')[:50]}..."
         elif status == "complete":
             return spool.get("result", "No result")
         else:
-            return f"Spool {spool_id} failed: {spool.get('error', 'Unknown error')}"
+            return _format_spool_failure(spool_id, spool)
 
 
 @mcp.tool()
