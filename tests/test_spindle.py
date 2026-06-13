@@ -48,6 +48,7 @@ from spindle import (
     _get_output_path,
     _get_spool_path,
     _get_transcript_path,
+    _handle_expired_session,
     _is_pid_alive,
     _is_review_tag,
     _kimi_respin_sync,
@@ -58,6 +59,7 @@ from spindle import (
     _monitor_spool,
     _op_inject,
     _parse_duration,
+    _profile_spawn_env,
     _read_spool,
     _recover_orphans,
     _refusal_category,
@@ -78,6 +80,7 @@ from spindle import (
     spin,
     spool_info,
     spool_peek,
+    spool_retry,
 )
 
 
@@ -5925,6 +5928,347 @@ class TestProfiles:
         spool = _read_spool(spool_id)
         assert spool["env"] == {"CALLER_TAG": "from-caller"}
         assert sentinel not in _get_spool_path(spool_id).read_text()
+
+    # --- shared spawn-env helper ------------------------------------------
+
+    def test_profile_spawn_env_resolves_overlays_and_degrades(self, profiles_root, monkeypatch):
+        """The shared helper re-resolves a profile fresh, overlays caller env,
+        and degrades to caller env alone when the profile is gone."""
+        monkeypatch.setenv("ALT_KEY", "key-fresh")
+        _make_profile(
+            profiles_root,
+            "alt",
+            {
+                "base_url": "https://api.example.com/anthropic",
+                "api_key": "${ALT_KEY}",
+                "extra_args": ["--verbose"],
+                "model": "big",
+                "model_aliases": {"fast": "small-model"},
+            },
+        )
+
+        # Valid profile: secrets resolved into spawn env, caller env overlaid,
+        # profile default model + extra_args returned, resolved=True.
+        spawn_env, model, extra_args, resolved = _profile_spawn_env("alt", {"CALLER": "c"})
+        assert resolved is True
+        assert spawn_env["ANTHROPIC_BASE_URL"] == "https://api.example.com/anthropic"
+        assert spawn_env["ANTHROPIC_API_KEY"] == "key-fresh"
+        assert spawn_env["CALLER"] == "c"
+        assert model == "big"
+        assert extra_args == ["--verbose"]
+
+        # A caller model matching a profile alias is mapped; an unrelated one passes through.
+        _, mapped, _, _ = _profile_spawn_env("alt", None, model="fast")
+        assert mapped == "small-model"
+        _, passthru, _, _ = _profile_spawn_env("alt", None, model="opus")
+        assert passthru == "opus"
+
+        # Missing profile degrades to caller env alone, resolved=False — no alt endpoint.
+        se, m, ea, r = _profile_spawn_env("ghost", {"CALLER": "c"}, model="opus")
+        assert (se, m, ea, r) == ({"CALLER": "c"}, "opus", [], False)
+
+        # No profile name is a no-op passthrough.
+        assert _profile_spawn_env(None, {"X": "y"}, model="m") == ({"X": "y"}, "m", [], False)
+
+    def test_profile_spawn_env_strict_raises_on_missing(self, profiles_root):
+        """strict=True surfaces a missing/malformed profile as ValueError (spin path)."""
+        with pytest.raises(ValueError):
+            _profile_spawn_env("ghost", None, strict=True)
+        _make_profile(profiles_root, "bad", {"env": "not-a-dict"})
+        with pytest.raises(ValueError):
+            _profile_spawn_env("bad", None, strict=True)
+
+    def test_all_profile_spawn_paths_route_through_helper(self, profiles_root, tmp_path, monkeypatch):
+        """spin, respin, retry, and the expired-session fallback all reconstruct
+        the profile spawn env through the one shared helper."""
+        monkeypatch.setenv("ALT_KEY", "k")
+        _make_profile(
+            profiles_root,
+            "alt",
+            {"base_url": "https://api.example.com/anthropic", "api_key": "${ALT_KEY}", "model": "big"},
+        )
+
+        def fake_spawn(spool_id, cmd, cwd, env=None):
+            return 1
+
+        # Distinct originals per path so _find_spool_by_session stays unambiguous.
+        _write_spool(
+            "route-respin",
+            {
+                "id": "route-respin",
+                "status": "complete",
+                "session_id": "sess-respin",
+                "model": "big",
+                "profile": "alt",
+                "env": None,
+                "working_dir": str(tmp_path),
+                "harness": "claude-code",
+                "created_at": datetime.now().isoformat(),
+            },
+        )
+        _write_spool(
+            "route-retry",
+            {
+                "id": "route-retry",
+                "status": "error",
+                "prompt": "do it",
+                "permission": "careful",
+                "model": "big",
+                "profile": "alt",
+                "env": None,
+                "working_dir": str(tmp_path),
+                "harness": "claude-code",
+                "tags": [],
+                "created_at": datetime.now().isoformat(),
+            },
+        )
+        _write_spool(
+            "route-exp-orig",
+            {
+                "id": "route-exp-orig",
+                "status": "complete",
+                "session_id": "sess-exp-route",
+                "model": "big",
+                "profile": "alt",
+                "env": None,
+                "working_dir": str(tmp_path),
+                "harness": "claude-code",
+                "created_at": datetime.now().isoformat(),
+            },
+        )
+        exp_transcript = _get_transcript_path("route-exp-orig")
+        exp_transcript.parent.mkdir(parents=True, exist_ok=True)
+        exp_transcript.write_text("prior transcript")
+        failing = {
+            "id": "route-exp-fail",
+            "status": "running",
+            "session_id": "sess-exp-route",
+            "prompt": "Continue sess-exp-route: keep going",
+            "profile": "alt",
+            "env": None,
+            "working_dir": str(tmp_path),
+            "pid": None,
+        }
+
+        wrapped = MagicMock(side_effect=_profile_spawn_env)
+        with patch("spindle._profile_spawn_env", wrapped):
+            with patch("spindle._spawn_detached", side_effect=fake_spawn):
+                with patch("spindle._count_running", return_value=0):
+                    asyncio.run(self._spin()("x", harness="alt", working_dir=str(tmp_path)))  # 1. spin
+                    _respin_sync("sess-respin", "again")  # 2. respin
+                    asyncio.run(spool_retry.fn("route-retry"))  # 3. retry
+                    assert _handle_expired_session("route-exp-fail", failing) is True  # 4. expired
+
+        called_profiles = [c.args[0] for c in wrapped.call_args_list]
+        # Every path asked the helper to reconstruct the "alt" profile spawn env.
+        assert called_profiles.count("alt") == 4
+
+    # --- retry / expired-session profile re-resolution --------------------
+
+    def test_retry_reresolves_profile_secret_not_persisted(self, profiles_root, tmp_path, monkeypatch):
+        """Retrying a profile spool re-resolves the alt endpoint/key/model/extra_args
+        and applies the caller overlay, while the secret never hits disk."""
+        sentinel = "SENTINEL-RETRY-3e9a"
+        monkeypatch.setenv("ALT_KEY", sentinel)
+        _make_profile(
+            profiles_root,
+            "alt",
+            {
+                "base_url": "https://api.example.com/anthropic",
+                "api_key": "${ALT_KEY}",
+                "extra_args": ["--verbose"],
+                "model": "big",
+            },
+        )
+        # A failed profile spool: persisted env is caller-only (no secret).
+        _write_spool(
+            "retry-orig",
+            {
+                "id": "retry-orig",
+                "status": "error",
+                "prompt": "do the thing",
+                "permission": "careful",
+                "model": "big",
+                "profile": "alt",
+                "env": {"CALLER_TAG": "from-caller"},
+                "working_dir": str(tmp_path),
+                "harness": "claude-code",
+                "tags": [],
+                "created_at": datetime.now().isoformat(),
+            },
+        )
+        captured = {}
+
+        def fake_spawn(spool_id, cmd, cwd, env=None):
+            captured["env"] = env
+            captured["cmd"] = cmd
+            return 4321
+
+        with patch("spindle._spawn_detached", side_effect=fake_spawn):
+            with patch("spindle._count_running", return_value=0):
+                new_id = asyncio.run(spool_retry.fn("retry-orig"))
+
+        # The retried spawn re-resolves the alt endpoint, key, model, and extra_args.
+        env = captured["env"]
+        assert env["ANTHROPIC_BASE_URL"] == "https://api.example.com/anthropic"
+        assert env["ANTHROPIC_API_KEY"] == sentinel
+        assert env["CALLER_TAG"] == "from-caller"
+        cmd = captured["cmd"]
+        assert "--model" in cmd and cmd[cmd.index("--model") + 1] == "big"
+        assert "--verbose" in cmd
+
+        # The re-resolved secret is never persisted on the retried spool.
+        assert sentinel not in _get_spool_path(new_id).read_text()
+        new_spool = _read_spool(new_id)
+        assert new_spool["profile"] == "alt"
+        assert new_spool["env"] == {"CALLER_TAG": "from-caller"}
+        info = asyncio.run(spindle.spool_info.fn(new_id))
+        assert sentinel not in info
+        export_path = tmp_path / "retry-export.json"
+        asyncio.run(spindle.spool_export.fn(new_id, format="json", output_path=str(export_path)))
+        assert sentinel not in export_path.read_text()
+
+    def test_retry_non_profile_uses_stored_env(self, tmp_path):
+        """A non-profile retry spawns with the stored caller env and no profile injection."""
+        _write_spool(
+            "retry-plain",
+            {
+                "id": "retry-plain",
+                "status": "error",
+                "prompt": "plain task",
+                "permission": "careful",
+                "model": "opus",
+                "profile": None,
+                "env": {"SOME_VAR": "v"},
+                "working_dir": str(tmp_path),
+                "harness": "claude-code",
+                "tags": [],
+                "created_at": datetime.now().isoformat(),
+            },
+        )
+        captured = {}
+
+        def fake_spawn(spool_id, cmd, cwd, env=None):
+            captured["env"] = env
+            return 1
+
+        with patch("spindle._spawn_detached", side_effect=fake_spawn):
+            with patch("spindle._count_running", return_value=0):
+                asyncio.run(spool_retry.fn("retry-plain"))
+
+        assert captured["env"] == {"SOME_VAR": "v"}
+        assert "ANTHROPIC_BASE_URL" not in captured["env"]
+
+    def test_expired_session_reresolves_profile_secret_not_persisted(self, profiles_root, tmp_path, monkeypatch):
+        """The transcript-fallback respin of a profile spool rebuilds the alt
+        endpoint/key/model rather than running against the default endpoint."""
+        sentinel = "SENTINEL-EXPIRED-b71c"
+        monkeypatch.setenv("ALT_KEY", sentinel)
+        _make_profile(
+            profiles_root,
+            "alt",
+            {
+                "base_url": "https://api.example.com/anthropic",
+                "api_key": "${ALT_KEY}",
+                "extra_args": ["--verbose"],
+                "model": "big",
+            },
+        )
+        # The original (resumable) spool carries the effective model + profile.
+        _write_spool(
+            "exp-orig",
+            {
+                "id": "exp-orig",
+                "status": "complete",
+                "session_id": "sess-exp",
+                "model": "big",
+                "profile": "alt",
+                "env": {"CALLER_TAG": "from-caller"},
+                "working_dir": str(tmp_path),
+                "harness": "claude-code",
+                "created_at": datetime.now().isoformat(),
+            },
+        )
+        transcript = _get_transcript_path("exp-orig")
+        transcript.parent.mkdir(parents=True, exist_ok=True)
+        transcript.write_text("prior conversation")
+
+        # The failing respin spool (session expired) carries the caller env + profile.
+        failing = {
+            "id": "exp-fail",
+            "status": "running",
+            "session_id": "sess-exp",
+            "prompt": "Continue sess-exp: keep going",
+            "profile": "alt",
+            "env": {"CALLER_TAG": "from-caller"},
+            "working_dir": str(tmp_path),
+            "pid": None,
+        }
+        captured = {}
+
+        def fake_spawn(spool_id, cmd, cwd, env=None):
+            captured["env"] = env
+            captured["cmd"] = cmd
+            return 7777
+
+        with patch("spindle._spawn_detached", side_effect=fake_spawn):
+            assert _handle_expired_session("exp-fail", failing) is True
+
+        # The fallback spawn hits the alt endpoint with the re-resolved key.
+        env = captured["env"]
+        assert env["ANTHROPIC_BASE_URL"] == "https://api.example.com/anthropic"
+        assert env["ANTHROPIC_API_KEY"] == sentinel
+        assert env["CALLER_TAG"] == "from-caller"
+        cmd = captured["cmd"]
+        # Re-injected recorded model + extra_args; no --resume on a transcript fallback.
+        assert "--model" in cmd and cmd[cmd.index("--model") + 1] == "big"
+        assert "--verbose" in cmd
+        assert "--resume" not in cmd
+
+        # The fallback never persists the secret on the spool record.
+        assert sentinel not in _get_spool_path("exp-fail").read_text()
+
+    def test_expired_session_non_profile_unchanged(self, tmp_path):
+        """A non-profile expired-session fallback keeps the stored env and adds no --model."""
+        _write_spool(
+            "exp-orig2",
+            {
+                "id": "exp-orig2",
+                "status": "complete",
+                "session_id": "sess-exp2",
+                "model": "opus",
+                "profile": None,
+                "env": {"SOME_VAR": "v"},
+                "working_dir": str(tmp_path),
+                "harness": "claude-code",
+                "created_at": datetime.now().isoformat(),
+            },
+        )
+        transcript = _get_transcript_path("exp-orig2")
+        transcript.parent.mkdir(parents=True, exist_ok=True)
+        transcript.write_text("prior")
+        failing = {
+            "id": "exp-fail2",
+            "status": "running",
+            "session_id": "sess-exp2",
+            "prompt": "Continue sess-exp2: go",
+            "profile": None,
+            "env": {"SOME_VAR": "v"},
+            "working_dir": str(tmp_path),
+            "pid": None,
+        }
+        captured = {}
+
+        def fake_spawn(spool_id, cmd, cwd, env=None):
+            captured["env"] = env
+            captured["cmd"] = cmd
+            return 1
+
+        with patch("spindle._spawn_detached", side_effect=fake_spawn):
+            assert _handle_expired_session("exp-fail2", failing) is True
+
+        assert captured["env"] == {"SOME_VAR": "v"}
+        assert "--model" not in captured["cmd"]
 
     # --- malformed profile fields -----------------------------------------
 

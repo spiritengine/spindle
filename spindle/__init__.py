@@ -1115,6 +1115,86 @@ def _resolve_profile_overrides(profile: dict) -> dict:
     }
 
 
+def _profile_spawn_env(
+    profile_name: Optional[str],
+    caller_env: Optional[Dict[str, str]],
+    model: Optional[str] = None,
+    *,
+    strict: bool = False,
+) -> Tuple[Optional[Dict[str, str]], Optional[str], list, bool]:
+    """Reconstruct a profile spool's child spawn env, model, and extra args.
+
+    Every profile spawn path — the fresh spin, ``_respin_sync``,
+    ``spool_retry``, and ``_handle_expired_session``'s transcript fallback —
+    routes through here so the alt endpoint / key / model / extra_args are
+    rebuilt identically at every spawn. Before this helper existed, two of
+    those four paths read the (deliberately secret-stripped) persisted env and
+    silently ran the profile spool against the default api.anthropic.com
+    endpoint; centralizing the reconstruction keeps a future spawn path from
+    regressing the same way.
+
+    The profile is re-resolved fresh on every call: ``${ENV}`` and ``op://``
+    secrets are re-expanded (so rotated keys take effect) into ``spawn_env``,
+    the caller's persisted non-secret env is overlaid on top (caller wins), and
+    ``spawn_env`` is returned for the child process ONLY. The resolved secrets
+    are never part of the persisted record — callers persist ``caller_env``.
+
+    ``model`` is the caller-supplied (fresh spin) or recorded (resume) model to
+    honor: ``None`` falls back to the profile's default model; a value matching
+    a profile-scoped alias is mapped; any other value is kept as-is.
+
+    ``strict`` True re-raises a missing/malformed profile's ``ValueError`` so
+    the fresh-spin path can surface it to the caller. ``strict`` False (the
+    resume/retry default) logs and degrades to the caller env alone — a
+    deleted/corrupted profile loses the alt endpoint on resume rather than
+    crashing the recovery.
+
+    Returns ``(spawn_env, model, extra_args, resolved)``. ``resolved`` is True
+    only when the profile loaded and resolved; resume paths gate re-injecting
+    ``--model``/extra_args on it so a degraded resume matches its pre-profile
+    behavior.
+    """
+    if not profile_name:
+        return caller_env, model, [], False
+
+    prof = _load_profile(profile_name)
+    if prof is None:
+        if strict:
+            raise ValueError(f"profile {profile_name!r} is not lodged")
+        logger.warning(
+            "spindle: profile %r no longer lodged; reusing stored env (alt endpoint lost on resume)",
+            profile_name,
+        )
+        return caller_env, model, [], False
+
+    try:
+        overrides = _resolve_profile_overrides(prof)
+    except ValueError as exc:
+        if strict:
+            raise
+        logger.warning(
+            "spindle: profile %r failed to resolve (%s); reusing stored env (alt endpoint lost on resume)",
+            profile_name,
+            exc,
+        )
+        return caller_env, model, [], False
+
+    # Spawn env: profile-injected env (fresh secrets) is the base; the caller's
+    # persisted non-secret env wins on top. Child process only — never persisted.
+    spawn_env = dict(overrides["env"])
+    if caller_env:
+        spawn_env.update(caller_env)
+
+    # Model: None -> profile default; a profile-scoped alias is mapped;
+    # otherwise the caller/recorded model passes through unchanged.
+    if model is None:
+        model = overrides["model"]
+    elif model in overrides["model_aliases"]:
+        model = overrides["model_aliases"][model]
+
+    return spawn_env, model, overrides["extra_args"], True
+
+
 def _get_cc_bg_tasks(session_id: str) -> list:
     """
     Read Claude Code background-task records for a session.
@@ -1921,10 +2001,25 @@ Continue from above. New message: {spool["prompt"].split(": ", 1)[-1]}"""
     # Spawn new process without --resume flag, with transcript as context
     cmd = ["claude", "-p", context_prompt, "--output-format", "json"]
 
+    # Profile spools: rebuild the alt endpoint/key spawn env fresh and re-inject
+    # --model/extra_args so the transcript fallback hits the same endpoint as the
+    # original spin instead of the default api.anthropic.com. The recorded
+    # effective model lives on the original spool (the failing respin spool does
+    # not persist a model). caller_env (the only persisted env) is overlaid and
+    # remains the only env written to disk.
+    profile_name = spool.get("profile")
+    caller_env = spool.get("env")
+    spawn_env, eff_model, profile_extra_args, resolved = _profile_spawn_env(
+        profile_name, caller_env, model=original_spool.get("model")
+    )
+    if resolved:
+        if eff_model:
+            cmd.extend(["--model", CLAUDE_MODEL_ALIASES.get(eff_model, eff_model)])
+        if profile_extra_args:
+            cmd.extend(profile_extra_args)
+
     try:
-        # Inherit env from spool if available
-        env = spool.get("env")
-        new_pid = _spawn_detached(spool_id, cmd, spool["working_dir"], env)
+        new_pid = _spawn_detached(spool_id, cmd, spool["working_dir"], spawn_env)
 
         # Update spool with new PID and mark as using transcript fallback
         spool["pid"] = new_pid
@@ -2437,26 +2532,20 @@ async def spin(
     # extra CLI args. base harness is enforced to claude-code in v1, so a
     # resolved profile always routes through the Claude Code path below.
     if profile is not None:
+        profile_name = profile["_name"]
+        # Reconstruct the child spawn env (carrying fresh secrets), effective
+        # model (caller model wins / alias-mapped / profile default), and extra
+        # CLI args. strict=True surfaces a malformed profile to the caller
+        # instead of silently degrading. caller_env stays the only persisted env.
         try:
-            overrides = _resolve_profile_overrides(profile)
+            spawn_env, model, profile_extra_args, _ = _profile_spawn_env(
+                profile_name, caller_env, model=model, strict=True
+            )
         except ValueError as exc:
             return json.dumps({"error": str(exc)})
-        profile_name = profile["_name"]
-        # Model: caller-passed model wins; a caller model that matches a
-        # profile-scoped alias is mapped; otherwise fall back to profile.model.
-        if model is None:
-            model = overrides["model"]
-        elif model in overrides["model_aliases"]:
-            model = overrides["model_aliases"][model]
-        # Spawn env: profile-injected env (fresh secrets) is the base; the
-        # caller's explicit env wins on top. This is passed to the child only;
-        # the persisted record keeps caller_env (no secrets).
-        spawn_env = dict(overrides["env"])
-        if caller_env:
-            spawn_env.update(caller_env)
-        profile_extra_args = overrides["extra_args"]
-        # Route through the base harness (claude-code in v1).
-        harness_lower = overrides["base_harness"]
+        # base harness is enforced to claude-code in v1 (_resolve_profile_overrides
+        # raises otherwise), so a resolved profile always routes through CC.
+        harness_lower = "claude-code"
 
     # auto/auto+shard is CC-specific; non-CC harnesses have no classifier-vetted mode
     if permission and permission.startswith("auto") and harness_lower and harness_lower != "claude-code":
@@ -2990,36 +3079,27 @@ def _respin_sync(handle: str, prompt: str) -> str:
         # ANTHROPIC_BASE_URL still needs --model specified explicitly. The
         # re-resolved env carries secrets, so it goes only into spawn_env; the
         # caller's non-secret env overrides are reapplied on top of it.
+        #
+        # If the profile was deleted or has gone malformed since the original
+        # spin, _profile_spawn_env logs and returns resolved=False: we degrade
+        # to the persisted caller env, which no longer carries the alt
+        # base_url/api_key, so the resume loses the alt endpoint. We skip
+        # re-injecting --model/extra_args in that case (matching a non-profile
+        # resume) rather than forcing an alt-endpoint model onto the default
+        # endpoint.
         profile_name = original_spool.get("profile") if original_spool else None
-        if profile_name:
-            prof = _load_profile(profile_name)
-            if prof is not None:
-                try:
-                    overrides = _resolve_profile_overrides(prof)
-                except ValueError as exc:
-                    logger.warning(
-                        "spindle: respin: profile %r failed to resolve (%s); reusing stored env",
-                        profile_name,
-                        exc,
-                    )
-                else:
-                    spawn_env = dict(overrides["env"])
-                    if caller_env:
-                        spawn_env.update(caller_env)
-                    # resume_model is the effective model recorded at spin. When
-                    # it is None (profile sets no default and no caller model was
-                    # given) we deliberately omit --model and let the alt
-                    # endpoint use its own default — matching the original spin.
-                    resume_model = original_spool.get("model")
-                    if resume_model:
-                        cmd.extend(["--model", CLAUDE_MODEL_ALIASES.get(resume_model, resume_model)])
-                    if overrides["extra_args"]:
-                        cmd.extend(overrides["extra_args"])
-            else:
-                logger.warning(
-                    "spindle: respin: profile %r no longer lodged; reusing stored env",
-                    profile_name,
-                )
+        # resume_model is the effective model recorded at spin. When it is None
+        # (profile sets no default and no caller model was given) we deliberately
+        # omit --model and let the alt endpoint use its own default — matching
+        # the original spin.
+        spawn_env, resume_model, profile_extra_args, resolved = _profile_spawn_env(
+            profile_name, caller_env, model=original_spool.get("model")
+        )
+        if resolved:
+            if resume_model:
+                cmd.extend(["--model", CLAUDE_MODEL_ALIASES.get(resume_model, resume_model)])
+            if profile_extra_args:
+                cmd.extend(profile_extra_args)
 
         spool = {
             "id": spool_id,
@@ -3799,6 +3879,16 @@ async def spool_retry(spool_id: str) -> str:
         # Default to Claude Code harness
         retry_working_dir = spool.get("working_dir")
         retry_base_branch = spool.get("base_branch") or _detect_default_branch(retry_working_dir or os.getcwd())
+        # Profile spools: re-resolve the profile fresh so the retry hits the same
+        # alt endpoint/key with the recorded model + extra_args. The persisted
+        # env is caller-only (secrets are never written to disk), so reading it
+        # back without re-resolving would silently retry against the default
+        # endpoint. caller_env stays the only env persisted on the new spool.
+        caller_env = spool.get("env")
+        profile_name = spool.get("profile")
+        spawn_env, retry_model, profile_extra_args, _ = _profile_spawn_env(
+            profile_name, caller_env, model=spool.get("model")
+        )
         return await asyncio.to_thread(
             _spin_sync,
             spool.get("prompt", ""),  # prompt
@@ -3808,11 +3898,14 @@ async def spool_retry(spool_id: str) -> str:
             retry_working_dir,  # working_dir
             spool.get("allowed_tools"),  # allowed_tools
             tags_str,  # tags
-            spool.get("model"),  # model
+            retry_model,  # model
             spool.get("timeout"),  # timeout
             False,  # skeinless
-            spool.get("env"),  # env
+            caller_env,  # env (persisted; caller-only, no secrets)
             retry_base_branch,  # base_branch
+            extra_args=profile_extra_args,
+            profile=profile_name,
+            spawn_env=spawn_env,
         )
 
 
