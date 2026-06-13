@@ -179,18 +179,12 @@ def _has_skein(working_dir: str) -> bool:
 
 def _parse_research_target(research_target: Optional[str]) -> Dict[str, str]:
     if not research_target:
-        raise ValueError(
-            "research permission requires research_target (site:<id>, file:<path>, or dir:<path>)"
-        )
+        raise ValueError("research permission requires research_target (site:<id>, file:<path>, or dir:<path>)")
     prefix, sep, value = research_target.partition(":")
     if not sep:
-        raise ValueError(
-            f"unknown research_target prefix {research_target!r} (expected site:, file:, or dir:)"
-        )
+        raise ValueError(f"unknown research_target prefix {research_target!r} (expected site:, file:, or dir:)")
     if prefix not in {"site", "file", "dir"}:
-        raise ValueError(
-            f"unknown research_target prefix {prefix!r} (expected site:, file:, or dir:)"
-        )
+        raise ValueError(f"unknown research_target prefix {prefix!r} (expected site:, file:, or dir:)")
     if not value:
         raise ValueError(f"research_target {prefix}: requires a value")
     return {"type": prefix, "value": value, "raw": research_target}
@@ -246,8 +240,7 @@ def _research_target_preamble(target: Dict[str, str]) -> str:
     if target_type == "site":
         target_description = f"SKEIN site {value} (site:{value})"
         target_instruction = (
-            f'File findings, notions, briefs via `skein post <type> {value} "..."`.\n'
-            "Do not write loose files."
+            f'File findings, notions, briefs via `skein post <type> {value} "..."`.\nDo not write loose files.'
         )
     elif target_type == "file":
         target_description = f"file:{value}"
@@ -493,7 +486,9 @@ def _spawn_shard(
             )
         # Surface errors; use friendly message for the branch-not-found case
         if "invalid reference" in result.stderr:
-            git_error = f"base branch '{base_branch}' not found in repo at {working_dir}. Try --base-branch <correct-name>."
+            git_error = (
+                f"base branch '{base_branch}' not found in repo at {working_dir}. Try --base-branch <correct-name>."
+            )
         else:
             git_error = result.stderr.strip() or "git worktree add failed"
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
@@ -1379,9 +1374,7 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
             spool["exit_code"] = exit_code
         # Suffix for the "no output" fallbacks so a silent failure reports the
         # code (distinguishes a kill/exec-failure from a clean but silent exit).
-        no_output = "Process exited with no output" + (
-            f" (exit code {exit_code})" if exit_code is not None else ""
-        )
+        no_output = "Process exited with no output" + (f" (exit code {exit_code})" if exit_code is not None else "")
 
         # Parse result based on harness type
         harness_type = spool.get("harness", "claude-code")
@@ -2174,10 +2167,10 @@ def _budget_result(text: str, spool_id: str) -> str:
     crumb = (
         f"\n\n[... {elided:,} of {len(text):,} chars elided "
         f"(showing first {len(head):,} and last {len(tail):,}) ...]\n"
-        f"[full:   unspool(\"{spool_id}\", full=True)]\n"
-        f"[page:   unspool(\"{spool_id}\", offset={len(head)}, limit=20000)]\n"
-        f"[file:   spool_export(\"{spool_id}\", format=\"md\", output_path=\"/tmp/{spool_id}.md\")]\n"
-        f"[search: spool_grep(\"<pattern>\", spool_id=\"{spool_id}\")]\n\n"
+        f'[full:   unspool("{spool_id}", full=True)]\n'
+        f'[page:   unspool("{spool_id}", offset={len(head)}, limit=20000)]\n'
+        f'[file:   spool_export("{spool_id}", format="md", output_path="/tmp/{spool_id}.md")]\n'
+        f'[search: spool_grep("<pattern>", spool_id="{spool_id}")]\n\n'
     )
     truncated = head + crumb + tail
     # Only truncate when it actually saves space. If the windows overlap or the
@@ -2548,10 +2541,7 @@ def _respin_sync(handle: str, prompt: str) -> str:
     # opaque harness thread-id; for claude-code it's the claude session id.
     session_id = original_spool.get("session_id")
     if not session_id:
-        return (
-            f"Spool '{original_spool.get('id', handle)}' completed without a "
-            f"resumable session (status={status})"
-        )
+        return f"Spool '{original_spool.get('id', handle)}' completed without a resumable session (status={status})"
 
     harness = original_spool.get("harness", "claude-code")
 
@@ -3264,7 +3254,10 @@ async def spool_peek(spool_id: str, lines: int = 50) -> str:
             status_str = t.get("status", "unknown")
             subject = t.get("subject", "")
             active = t.get("activeForm", "")
-            task_lines.append(f"  task {t.get('id')}: {status_str} - {subject}" + (f" ({active})" if active and active != subject else ""))
+            task_lines.append(
+                f"  task {t.get('id')}: {status_str} - {subject}"
+                + (f" ({active})" if active and active != subject else "")
+            )
         return "[spool %s - main output empty, showing bg tasks]\n%s" % (spool_id, "\n".join(task_lines))
 
     if not stdout_path.exists():
@@ -4299,19 +4292,28 @@ def _codex_bwrap_wrap(
     worktree_root = shard_info["worktree_path"]
     cmd = [
         "bwrap",
-        "--ro-bind", "/", "/",
+        "--ro-bind",
+        "/",
+        "/",
     ]
     if research_target_info and research_target_info["type"] in {"file", "dir"}:
         bind_path = _research_writable_path(research_target_info)
         cmd.extend(["--bind", bind_path, bind_path])
     else:
         cmd.extend(["--bind", worktree_root, worktree_root])
-    cmd.extend([
-        "--bind", "/tmp", "/tmp",
-        "--dev", "/dev",
-        "--proc", "/proc",
-        "--chdir", cwd,
-    ])
+    cmd.extend(
+        [
+            "--bind",
+            "/tmp",
+            "/tmp",
+            "--dev",
+            "/dev",
+            "--proc",
+            "/proc",
+            "--chdir",
+            cwd,
+        ]
+    )
     # Make git writable for commits inside the worktree
     git_file = Path(worktree_root) / ".git"
     if git_file.exists() and git_file.is_file():
@@ -4330,12 +4332,16 @@ def _codex_bwrap_wrap(
                         cmd.extend(["--bind", str(refs_heads), str(refs_heads)])
                     logs_refs_heads = main_git / "logs" / "refs" / "heads"
                     if logs_refs_heads.exists():
-                        cmd.extend(
-                            ["--bind", str(logs_refs_heads), str(logs_refs_heads)]
-                        )
+                        cmd.extend(["--bind", str(logs_refs_heads), str(logs_refs_heads)])
     for config_item in [
-        ".claude", ".claude.json", ".anthropic", ".codex", ".gemini",
-        ".spindle", ".config", ".cache",
+        ".claude",
+        ".claude.json",
+        ".anthropic",
+        ".codex",
+        ".gemini",
+        ".spindle",
+        ".config",
+        ".cache",
     ]:
         path = f"{home}/{config_item}"
         if Path(path).exists():
@@ -4981,7 +4987,18 @@ Your task:
     _write_spool(spool_id, spool)
 
     # Spawn detached process
-    pid = _spawn_detached(spool_id, gemini_cmd, cwd, env)
+    try:
+        pid = _spawn_detached(spool_id, gemini_cmd, cwd, env)
+    except Exception as e:
+        # Spawn failed - mark spool as error so the slot is freed
+        spool["status"] = "error"
+        spool["error"] = f"spawn failed: {e}"
+        spool["completed_at"] = datetime.now().isoformat()
+        _write_spool(spool_id, spool)
+        # Clean up shard worktree only if we created it; don't destroy pre-existing shards
+        if shard_newly_created:
+            _cleanup_shard(shard_info, working_dir)
+        return f"Error: Failed to spawn process: {e}"
 
     # Update spool with PID and status
     spool["pid"] = pid
@@ -5247,6 +5264,9 @@ Your task:
         spool["error"] = f"spawn failed: {e}"
         spool["completed_at"] = datetime.now().isoformat()
         _write_spool(spool_id, spool)
+        # Clean up shard worktree only if we created it; don't destroy pre-existing shards
+        if shard_newly_created:
+            _cleanup_shard(shard_info, working_dir)
         return f"Error: Failed to spawn process: {e}"
 
     # Update spool with PID and status
@@ -5425,6 +5445,7 @@ async def spindle_reload(force: bool = False) -> str:
             )
 
     if force:
+
         def immediate():
             time.sleep(0.5)  # Give time for response to be sent
             _do_restart()
@@ -5495,7 +5516,17 @@ def main():
     spin_parser.add_argument(
         "--permission",
         "-p",
-        choices=["readonly", "careful", "research", "full", "shard", "careful+shard", "research+shard", "auto", "auto+shard"],
+        choices=[
+            "readonly",
+            "careful",
+            "research",
+            "full",
+            "shard",
+            "careful+shard",
+            "research+shard",
+            "auto",
+            "auto+shard",
+        ],
         help="Permission profile (default: careful)",
     )
     spin_parser.add_argument(

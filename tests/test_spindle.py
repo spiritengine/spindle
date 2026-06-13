@@ -39,7 +39,6 @@ from spindle import (
     _detect_existing_shard,
     _extract_codex_result,
     _extract_kimi_result,
-    _gemini_respin_sync,
     _gemini_spin_sync,
     _gemini_unspool_sync,
     _get_cc_bg_tasks,
@@ -557,9 +556,7 @@ class TestResultBudgeting:
         # If HEAD+TAIL >= len(text), there is nothing to elide: return as-is
         # rather than emit a negative count or duplicate the middle.
         text = "a" * (UNSPOOL_MAX_CHARS + 100)
-        with patch("spindle.UNSPOOL_HEAD_CHARS", len(text)), patch(
-            "spindle.UNSPOOL_TAIL_CHARS", len(text)
-        ):
+        with patch("spindle.UNSPOOL_HEAD_CHARS", len(text)), patch("spindle.UNSPOOL_TAIL_CHARS", len(text)):
             assert _budget_result(text, "id1") == text
 
     def test_zero_tail_does_not_duplicate_text(self):
@@ -602,9 +599,11 @@ class TestResultBudgeting:
         # elided positive but smaller than the breadcrumb: truncating would grow
         # the output, so _budget_result must return the text unchanged.
         text = "c" * 50001
-        with patch("spindle.UNSPOOL_MAX_CHARS", 50000), patch(
-            "spindle.UNSPOOL_HEAD_CHARS", 25000
-        ), patch("spindle.UNSPOOL_TAIL_CHARS", 24999):
+        with (
+            patch("spindle.UNSPOOL_MAX_CHARS", 50000),
+            patch("spindle.UNSPOOL_HEAD_CHARS", 25000),
+            patch("spindle.UNSPOOL_TAIL_CHARS", 24999),
+        ):
             assert _budget_result(text, "id1") == text
 
     def test_head_zero_uses_tail_only(self):
@@ -721,7 +720,10 @@ class TestCodexResultExtraction:
             {"type": "thread.started", "thread_id": "thread-abc"},
             {"type": "turn.started"},
             {"type": "item.completed", "item": {"id": "i0", "type": "agent_message", "text": "Planning the review."}},
-            {"type": "item.completed", "item": {"id": "i1", "type": "command_execution", "command": "ls", "aggregated_output": big_output}},
+            {
+                "type": "item.completed",
+                "item": {"id": "i1", "type": "command_execution", "command": "ls", "aggregated_output": big_output},
+            },
             {"type": "item.completed", "item": {"id": "i2", "type": "agent_message", "text": "Final verdict: clean."}},
             {"type": "turn.completed", "usage": {"input_tokens": 100, "output_tokens": 20}},
         ]
@@ -789,14 +791,17 @@ class TestCodexResultExtraction:
         stream = "\n".join(lines)
         spool_id = "codex-fin2"
         with patch("spindle.SPINDLE_DIR", tmp_path):
-            _write_spool(spool_id, {
-                "id": spool_id,
-                "status": "running",
-                "harness": "codex",
-                "prompt": "x",
-                "pid": 999999999,
-                "created_at": datetime.now().isoformat(),
-            })
+            _write_spool(
+                spool_id,
+                {
+                    "id": spool_id,
+                    "status": "running",
+                    "harness": "codex",
+                    "prompt": "x",
+                    "pid": 999999999,
+                    "created_at": datetime.now().isoformat(),
+                },
+            )
             _get_output_path(spool_id).write_text(stream)
             assert _check_and_finalize_spool(spool_id) is True
             spool = _read_spool(spool_id)
@@ -811,14 +816,17 @@ class TestCodexResultExtraction:
         stream, big_output = self._stream()
         spool_id = "codex-fin1"
         with patch("spindle.SPINDLE_DIR", tmp_path):
-            _write_spool(spool_id, {
-                "id": spool_id,
-                "status": "running",
-                "harness": "codex",
-                "prompt": "review",
-                "pid": 999999999,  # dead → finalize proceeds
-                "created_at": datetime.now().isoformat(),
-            })
+            _write_spool(
+                spool_id,
+                {
+                    "id": spool_id,
+                    "status": "running",
+                    "harness": "codex",
+                    "prompt": "review",
+                    "pid": 999999999,  # dead → finalize proceeds
+                    "created_at": datetime.now().isoformat(),
+                },
+            )
             _get_output_path(spool_id).write_text(stream)
 
             assert _check_and_finalize_spool(spool_id) is True
@@ -857,10 +865,13 @@ class TestKimiResultExtraction:
 
     def test_list_content_thinking_skips_think_block(self):
         events = [
-            {"role": "assistant", "content": [
-                {"type": "think", "text": "internal reasoning"},
-                {"type": "text", "text": "Final answer."},
-            ]},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "think", "text": "internal reasoning"},
+                    {"type": "text", "text": "Final answer."},
+                ],
+            },
         ]
         out = _extract_kimi_result("\n".join(json.dumps(e) for e in events))
         assert out == "Final answer."
@@ -898,15 +909,18 @@ class TestKimiResultExtraction:
         stream = "\n".join(json.dumps(e) for e in events)
         spool_id = "kimi-fin1"
         with patch("spindle.SPINDLE_DIR", tmp_path):
-            _write_spool(spool_id, {
-                "id": spool_id,
-                "status": "running",
-                "harness": "kimi",
-                "prompt": "q",
-                "session_id": "kimi-sess",  # kimi sets this at creation
-                "pid": 999999999,
-                "created_at": datetime.now().isoformat(),
-            })
+            _write_spool(
+                spool_id,
+                {
+                    "id": spool_id,
+                    "status": "running",
+                    "harness": "kimi",
+                    "prompt": "q",
+                    "session_id": "kimi-sess",  # kimi sets this at creation
+                    "pid": 999999999,
+                    "created_at": datetime.now().isoformat(),
+                },
+            )
             _get_output_path(spool_id).write_text(stream)
             assert _check_and_finalize_spool(spool_id) is True
             spool = _read_spool(spool_id)
@@ -918,20 +932,26 @@ class TestKimiResultExtraction:
             assert "FILEDUMP" in transcript
 
     def test_finalize_falls_back_to_raw_when_no_assistant_text(self, tmp_path):
-        stream = "\n".join(json.dumps(e) for e in [
-            {"role": "tool", "content": "only tool output"},
-        ])
+        stream = "\n".join(
+            json.dumps(e)
+            for e in [
+                {"role": "tool", "content": "only tool output"},
+            ]
+        )
         spool_id = "kimi-fin2"
         with patch("spindle.SPINDLE_DIR", tmp_path):
-            _write_spool(spool_id, {
-                "id": spool_id,
-                "status": "running",
-                "harness": "kimi",
-                "prompt": "q",
-                "session_id": "s2",
-                "pid": 999999999,
-                "created_at": datetime.now().isoformat(),
-            })
+            _write_spool(
+                spool_id,
+                {
+                    "id": spool_id,
+                    "status": "running",
+                    "harness": "kimi",
+                    "prompt": "q",
+                    "session_id": "s2",
+                    "pid": 999999999,
+                    "created_at": datetime.now().isoformat(),
+                },
+            )
             _get_output_path(spool_id).write_text(stream)
             assert _check_and_finalize_spool(spool_id) is True
             spool = _read_spool(spool_id)
@@ -979,10 +999,16 @@ class TestExitCodeCapture:
         sid = "ec1"
         with patch("spindle.SPINDLE_DIR", tmp_path):
             spindle._PROC_HANDLES[sid] = self._FakeProc(3)
-            _write_spool(sid, {
-                "id": sid, "status": "running", "prompt": "x",
-                "pid": 999999999, "created_at": datetime.now().isoformat(),
-            })
+            _write_spool(
+                sid,
+                {
+                    "id": sid,
+                    "status": "running",
+                    "prompt": "x",
+                    "pid": 999999999,
+                    "created_at": datetime.now().isoformat(),
+                },
+            )
             assert _check_and_finalize_spool(sid) is True
             spool = _read_spool(sid)
             assert spool["status"] == "error"
@@ -993,10 +1019,16 @@ class TestExitCodeCapture:
     def test_no_output_without_handle_omits_code(self, tmp_path):
         sid = "ec2"
         with patch("spindle.SPINDLE_DIR", tmp_path):
-            _write_spool(sid, {
-                "id": sid, "status": "running", "prompt": "x",
-                "pid": 999999999, "created_at": datetime.now().isoformat(),
-            })
+            _write_spool(
+                sid,
+                {
+                    "id": sid,
+                    "status": "running",
+                    "prompt": "x",
+                    "pid": 999999999,
+                    "created_at": datetime.now().isoformat(),
+                },
+            )
             assert _check_and_finalize_spool(sid) is True
             spool = _read_spool(sid)
             assert spool["status"] == "error"
@@ -1019,10 +1051,12 @@ class TestReloadDrain:
             elif "restart" in cmd or "start" in cmd:
                 restart_evt.set()
             return m
+
         return run
 
     def test_missing_service_errors(self):
         import threading as _t
+
         evt = _t.Event()
         with patch("spindle.subprocess.run", self._fake_systemctl(evt, present=False)):
             out = asyncio.run(spindle.spindle_reload.fn())
@@ -1031,9 +1065,9 @@ class TestReloadDrain:
 
     def test_force_restarts_immediately(self):
         import threading as _t
+
         evt = _t.Event()
-        with patch("spindle.subprocess.run", self._fake_systemctl(evt)), \
-                patch("spindle.time.sleep", lambda *_: None):
+        with patch("spindle.subprocess.run", self._fake_systemctl(evt)), patch("spindle.time.sleep", lambda *_: None):
             out = asyncio.run(spindle.spindle_reload.fn(force=True))
             assert "force" in out.lower()
             assert evt.wait(2), "force should restart without draining"
@@ -1041,31 +1075,37 @@ class TestReloadDrain:
     def test_default_idle_restarts(self):
         # Empty store -> queue already idle -> restarts promptly.
         import threading as _t
+
         evt = _t.Event()
-        with patch("spindle.subprocess.run", self._fake_systemctl(evt)), \
-                patch("spindle.time.sleep", lambda *_: None):
+        with patch("spindle.subprocess.run", self._fake_systemctl(evt)), patch("spindle.time.sleep", lambda *_: None):
             out = asyncio.run(spindle.spindle_reload.fn())
             assert "No spools active" in out
             assert evt.wait(2)
 
     def test_default_active_reports_draining_then_restarts(self):
         import threading as _t
+
         evt = _t.Event()
-        with patch("spindle.subprocess.run", self._fake_systemctl(evt)), \
-                patch("spindle.time.sleep", lambda *_: None), \
-                patch("spindle._count_running", return_value=2), \
-                patch("spindle._wait_until_idle", lambda *a, **k: None):
+        with (
+            patch("spindle.subprocess.run", self._fake_systemctl(evt)),
+            patch("spindle.time.sleep", lambda *_: None),
+            patch("spindle._count_running", return_value=2),
+            patch("spindle._wait_until_idle", lambda *a, **k: None),
+        ):
             out = asyncio.run(spindle.spindle_reload.fn())
             assert "Draining: 2 spool(s)" in out
             assert evt.wait(2), "should restart after draining"
 
     def test_reload_already_pending_does_not_stack(self):
         import threading as _t
+
         evt = _t.Event()
         spindle._reload_pending = True
         try:
-            with patch("spindle.subprocess.run", self._fake_systemctl(evt)), \
-                    patch("spindle._count_running", return_value=1):
+            with (
+                patch("spindle.subprocess.run", self._fake_systemctl(evt)),
+                patch("spindle._count_running", return_value=1),
+            ):
                 out = asyncio.run(spindle.spindle_reload.fn())
             assert "already pending" in out
             assert not evt.is_set()
@@ -1077,28 +1117,38 @@ class TestWaitUntilIdle:
     """_wait_until_idle / _spools_idle drain semantics."""
 
     def test_wait_loops_until_idle(self):
-        with patch("spindle._spools_idle", side_effect=[False, False, True]) as si, \
-                patch("spindle.time.sleep") as sl:
+        with patch("spindle._spools_idle", side_effect=[False, False, True]) as si, patch("spindle.time.sleep") as sl:
             spindle._wait_until_idle(poll_interval=0.01)
         assert si.call_count == 3
         assert sl.call_count == 2  # slept after each non-idle check
 
     def test_spools_idle_finalizes_dead_running_spool(self, tmp_path):
         with patch("spindle.SPINDLE_DIR", tmp_path):
-            _write_spool("d1", {
-                "id": "d1", "status": "running", "prompt": "x",
-                "pid": 999999999, "created_at": datetime.now().isoformat(),
-            })
+            _write_spool(
+                "d1",
+                {
+                    "id": "d1",
+                    "status": "running",
+                    "prompt": "x",
+                    "pid": 999999999,
+                    "created_at": datetime.now().isoformat(),
+                },
+            )
             # dead pid, no output -> finalize flips it off "running" -> idle
             assert spindle._spools_idle() is True
             assert _read_spool("d1")["status"] != "running"
 
     def test_spools_idle_false_when_pending(self, tmp_path):
         with patch("spindle.SPINDLE_DIR", tmp_path):
-            _write_spool("d2", {
-                "id": "d2", "status": "pending", "prompt": "x",
-                "created_at": datetime.now().isoformat(),
-            })
+            _write_spool(
+                "d2",
+                {
+                    "id": "d2",
+                    "status": "pending",
+                    "prompt": "x",
+                    "created_at": datetime.now().isoformat(),
+                },
+            )
             assert spindle._spools_idle() is False
 
     def test_spools_idle_clears_stuck_pending(self, tmp_path):
@@ -1106,10 +1156,16 @@ class TestWaitUntilIdle:
         # must not wedge the drain - _recover_orphans times it out.
         old = (datetime.now() - timedelta(seconds=spindle.PENDING_SPAWN_TIMEOUT + 10)).isoformat()
         with patch("spindle.SPINDLE_DIR", tmp_path):
-            _write_spool("d3", {
-                "id": "d3", "status": "pending", "prompt": "x",
-                "pid": None, "created_at": old,
-            })
+            _write_spool(
+                "d3",
+                {
+                    "id": "d3",
+                    "status": "pending",
+                    "prompt": "x",
+                    "pid": None,
+                    "created_at": old,
+                },
+            )
             assert spindle._spools_idle() is True
             assert _read_spool("d3")["status"] == "error"
 
@@ -1136,17 +1192,21 @@ class TestOrphanedLockSweep:
             live = tmp_path / "alive.lock"  # has a live json -> keep
             live.write_text("")
             os.utime(live, (old, old))
-            _write_spool("alive", {
-                "id": "alive", "status": "complete",
-                "created_at": datetime.now().isoformat(),
-            })
+            _write_spool(
+                "alive",
+                {
+                    "id": "alive",
+                    "status": "complete",
+                    "created_at": datetime.now().isoformat(),
+                },
+            )
 
             spindle._cleanup_old_spools()
 
             assert not orphan.exists()  # swept
-            assert fresh.exists()       # too fresh to be safe
-            assert conc.exists()        # shared concurrency lock spared
-            assert live.exists()        # spool json still present
+            assert fresh.exists()  # too fresh to be safe
+            assert conc.exists()  # shared concurrency lock spared
+            assert live.exists()  # spool json still present
 
 
 class TestProcessUtils:
@@ -1246,29 +1306,35 @@ class TestPermissionProfileContents:
         for tool in ["Read", "Grep", "Glob", "Bash(git status:*)", "Bash(ls:*)", "Bash(skein:*)"]:
             assert tool in readonly, f"readonly is missing inspection tool: {tool}"
 
-    @pytest.mark.parametrize("tool", [
-        "Bash(python3:*)",
-        "Bash(npx:*)",
-        "Bash(node:*)",
-        "Bash(ruff:*)",
-        "Bash(black:*)",
-        "Bash(mypy:*)",
-        "Bash(pip:*)",
-        "Bash(uv:*)",
-    ])
+    @pytest.mark.parametrize(
+        "tool",
+        [
+            "Bash(python3:*)",
+            "Bash(npx:*)",
+            "Bash(node:*)",
+            "Bash(ruff:*)",
+            "Bash(black:*)",
+            "Bash(mypy:*)",
+            "Bash(pip:*)",
+            "Bash(uv:*)",
+        ],
+    )
     def test_careful_includes_new_dev_tools(self, tool):
         """Careful and careful+shard must include common dev tools."""
         assert tool in PERMISSION_PROFILES["careful"], f"careful missing: {tool}"
         assert tool in PERMISSION_PROFILES["careful+shard"], f"careful+shard missing: {tool}"
 
-    @pytest.mark.parametrize("tool", [
-        "Bash(ls:*)",
-        "Bash(cat:*)",
-        "Bash(head:*)",
-        "Bash(tail:*)",
-        "Bash(wc:*)",
-        "Bash(diff:*)",
-    ])
+    @pytest.mark.parametrize(
+        "tool",
+        [
+            "Bash(ls:*)",
+            "Bash(cat:*)",
+            "Bash(head:*)",
+            "Bash(tail:*)",
+            "Bash(wc:*)",
+            "Bash(diff:*)",
+        ],
+    )
     def test_careful_includes_basic_unix_tools(self, tool):
         """Careful and careful+shard must include basic Unix inspection tools."""
         assert tool in PERMISSION_PROFILES["careful"], f"careful missing: {tool}"
@@ -3593,14 +3659,12 @@ class TestCodexRespinPreservesGitAccess:
         add_dir_indices = [i for i, tok in enumerate(cmd) if tok == "--add-dir"]
         for idx in add_dir_indices:
             assert idx < resume_idx, (
-                f"--add-dir at index {idx} must come before `resume` at index {resume_idx}; "
-                f"cmd={cmd!r}"
+                f"--add-dir at index {idx} must come before `resume` at index {resume_idx}; cmd={cmd!r}"
             )
         cd_idx = next((i for i, tok in enumerate(cmd) if tok == "--cd"), None)
         assert cd_idx is not None, "--cd must be present in codex respin command"
         assert cd_idx < resume_idx, (
-            f"--cd at index {cd_idx} must come before `resume` at index {resume_idx}; "
-            f"cmd={cmd!r}"
+            f"--cd at index {cd_idx} must come before `resume` at index {resume_idx}; cmd={cmd!r}"
         )
 
     def test_codex_respin_sets_cd_to_shard_worktree(self, tmp_path):
@@ -4415,7 +4479,9 @@ class TestCCBgTasks:
         tasks_dir.mkdir()
         sess_dir = tasks_dir / "mysession"
         sess_dir.mkdir()
-        (sess_dir / "1.json").write_text(json.dumps({"id": "1", "subject": "pgrep loop", "status": "running", "activeForm": "waiting for pytest"}))
+        (sess_dir / "1.json").write_text(
+            json.dumps({"id": "1", "subject": "pgrep loop", "status": "running", "activeForm": "waiting for pytest"})
+        )
 
         spool_data = {
             "id": "peek1",
@@ -4636,8 +4702,7 @@ class TestRespinHandleResolution:
         cmd = captured_cmd[0]
         assert "--resume" in cmd
         assert cmd[cmd.index("--resume") + 1] == session_id, (
-            f"claude resume must use the resolved session_id {session_id!r}, "
-            f"not the spool_id {spool_id!r}; got {cmd!r}"
+            f"claude resume must use the resolved session_id {session_id!r}, not the spool_id {spool_id!r}; got {cmd!r}"
         )
 
     def test_respin_running_spool_no_session_distinct_error(self, tmp_path):
@@ -4674,11 +4739,12 @@ class TestRespinHandleResolution:
                     "harness": "codex",
                 },
             )
-            with patch("spindle._codex_respin_sync") as codex_resume, patch(
-                "spindle._gemini_respin_sync"
-            ) as gemini_resume, patch("spindle._kimi_respin_sync") as kimi_resume, patch(
-                "spindle._spawn_detached"
-            ) as spawn:
+            with (
+                patch("spindle._codex_respin_sync") as codex_resume,
+                patch("spindle._gemini_respin_sync") as gemini_resume,
+                patch("spindle._kimi_respin_sync") as kimi_resume,
+                patch("spindle._spawn_detached") as spawn,
+            ):
                 result = _respin_sync(spool_id, "continue")
 
         assert "not in a resumable state" in result
@@ -4811,23 +4877,17 @@ class TestBaseBranchDefaultIsNone:
     def test_spawn_shard_default_param_is_none(self):
         sig = inspect.signature(_spawn_shard)
         default = sig.parameters["base_branch"].default
-        assert default is None, (
-            f"_spawn_shard base_branch default must be None, got {default!r}"
-        )
+        assert default is None, f"_spawn_shard base_branch default must be None, got {default!r}"
 
     def test_spin_sync_default_param_is_none(self):
         sig = inspect.signature(_spin_sync)
         default = sig.parameters["base_branch"].default
-        assert default is None, (
-            f"_spin_sync base_branch default must be None, got {default!r}"
-        )
+        assert default is None, f"_spin_sync base_branch default must be None, got {default!r}"
 
     def test_codex_spin_sync_default_param_is_none(self):
         sig = inspect.signature(_codex_spin_sync)
         default = sig.parameters["base_branch"].default
-        assert default is None, (
-            f"_codex_spin_sync base_branch default must be None, got {default!r}"
-        )
+        assert default is None, f"_codex_spin_sync base_branch default must be None, got {default!r}"
 
     def test_spawn_shard_falls_back_to_detect(self, tmp_path):
         """Calling _spawn_shard without base_branch on a main-only repo succeeds.
@@ -4875,9 +4935,7 @@ class TestBaseBranchDefaultIsNone:
         subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True)
 
         with patch("spindle._has_skein", return_value=False):
-            shard_info, shard_error = _spawn_shard(
-                "test-agent", str(repo), base_branch="nonexistent-branch-abc"
-            )
+            shard_info, shard_error = _spawn_shard("test-agent", str(repo), base_branch="nonexistent-branch-abc")
 
         assert shard_info is None
         assert shard_error is not None
@@ -4981,8 +5039,7 @@ class TestShardWritableBinds:
         )
         assert cmd[0] == "bwrap"
         found = any(
-            cmd[i] == "--bind" and cmd[i + 1] == str(target) and cmd[i + 2] == str(target)
-            for i in range(len(cmd) - 2)
+            cmd[i] == "--bind" and cmd[i + 1] == str(target) and cmd[i + 2] == str(target) for i in range(len(cmd) - 2)
         )
         assert found, f"Expected --bind {target} {target} in bwrap cmd: {cmd!r}"
 
@@ -4999,8 +5056,7 @@ class TestShardWritableBinds:
         )
         for d in (dir_a, dir_b):
             found = any(
-                cmd[i] == "--bind" and cmd[i + 1] == str(d) and cmd[i + 2] == str(d)
-                for i in range(len(cmd) - 2)
+                cmd[i] == "--bind" and cmd[i + 1] == str(d) and cmd[i + 2] == str(d) for i in range(len(cmd) - 2)
             )
             assert found, f"Expected --bind {d} {d} in bwrap cmd: {cmd!r}"
 
@@ -5062,9 +5118,7 @@ class TestShardWritableBinds:
         cmd = self._run_shard_spin(
             tmp_path,
             monkeypatch,
-            extra_env={
-                "SPINDLE_SHARD_WRITABLE_BINDS": f"{valid_dir}:{ghost}:relative/bad"
-            },
+            extra_env={"SPINDLE_SHARD_WRITABLE_BINDS": f"{valid_dir}:{ghost}:relative/bad"},
         )
         found_valid = any(
             cmd[i] == "--bind" and cmd[i + 1] == str(valid_dir) and cmd[i + 2] == str(valid_dir)
