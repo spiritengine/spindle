@@ -1,0 +1,14 @@
+{
+  "description": "Route the Claude Code harness at an Anthropic-compatible endpoint",
+  "harness": "claude-code",
+  "model": "provider-model-large",
+  "model_aliases": {
+    "fast": "provider-model-small"
+  },
+  "base_url": "https://api.example.com/anthropic",
+  "api_key": "${EXAMPLE_API_KEY}",
+  "env": {
+    "EXAMPLE_PROVIDER_TAG": "anthropic-compatible-example"
+  },
+  "extra_args": ["--verbose"]
+}

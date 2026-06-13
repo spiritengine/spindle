@@ -338,6 +338,68 @@ result = unspool(spool_id)  # Auto-detects harness
 
 See [docs/MULTI_HARNESS_GUIDE.md](docs/MULTI_HARNESS_GUIDE.md) and [docs/CODEX_SETUP.md](docs/CODEX_SETUP.md) for detailed documentation.
 
+## Profiles
+
+A **profile** is a named, lodged configuration: a base harness plus a set of
+overrides (model, alt-endpoint env, extra CLI flags). The motivating use is
+running any Anthropic-compatible model through the existing Claude Code harness
+by injecting `ANTHROPIC_BASE_URL` / `ANTHROPIC_API_KEY` / `CLAUDE_CONFIG_DIR`
+into the spawned child — spindle's output parsing, `unspool`, and `respin` all
+work unchanged because the child is still plain Claude Code.
+
+A profile is a **folder** (the folder name is the profile name) containing a
+single `profile.json`. Profiles are discovered from two locations, later
+overriding earlier:
+
+1. **Canonical:** `~/.spindle/profiles/<name>/profile.json` — where real,
+   private profiles live, outside any repo.
+2. **Dev convenience:** `./profiles/<name>/profile.json` relative to the current
+   working directory (gitignored).
+
+Use a profile by passing its name as `harness`:
+
+```python
+# Define ~/.spindle/profiles/my-endpoint/profile.json, then:
+spool_id = spin("Summarize this module", harness="my-endpoint", working_dir="/proj")
+spool_id = spin("Quick pass", harness="my-endpoint", model="fast")  # profile model_aliases
+result = unspool(spool_id)
+```
+
+Built-in harness names (`claude-code`, `codex`, `gemini`, `kimi`) always win
+over a same-named profile. `spin_harnesses()` lists lodged profiles alongside
+the built-ins.
+
+### profile.json fields
+
+All fields are optional except that the file must parse as a JSON object:
+
+- `description` — one-liner shown in `spin_harnesses()`
+- `harness` — base harness (default `"claude-code"`; only `"claude-code"` is
+  supported as a base in v1)
+- `model` — default model (a caller-passed `model` still wins)
+- `model_aliases` — profile-scoped alias map applied to the caller's `model`
+- `base_url` — sets `ANTHROPIC_BASE_URL`
+- `api_key` — sets `ANTHROPIC_API_KEY`
+- `config_dir` — sets `CLAUDE_CONFIG_DIR` (defaults to an isolated per-profile
+  dir when `base_url` is set, so the child doesn't load your real `~/.claude`)
+- `env` — arbitrary extra child env vars
+- `extra_args` — flags appended verbatim to the `claude` CLI
+
+### Secret resolution
+
+Every string value is resolved fresh at spawn time (so rotated secrets take
+effect on respin):
+
+1. `${ENV_VAR}` is expanded from the environment; an unset var is left literal
+   and a warning is logged.
+2. A value containing `op://` is resolved via `strongbox inject` (if `strongbox`
+   is on PATH) or `op inject` (if `op` is on PATH); if neither exists it's left
+   literal. This keeps 1Password/strongbox an optional convenience — the
+   `${ENV}` path needs no external tool.
+
+See [examples/profiles/anthropic-compatible/](examples/profiles/anthropic-compatible/)
+for a worked example and the full schema reference.
+
 ## API
 
 ### Unified API (works with all harnesses)

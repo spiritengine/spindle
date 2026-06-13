@@ -46,3 +46,9 @@ worktrees/
 .skein/
 .claude/
 .hypothesis/
+
+# Repo-local dev profiles: real/private profiles dropped into ./profiles must
+# never be committed. The example profile lives under examples/profiles/ and is
+# tracked; only this root-level dev dir is ignored (keep the .gitkeep).
+/profiles/*
+!/profiles/.gitkeep
