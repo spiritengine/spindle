@@ -5305,12 +5305,13 @@ GEMINI_MODEL_ALIASES = {
     "flash": "gemini-2.5-flash",
     "pro": "gemini-2.5-pro",
     "flash-lite": "gemini-2.5-flash-lite",
-    # 3.x family — all currently shipped as preview
+    # 3.x family — pro variants still preview-only; flash-lite and 3.5-flash now GA
     "3-pro": "gemini-3-pro-preview",
     "3-flash": "gemini-3-flash-preview",
     "3.1-pro": "gemini-3.1-pro-preview",
-    "3.1-flash-lite": "gemini-3.1-flash-lite-preview",
+    "3.1-flash-lite": "gemini-3.1-flash-lite",
     "3.1-customtools": "gemini-3.1-pro-preview-customtools",
+    "3.5-flash": "gemini-3.5-flash",
     # Gemma 4 open-weight variants
     "gemma-4": "gemma-4-31b-it",
     "gemma-4-mini": "gemma-4-26b-a4b-it",
