@@ -2461,7 +2461,7 @@ async def spin(
         tags: Comma-separated tags for organizing spools (e.g. "batch-1,triage")
         model: Model to use - for Claude: "haiku", "sonnet", "opus", "fable" (claude-fable-5, access ends 2026-06-22), or versioned aliases like "opus-4.8";
                for Gemini: "flash", "pro", or full model names like "gemini-2.5-pro";
-               for Kimi: "thinking" (k2.6 in thinking mode), "k2.6", "k2.5", "latest", or full model names.
+               for Kimi: "thinking" (k2.6 in thinking mode), "k2.6", "k2.5", "latest", "k2.7-code"/"code" (coding-focused, thinking-only), "highspeed", or full model names.
                Use spin_harnesses() to see all available models.
         timeout: Kill spool after this many seconds (default: no timeout).
                  Exception: spools tagged with a review marker ("review", "fell-r1"
@@ -5327,15 +5327,35 @@ GEMINI_MODEL_ALIASES = {
 # toggled with kimi-cli's --thinking flag. The "thinking" alias therefore resolves to
 # kimi-k2.6 and runs it in thinking mode (see KIMI_THINKING_ALIASES). Run `kimi /setup`
 # if a newer model isn't yet in the local config.
+#
+# kimi-k2.7-code (released 2026-06-12) is a coding-focused upgrade on the k2.6
+# foundation — ~30% fewer reasoning tokens on long-horizon coding tasks. It is a
+# thinking-only model: the moonshot endpoint rejects any request that disables
+# thinking ("only type=enabled is allowed for this model"), so it MUST always run
+# with --thinking regardless of how it was selected (see KIMI_THINKING_REQUIRED).
+# k2.6 stays the general default; "latest" tracks the newest *general* model, while
+# the explicit k2.7-code / code aliases opt into the coding-specialized model.
 KIMI_DEFAULT_MODEL = "moonshot-ai/kimi-k2.6"
 KIMI_MODEL_ALIASES = {
     "thinking": "moonshot-ai/kimi-k2.6",
     "latest": "moonshot-ai/kimi-k2.6",
     "k2.6": "moonshot-ai/kimi-k2.6",
     "k2.5": "moonshot-ai/kimi-k2.5",
+    # k2.7-code — coding-specialized, thinking-only (see KIMI_THINKING_REQUIRED)
+    "k2.7-code": "moonshot-ai/kimi-k2.7-code",
+    "k2.7": "moonshot-ai/kimi-k2.7-code",
+    "code": "moonshot-ai/kimi-k2.7-code",
+    "k2.7-code-highspeed": "moonshot-ai/kimi-k2.7-code-highspeed",
+    "highspeed": "moonshot-ai/kimi-k2.7-code-highspeed",
 }
 # Aliases whose resolved model should run with kimi-cli thinking mode enabled.
 KIMI_THINKING_ALIASES = {"thinking"}
+# Resolved models that are thinking-ONLY: the endpoint rejects type=disabled, so we
+# force --thinking no matter how the model was selected (alias or full model string).
+KIMI_THINKING_REQUIRED = {
+    "moonshot-ai/kimi-k2.7-code",
+    "moonshot-ai/kimi-k2.7-code-highspeed",
+}
 
 
 def _kimi_config_path() -> Path:
@@ -5677,7 +5697,12 @@ def _kimi_spin_sync(
     # kimi config BEFORE reserving a slot or creating a shard: an unregistered model makes
     # kimi-cli silently fall back to an empty LLM and emit only "LLM not set".
     resolved_model = KIMI_MODEL_ALIASES.get(model, model) if model else KIMI_DEFAULT_MODEL
-    enable_thinking = bool(model) and model in KIMI_THINKING_ALIASES
+    # Thinking is enabled when the caller picked a thinking alias, OR when the
+    # resolved model is thinking-only (k2.7-code rejects requests with thinking
+    # disabled, regardless of whether it was reached via alias or full model name).
+    enable_thinking = (bool(model) and model in KIMI_THINKING_ALIASES) or (
+        resolved_model in KIMI_THINKING_REQUIRED
+    )
     model_error = _kimi_validate_model(resolved_model)
     if model_error:
         return model_error
@@ -6098,7 +6123,7 @@ def main():
     spin_parser.add_argument(
         "--model",
         "-m",
-        help="Model to use (e.g. haiku/sonnet/opus/fable for Claude, flash/pro for Gemini, thinking/k2.6/k2.5 for Kimi)",
+        help="Model to use (e.g. haiku/sonnet/opus/fable for Claude, flash/pro for Gemini, thinking/k2.6/k2.5/k2.7-code for Kimi)",
     )
     spin_parser.add_argument("--harness", help="Harness to use: claude-code (default), codex, gemini, or kimi")
     spin_parser.add_argument("--timeout", "-t", type=int, help="Kill spool after N seconds")

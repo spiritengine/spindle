@@ -2502,6 +2502,62 @@ class TestKimiHarness:
         assert "moonshot-ai/kimi-k2-turbo-preview" not in KIMI_MODEL_ALIASES.values()
         # Default model must be a real, registerable model (regression: was kimi-k2-thinking).
         assert KIMI_DEFAULT_MODEL == "moonshot-ai/kimi-k2.6"
+        # k2.7-code (2026-06-12): coding-specialized aliases resolve to the served model.
+        assert KIMI_MODEL_ALIASES["k2.7-code"] == "moonshot-ai/kimi-k2.7-code"
+        assert KIMI_MODEL_ALIASES["k2.7"] == "moonshot-ai/kimi-k2.7-code"
+        assert KIMI_MODEL_ALIASES["code"] == "moonshot-ai/kimi-k2.7-code"
+        assert (
+            KIMI_MODEL_ALIASES["highspeed"] == "moonshot-ai/kimi-k2.7-code-highspeed"
+        )
+
+    def test_kimi_k2_7_code_forces_thinking_via_alias(self, tmp_path):
+        """k2.7-code is thinking-only; selecting it by alias must add --thinking."""
+        captured_cmd = []
+
+        def fake_spawn(spool_id, cmd, cwd, env=None):
+            captured_cmd.extend(cmd)
+            return 12345
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle._spawn_detached", side_effect=fake_spawn):
+                with patch("spindle._count_running", return_value=0):
+                    _kimi_spin_sync(
+                        prompt="Test",
+                        working_dir=str(tmp_path),
+                        model="k2.7-code",
+                        system_prompt=None,
+                        timeout=None,
+                        tags=None,
+                        env=None,
+                    )
+
+        assert "moonshot-ai/kimi-k2.7-code" in captured_cmd
+        assert "--thinking" in captured_cmd
+
+    def test_kimi_k2_7_code_forces_thinking_via_full_model(self, tmp_path):
+        """k2.7-code reached by full model name (not an alias) must still force
+        --thinking — the endpoint rejects requests with thinking disabled."""
+        captured_cmd = []
+
+        def fake_spawn(spool_id, cmd, cwd, env=None):
+            captured_cmd.extend(cmd)
+            return 12345
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle._spawn_detached", side_effect=fake_spawn):
+                with patch("spindle._count_running", return_value=0):
+                    _kimi_spin_sync(
+                        prompt="Test",
+                        working_dir=str(tmp_path),
+                        model="moonshot-ai/kimi-k2.7-code-highspeed",
+                        system_prompt=None,
+                        timeout=None,
+                        tags=None,
+                        env=None,
+                    )
+
+        assert "moonshot-ai/kimi-k2.7-code-highspeed" in captured_cmd
+        assert "--thinking" in captured_cmd
 
     def test_kimi_spin_resolves_alias(self, tmp_path):
         """The 'thinking' alias resolves to kimi-k2.6 and enables thinking mode."""
