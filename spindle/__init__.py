@@ -5299,13 +5299,15 @@ CODEX_MODEL_ALIASES = {
 # used by Claude Code and Codex harnesses.
 
 # Short aliases for common models. Anything not here passes through to the CLI.
-# Source of truth: google-gemini/gemini-cli (packages/core/src/config/models.ts)
+# Source of truth: Generative Language API — verify with:
+#   curl "https://generativelanguage.googleapis.com/v1beta/models?key=$GEMINI_API_KEY&pageSize=200"
+# All values verified 2026-06-20: every alias below resolves to a live generateContent model.
 GEMINI_MODEL_ALIASES = {
     # 2.5 family — current CLI default
     "flash": "gemini-2.5-flash",
     "pro": "gemini-2.5-pro",
     "flash-lite": "gemini-2.5-flash-lite",
-    # 3.x family — pro variants still preview-only; flash-lite and 3.5-flash now GA
+    # 3.x family — pro variants preview-only; flash-lite and 3.5-flash GA; all live as of 2026-06-20
     "3-pro": "gemini-3-pro-preview",
     "3-flash": "gemini-3-flash-preview",
     "3.1-pro": "gemini-3.1-pro-preview",
