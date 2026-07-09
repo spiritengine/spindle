@@ -2477,7 +2477,7 @@ async def spin(
         working_dir: Directory for the agent to work in (defaults to current)
         allowed_tools: Override permission profile with explicit tool list
         tags: Comma-separated tags for organizing spools (e.g. "batch-1,triage")
-        model: Model to use - for Claude: "haiku", "sonnet", "opus", "fable" (claude-fable-5, access ends 2026-06-22), or versioned aliases like "opus-4.8";
+        model: Model to use - for Claude: "haiku", "sonnet", "opus", "fable" (claude-fable-5, access ends 2026-07-12), or versioned aliases like "opus-4.8";
                for Gemini: "flash", "pro", or full model names like "gemini-2.5-pro";
                for Kimi: "thinking" (k2.6 in thinking mode), "k2.6", "k2.5", "latest", "k2.7-code"/"code" (coding-focused, thinking-only), "highspeed", or full model names.
                Use spin_harnesses() to see all available models.
@@ -4301,7 +4301,7 @@ def _get_harnesses() -> dict:
         },
         "codex": {
             "models": CODEX_MODEL_ALIASES,
-            "default_model": "gpt-5.3-codex",
+            "default_model": "gpt-5.6-sol",
             "requires": "codex CLI",
             "note": "Aliases are shortcuts; any model string accepted by codex CLI also works",
         },
@@ -5272,7 +5272,7 @@ CLAUDE_MODEL_ALIASES = {
     "opus-4.6": "claude-opus-4-6",
     "opus-4.7": "claude-opus-4-7",
     "opus-4.8": "claude-opus-4-8",
-    # Fable access sunsets 2026-06-22; after that the claude CLI will reject
+    # Fable access sunsets 2026-07-12; after that the claude CLI will reject
     # the model (the alias itself stays harmless — unknowns pass through).
     "fable": "claude-fable-5",
     "fable-5": "claude-fable-5",
@@ -5284,18 +5284,33 @@ CLAUDE_MODEL_ALIASES = {
 
 
 # Short aliases for common Codex/OpenAI models. Anything not here passes through.
-# Source of truth: openai/codex repo (codex-rs/skills/.../latest-model.md)
+# Source of truth: the codex CLI's own resolver, which reports the current latest
+# model (returns gpt-5.6-sol as of 2026-07-09):
+#   node ~/.codex/skills/.system/openai-docs/scripts/resolve-latest-model-info.js
 CODEX_MODEL_ALIASES = {
-    # GPT-5.5 series — current default for general/reasoning tasks
+    # GPT-5.6 series (Sol/Terra/Luna) — current default; publicly released
+    # 2026-07-09. The generation number is the family; Sol/Terra/Luna are
+    # durable capability tiers (flagship / balanced mini-like / fast nano-like).
+    # There is no separate "-codex" variant in this generation — the tiers ARE
+    # the coding models, and Sol is OpenAI's recommended default. So the bare
+    # "5.6"/"codex" aliases and the harness default track gpt-5.6-sol.
+    "5.6": "gpt-5.6-sol",
+    "5.6-sol": "gpt-5.6-sol",
+    "sol": "gpt-5.6-sol",
+    "codex": "gpt-5.6-sol",
+    "5.6-terra": "gpt-5.6-terra",
+    "terra": "gpt-5.6-terra",
+    "5.6-luna": "gpt-5.6-luna",
+    "luna": "gpt-5.6-luna",
+    # GPT-5.5 series — previous frontier
     "5.5": "gpt-5.5",
     "5.5-pro": "gpt-5.5-pro",
-    # GPT-5.3 / 5.1 codex variants — recommended for coding
+    # GPT-5.3 / 5.1 codex variants — prior coding models, still selectable
     "5.3-codex": "gpt-5.3-codex",
-    "codex": "gpt-5.3-codex",
     "5.1-codex-max": "gpt-5.1-codex-max",
     "5.1-codex-mini": "gpt-5.1-codex-mini",
     "codex-mini": "gpt-5.1-codex-mini",
-    # GPT-5.4 series — previous default, still active
+    # GPT-5.4 series
     "5.4": "gpt-5.4",
     "5.4-mini": "gpt-5.4-mini",
     "5.4-nano": "gpt-5.4-nano",
@@ -5531,9 +5546,25 @@ Your task:
 """
             effective_prompt = shard_preamble + effective_prompt
 
-    # Build gemini command: headless mode with sandbox and JSON output
-    # Note: -y (YOLO) is blocked by Google Workspace secureModeEnabled setting.
-    # -s (sandbox) works and is sufficient for research-only spins.
+    # Build gemini command: headless mode with sandbox and JSON output.
+    #
+    # Web-search reliability (verified empirically 2026-06-28): in headless -p
+    # mode the google_web_search tool DOES fire and is auto-accepted — the stats
+    # block in -o json output shows tools.byName.google_web_search with
+    # decisions.accept>0 and totalFail=0, so there is no approval gate to defeat
+    # (-y / --approval-mode are irrelevant here). -s does not block it either:
+    # searches return correct live data through the sandbox (confirmed against
+    # current npm versions and an obscure Royal Road serial premise).
+    #
+    # The real failure mode is INTERMITTENT EMPTY GROUNDING: the Gemini API's
+    # Search grounding sometimes returns no content (a documented server-side
+    # regression — empty groundingMetadata.webSearchQueries), and on an empty
+    # result gemini CONFABULATES instead of reporting failure. The -o json output
+    # exposes only `response` + `stats`, not groundingMetadata, so spindle cannot
+    # tell a grounded answer from a fabricated one. Treat gemini as UNRELIABLE for
+    # correctness-critical web research — route that to Claude/Codex and use gemini
+    # for offline synthesis or cheap, separately-verified pre-research.
+    #
     # Gemini has no allowedTools-equivalent; research restrictions are prompt-level,
     # plus bwrap's filesystem boundary when running in shard mode.
     gemini_cmd = ["gemini", "-p", effective_prompt, "-s", "-o", "json"]

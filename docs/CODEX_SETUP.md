@@ -121,15 +121,17 @@ Specify model via the `model` parameter:
 spin(
     prompt="Your task",
     harness="codex",
-    model="gpt-5-codex",  # Explicit model
+    model="gpt-5.6-sol",  # Explicit model
     working_dir="/path/to/project"
 )
 ```
 
 Available models:
-- `gpt-5-codex` (default)
-- `gpt-5`
-- Others as supported by your subscription
+- `gpt-5.6-sol` (default) — flagship GPT-5.6 tier; alias `sol` or `codex`
+- `gpt-5.6-terra` / `gpt-5.6-luna` — balanced and fast/cheap GPT-5.6 tiers
+- `gpt-5.5`, `gpt-5.3-codex`, and others as supported by your subscription
+
+See `spin_harnesses()` for the full alias list.
 
 ## Using Codex with Spindle
 

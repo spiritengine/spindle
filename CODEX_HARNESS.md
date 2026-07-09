@@ -23,7 +23,7 @@ Spawn a Codex CLI agent to handle a task. Returns immediately with spool_id.
 spool_id = spin(
     prompt="Write a function to parse CSV files",
     working_dir="/path/to/project",
-    model="gpt-5-codex",  # Optional, defaults to configured model
+    model="gpt-5.6-sol",  # Optional, defaults to gpt-5.6-sol
     harness="codex",  # Use Codex instead of Claude Code
     permission="full",  # Mapped to sandbox policy
     timeout=300,  # Optional, seconds
@@ -35,7 +35,7 @@ spool_id = spin(
 - `prompt` (required): The task/question for the Codex agent
 - `working_dir` (required): Directory for the agent to work in
 - `harness` (required): Set to "codex" to use Codex CLI
-- `model` (optional): Model to use (e.g., "gpt-5-codex")
+- `model` (optional): Model to use (e.g., "gpt-5.6-sol")
 - `permission` (optional): Mapped to Codex sandbox policy:
   - `"readonly"` → `"read-only"`
   - `"full"` or `"shard"` → `"danger-full-access"`
@@ -95,7 +95,7 @@ Codex spools include a `harness` field set to "codex" to distinguish them from C
   "status": "running",
   "prompt": "Write a CSV parser",
   "working_dir": "/path/to/project",
-  "model": "gpt-5-codex",
+  "model": "gpt-5.6-sol",
   "sandbox": "workspace-write",
   "tags": ["codex", "csv"],
   "session_id": null,
@@ -158,7 +158,7 @@ result2 = unspool(spool_id2)
 | Shard support | Full (via `permission="shard"`) | Not yet implemented |
 | SKEIN integration | Full | Not yet implemented |
 | Permission modes | careful, readonly, full, shard | Mapped to sandbox policies (read-only, workspace-write, danger-full-access) |
-| Model selection | sonnet, opus, haiku | gpt-5-codex, gpt-5 |
+| Model selection | sonnet, opus, haiku | gpt-5.6-sol, gpt-5.5 |
 | Session resume | `--resume` flag | `codex resume` command |
 
 ## Future Enhancements
