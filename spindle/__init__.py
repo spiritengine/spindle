@@ -129,14 +129,32 @@ CLAUDE_TASKS_DIR = Path.home() / ".claude" / "tasks"
 # These map to Claude Code's --allowedTools flag
 # Profiles ending with "+shard" auto-enable shard isolation
 RESEARCH_TOOLS = "Read,Grep,Glob,WebFetch,WebSearch,Bash(ls:*),Bash(cat:*),Bash(head:*),Bash(tail:*),Bash(git status:*),Bash(git log:*),Bash(git diff:*),Bash(curl:*),Bash(jq:*),Bash(skein:*)"
+
+# Absolute-path interpreters that mill/xgun chain bundles PIN — a bundle runs a
+# specific interpreter by FULL PATH (e.g. deep_code_audit's test suite under the
+# xgun pyenv). Bare Bash(python:*)/Bash(python3:*) do NOT match an absolute-path
+# command, and `careful` runs in acceptEdits mode (allowlist-enforced), so without
+# these a review/fell spin can't run a bundle's pinned interpreter and silently
+# degrades to static-only analysis (SKEIN friction-20260709-vfx2 — a Claude-
+# genotype reviewer that couldn't run the suite missed bugs the executing genotype
+# caught). Claude Code Bash rules match by exact command PREFIX and do NOT honor
+# mid-path globs (Bash(/a/*/bin/python*:*) falls through to approval — verified),
+# so each interpreter is listed by full path; add new pinned interpreters here.
+# Not a security widening: `careful` already allows arbitrary Python via
+# Bash(python:*)/Bash(python3:*); this only makes the absolute-path form work.
+PINNED_INTERPRETERS = (
+    "Bash(/home/patrick/.pyenv/versions/3.12.0/bin/python3.12:*),"
+    "Bash(/home/patrick/.pyenv/versions/3.12.0/bin/python3:*),"
+    "Bash(/home/patrick/.pyenv/versions/3.12.0/bin/python:*)"
+)
 PERMISSION_PROFILES = {
     "readonly": "Read,Grep,Glob,Bash(ls:*),Bash(cat:*),Bash(head:*),Bash(tail:*),Bash(git status:*),Bash(git log:*),Bash(git diff:*),Bash(skein:*)",
-    "careful": "Read,Write,Edit,Grep,Glob,Bash(git:*),Bash(make:*),Bash(pytest:*),Bash(python:*),Bash(python3:*),Bash(npm:*),Bash(npx:*),Bash(node:*),Bash(ruff:*),Bash(black:*),Bash(mypy:*),Bash(pip:*),Bash(uv:*),Bash(ls:*),Bash(cat:*),Bash(head:*),Bash(tail:*),Bash(wc:*),Bash(diff:*),Bash(skein:*),Bash(muster:*)",
+    "careful": "Read,Write,Edit,Grep,Glob,Bash(git:*),Bash(make:*),Bash(pytest:*),Bash(python:*),Bash(python3:*),Bash(npm:*),Bash(npx:*),Bash(node:*),Bash(ruff:*),Bash(black:*),Bash(mypy:*),Bash(pip:*),Bash(uv:*),Bash(ls:*),Bash(cat:*),Bash(head:*),Bash(tail:*),Bash(wc:*),Bash(diff:*),Bash(skein:*),Bash(muster:*)," + PINNED_INTERPRETERS,
     "research": RESEARCH_TOOLS,
     "full": None,  # None means no restrictions
     # Shard variants - same permissions but auto-enable worktree isolation
     "shard": None,  # Full permissions + shard isolation (common combo)
-    "careful+shard": "Read,Write,Edit,Grep,Glob,Bash(git:*),Bash(make:*),Bash(pytest:*),Bash(python:*),Bash(python3:*),Bash(npm:*),Bash(npx:*),Bash(node:*),Bash(ruff:*),Bash(black:*),Bash(mypy:*),Bash(pip:*),Bash(uv:*),Bash(ls:*),Bash(cat:*),Bash(head:*),Bash(tail:*),Bash(wc:*),Bash(diff:*),Bash(skein:*),Bash(muster:*)",
+    "careful+shard": "Read,Write,Edit,Grep,Glob,Bash(git:*),Bash(make:*),Bash(pytest:*),Bash(python:*),Bash(python3:*),Bash(npm:*),Bash(npx:*),Bash(node:*),Bash(ruff:*),Bash(black:*),Bash(mypy:*),Bash(pip:*),Bash(uv:*),Bash(ls:*),Bash(cat:*),Bash(head:*),Bash(tail:*),Bash(wc:*),Bash(diff:*),Bash(skein:*),Bash(muster:*)," + PINNED_INTERPRETERS,
     "research+shard": RESEARCH_TOOLS,
     # Classifier-vetted autonomous mode — CC vets each tool call server-side.
     # No allowedTools restriction: the classifier governs calls dynamically.

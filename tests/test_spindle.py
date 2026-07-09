@@ -25,6 +25,7 @@ from spindle import (
     MAX_CONCURRENT,
     PENDING_SPAWN_TIMEOUT,
     PERMISSION_PROFILES,
+    PINNED_INTERPRETERS,
     UNSPOOL_HEAD_CHARS,
     UNSPOOL_MAX_CHARS,
     UNSPOOL_TAIL_CHARS,
@@ -1690,6 +1691,36 @@ class TestPermissionProfileContents:
         """Careful and careful+shard must include python3 (most invocations use python3 explicitly)."""
         assert "Bash(python3:*)" in PERMISSION_PROFILES["careful"]
         assert "Bash(python3:*)" in PERMISSION_PROFILES["careful+shard"]
+
+    def test_careful_includes_pinned_abs_interpreters(self):
+        """Careful/careful+shard must allow the absolute-path pinned interpreters a
+        chain bundle runs by full path. Bare Bash(python3:*) does NOT match an
+        absolute path, so without these an acceptEdits-mode review spin can't run a
+        pinned interpreter and degrades to static analysis (friction-20260709-vfx2)."""
+        pyenv = "Bash(/home/patrick/.pyenv/versions/3.12.0/bin/python3.12:*)"
+        assert pyenv in PERMISSION_PROFILES["careful"]
+        assert pyenv in PERMISSION_PROFILES["careful+shard"]
+        # every pinned-interpreter entry is appended to both careful profiles
+        for entry in PINNED_INTERPRETERS.split(","):
+            assert entry in PERMISSION_PROFILES["careful"], f"careful missing {entry}"
+            assert entry in PERMISSION_PROFILES["careful+shard"], f"careful+shard missing {entry}"
+
+    def test_pinned_interpreters_are_exact_abs_prefix_rules(self):
+        """Each pinned interpreter must be an exact absolute-path Bash prefix rule
+        (Bash(/abs/path:*)) — Claude Code Bash rules do NOT honor mid-path globs, so
+        a wildcard like Bash(/a/*/bin/python*:*) would silently fail to match."""
+        for entry in PINNED_INTERPRETERS.split(","):
+            assert entry.startswith("Bash(/"), f"not an absolute-path rule: {entry}"
+            assert entry.endswith(":*)"), f"not a prefix (:*) rule: {entry}"
+            inner = entry[len("Bash("):-len(":*)")]
+            assert "*" not in inner, f"mid-path glob won't match Claude Code's matcher: {entry}"
+
+    def test_pinned_interpreters_not_in_readonly_or_research(self):
+        """The pinned interpreters must NOT leak into readonly/research — those
+        intentionally exclude Python execution."""
+        for profile in ("readonly", "research"):
+            for entry in PINNED_INTERPRETERS.split(","):
+                assert entry not in PERMISSION_PROFILES[profile], f"{profile} leaked {entry}"
 
     def test_full_and_shard_unchanged_none(self):
         """Full and shard profiles must remain None (unrestricted)."""
