@@ -1712,7 +1712,7 @@ class TestPermissionProfileContents:
         for entry in PINNED_INTERPRETERS.split(","):
             assert entry.startswith("Bash(/"), f"not an absolute-path rule: {entry}"
             assert entry.endswith(":*)"), f"not a prefix (:*) rule: {entry}"
-            inner = entry[len("Bash("):-len(":*)")]
+            inner = entry[len("Bash(") : -len(":*)")]
             assert "*" not in inner, f"mid-path glob won't match Claude Code's matcher: {entry}"
 
     def test_pinned_interpreters_not_in_readonly_or_research(self):
@@ -2034,17 +2034,17 @@ class TestConcurrencyLimit:
             failure_count = len(results["failure"])
 
             # All threads should have completed
-            assert (
-                success_count + failure_count == num_threads
-            ), f"Expected {num_threads} results, got {success_count + failure_count}"
+            assert success_count + failure_count == num_threads, (
+                f"Expected {num_threads} results, got {success_count + failure_count}"
+            )
 
             # We started with initial_running, so only (MAX_CONCURRENT - initial_running)
             # new slots should be available
             max_new_slots = MAX_CONCURRENT - initial_running
 
-            assert (
-                success_count == max_new_slots
-            ), f"Expected exactly {max_new_slots} successful reservations, got {success_count}"
+            assert success_count == max_new_slots, (
+                f"Expected exactly {max_new_slots} successful reservations, got {success_count}"
+            )
 
             # The rest should have been rejected
             expected_failures = num_threads - max_new_slots
@@ -2053,9 +2053,9 @@ class TestConcurrencyLimit:
             # Verify we never exceeded the limit by checking total running
             all_spools = _list_spools()
             running_count = sum(1 for s in all_spools if s.get("status") == "running")
-            assert (
-                running_count == MAX_CONCURRENT
-            ), f"Expected exactly {MAX_CONCURRENT} running spools, got {running_count}"
+            assert running_count == MAX_CONCURRENT, (
+                f"Expected exactly {MAX_CONCURRENT} running spools, got {running_count}"
+            )
 
     def test_lock_file_created(self, tmp_path):
         """Lock file should be created during reservation."""
@@ -2212,9 +2212,9 @@ class TestWorktreeNameUniqueness:
         assert shard1_id != shard2_id, f"Shard IDs collided: {shard1_id} == {shard2_id}"
 
         # Branch names should also be different
-        assert (
-            shard1["branch_name"] != shard2["branch_name"]
-        ), f"Branch names collided: {shard1['branch_name']} == {shard2['branch_name']}"
+        assert shard1["branch_name"] != shard2["branch_name"], (
+            f"Branch names collided: {shard1['branch_name']} == {shard2['branch_name']}"
+        )
 
         # Verify both worktrees exist
         assert Path(shard1["worktree_path"]).exists(), f"Worktree 1 doesn't exist: {shard1['worktree_path']}"
@@ -2537,9 +2537,7 @@ class TestKimiHarness:
         assert KIMI_MODEL_ALIASES["k2.7-code"] == "moonshot-ai/kimi-k2.7-code"
         assert KIMI_MODEL_ALIASES["k2.7"] == "moonshot-ai/kimi-k2.7-code"
         assert KIMI_MODEL_ALIASES["code"] == "moonshot-ai/kimi-k2.7-code"
-        assert (
-            KIMI_MODEL_ALIASES["highspeed"] == "moonshot-ai/kimi-k2.7-code-highspeed"
-        )
+        assert KIMI_MODEL_ALIASES["highspeed"] == "moonshot-ai/kimi-k2.7-code-highspeed"
 
     def test_kimi_k2_7_code_forces_thinking_via_alias(self, tmp_path):
         """k2.7-code is thinking-only; selecting it by alias must add --thinking."""
@@ -3487,15 +3485,15 @@ class TestDetectExistingShard:
                             )
 
         # _spawn_shard must NOT have been called — the existing shard was reused
-        assert (
-            len(spawned) == 0
-        ), f"_spawn_shard was called {len(spawned)} time(s); should be 0 when working_dir is already a shard worktree"
+        assert len(spawned) == 0, (
+            f"_spawn_shard was called {len(spawned)} time(s); should be 0 when working_dir is already a shard worktree"
+        )
 
         # The agent's cwd should be the existing worktree, not a new one
         assert len(captured_cwd) == 1
-        assert str(Path(wt_path).resolve()) == str(
-            Path(captured_cwd[0]).resolve()
-        ), f"Agent cwd {captured_cwd[0]!r} does not match existing shard {wt_path!r}"
+        assert str(Path(wt_path).resolve()) == str(Path(captured_cwd[0]).resolve()), (
+            f"Agent cwd {captured_cwd[0]!r} does not match existing shard {wt_path!r}"
+        )
 
     def test_returns_none_for_worktrees_in_path_but_not_under_repo_root(self, tmp_path):
         """
@@ -3628,9 +3626,9 @@ class TestDetectExistingShard:
 
         # Agent lands in the subdirectory the user pointed at
         assert len(captured_cwd) == 1
-        assert (
-            Path(captured_cwd[0]).resolve() == subdir.resolve()
-        ), f"Agent cwd {captured_cwd[0]!r} should be the requested subdir {str(subdir)!r}"
+        assert Path(captured_cwd[0]).resolve() == subdir.resolve(), (
+            f"Agent cwd {captured_cwd[0]!r} should be the requested subdir {str(subdir)!r}"
+        )
 
         # shard_info['worktree_path'] is the worktree ROOT, not the subdir
         assert spool is not None
@@ -3643,9 +3641,9 @@ class TestDetectExistingShard:
 
         # Verify merge/drop's main_repo derivation (worktrees/<name> -> repo)
         main_repo = Path(shard_info["worktree_path"]).parent.parent
-        assert (
-            main_repo.resolve() == Path(repo).resolve()
-        ), f"main_repo derived via .parent.parent {main_repo!r} must match the actual repo root {repo!r}"
+        assert main_repo.resolve() == Path(repo).resolve(), (
+            f"main_repo derived via .parent.parent {main_repo!r} must match the actual repo root {repo!r}"
+        )
 
     def test_codex_spin_sync_reuses_existing_shard(self, tmp_path):
         """
@@ -3691,9 +3689,9 @@ class TestDetectExistingShard:
             f"shard worktree"
         )
         assert len(captured_cwd) == 1
-        assert str(Path(wt_path).resolve()) == str(
-            Path(captured_cwd[0]).resolve()
-        ), f"Codex agent cwd {captured_cwd[0]!r} does not match existing shard {wt_path!r}"
+        assert str(Path(wt_path).resolve()) == str(Path(captured_cwd[0]).resolve()), (
+            f"Codex agent cwd {captured_cwd[0]!r} does not match existing shard {wt_path!r}"
+        )
 
 
 class TestSpinSyncShardCleanupOnFailure:
@@ -4078,9 +4076,9 @@ class TestCodexRespinPreservesGitAccess:
         resolved = {str(Path(d).resolve()) for d in add_dirs}
 
         main_git = (repo / ".git").resolve()
-        assert (
-            str(main_git) in resolved
-        ), f"codex respin must --add-dir the main repo's .git ({main_git}); got {add_dirs!r}"
+        assert str(main_git) in resolved, (
+            f"codex respin must --add-dir the main repo's .git ({main_git}); got {add_dirs!r}"
+        )
         assert str(wt_path.resolve()) in resolved, (
             f"codex respin must --add-dir the worktree root ({wt_path}) so a "
             f"subdirectory cwd retains write access to sibling files; got {add_dirs!r}"
@@ -4091,14 +4089,14 @@ class TestCodexRespinPreservesGitAccess:
         resume_idx = cmd.index("resume")
         add_dir_indices = [i for i, tok in enumerate(cmd) if tok == "--add-dir"]
         for idx in add_dir_indices:
-            assert (
-                idx < resume_idx
-            ), f"--add-dir at index {idx} must come before `resume` at index {resume_idx}; cmd={cmd!r}"
+            assert idx < resume_idx, (
+                f"--add-dir at index {idx} must come before `resume` at index {resume_idx}; cmd={cmd!r}"
+            )
         cd_idx = next((i for i, tok in enumerate(cmd) if tok == "--cd"), None)
         assert cd_idx is not None, "--cd must be present in codex respin command"
-        assert (
-            cd_idx < resume_idx
-        ), f"--cd at index {cd_idx} must come before `resume` at index {resume_idx}; cmd={cmd!r}"
+        assert cd_idx < resume_idx, (
+            f"--cd at index {cd_idx} must come before `resume` at index {resume_idx}; cmd={cmd!r}"
+        )
 
     def test_codex_respin_sets_cd_to_shard_worktree(self, tmp_path):
         session_id = "codex-session-cd"
@@ -4408,18 +4406,18 @@ class TestDetectDefaultBranch:
             capture_output=True,
             text=True,
         ).stdout.strip()
-        assert (
-            head_sha == main_sha
-        ), f"Shard HEAD {head_sha} does not match main {main_sha} — shard was not forked from main"
+        assert head_sha == main_sha, (
+            f"Shard HEAD {head_sha} does not match main {main_sha} — shard was not forked from main"
+        )
 
         # Spool record should have base_branch persisted as 'main' so retries
         # don't fall back to literal 'master'.
         spool_path = spool_dir / f"{spool_id}.json"
         assert spool_path.exists()
         spool = json.loads(spool_path.read_text())
-        assert (
-            spool.get("base_branch") == "main"
-        ), f"Expected spool.base_branch='main', got {spool.get('base_branch')!r}"
+        assert spool.get("base_branch") == "main", (
+            f"Expected spool.base_branch='main', got {spool.get('base_branch')!r}"
+        )
 
 
 class TestShardFailLoud:
@@ -5134,9 +5132,9 @@ class TestRespinHandleResolution:
         assert len(captured_cmd) == 1
         cmd = captured_cmd[0]
         assert "--resume" in cmd
-        assert (
-            cmd[cmd.index("--resume") + 1] == session_id
-        ), f"claude resume must use the resolved session_id {session_id!r}, not the spool_id {spool_id!r}; got {cmd!r}"
+        assert cmd[cmd.index("--resume") + 1] == session_id, (
+            f"claude resume must use the resolved session_id {session_id!r}, not the spool_id {spool_id!r}; got {cmd!r}"
+        )
 
     def test_respin_running_spool_no_session_distinct_error(self, tmp_path):
         """A running spool whose thread_id hasn't been parsed yet must give
