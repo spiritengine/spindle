@@ -4301,7 +4301,11 @@ def _get_harnesses() -> dict:
         },
         "codex": {
             "models": CODEX_MODEL_ALIASES,
-            "default_model": "gpt-5.6-sol",
+            # gpt-5.5 is the current WORKING default: gpt-5.6-sol 400s on the
+            # released codex CLI and gpt-5.3-codex 400s on ChatGPT-account auth
+            # (see the CODEX_MODEL_ALIASES access note). Flip to gpt-5.6-sol once
+            # a codex build accepts it.
+            "default_model": "gpt-5.5",
             "requires": "codex CLI",
             "note": "Aliases are shortcuts; any model string accepted by codex CLI also works",
         },
@@ -5287,25 +5291,34 @@ CLAUDE_MODEL_ALIASES = {
 # Source of truth: the codex CLI's own resolver, which reports the current latest
 # model (returns gpt-5.6-sol as of 2026-07-09):
 #   node ~/.codex/skills/.system/openai-docs/scripts/resolve-latest-model-info.js
+#
+# ACCESS REALITY (verified via live smoke tests 2026-07-09, codex CLI 0.144.0 —
+# the newest released build — on this box's ChatGPT-account auth):
+#   * gpt-5.6-sol/terra/luna: announced + live in ChatGPT, but the API 400s
+#     ("requires a newer version of Codex") — no released codex CLI speaks the
+#     5.6 protocol yet. The aliases are STAGED here; when a codex build lands
+#     that accepts 5.6, flip the "codex" alias and the harness default_model
+#     (in _get_harnesses) to gpt-5.6-sol.
+#   * gpt-5.3-codex and the other API-only *-codex ids: 400 "not supported when
+#     using Codex with a ChatGPT account" — unusable on this auth (so the old
+#     gpt-5.3-codex default was itself broken here).
+#   * gpt-5.5: works. It is the current working default (see default_model).
 CODEX_MODEL_ALIASES = {
-    # GPT-5.6 series (Sol/Terra/Luna) — current default; publicly released
-    # 2026-07-09. The generation number is the family; Sol/Terra/Luna are
-    # durable capability tiers (flagship / balanced mini-like / fast nano-like).
-    # There is no separate "-codex" variant in this generation — the tiers ARE
-    # the coding models, and Sol is OpenAI's recommended default. So the bare
-    # "5.6"/"codex" aliases and the harness default track gpt-5.6-sol.
+    # GPT-5.6 series (Sol/Terra/Luna) — STAGED, not yet reachable (see access
+    # note above). Sol/Terra/Luna are durable capability tiers (flagship /
+    # balanced mini-like / fast nano-like); no separate "-codex" variant.
     "5.6": "gpt-5.6-sol",
     "5.6-sol": "gpt-5.6-sol",
     "sol": "gpt-5.6-sol",
-    "codex": "gpt-5.6-sol",
     "5.6-terra": "gpt-5.6-terra",
     "terra": "gpt-5.6-terra",
     "5.6-luna": "gpt-5.6-luna",
     "luna": "gpt-5.6-luna",
-    # GPT-5.5 series — previous frontier
+    # GPT-5.5 series — current working default; "codex" tracks it until 5.6 lands
     "5.5": "gpt-5.5",
     "5.5-pro": "gpt-5.5-pro",
-    # GPT-5.3 / 5.1 codex variants — prior coding models, still selectable
+    "codex": "gpt-5.5",
+    # GPT-5.3 / 5.1 codex variants — API-only; 400 on ChatGPT-account auth
     "5.3-codex": "gpt-5.3-codex",
     "5.1-codex-max": "gpt-5.1-codex-max",
     "5.1-codex-mini": "gpt-5.1-codex-mini",

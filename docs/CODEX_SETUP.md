@@ -121,15 +121,16 @@ Specify model via the `model` parameter:
 spin(
     prompt="Your task",
     harness="codex",
-    model="gpt-5.6-sol",  # Explicit model
+    model="gpt-5.5",  # Explicit model
     working_dir="/path/to/project"
 )
 ```
 
 Available models:
-- `gpt-5.6-sol` (default) — flagship GPT-5.6 tier; alias `sol` or `codex`
-- `gpt-5.6-terra` / `gpt-5.6-luna` — balanced and fast/cheap GPT-5.6 tiers
-- `gpt-5.5`, `gpt-5.3-codex`, and others as supported by your subscription
+- `gpt-5.5` (default) — current working default on ChatGPT-account codex; alias `codex`
+- `gpt-5.6-sol` / `gpt-5.6-terra` / `gpt-5.6-luna` — staged aliases; NOT yet reachable
+  via the released codex CLI (API 400s "requires a newer version of Codex")
+- `gpt-5.3-codex` and other `-codex` ids — API-only; 400 on ChatGPT-account auth
 
 See `spin_harnesses()` for the full alias list.
 
