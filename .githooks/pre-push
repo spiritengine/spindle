@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Local mirror of the CI `lint` job, run right before a push so ruff format
+# drift (or a lint error) never reaches a red CI run. Same commands CI runs:
+#   ruff format --check .   and   ruff check .
+#
+# Enable once per clone (also applies to this repo's worktrees):
+#   git config core.hooksPath .githooks
+#
+# Bypass for a one-off push:  git push --no-verify
+set -euo pipefail
+
+if ! command -v ruff >/dev/null 2>&1; then
+  echo "pre-push: ruff not found on PATH — skipping lint gate (pip install ruff to enable). CI still checks." >&2
+  exit 0
+fi
+
+fail=0
+
+if ! ruff format --check . ; then
+  echo "" >&2
+  echo "pre-push: formatting check failed. Fix with:  ruff format ." >&2
+  fail=1
+fi
+
+if ! ruff check . ; then
+  echo "" >&2
+  echo "pre-push: lint check failed. Fix with:  ruff check --fix .  (or address manually)" >&2
+  fail=1
+fi
+
+if [ "$fail" -ne 0 ]; then
+  echo "" >&2
+  echo "pre-push blocked. Re-run the fix above, or bypass with:  git push --no-verify" >&2
+  exit 1
+fi
