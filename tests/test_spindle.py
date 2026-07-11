@@ -29,6 +29,7 @@ from spindle import (
     UNSPOOL_HEAD_CHARS,
     UNSPOOL_MAX_CHARS,
     UNSPOOL_TAIL_CHARS,
+    VENV_TOOLS,
     _budget_result,
     _check_and_finalize_spool,
     _cleanup_shard,
@@ -1721,6 +1722,36 @@ class TestPermissionProfileContents:
         for profile in ("readonly", "research"):
             for entry in PINNED_INTERPRETERS.split(","):
                 assert entry not in PERMISSION_PROFILES[profile], f"{profile} leaked {entry}"
+
+    def test_careful_includes_venv_tools(self):
+        """Careful/careful+shard must allow project venv tool paths."""
+        assert "Bash(.venv/bin/python:*)" in PERMISSION_PROFILES["careful"]
+        assert "Bash(.venv/bin/pytest:*)" in PERMISSION_PROFILES["careful"]
+        for entry in VENV_TOOLS.split(","):
+            assert entry in PERMISSION_PROFILES["careful"], f"careful missing {entry}"
+            assert entry in PERMISSION_PROFILES["careful+shard"], f"careful+shard missing {entry}"
+
+    def test_venv_tools_are_relative_prefix_rules(self):
+        """Each venv tool must be an exact relative-path Bash prefix rule."""
+        for entry in VENV_TOOLS.split(","):
+            assert entry.startswith(("Bash(.venv/bin/", "Bash(venv/bin/")), f"not a venv rule: {entry}"
+            assert entry.endswith(":*)"), f"not a prefix (:*) rule: {entry}"
+            inner = entry[len("Bash(") : -len(":*)")]
+            assert "*" not in inner, f"mid-path glob won't match Claude Code's matcher: {entry}"
+
+    def test_venv_tools_not_in_readonly_or_research(self):
+        """The venv tools must NOT leak into readonly/research."""
+        for profile in ("readonly", "research"):
+            for entry in VENV_TOOLS.split(","):
+                assert entry not in PERMISSION_PROFILES[profile], f"{profile} leaked {entry}"
+
+    def test_bare_python_and_venv_python_matcher_contract(self):
+        """Bare and path-form Python rules must coexist because Claude Code matches the command as typed."""
+        careful = PERMISSION_PROFILES["careful"]
+        assert "Bash(python:*)" in careful
+        assert "Bash(.venv/bin/python:*)" in careful
+        assert "Bash(pytest:*)" in careful
+        assert "Bash(.venv/bin/pytest:*)" in careful
 
     def test_full_and_shard_unchanged_none(self):
         """Full and shard profiles must remain None (unrestricted)."""

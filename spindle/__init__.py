@@ -147,16 +147,48 @@ PINNED_INTERPRETERS = (
     "Bash(/home/patrick/.pyenv/versions/3.12.0/bin/python3:*),"
     "Bash(/home/patrick/.pyenv/versions/3.12.0/bin/python:*)"
 )
+
+# Project-virtualenv tools invoked by their conventional RELATIVE path. A reviewer
+# following a project's test convention runs the pinned venv interpreter/tool by
+# path — e.g. mill's `.venv/bin/python -m pytest`, or `.venv/bin/pytest`,
+# `.venv/bin/ruff`. Claude Code matches an allowlist Bash rule against the command
+# string AS TYPED, and Bash(python:*)/Bash(pytest:*) match only when the command's
+# first token is exactly `python`/`pytest`; a path form like `.venv/bin/python`
+# shares no prefix with `python`, so it falls through to approval and, headless
+# (acceptEdits), is DENIED — degrading a careful Claude reviewer to static-only
+# while a bypass-mode codex reviewer runs the same suite. The agent's cwd is the
+# project root, so the `.venv/bin/...` string is project-independent — one static
+# rule set covers every project on the venv convention with no per-project config.
+# Not a security widening: `careful` already permits these exact tools bare
+# (Bash(python:*)/Bash(pytest:*)/Bash(ruff:*)/Bash(mypy:*)/Bash(black:*)); this only
+# makes the pinned-path form of the SAME tools resolve. `venv/bin` (non-dotted) is
+# included as the second most common layout at the same no-widening cost.
+VENV_TOOLS = (
+    "Bash(.venv/bin/python:*),"
+    "Bash(.venv/bin/python3:*),"
+    "Bash(.venv/bin/pytest:*),"
+    "Bash(.venv/bin/ruff:*),"
+    "Bash(.venv/bin/mypy:*),"
+    "Bash(.venv/bin/black:*),"
+    "Bash(.venv/bin/coverage:*),"
+    "Bash(venv/bin/python:*),"
+    "Bash(venv/bin/python3:*),"
+    "Bash(venv/bin/pytest:*),"
+    "Bash(venv/bin/ruff:*),"
+    "Bash(venv/bin/mypy:*),"
+    "Bash(venv/bin/black:*),"
+    "Bash(venv/bin/coverage:*)"
+)
 PERMISSION_PROFILES = {
     "readonly": "Read,Grep,Glob,Bash(ls:*),Bash(cat:*),Bash(head:*),Bash(tail:*),Bash(git status:*),Bash(git log:*),Bash(git diff:*),Bash(skein:*)",
     "careful": "Read,Write,Edit,Grep,Glob,Bash(git:*),Bash(make:*),Bash(pytest:*),Bash(python:*),Bash(python3:*),Bash(npm:*),Bash(npx:*),Bash(node:*),Bash(ruff:*),Bash(black:*),Bash(mypy:*),Bash(pip:*),Bash(uv:*),Bash(ls:*),Bash(cat:*),Bash(head:*),Bash(tail:*),Bash(wc:*),Bash(diff:*),Bash(skein:*),Bash(muster:*),"
-    + PINNED_INTERPRETERS,
+    + VENV_TOOLS + "," + PINNED_INTERPRETERS,
     "research": RESEARCH_TOOLS,
     "full": None,  # None means no restrictions
     # Shard variants - same permissions but auto-enable worktree isolation
     "shard": None,  # Full permissions + shard isolation (common combo)
     "careful+shard": "Read,Write,Edit,Grep,Glob,Bash(git:*),Bash(make:*),Bash(pytest:*),Bash(python:*),Bash(python3:*),Bash(npm:*),Bash(npx:*),Bash(node:*),Bash(ruff:*),Bash(black:*),Bash(mypy:*),Bash(pip:*),Bash(uv:*),Bash(ls:*),Bash(cat:*),Bash(head:*),Bash(tail:*),Bash(wc:*),Bash(diff:*),Bash(skein:*),Bash(muster:*),"
-    + PINNED_INTERPRETERS,
+    + VENV_TOOLS + "," + PINNED_INTERPRETERS,
     "research+shard": RESEARCH_TOOLS,
     # Classifier-vetted autonomous mode — CC vets each tool call server-side.
     # No allowedTools restriction: the classifier governs calls dynamically.
