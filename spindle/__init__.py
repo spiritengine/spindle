@@ -170,14 +170,12 @@ VENV_TOOLS = (
     "Bash(.venv/bin/ruff:*),"
     "Bash(.venv/bin/mypy:*),"
     "Bash(.venv/bin/black:*),"
-    "Bash(.venv/bin/coverage:*),"
     "Bash(venv/bin/python:*),"
     "Bash(venv/bin/python3:*),"
     "Bash(venv/bin/pytest:*),"
     "Bash(venv/bin/ruff:*),"
     "Bash(venv/bin/mypy:*),"
-    "Bash(venv/bin/black:*),"
-    "Bash(venv/bin/coverage:*)"
+    "Bash(venv/bin/black:*)"
 )
 PERMISSION_PROFILES = {
     "readonly": "Read,Grep,Glob,Bash(ls:*),Bash(cat:*),Bash(head:*),Bash(tail:*),Bash(git status:*),Bash(git log:*),Bash(git diff:*),Bash(skein:*)",
