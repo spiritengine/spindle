@@ -43,69 +43,63 @@ codex exec "print('Hello from Codex')"
 
 If successful, you'll see Codex execute the command.
 
-### 3. Check Kernel Version (Linux)
+### 3. Check the Codex Version (Linux)
 
-Codex uses Landlock sandboxing, which requires kernel 5.13+:
+Sandbox enforcement depends on which codex the running process resolves, so check the one
+on *its* PATH — a login shell and a long-lived server often resolve different installs:
 
 ```bash
-uname -r
+which codex && codex --version
 ```
 
-**If kernel >= 5.13:** Sandboxing works automatically
-**If kernel < 5.13:** Spindle automatically uses bypass mode (see below)
+Enforcement is verified for the versions in `CODEX_SANDBOX_VERIFIED_VERSIONS`
+(`spindle/__init__.py`). Spindle warns on anything else and records the resolved
+`codex_bin` / `codex_version` on every spool.
 
-Check Landlock support:
+No kernel Landlock is required — see below.
+
+## Codex Sandboxing
+
+### How it works
+
+Codex sandboxes with its own vendored bubblewrap plus seccomp. It does **not** require
+kernel Landlock (that is a legacy fallback in current codex builds), so `--sandbox`
+enforces on kernels older than 5.13 — verified on kernel 5.4 with codex-cli 0.125.0.
+
+Bubblewrap must be available, and codex needs a writable `~/.codex`: it materializes its
+sandbox helper under `$CODEX_HOME/tmp/arg0/` at startup. If that directory cannot be
+written, every sandboxed command fails with `bwrap: execvp codex-linux-sandbox: No such
+file or directory` (fails closed — nothing escapes, but nothing runs either).
+
+### How Spindle invokes it
+
+Spindle always passes the tier explicitly:
+
 ```bash
-ls /sys/kernel/security/landlock
+codex exec --json --sandbox <mode> "your task"
 ```
 
-If the directory exists, Landlock is available.
+`--full-auto` is never passed: it carries its own workspace-write tier that overrides
+`--sandbox` regardless of order, and `codex exec` is already non-interactive without it.
 
-## Landlock Sandboxing
+### Sandbox Policies
 
-### What is Landlock?
-
-Landlock is a Linux security module that provides filesystem sandboxing. Codex CLI uses it to restrict agent file access based on sandbox policies.
-
-**Requirements:**
-- Linux kernel 5.13 or later
-- `/sys/kernel/security/landlock` directory exists
-
-### Automatic Detection in Spindle
-
-Spindle automatically detects Landlock support and adjusts Codex commands:
-
-**With Landlock (kernel >= 5.13):**
-```bash
-codex exec --json --full-auto "your task"
-```
-
-**Without Landlock (kernel < 5.13):**
-```bash
-codex exec --json --dangerously-bypass-approvals-and-sandbox "your task"
-```
-
-You'll see a log message when bypass mode is used:
-```
-[Spindle] Kernel 5.4.0 lacks Landlock support (needs 5.13+), using bypass mode for Codex
-```
-
-### Sandbox Policies (Landlock Required)
-
-When Landlock is available, Spindle maps permission levels to Codex sandbox policies:
+Spindle maps permission levels to Codex sandbox policies:
 
 | Spindle Permission | Codex Sandbox Policy | Description |
 |-------------------|---------------------|-------------|
 | `readonly` | `read-only` | Can only read files |
 | `careful` (default) | `workspace-write` | Can read/write in workspace |
 | `full` | `danger-full-access` | Full filesystem access |
-| `shard` | `danger-full-access` | Full access (for isolated worktrees) |
+| `shard` | `workspace-write` via `spin()`; `danger-full-access` via the `spindle spin` CLI | Isolated worktree |
 | `research` (site target) | `read-only` | Web research against a site; no writes |
 | `research` (file/dir target) | `workspace-write` | Adds `--add-dir` for the writable target path |
 | `research+shard` (site target) | `read-only` | research + isolated worktree; no writes |
 | `research+shard` (file/dir target) | `workspace-write` | Adds `--add-dir` for the writable target path + isolated worktree |
 
-**Without Landlock:** All permissions use `--dangerously-bypass-approvals-and-sandbox`
+Note that codex's `workspace-write` treats `/tmp` and `$TMPDIR` as writable in addition to
+the workspace, so a `careful` spool can still write there. Only `read-only` prevents all
+writes.
 
 ## Configuration
 
@@ -372,17 +366,26 @@ cat ~/.spindle/<spool_id>.stdout
 cat ~/.spindle/<spool_id>.stderr
 ```
 
-### Verify Landlock Detection
+### Verify Sandbox Enforcement
 
-Test detection logic:
+Check which codex spindle will resolve, and whether its enforcement is verified:
 ```python
-from spindle import _has_landlock_support
-print(f"Landlock available: {_has_landlock_support()}")
+from spindle import CODEX_SANDBOX_VERIFIED_VERSIONS, _codex_cli_version, _resolve_codex_binary
+
+binary = _resolve_codex_binary()
+version = _codex_cli_version(binary)
+print(f"codex: {binary} ({version})")
+print(f"enforcement verified: {version in CODEX_SANDBOX_VERIFIED_VERSIONS}")
 ```
 
-Expected:
-- `True` on kernel >= 5.13 with `/sys/kernel/security/landlock`
-- `False` otherwise
+To confirm enforcement end-to-end, ask a read-only run to write and check nothing appears:
+```bash
+cd /tmp && rm -f /tmp/probe.txt
+codex exec --sandbox read-only "run: echo x > /tmp/probe.txt ; report the literal error"
+ls /tmp/probe.txt   # must not exist
+```
+Expected: `zsh:1: read-only file system: /tmp/probe.txt`, and no file. If the file appears,
+this codex is not enforcing `--sandbox` — do not use it for readonly spools.
 
 ### Test Codex Manually
 

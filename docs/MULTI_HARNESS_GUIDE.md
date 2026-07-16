@@ -376,36 +376,42 @@ spin("Research deepseek pricing", permission="research", research_target="site:s
 
 Codex uses OpenAI's sandbox policies, mapped from Claude permissions:
 
+Every codex spool is launched with an explicit `--sandbox` tier, mapped from Claude permissions:
+
 - `permission="readonly"` → `--sandbox read-only`
-- `permission="careful"` → `--full-auto` (workspace-write + approvals)
-- `permission="full"` → `--dangerously-bypass-approvals-and-sandbox`
-- `permission="shard"` → `--dangerously-bypass-approvals-and-sandbox`
+- `permission="careful"` → `--sandbox workspace-write`
+- `permission="full"` → `--sandbox danger-full-access`
+- `permission="shard"` → `--sandbox workspace-write` (the `spindle spin` CLI maps `shard` to `danger-full-access`)
 - `permission="research"` → site target: `--sandbox read-only`; file/dir target: `--sandbox workspace-write` + `--add-dir` for the target path (no bwrap — plain research uses Codex native sandbox only)
 - `permission="research+shard"` → same conditional sandbox as `research` + isolated worktree; bwrap adds OS-level isolation on top when available
 
-The mapping happens automatically in `_codex_spin_sync()`.
+The mapping happens automatically in `_codex_spin_sync()`, and the tier that was actually
+passed is stored on the spool record as `sandbox` (alongside the requested `permission`).
 
-## Landlock Detection (Codex)
+## Codex Sandbox Enforcement
 
-Codex CLI requires Linux kernel 5.13+ for Landlock sandbox support. Spindle automatically detects kernel version and adjusts:
+Codex does **not** need kernel Landlock. It sandboxes with its own vendored bubblewrap plus
+seccomp (`--use-legacy-landlock` is a fallback for older codex builds), so `--sandbox` is
+passed unconditionally and enforces on pre-5.13 kernels. Verified 2026-07-16 on kernel 5.4
+against codex-cli 0.125.0: a `read-only` spool cannot write even inside its own cwd, and a
+`workspace-write` spool can write inside cwd but not to `$HOME`.
 
-**Kernel 5.13+:**
-```bash
-codex exec --json --full-auto "task"
-```
+Two traps to know about, both of which silently disable enforcement while leaving the
+command line looking correct:
 
-**Kernel < 5.13:**
-```bash
-codex exec --json --dangerously-bypass-approvals-and-sandbox "task"
-```
+**`--full-auto` overrides `--sandbox`.** It is an alias carrying its own tier and it wins
+regardless of flag order. `codex exec --full-auto --sandbox read-only` reports
+`sandbox: workspace-write [workdir, /tmp, $TMPDIR]` and happily writes outside the
+workspace. Spindle therefore never passes it; `codex exec` is already non-interactive
+(`approval: never`) without it.
 
-Detection happens in `_has_landlock_support()`:
-1. Parse kernel version from `platform.release()`
-2. Check for major.minor >= 5.13
-3. Verify `/sys/kernel/security/landlock` exists
-4. Use bypass flag if check fails
-
-This ensures Codex works on older systems (e.g., Ubuntu 20.04 with kernel 5.4) without manual configuration.
+**Enforcement varies by codex version.** Under codex 0.144.4, a `sandbox_mode` in
+`~/.codex/config.toml` silently overrides `--sandbox` — a read-only spool runs at the
+config's more permissive tier with exit 0 and no warning. 0.125.0 gives the CLI flag
+precedence over that same config. Because PATH decides which codex runs (a login shell and
+the spindle server often resolve different installs), each spool records the resolved
+`codex_bin` and `codex_version`, and spindle prints a warning when the version is outside
+`CODEX_SANDBOX_VERIFIED_VERSIONS`.
 
 ## Spool Management
 
@@ -490,20 +496,33 @@ kimi-cli login      # Authenticate
 # Or configure API key in ~/.kimi/config.toml
 ```
 
-### Landlock Errors (Codex)
+### Sandbox Errors (Codex)
 
-**Error:** Sandbox failures on kernel < 5.13
+**Error:** every shell command in a codex spool fails with
+```
+bwrap: execvp codex-linux-sandbox: No such file or directory
+```
 
-**Solution:** Spindle automatically detects and bypasses. If you see this error, check:
+**Cause:** codex materializes its sandbox helper as a symlink under
+`$CODEX_HOME/tmp/arg0/` at startup and prepends that directory to PATH. If `~/.codex` is
+not writable, the helper is never created and every sandboxed command fails to exec. Codex
+only warns (`WARNING: proceeding, even though we could not update PATH`) and then proceeds,
+so the spool runs but can do nothing. This fails closed, not open — no command escapes the
+sandbox — but the spool is useless.
+
+**Solution:** make `~/.codex` writable for the process running codex. Anything wrapping
+codex in its own sandbox must bind `~/.codex` read-write (spindle's `_codex_bwrap_wrap`
+does). Note codex refuses to create the helper when `CODEX_HOME` is under a temp dir
+(`Refusing to create helper binaries under temporary dir "/tmp"`).
+
+**Error:** a `readonly` spool wrote somewhere it should not have.
+
+**Cause:** the resolved codex does not honor `--sandbox`. Check what actually ran:
 ```bash
-uname -r  # Check kernel version
-ls /sys/kernel/security/landlock  # Verify Landlock availability
+spindle unspool <spool_id>   # the record carries codex_bin and codex_version
 ```
-
-Spindle will log:
-```
-[Spindle] Kernel 5.4.0 lacks Landlock support (needs 5.13+), using bypass mode for Codex
-```
+Compare `codex_version` against `CODEX_SANDBOX_VERIFIED_VERSIONS`. Spindle warns on an
+unverified version, but the warning goes to the server log — the record is authoritative.
 
 ### Wrong Harness Used
 

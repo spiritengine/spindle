@@ -82,7 +82,12 @@ result = unspool(spool_id)
 
 The harness uses `codex exec` with the following flags:
 - `--json`: Structured JSON output for parsing
-- `--full-auto`: Non-interactive execution (combines workspace-write sandbox with on-failure approvals)
+- `--sandbox <mode>`: the tier the spool's permission maps to, always passed explicitly
+
+`--full-auto` is deliberately not used. It combines a workspace-write sandbox with
+on-failure approvals, and that bundled tier silently overrides `--sandbox` regardless of
+flag order — `codex exec --full-auto --sandbox read-only` runs at workspace-write. It is
+also unnecessary: `codex exec` is already non-interactive on its own.
 
 ### Spool Structure
 
