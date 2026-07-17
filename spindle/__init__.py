@@ -4333,11 +4333,12 @@ def _get_harnesses() -> dict:
         },
         "codex": {
             "models": CODEX_MODEL_ALIASES,
-            # gpt-5.5 is the current WORKING default: gpt-5.6-sol 400s on the
-            # released codex CLI and gpt-5.3-codex 400s on ChatGPT-account auth
-            # (see the CODEX_MODEL_ALIASES access note). Flip to gpt-5.6-sol once
-            # a codex build accepts it.
-            "default_model": "gpt-5.5",
+            # gpt-5.6-sol is the default: it works on codex 0.144.4 (verified
+            # 2026-07-17). gpt-5.3-codex still 400s on ChatGPT-account auth
+            # (see the CODEX_MODEL_ALIASES access note). Keep the spindle
+            # service's PATH on a node whose global codex is current — an old
+            # node's stale codex (e.g. 0.125.0) 400s on 5.6.
+            "default_model": "gpt-5.6-sol",
             "requires": "codex CLI",
             "note": "Aliases are shortcuts; any model string accepted by codex CLI also works",
         },
@@ -4975,8 +4976,11 @@ def _codex_spin_sync(
     if not working_dir:
         return "Error: working_dir required. Pass the project directory."
 
-    # Resolve model alias
-    resolved_model = CODEX_MODEL_ALIASES.get(model, model) if model else None
+    # Resolve model alias. When no model is given, fall back to the codex
+    # harness default (gpt-5.6-sol) instead of None — otherwise no --model is
+    # passed and codex picks its own default, so the harness default_model would
+    # never actually apply. Mirrors the gemini/kimi harnesses.
+    resolved_model = CODEX_MODEL_ALIASES.get(model, model) if model else "gpt-5.6-sol"
 
     try:
         research_target_info = (
@@ -5324,20 +5328,20 @@ CLAUDE_MODEL_ALIASES = {
 # model (returns gpt-5.6-sol as of 2026-07-09):
 #   node ~/.codex/skills/.system/openai-docs/scripts/resolve-latest-model-info.js
 #
-# ACCESS REALITY (verified via live smoke tests 2026-07-09, codex CLI 0.144.0 —
-# the newest released build — on this box's ChatGPT-account auth):
-#   * gpt-5.6-sol/terra/luna: announced + live in ChatGPT, but the API 400s
-#     ("requires a newer version of Codex") — no released codex CLI speaks the
-#     5.6 protocol yet. The aliases are STAGED here; when a codex build lands
-#     that accepts 5.6, flip the "codex" alias and the harness default_model
-#     (in _get_harnesses) to gpt-5.6-sol.
+# ACCESS REALITY (ChatGPT-account auth on this box):
+#   * gpt-5.6-sol/terra/luna: LIVE and the default (verified 2026-07-17 on codex
+#     0.144.4). Earlier (2026-07-09) codex 0.144.0 400'd with "requires a newer
+#     version of Codex", so 5.6 was staged; 0.144.4 speaks it. Gotcha: the 400
+#     is per codex-BINARY version, and the spindle service resolves `codex` off
+#     its systemd-unit PATH — if that PATH leads with an old node whose global
+#     codex is stale (e.g. 0.125.0), every spin 400s on 5.6 while an interactive
+#     shell on a newer node works. Keep the unit PATH on a current-codex node.
 #   * gpt-5.3-codex and the other API-only *-codex ids: 400 "not supported when
-#     using Codex with a ChatGPT account" — unusable on this auth (so the old
-#     gpt-5.3-codex default was itself broken here).
-#   * gpt-5.5: works. It is the current working default (see default_model).
+#     using Codex with a ChatGPT account" — unusable on this auth.
+#   * gpt-5.5: works; prior default, kept as an alias.
 CODEX_MODEL_ALIASES = {
-    # GPT-5.6 series (Sol/Terra/Luna) — STAGED, not yet reachable (see access
-    # note above). Sol/Terra/Luna are durable capability tiers (flagship /
+    # GPT-5.6 series (Sol/Terra/Luna) — LIVE on codex 0.144.4 (see access note
+    # above). Sol/Terra/Luna are durable capability tiers (flagship /
     # balanced mini-like / fast nano-like); no separate "-codex" variant.
     "5.6": "gpt-5.6-sol",
     "5.6-sol": "gpt-5.6-sol",
@@ -5346,10 +5350,10 @@ CODEX_MODEL_ALIASES = {
     "terra": "gpt-5.6-terra",
     "5.6-luna": "gpt-5.6-luna",
     "luna": "gpt-5.6-luna",
-    # GPT-5.5 series — current working default; "codex" tracks it until 5.6 lands
+    # GPT-5.5 series — prior default; "codex" now tracks the 5.6 flagship
     "5.5": "gpt-5.5",
     "5.5-pro": "gpt-5.5-pro",
-    "codex": "gpt-5.5",
+    "codex": "gpt-5.6-sol",
     # GPT-5.3 / 5.1 codex variants — API-only; 400 on ChatGPT-account auth
     "5.3-codex": "gpt-5.3-codex",
     "5.1-codex-max": "gpt-5.1-codex-max",
