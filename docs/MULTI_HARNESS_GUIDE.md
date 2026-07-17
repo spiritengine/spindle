@@ -167,7 +167,7 @@ spool_id = spin(
 - `tags` - Organization tags
 
 **Claude-specific parameters:**
-- `permission` - "readonly" (alias "manual"), "careful" (default, = auto), "full", "shard", "careful+shard", "manual+shard", "research", "research+shard", "auto", "auto+shard"
+- `permission` - "readonly" (alias "manual"), "careful" (default, = auto), "full", "shard", "careful+shard", "research", "research+shard", "auto", "auto+shard" (readonly/manual has no +shard form; readonly+shard/manual+shard are rejected)
 - `shard` - Auto-create git worktree
 - `system_prompt` - Custom system instructions
 - `allowed_tools` - Explicit tool permissions
@@ -361,7 +361,7 @@ Claude maps each tier to a `--permission-mode` (and, for the tight tier, an `--a
 - **full** - No restrictions (`bypassPermissions`)
 - **shard** - Full permissions + isolated git worktree (`bypassPermissions` inside the bwrap-contained shard)
 - **careful+shard** - `auto` semantics + worktree (`bypassPermissions` inside the bwrap-contained shard)
-- **manual+shard** - readonly allowlist + worktree (`acceptEdits`; the tight tier, isolated)
+- **readonly+shard / manual+shard** - rejected: the readonly/manual tier has no write tools, so a shard (isolated worktree for changes) is incoherent; use careful+shard or shard for isolated write work
 - **auto** / **auto+shard** - explicit aliases of the careful default
 - **research** - WebFetch/WebSearch/curl/jq enabled; no python/find/Write/Edit; requires `research_target` (site:, file:, or dir: prefix)
 - **research+shard** - research tools + isolated git worktree

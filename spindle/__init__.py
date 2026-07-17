@@ -150,7 +150,10 @@ READONLY_TOOLS = "Read,Grep,Glob,Bash(ls:*),Bash(cat:*),Bash(head:*),Bash(tail:*
 PERMISSION_PROFILES = {
     "readonly": READONLY_TOOLS,
     "manual": READONLY_TOOLS,  # exact alias of readonly — the tight/manual tier
-    "manual+shard": READONLY_TOOLS,  # readonly allowlist + worktree isolation
+    # NOTE: no readonly+shard / manual+shard. The readonly/manual tier has no
+    # write tools, so pairing it with a shard (an isolated worktree for making
+    # changes) is incoherent; both forms are rejected at spin entry by
+    # _incoherent_permission_error rather than resolving asymmetrically.
     "careful": None,  # alias of auto: no allowlist, classifier vets each call
     "careful+shard": None,  # auto-vetted; bypassPermissions inside a bwrap-contained shard
     "research": RESEARCH_TOOLS,
@@ -384,26 +387,51 @@ def _claude_permission_mode(permission: Optional[str]) -> str:
     This is the claude-harness tier table:
       - auto / auto+shard              -> "auto"            (classifier-vetted)
       - careful / None default         -> "auto"            (careful is now auto)
-      - readonly / manual / manual+shard / research
-                                       -> "acceptEdits"     (tight allowlist tiers)
+      - readonly / manual / research   -> "acceptEdits"     (tight allowlist tiers)
       - full / shard / careful+shard / research+shard
                                        -> "bypassPermissions" (bwrap-contained)
 
     The base tier drives the mode, not the "+shard" suffix alone: auto+shard is
-    still auto, and manual+shard keeps the tight acceptEdits of its base. Only the
-    tiers that were already bypass-in-shard (careful+shard, research+shard, shard)
-    resolve to bypassPermissions via the "+shard" fallthrough.
+    still auto. Only the tiers that were already bypass-in-shard (careful+shard,
+    research+shard, shard) resolve to bypassPermissions via the "+shard"
+    fallthrough. The readonly/manual tier has no coherent +shard variant —
+    readonly+shard/manual+shard are rejected at spin entry (see
+    _incoherent_permission_error), so they never reach this table.
     """
     perm = permission or "careful"
     if perm.startswith("auto"):
         return "auto"
-    if perm in ("readonly", "manual", "manual+shard", "research"):
+    if perm in ("readonly", "manual", "research"):
         return "acceptEdits"
     if perm in ("full", "shard") or perm.endswith("+shard"):
         return "bypassPermissions"
     # careful, the None default, and any unknown profile fall back to careful
     # semantics, which is now auto.
     return "auto"
+
+
+# readonly/manual paired with a shard: the tight tier has no write tools, and a
+# shard is an isolated worktree for making changes, so the pairing is incoherent.
+# Left to resolve, the two spellings diverge (manual+shard -> tight acceptEdits;
+# readonly+shard falls through to bypassPermissions with no allowlist, a silent
+# escalation), so both are rejected identically at spin entry instead.
+INCOHERENT_PERMISSIONS = ("readonly+shard", "manual+shard")
+
+
+def _incoherent_permission_error(permission: Optional[str]) -> Optional[str]:
+    """Return an error string if `permission` names an incoherent tier, else None.
+
+    Harness-agnostic: callers invoke this at spin entry (before any harness
+    launches) so readonly+shard and manual+shard are rejected the same way for
+    every harness rather than resolving asymmetrically.
+    """
+    if permission in INCOHERENT_PERMISSIONS:
+        return (
+            f"permission={permission!r} is not a valid tier: the readonly/manual "
+            "tier has no write tools; +shard adds a worktree it can't write in — "
+            "use careful+shard or shard for isolated write work."
+        )
+    return None
 
 
 def _detect_default_branch(working_dir: str) -> str:
@@ -2494,7 +2522,8 @@ async def spin(
                     where CC vets each tool call server-side with no allowlist; use
                     it for most code work including reviews/fells. "readonly" (alias
                     "manual") is the one tight, no-exec tier: Read/Grep/Glob + a few
-                    safe read-only Bash rules, no python, enforced by an allowlist.
+                    safe read-only Bash rules, no python, enforced by an allowlist
+                    (it has no +shard form; readonly+shard/manual+shard are rejected).
                     "research" for web/file research with required research_target;
                     "full" for setup/install; "shard" or "careful+shard" for any
                     code-modifying work (adds isolated git worktree, bypass inside
@@ -2543,6 +2572,12 @@ async def spin(
     """
     # Normalize harness parameter (case-insensitive)
     harness_lower = harness.lower() if harness else None
+
+    # Reject incoherent readonly/manual + shard combos up front, harness-agnostic,
+    # before any harness resolves or a slot is reserved.
+    incoherent = _incoherent_permission_error(permission)
+    if incoherent:
+        return json.dumps({"error": incoherent})
 
     # Resolve harness against built-ins and lodged profiles. Built-in names win
     # over a same-named profile (with a warning); otherwise a non-built-in name
@@ -6203,7 +6238,6 @@ def main():
         choices=[
             "readonly",
             "manual",
-            "manual+shard",
             "careful",
             "research",
             "full",

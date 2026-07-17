@@ -52,6 +52,7 @@ from spindle import (
     _get_spool_path,
     _get_transcript_path,
     _handle_expired_session,
+    _incoherent_permission_error,
     _is_pid_alive,
     _is_review_tag,
     _kimi_respin_sync,
@@ -119,11 +120,28 @@ class TestPermissionProfiles:
         assert tools == PERMISSION_PROFILES["readonly"]
         assert shard is False
 
-    def test_manual_plus_shard_resolution(self):
-        """manual+shard resolves to the readonly allowlist and sets the shard flag."""
-        tools, shard = _resolve_permission("manual+shard", None)
-        assert tools == PERMISSION_PROFILES["readonly"]
-        assert shard is True
+    def test_incoherent_permission_error_flags_both_shard_forms(self):
+        """readonly+shard and manual+shard are flagged identically; valid tiers pass.
+
+        The readonly/manual tier has no write tools, so pairing it with a shard is
+        incoherent — both spellings must be rejected the same way rather than
+        resolving asymmetrically."""
+        for bad in ("readonly+shard", "manual+shard"):
+            msg = _incoherent_permission_error(bad)
+            assert msg is not None, bad
+            assert "no write tools" in msg
+            assert "careful+shard or shard" in msg
+        for ok in (
+            None,
+            "readonly",
+            "manual",
+            "careful",
+            "careful+shard",
+            "shard",
+            "auto+shard",
+            "research+shard",
+        ):
+            assert _incoherent_permission_error(ok) is None, ok
 
     def test_full_permission(self):
         """Full permission should return None (no restrictions)."""
@@ -566,7 +584,6 @@ class TestClaudePermissionMode:
             ("auto+shard", "auto"),
             ("readonly", "acceptEdits"),
             ("manual", "acceptEdits"),
-            ("manual+shard", "acceptEdits"),
             ("research", "acceptEdits"),
             ("full", "bypassPermissions"),
             ("shard", "bypassPermissions"),
@@ -691,6 +708,25 @@ class TestClaudePermissionCommandShape:
         cmd = captured_cmd[0]
         assert cmd[cmd.index("--permission-mode") + 1] == "acceptEdits"
         assert cmd[cmd.index("--allowedTools") + 1] == PERMISSION_PROFILES["readonly"]
+
+    @pytest.mark.parametrize("bad", ["readonly+shard", "manual+shard"])
+    def test_incoherent_shard_permission_rejected_at_spin_entry(self, bad, tmp_path):
+        """spin() rejects readonly+shard / manual+shard with a clear error and does
+        NOT launch a spool. The rejection is harness-agnostic (spin entry, before
+        any harness routes), so both forms fail identically."""
+        _spin = spin.fn if hasattr(spin, "fn") else spin
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            # If routing were reached, these would blow up — assert they are not.
+            with patch("spindle._spin_sync", side_effect=AssertionError("must not launch")):
+                with patch("spindle._codex_spin_sync", side_effect=AssertionError("must not launch")):
+                    result = asyncio.run(
+                        _spin("do something", permission=bad, working_dir=str(tmp_path), skeinless=True)
+                    )
+        assert "not a valid tier" in result
+        assert "no write tools" in result
+        assert "careful+shard or shard" in result
+        # No spool file was written (rejected before slot reservation).
+        assert list(tmp_path.glob("*.json")) == []
 
 
 class TestSpoolStorage:
@@ -1829,11 +1865,12 @@ class TestPermissionProfileContents:
         assert PERMISSION_PROFILES["careful+shard"] is None
 
     def test_manual_is_exact_readonly_allowlist(self):
-        """manual is an exact alias of readonly; manual+shard carries the same
-        tight allowlist (worktree isolation is resolved separately)."""
+        """manual is an exact alias of readonly. There is no manual+shard key — the
+        incoherent readonly/manual + shard combos are rejected at spin entry."""
         assert PERMISSION_PROFILES["manual"] == PERMISSION_PROFILES["readonly"]
         assert PERMISSION_PROFILES["manual"] == READONLY_TOOLS
-        assert PERMISSION_PROFILES["manual+shard"] == PERMISSION_PROFILES["readonly"]
+        assert "manual+shard" not in PERMISSION_PROFILES
+        assert "readonly+shard" not in PERMISSION_PROFILES
 
     def test_manual_excludes_python_and_write(self):
         """manual, like readonly, must exclude python execution and write tools."""
