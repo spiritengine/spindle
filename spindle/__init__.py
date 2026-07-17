@@ -317,6 +317,10 @@ def _research_omits_shard_commit_preamble(research_target_info: Optional[Dict[st
     return bool(research_target_info and research_target_info["type"] in {"file", "dir"})
 
 
+# The tiers codex's --sandbox accepts.
+CODEX_SANDBOX_MODES = frozenset({"read-only", "workspace-write", "danger-full-access"})
+
+
 def _codex_sandbox_for_permission(
     permission: Optional[str],
     research_target: Optional[str],
@@ -334,6 +338,29 @@ def _codex_sandbox_for_permission(
         return "read-only"
     if permission == "full" or (cli_shard_full_access and permission == "shard"):
         return "danger-full-access"
+    return "workspace-write"
+
+
+def _codex_respin_sandbox(original_spool: Optional[dict]) -> str:
+    """The codex sandbox tier a respin of `original_spool` should continue at.
+
+    Prefers the tier the original run actually passed, so a respin reproduces the session's
+    isolation exactly — including a CLI `shard` spool that resolved to danger-full-access,
+    which re-deriving from the permission alone would silently narrow. Falls back to
+    re-deriving from the recorded permission for records written before the tier was stored
+    (their recorded sandbox is the tier that was *intended*, which is the safe reading).
+    """
+    if not original_spool:
+        return "workspace-write"
+
+    recorded = original_spool.get("sandbox")
+    if recorded in CODEX_SANDBOX_MODES:
+        return recorded
+
+    permission = original_spool.get("permission")
+    if permission:
+        return _codex_sandbox_for_permission(permission, original_spool.get("research_target"))
+
     return "workspace-write"
 
 
@@ -2688,6 +2715,7 @@ async def spin(
             skeinless=skeinless,
             research_target=research_target,
             require_research_target=permission in {"research", "research+shard"},
+            permission=permission,
         )
     elif harness_lower == "gemini":
         use_shard = shard or (permission and "shard" in permission)
@@ -4938,31 +4966,89 @@ async def spool_info(spool_id: str) -> str:
 # ============================================================================
 
 
-def _has_landlock_support() -> bool:
-    """Check if the kernel supports Landlock (5.13+).
+# Codex CLI versions whose --sandbox flag is verified to actually enforce.
+#
+# Codex sandboxes with its own vendored bubblewrap + seccomp and does not need kernel
+# Landlock, so a pre-5.13 kernel is no reason to skip --sandbox. Verified 2026-07-16 on
+# kernel 5.4 (no Landlock): under 0.125.0, --sandbox read-only blocks writes outside the
+# workspace and --sandbox workspace-write permits them only inside cwd.
+#
+# The set is pinned per-version because enforcement is not stable across upgrades: under
+# 0.144.4 a sandbox_mode in ~/.codex/config.toml silently overrides --sandbox, so a
+# read-only spool runs at the config's (more permissive) mode with no warning and exit 0.
+# 0.125.0 gives the CLI flag precedence over that same config. Which binary PATH resolves
+# therefore decides whether a spool is sandboxed at all — hence the per-spool record.
+CODEX_SANDBOX_VERIFIED_VERSIONS = {"0.125.0"}
 
-    Returns True if Landlock is available, False otherwise.
-    Landlock was added in Linux kernel 5.13.
+# Versions verified to NOT honor --sandbox. Warned about by name, since a silent
+# fail-open is the exact failure this recording is meant to make visible.
+CODEX_SANDBOX_KNOWN_BAD_VERSIONS = {"0.144.4"}
+
+_CODEX_VERSION_CACHE: Dict[str, Optional[str]] = {}
+
+
+def _resolve_codex_binary() -> Optional[str]:
+    """Absolute path that `codex` resolves to on PATH, or None if absent.
+
+    Recorded per spool: spindle's PATH and a login shell's often resolve different
+    codex installs, and they do not enforce --sandbox alike.
     """
-    import platform
-    import re
+    return shutil.which("codex")
 
-    # Get kernel version
-    kernel_version = platform.release()
 
-    # Extract major.minor version
-    match = re.match(r"(\d+)\.(\d+)", kernel_version)
-    if match:
-        major, minor = int(match.group(1)), int(match.group(2))
-        # Landlock added in 5.13
-        if major > 5 or (major == 5 and minor >= 13):
-            return True
+def _codex_cli_version(binary: Optional[str]) -> Optional[str]:
+    """Version of a codex binary (e.g. "0.125.0"), or None if it can't be determined.
 
-    # Also check if /sys/kernel/security/landlock exists
-    if os.path.exists("/sys/kernel/security/landlock"):
-        return True
+    Cached per path: this shells out, and spin is on the hot path.
+    """
+    if not binary:
+        return None
+    if binary in _CODEX_VERSION_CACHE:
+        return _CODEX_VERSION_CACHE[binary]
 
-    return False
+    version = None
+    try:
+        proc = subprocess.run(
+            [binary, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        # e.g. "codex-cli 0.125.0"
+        match = re.search(r"codex-cli\s+(\S+)", proc.stdout or "")
+        if match:
+            version = match.group(1)
+    except Exception:
+        version = None
+
+    _CODEX_VERSION_CACHE[binary] = version
+    return version
+
+
+def _codex_sandbox_enforcement_warning(
+    binary: Optional[str],
+    version: Optional[str],
+    sandbox: Optional[str],
+) -> Optional[str]:
+    """Warning text if `sandbox` may not be enforced by this binary, else None."""
+    if sandbox == "danger-full-access":
+        # Nothing to enforce; the tier asks for an unsandboxed run.
+        return None
+    if version in CODEX_SANDBOX_VERIFIED_VERSIONS:
+        return None
+
+    verified = ", ".join(sorted(CODEX_SANDBOX_VERIFIED_VERSIONS))
+    if version in CODEX_SANDBOX_KNOWN_BAD_VERSIONS:
+        return (
+            f"[Spindle] WARNING: codex {version} ({binary}) is known to ignore --sandbox when "
+            f"~/.codex/config.toml sets sandbox_mode — this {sandbox!r} spool may run with no "
+            f"sandbox at all. Verified-enforcing versions: {verified}."
+        )
+    return (
+        f"[Spindle] WARNING: codex sandbox enforcement is unverified for version "
+        f"{version or 'unknown'} ({binary or 'codex not found on PATH'}) — this {sandbox!r} "
+        f"spool may not be enforced. Verified-enforcing versions: {verified}."
+    )
 
 
 def _codex_bwrap_wrap(
@@ -5058,8 +5144,13 @@ def _codex_spin_sync(
     skeinless: bool = False,
     research_target: Optional[str] = None,
     require_research_target: bool = False,
+    permission: Optional[str] = None,
 ) -> str:
-    """Synchronous implementation of codex_spin - runs Codex CLI in background."""
+    """Synchronous implementation of codex_spin - runs Codex CLI in background.
+
+    `sandbox` is the codex tier to enforce; `permission` is the tier it was derived from and
+    is recorded so a respin of this session can re-derive the same sandbox.
+    """
     # Require working_dir
     if not working_dir:
         return "Error: working_dir required. Pass the project directory."
@@ -5148,36 +5239,43 @@ Your task:
 """
             effective_prompt = shard_preamble + effective_prompt
 
-    # Build codex exec command
-    # Check for Landlock support and use appropriate flags
-    has_landlock = _has_landlock_support()
+    # Build codex exec command.
+    #
+    # --sandbox is always passed and always decides the tier. It is stated explicitly rather
+    # than left to ~/.codex/config.toml's sandbox_mode, so a spool's isolation comes from the
+    # permission it was spun with and not from whatever the local config happens to say.
+    effective_sandbox = sandbox or "workspace-write"
 
-    if has_landlock:
-        # Use --json for structured output, --full-auto for non-interactive execution
-        codex_cmd = ["codex", "exec", "--json", "--full-auto"]
-    else:
-        # Kernel lacks Landlock support - use bypass mode
-        import platform
+    codex_bin = _resolve_codex_binary()
+    codex_version = _codex_cli_version(codex_bin)
+    enforcement_warning = _codex_sandbox_enforcement_warning(codex_bin, codex_version, effective_sandbox)
+    if enforcement_warning:
+        print(enforcement_warning)
 
-        kernel_version = platform.release()
-        print(f"[Spindle] Kernel {kernel_version} lacks Landlock support (needs 5.13+), using bypass mode for Codex")
-        codex_cmd = ["codex", "exec", "--json", "--dangerously-bypass-approvals-and-sandbox"]
+    # --json for structured output.
+    #
+    # --full-auto is deliberately NOT passed. It is an alias that sets a tier of its own, and
+    # it silently WINS over --sandbox regardless of flag order: `codex exec --full-auto
+    # --sandbox read-only` reports "sandbox: workspace-write [workdir, /tmp, $TMPDIR]" and
+    # lets a spool write outside its workspace, while the command line still reads
+    # "--sandbox read-only". It is not needed for non-interactive use either — `codex exec`
+    # already reports "approval: never" on its own. Verified against codex 0.125.0,
+    # 2026-07-16. Re-adding it silently disables every tier below workspace-write.
+    codex_cmd = ["codex", "exec", "--json"]
 
     if resolved_model:
         codex_cmd.extend(["--model", resolved_model])
 
-    if sandbox and has_landlock:
-        # Only apply sandbox flag if we have Landlock support
-        codex_cmd.extend(["--sandbox", sandbox])
+    codex_cmd.extend(["--sandbox", effective_sandbox])
 
     if shard_info:
         codex_cmd.extend(["--cd", shard_info["worktree_path"]])
 
-    if research_target_info and research_target_info["type"] in {"file", "dir"} and has_landlock:
+    if research_target_info and research_target_info["type"] in {"file", "dir"}:
         codex_cmd.extend(["--add-dir", _research_writable_path(research_target_info)])
 
     # For shards, grant write access to main repo's .git for commits
-    if shard_info and has_landlock:
+    if shard_info:
         # Resolve .git via the worktree root, since cwd may be a subdirectory.
         if not (research_target_info and research_target_info["type"] in {"file", "dir"}):
             git_file = Path(shard_info["worktree_path"]) / ".git"
@@ -5196,7 +5294,8 @@ Your task:
     codex_cmd.append(effective_prompt)
 
     # Wrap in bwrap sandbox for shards - worktree writable, rest read-only.
-    # When Landlock is also active, both layers run as defense-in-depth.
+    # Codex's own bubblewrap sandbox nests inside this one, so both layers run as
+    # defense-in-depth.
     if shard_info:
         cmd = _codex_bwrap_wrap(codex_cmd, shard_info, cwd, research_target_info=research_target_info)
     else:
@@ -5215,7 +5314,13 @@ Your task:
         "session_id": None,  # Will be extracted from output
         "working_dir": cwd,
         "model": resolved_model or "default",
-        "sandbox": sandbox or "workspace-write",
+        # The tier actually passed to codex, not the one that was merely asked for.
+        "sandbox": effective_sandbox,
+        # The requested tier, kept so a respin can re-derive the same sandbox.
+        "permission": permission,
+        # Which codex actually ran: enforcement varies by version, and PATH decides.
+        "codex_bin": codex_bin,
+        "codex_version": codex_version,
         "research_target": research_target,
         "tags": tag_list,
         "timeout": timeout,
@@ -5299,17 +5404,39 @@ def _codex_respin_sync(session_id: str, prompt: str) -> str:
     env = original_spool.get("env") if original_spool else None
     shard_info = original_spool.get("shard") if original_spool else None
 
-    # Build codex exec resume command
-    # Check for Landlock support and use appropriate flags
-    has_landlock = _has_landlock_support()
-    codex_cmd = ["codex", "exec"]
+    # Continue at the tier the session was spun with — a respin must not widen it.
+    permission = original_spool.get("permission") if original_spool else None
+    sandbox = _codex_respin_sandbox(original_spool)
+
+    codex_bin = _resolve_codex_binary()
+    codex_version = _codex_cli_version(codex_bin)
+    enforcement_warning = _codex_sandbox_enforcement_warning(codex_bin, codex_version, sandbox)
+    if enforcement_warning:
+        print(enforcement_warning)
+
+    # Re-grant the original run's writable research target; `resume` inherits neither the
+    # sandbox tier nor its --add-dir grants, so without this a research respin runs
+    # workspace-write with no way to write its output.
+    research_target = original_spool.get("research_target") if original_spool else None
+    try:
+        research_target_info = _validate_research_target(research_target, working_dir) if research_target else None
+    except ValueError:
+        research_target_info = None
+
+    # Build codex exec resume command.
+    # --sandbox, --cd and --add-dir are `codex exec` flags that `codex exec resume` does not
+    # accept, so they must all precede the `resume` subcommand.
+    codex_cmd = ["codex", "exec", "--sandbox", sandbox]
     if shard_info:
         codex_cmd.extend(["--cd", shard_info["worktree_path"]])
 
-    # --add-dir is a `codex exec` flag, not `codex exec resume` — must come before the
-    # `resume` subcommand. Resolve .git via the worktree root (shard_info), not
-    # working_dir, since working_dir may be a subdirectory inside the worktree.
-    if shard_info and has_landlock:
+    if research_target_info and research_target_info["type"] in {"file", "dir"}:
+        codex_cmd.extend(["--add-dir", _research_writable_path(research_target_info)])
+
+    # For shards, grant write access to main repo's .git for commits. Resolve .git via the
+    # worktree root (shard_info), not working_dir, since working_dir may be a subdirectory
+    # inside the worktree.
+    if shard_info and not (research_target_info and research_target_info["type"] in {"file", "dir"}):
         git_file = Path(shard_info["worktree_path"]) / ".git"
         if git_file.exists() and git_file.is_file():
             git_content = git_file.read_text().strip()
@@ -5324,22 +5451,15 @@ def _codex_respin_sync(session_id: str, prompt: str) -> str:
 
     codex_cmd.extend(["resume", session_id, "--json"])
 
-    if has_landlock:
-        # Use --json for structured output, --full-auto for non-interactive
-        codex_cmd.append("--full-auto")
-    else:
-        # Kernel lacks Landlock support - use bypass mode
-        import platform
-
-        kernel_version = platform.release()
-        print(f"[Spindle] Kernel {kernel_version} lacks Landlock support (needs 5.13+), using bypass mode for Codex")
-        codex_cmd.append("--dangerously-bypass-approvals-and-sandbox")
+    # --full-auto is deliberately NOT passed here either: it overrides --sandbox with its own
+    # workspace-write tier. See the note in _codex_spin_sync.
 
     # The prompt is passed as additional argument to resume
     codex_cmd.append(prompt)
 
     # Wrap in bwrap sandbox for shards - worktree writable, rest read-only.
-    # When Landlock is also active, both layers run as defense-in-depth.
+    # Codex's own bubblewrap sandbox nests inside this one, so both layers run as
+    # defense-in-depth.
     if shard_info:
         cmd = _codex_bwrap_wrap(codex_cmd, shard_info, working_dir)
     else:
@@ -5353,6 +5473,14 @@ def _codex_respin_sync(session_id: str, prompt: str) -> str:
         "result": None,
         "session_id": session_id,
         "working_dir": working_dir,
+        # Carried forward, not just recorded: a later respin of this same session_id may
+        # resolve to this record instead of the original spin (both share the session_id,
+        # and _list_spools globs in arbitrary order), so the tier has to survive here too.
+        "sandbox": sandbox,
+        "permission": permission,
+        "research_target": research_target,
+        "codex_bin": codex_bin,
+        "codex_version": codex_version,
         "tags": ["codex", "respin"],
         "env": env,
         "shard": shard_info,
@@ -6454,6 +6582,7 @@ def main():
                 skeinless=args.skeinless,
                 research_target=args.research_target,
                 require_research_target=args.permission in {"research", "research+shard"},
+                permission=args.permission,
             )
         elif harness_lower == "gemini":
             use_shard = args.shard or (args.permission and "shard" in args.permission)

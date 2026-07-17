@@ -8,6 +8,7 @@ import multiprocessing
 import os
 import subprocess
 import threading
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -19,6 +20,7 @@ import spindle
 # Import the module to test
 from spindle import (
     CLAUDE_MODEL_ALIASES,
+    CODEX_SANDBOX_KNOWN_BAD_VERSIONS,
     DEFAULT_REVIEW_TIMEOUT,
     GEMINI_MODEL_ALIASES,
     KIMI_DEFAULT_MODEL,
@@ -35,7 +37,9 @@ from spindle import (
     _claude_permission_mode,
     _cleanup_shard,
     _codex_bwrap_wrap,
+    _codex_respin_sandbox,
     _codex_respin_sync,
+    _codex_sandbox_for_permission,
     _codex_spin_sync,
     _count_running,
     _detect_default_branch,
@@ -3356,19 +3360,18 @@ class TestSpinHarnesses:
 
         with patch("spindle.SPINDLE_DIR", tmp_path):
             with patch("spindle._count_running", return_value=0):
-                with patch("spindle._has_landlock_support", return_value=True):
-                    with patch("spindle._spawn_detached", side_effect=fake_spawn):
-                        result = _codex_spin_sync(
-                            prompt="research a topic",
-                            working_dir=str(tmp_path),
-                            model=None,
-                            sandbox="workspace-write",
-                            timeout=None,
-                            tags=None,
-                            env=None,
-                            research_target=f"file:{target}",
-                            require_research_target=True,
-                        )
+                with patch("spindle._spawn_detached", side_effect=fake_spawn):
+                    result = _codex_spin_sync(
+                        prompt="research a topic",
+                        working_dir=str(tmp_path),
+                        model=None,
+                        sandbox="workspace-write",
+                        timeout=None,
+                        tags=None,
+                        env=None,
+                        research_target=f"file:{target}",
+                        require_research_target=True,
+                    )
 
         assert result.startswith("codex-")
         sandbox_idx = captured_cmd.index("--sandbox")
@@ -4067,20 +4070,19 @@ class TestShardSpawnPreamblesAndCodexCd:
         with patch("spindle.SPINDLE_DIR", tmp_path):
             with patch("spindle._count_running", return_value=0):
                 with patch("spindle._has_skein", return_value=True):
-                    with patch("spindle._has_landlock_support", return_value=False):
-                        with patch("spindle._spawn_shard", return_value=(fake_shard, None)):
-                            with patch("spindle._detect_existing_shard", return_value=None):
-                                with patch("spindle._spawn_detached", side_effect=fake_detached):
-                                    _codex_spin_sync(
-                                        "do codex shard work",
-                                        str(tmp_path),
-                                        None,
-                                        None,
-                                        None,
-                                        None,
-                                        None,
-                                        shard=True,
-                                    )
+                    with patch("spindle._spawn_shard", return_value=(fake_shard, None)):
+                        with patch("spindle._detect_existing_shard", return_value=None):
+                            with patch("spindle._spawn_detached", side_effect=fake_detached):
+                                _codex_spin_sync(
+                                    "do codex shard work",
+                                    str(tmp_path),
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    shard=True,
+                                )
 
         assert len(captured_cmd) == 1
         cmd = captured_cmd[0]
@@ -4104,21 +4106,20 @@ class TestShardSpawnPreamblesAndCodexCd:
         with patch("spindle.SPINDLE_DIR", tmp_path):
             with patch("spindle._count_running", return_value=0):
                 with patch("spindle._has_skein", return_value=False):
-                    with patch("spindle._has_landlock_support", return_value=False):
-                        with patch("spindle._spawn_shard", return_value=(fake_shard, None)):
-                            with patch("spindle._detect_existing_shard", return_value=None):
-                                with patch("shutil.which", return_value="/usr/bin/bwrap"):
-                                    with patch("spindle._spawn_detached", side_effect=fake_detached):
-                                        _codex_spin_sync(
-                                            "do codex shard work",
-                                            str(tmp_path),
-                                            None,
-                                            None,
-                                            None,
-                                            None,
-                                            None,
-                                            shard=True,
-                                        )
+                    with patch("spindle._spawn_shard", return_value=(fake_shard, None)):
+                        with patch("spindle._detect_existing_shard", return_value=None):
+                            with patch("shutil.which", return_value="/usr/bin/bwrap"):
+                                with patch("spindle._spawn_detached", side_effect=fake_detached):
+                                    _codex_spin_sync(
+                                        "do codex shard work",
+                                        str(tmp_path),
+                                        None,
+                                        None,
+                                        None,
+                                        None,
+                                        None,
+                                        shard=True,
+                                    )
 
         assert len(captured_cmd) == 1
         cmd = captured_cmd[0]
@@ -4150,21 +4151,20 @@ class TestShardSpawnPreamblesAndCodexCd:
         with patch("spindle.SPINDLE_DIR", tmp_path):
             with patch("spindle._count_running", return_value=0):
                 with patch("spindle._has_skein", return_value=False):
-                    with patch("spindle._has_landlock_support", return_value=False):
-                        with patch("spindle._spawn_shard", return_value=(fake_shard, None)):
-                            with patch("spindle._detect_existing_shard", return_value=None):
-                                with patch("shutil.which", return_value=None):
-                                    with patch("spindle._spawn_detached", side_effect=fake_detached):
-                                        _codex_spin_sync(
-                                            "do codex shard work",
-                                            str(tmp_path),
-                                            None,
-                                            None,
-                                            None,
-                                            None,
-                                            None,
-                                            shard=True,
-                                        )
+                    with patch("spindle._spawn_shard", return_value=(fake_shard, None)):
+                        with patch("spindle._detect_existing_shard", return_value=None):
+                            with patch("shutil.which", return_value=None):
+                                with patch("spindle._spawn_detached", side_effect=fake_detached):
+                                    _codex_spin_sync(
+                                        "do codex shard work",
+                                        str(tmp_path),
+                                        None,
+                                        None,
+                                        None,
+                                        None,
+                                        None,
+                                        shard=True,
+                                    )
 
         assert len(captured_cmd) == 1
         cmd = captured_cmd[0]
@@ -4320,10 +4320,9 @@ class TestCodexRespinPreservesGitAccess:
         spindle_state.mkdir()
         with patch("spindle.SPINDLE_DIR", spindle_state):
             _write_spool(original_id, original_spool)
-            with patch("spindle._has_landlock_support", return_value=True):
-                with patch("spindle._spawn_detached", side_effect=fake_detached):
-                    with patch("spindle._count_running", return_value=0):
-                        _codex_respin_sync(session_id, "follow up")
+            with patch("spindle._spawn_detached", side_effect=fake_detached):
+                with patch("spindle._count_running", return_value=0):
+                    _codex_respin_sync(session_id, "follow up")
 
         assert len(captured_cmd) == 1, "Expected one spawn for codex respin"
         cmd = captured_cmd[0]
@@ -4385,8 +4384,7 @@ class TestCodexRespinPreservesGitAccess:
             _write_spool(original_spool["id"], original_spool)
             with patch("spindle._spawn_detached", side_effect=fake_detached):
                 with patch("spindle._count_running", return_value=0):
-                    with patch("spindle._has_landlock_support", return_value=False):
-                        _codex_respin_sync(session_id, "follow up")
+                    _codex_respin_sync(session_id, "follow up")
 
         assert len(captured_cmd) == 1, "Expected one spawn for codex respin"
         cmd = captured_cmd[0]
@@ -4427,11 +4425,10 @@ class TestCodexRespinPreservesGitAccess:
         spindle_state.mkdir()
         with patch("spindle.SPINDLE_DIR", spindle_state):
             _write_spool(original_spool["id"], original_spool)
-            with patch("spindle._has_landlock_support", return_value=False):
-                with patch("spindle._spawn_detached", side_effect=fake_detached):
-                    with patch("spindle._count_running", return_value=0):
-                        with patch("shutil.which", return_value="/usr/bin/bwrap"):
-                            _codex_respin_sync(session_id, "follow up")
+            with patch("spindle._spawn_detached", side_effect=fake_detached):
+                with patch("spindle._count_running", return_value=0):
+                    with patch("shutil.which", return_value="/usr/bin/bwrap"):
+                        _codex_respin_sync(session_id, "follow up")
 
         assert len(captured_cmd) == 1, "Expected one spawn for codex respin"
         cmd = captured_cmd[0]
@@ -4462,11 +4459,10 @@ class TestCodexRespinPreservesGitAccess:
         spindle_state.mkdir()
         with patch("spindle.SPINDLE_DIR", spindle_state):
             _write_spool(original_spool["id"], original_spool)
-            with patch("spindle._has_landlock_support", return_value=False):
-                with patch("spindle._spawn_detached", side_effect=fake_detached):
-                    with patch("spindle._count_running", return_value=0):
-                        with patch("shutil.which", return_value=None):
-                            _codex_respin_sync(session_id, "follow up")
+            with patch("spindle._spawn_detached", side_effect=fake_detached):
+                with patch("spindle._count_running", return_value=0):
+                    with patch("shutil.which", return_value=None):
+                        _codex_respin_sync(session_id, "follow up")
 
         assert len(captured_cmd) == 1
         cmd = captured_cmd[0]
@@ -4474,6 +4470,291 @@ class TestCodexRespinPreservesGitAccess:
         out = capsys.readouterr().out
         assert "WARNING" in out
         assert "bwrap" in out.lower()
+
+
+class TestCodexSandboxEnforcement:
+    """Codex must actually run at the sandbox tier its permission asks for.
+
+    Codex sandboxes with its own vendored bubblewrap and needs no kernel Landlock, so the
+    tier is passed unconditionally. These tests pin the flag onto the command, the truth of
+    the record, and the tier surviving a respin.
+    """
+
+    @contextmanager
+    def _captured_codex_spin(self, tmp_path, verified_version=True):
+        """Run _codex_spin_sync with a stable codex binary, capturing the spawned argv."""
+        captured_cmd = []
+
+        def fake_detached(spool_id, cmd, cwd, env=None):
+            captured_cmd.append(list(cmd))
+            return 99999
+
+        version = "0.125.0" if verified_version else "9.9.9-unverified"
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle._count_running", return_value=0):
+                with patch("spindle._has_skein", return_value=False):
+                    with patch("spindle._resolve_codex_binary", return_value="/fake/bin/codex"):
+                        with patch("spindle._codex_cli_version", return_value=version):
+                            with patch("spindle._spawn_detached", side_effect=fake_detached):
+                                yield captured_cmd
+
+    @pytest.mark.parametrize(
+        "permission,expected_sandbox",
+        [
+            ("readonly", "read-only"),
+            ("careful", "workspace-write"),
+            ("research", "read-only"),
+            ("full", "danger-full-access"),
+            (None, "workspace-write"),
+        ],
+    )
+    def test_sandbox_flag_passed_for_each_tier(self, tmp_path, permission, expected_sandbox):
+        """Every tier reaches codex as an explicit --sandbox value."""
+        sandbox = _codex_sandbox_for_permission(permission, None)
+        assert sandbox == expected_sandbox, f"permission {permission!r} should map to {expected_sandbox!r}"
+
+        with self._captured_codex_spin(tmp_path) as captured_cmd:
+            _codex_spin_sync(
+                "do work",
+                str(tmp_path),
+                None,
+                sandbox,
+                None,
+                None,
+                None,
+                permission=permission,
+            )
+
+        assert len(captured_cmd) == 1
+        cmd = captured_cmd[0]
+        assert "--sandbox" in cmd, f"Expected --sandbox in codex command, got {cmd!r}"
+        assert cmd[cmd.index("--sandbox") + 1] == expected_sandbox, f"got {cmd!r}"
+
+    def test_normal_spin_never_bypasses_the_sandbox(self, tmp_path):
+        """The bypass flag disables enforcement outright; it must not appear on the spin path."""
+        with self._captured_codex_spin(tmp_path) as captured_cmd:
+            _codex_spin_sync("do work", str(tmp_path), None, "read-only", None, None, None, permission="readonly")
+
+        cmd = captured_cmd[0]
+        assert "--dangerously-bypass-approvals-and-sandbox" not in cmd, f"got {cmd!r}"
+
+    def test_spin_never_passes_full_auto(self, tmp_path):
+        """--full-auto silently overrides --sandbox with its own workspace-write tier.
+
+        Verified against codex 0.125.0: `codex exec --full-auto --sandbox read-only` reports
+        "sandbox: workspace-write [workdir, /tmp, $TMPDIR]" and writes outside the workspace,
+        while the argv still reads --sandbox read-only. It buys nothing either — `codex exec`
+        is already non-interactive. This is the regression guard for re-adding it.
+        """
+        with self._captured_codex_spin(tmp_path) as captured_cmd:
+            _codex_spin_sync("do work", str(tmp_path), None, "read-only", None, None, None, permission="readonly")
+
+        cmd = captured_cmd[0]
+        assert "--full-auto" not in cmd, f"--full-auto would nullify --sandbox, got {cmd!r}"
+
+    def test_respin_never_passes_full_auto(self, tmp_path):
+        """A respin must not re-widen the tier via --full-auto either."""
+        original = {
+            "id": "codex-orig-fullauto",
+            "status": "complete",
+            "session_id": "sess-fullauto",
+            "working_dir": str(tmp_path),
+            "sandbox": "read-only",
+            "permission": "readonly",
+            "harness": "codex",
+            "tags": ["codex"],
+        }
+        cmd, _, _ = self._respin_with_spool(tmp_path, original)
+
+        assert "--full-auto" not in cmd, f"--full-auto would nullify --sandbox, got {cmd!r}"
+
+    def test_record_sandbox_is_what_was_actually_passed(self, tmp_path):
+        """The record must state the tier codex ran at, not the one that was merely requested."""
+        with self._captured_codex_spin(tmp_path) as captured_cmd:
+            spool_id = _codex_spin_sync(
+                "do work",
+                str(tmp_path),
+                None,
+                "read-only",
+                None,
+                None,
+                None,
+                permission="readonly",
+            )
+
+        cmd = captured_cmd[0]
+        passed_sandbox = cmd[cmd.index("--sandbox") + 1]
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            spool = _read_spool(spool_id)
+
+        assert spool["sandbox"] == passed_sandbox == "read-only"
+        assert spool["permission"] == "readonly"
+
+    def test_record_carries_resolved_codex_binary_and_version(self, tmp_path):
+        """Enforcement varies by codex version, so which binary ran has to be recoverable."""
+        with self._captured_codex_spin(tmp_path):
+            spool_id = _codex_spin_sync(
+                "do work", str(tmp_path), None, "read-only", None, None, None, permission="readonly"
+            )
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            spool = _read_spool(spool_id)
+
+        assert spool["codex_bin"] == "/fake/bin/codex"
+        assert spool["codex_version"] == "0.125.0"
+
+    def test_unverified_version_warns_loudly(self, tmp_path, capsys):
+        """An unverified codex must not silently drop enforcement."""
+        with self._captured_codex_spin(tmp_path, verified_version=False):
+            _codex_spin_sync("do work", str(tmp_path), None, "read-only", None, None, None, permission="readonly")
+
+        out = capsys.readouterr().out
+        assert "WARNING" in out
+        assert "9.9.9-unverified" in out
+
+    def test_known_bad_version_is_named_in_the_warning(self, tmp_path, capsys):
+        """0.144.4 lets config.toml override --sandbox; say so rather than just 'unverified'."""
+        known_bad = sorted(CODEX_SANDBOX_KNOWN_BAD_VERSIONS)[0]
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle._count_running", return_value=0):
+                with patch("spindle._has_skein", return_value=False):
+                    with patch("spindle._resolve_codex_binary", return_value="/fake/bin/codex"):
+                        with patch("spindle._codex_cli_version", return_value=known_bad):
+                            with patch("spindle._spawn_detached", return_value=99999):
+                                _codex_spin_sync(
+                                    "do work", str(tmp_path), None, "read-only", None, None, None, permission="readonly"
+                                )
+
+        out = capsys.readouterr().out
+        assert "WARNING" in out
+        assert known_bad in out
+        assert "config.toml" in out
+
+    def test_full_access_tier_does_not_warn(self, tmp_path, capsys):
+        """danger-full-access asks for no sandbox, so there is no enforcement to warn about."""
+        with self._captured_codex_spin(tmp_path, verified_version=False):
+            _codex_spin_sync("do work", str(tmp_path), None, "danger-full-access", None, None, None, permission="full")
+
+        assert "WARNING" not in capsys.readouterr().out
+
+    def _respin_with_spool(self, tmp_path, original_spool):
+        """Run _codex_respin_sync against a stored spool, capturing the spawned argv."""
+        captured_cmd = []
+
+        def fake_detached(spool_id, cmd, cwd, env=None):
+            captured_cmd.append(list(cmd))
+            return 99999
+
+        state = tmp_path / "spindle_state"
+        state.mkdir(exist_ok=True)
+        with patch("spindle.SPINDLE_DIR", state):
+            _write_spool(original_spool["id"], original_spool)
+            with patch("spindle._resolve_codex_binary", return_value="/fake/bin/codex"):
+                with patch("spindle._codex_cli_version", return_value="0.125.0"):
+                    with patch("spindle._spawn_detached", side_effect=fake_detached):
+                        with patch("spindle._count_running", return_value=0):
+                            spool_id = _codex_respin_sync(original_spool["session_id"], "follow up")
+        return captured_cmd[0], spool_id, state
+
+    def test_respin_carries_the_tier(self, tmp_path):
+        """A respin of a readonly session must stay read-only."""
+        original = {
+            "id": "codex-orig-ro",
+            "status": "complete",
+            "session_id": "sess-readonly",
+            "working_dir": str(tmp_path),
+            "sandbox": "read-only",
+            "permission": "readonly",
+            "harness": "codex",
+            "tags": ["codex"],
+        }
+        cmd, _, _ = self._respin_with_spool(tmp_path, original)
+
+        assert "--sandbox" in cmd, f"Expected --sandbox in respin command, got {cmd!r}"
+        assert cmd[cmd.index("--sandbox") + 1] == "read-only", f"got {cmd!r}"
+        assert "--dangerously-bypass-approvals-and-sandbox" not in cmd, f"got {cmd!r}"
+
+    def test_respin_sandbox_flag_precedes_resume_subcommand(self, tmp_path):
+        """`codex exec resume` rejects --sandbox; it is only valid before the subcommand."""
+        original = {
+            "id": "codex-orig-order",
+            "status": "complete",
+            "session_id": "sess-order",
+            "working_dir": str(tmp_path),
+            "sandbox": "read-only",
+            "permission": "readonly",
+            "harness": "codex",
+            "tags": ["codex"],
+        }
+        cmd, _, _ = self._respin_with_spool(tmp_path, original)
+
+        assert cmd.index("--sandbox") < cmd.index("resume"), f"got {cmd!r}"
+
+    def test_respin_record_carries_tier_forward_for_chained_respins(self, tmp_path):
+        """A respin record shares its session_id, so it must carry the tier itself.
+
+        _list_spools globs in arbitrary order, so a second respin may resolve to this
+        record rather than the original spin; both must yield the same tier.
+        """
+        original = {
+            "id": "codex-orig-chain",
+            "status": "complete",
+            "session_id": "sess-chain",
+            "working_dir": str(tmp_path),
+            "sandbox": "read-only",
+            "permission": "readonly",
+            "harness": "codex",
+            "tags": ["codex"],
+        }
+        _, respin_id, state = self._respin_with_spool(tmp_path, original)
+
+        with patch("spindle.SPINDLE_DIR", state):
+            respin_spool = _read_spool(respin_id)
+
+        assert respin_spool["sandbox"] == "read-only"
+        assert respin_spool["permission"] == "readonly"
+        assert _codex_respin_sandbox(respin_spool) == "read-only"
+
+    def test_respin_of_legacy_record_without_permission_uses_recorded_sandbox(self, tmp_path):
+        """Pre-fix records carry no permission; their recorded tier is the intended one."""
+        legacy = {
+            "id": "codex-legacy",
+            "status": "complete",
+            "session_id": "sess-legacy",
+            "working_dir": str(tmp_path),
+            "sandbox": "read-only",  # recorded but never applied by the old code
+            "harness": "codex",
+            "tags": ["codex"],
+        }
+        cmd, _, _ = self._respin_with_spool(tmp_path, legacy)
+
+        assert cmd[cmd.index("--sandbox") + 1] == "read-only", f"got {cmd!r}"
+
+    def test_respin_sandbox_resolution_precedence(self):
+        """Recorded tier wins; permission is the fallback; workspace-write is the floor."""
+        assert _codex_respin_sandbox({"sandbox": "read-only", "permission": "full"}) == "read-only"
+        assert _codex_respin_sandbox({"permission": "readonly"}) == "read-only"
+        assert _codex_respin_sandbox({"sandbox": "bogus-mode", "permission": "readonly"}) == "read-only"
+        assert _codex_respin_sandbox({}) == "workspace-write"
+        assert _codex_respin_sandbox(None) == "workspace-write"
+
+    def test_cli_shard_full_access_survives_respin(self, tmp_path):
+        """A CLI `shard` spool resolves to danger-full-access; re-deriving would narrow it."""
+        original = {
+            "id": "codex-orig-cli-shard",
+            "status": "complete",
+            "session_id": "sess-cli-shard",
+            "working_dir": str(tmp_path),
+            "sandbox": _codex_sandbox_for_permission("shard", None, cli_shard_full_access=True),
+            "permission": "shard",
+            "harness": "codex",
+            "tags": ["codex"],
+        }
+        assert original["sandbox"] == "danger-full-access"
+        cmd, _, _ = self._respin_with_spool(tmp_path, original)
+
+        assert cmd[cmd.index("--sandbox") + 1] == "danger-full-access", f"got {cmd!r}"
 
 
 class TestDetectDefaultBranch:
