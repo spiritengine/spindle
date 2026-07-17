@@ -61,10 +61,10 @@ result = unspool(spool_id)
 Control what tools the spawned agent can use:
 
 ```
-# Read-only: Can only search and read
-spin("Analyze the codebase", permission="readonly")
+# Read-only / manual: the one tight, no-exec tier (allowlist-enforced)
+spin("Analyze the codebase", permission="readonly")   # "manual" is an alias
 
-# Careful (default): Can read/write but limited bash
+# Careful (default): classifier-vetted auto — CC vets each tool call server-side
 spin("Fix this bug", permission="careful")
 
 # Full access: for initial setup, dependency installs, environment provisioning
@@ -73,23 +73,23 @@ spin("Set up a new Python project with dependencies", permission="full")
 # Shard: Full access + auto-isolated worktree (common for risky work)
 spin("Refactor the auth system", permission="shard")
 
-# Careful + shard: Limited tools but isolated
+# Careful + shard: classifier-vetted, isolated in a bwrap-contained worktree
 spin("Update configs", permission="careful+shard")
 
 # Research: web/file research routed to a SKEIN site, a single file, or a directory
 spin("Research deepseek vs kimi", permission="research", research_target="site:spindle-development")
 ```
 
-Profiles:
-- `readonly`: Read, Grep, Glob, safe bash (ls, cat, git status/log/diff)
-- `careful`: Read, Write, Edit, Grep, Glob, bash for git/build/test/lint/typecheck/python+node tooling plus basic Unix inspection
+Profiles (claude-code harness):
+- `readonly` (alias `manual`): Read, Grep, Glob, safe bash (ls, cat, git status/log/diff). The only tier still governed by an allowlist — no python, no find, no write. This is the tight, inspectable, manual option.
+- `careful` (default): now an alias of `auto`. No allowlist; runs under `--permission-mode auto`, where Claude Code vets each tool call server-side on intent. Use it for most code work including reviews/fells. (It used to be a Bash allowlist that gated capability on command *phrasing*, not security — `auto` removes that gate.)
 - `full`: No restrictions
-- `shard`: Full access + auto-creates isolated worktree
-- `careful+shard`: Careful permissions + auto-creates isolated worktree
+- `shard`: Full access + auto-creates isolated worktree (bypass inside the bwrap-contained shard)
+- `careful+shard`: `auto` semantics + auto-creates isolated worktree (bypass inside the bwrap-contained shard)
 - `research`: Read, Grep, Glob, WebFetch, WebSearch, curl, jq, safe bash; no python/find; requires `research_target` (Write/Edit added when target is `file:` or `dir:`)
 - `research+shard`: research tools + auto-creates isolated worktree
 
-Web-egress work (WebFetch, WebSearch, curl) belongs in `research`, not `careful` — `careful` intentionally has no web access so it's safe for code review and code-modifying work.
+Web-egress work (WebFetch, WebSearch, curl) belongs in `research` — the other code tiers intentionally have no web access so they're safe for code review and code-modifying work.
 
 You can also pass explicit `allowed_tools` to override the profile.
 
@@ -414,7 +414,7 @@ for a worked example and the full schema reference.
 - `prompt` (required): The task for the agent
 - `harness` (optional): "claude-code" (default), "codex", "gemini", or "kimi"
 - `working_dir` (optional for Claude, required for Codex/Gemini/Kimi): Project directory
-- `permission` (optional): "readonly", "careful" (default), "full", "shard", "careful+shard", "research", "research+shard"
+- `permission` (optional): "readonly" (alias "manual"), "careful" (default, = auto), "full", "shard", "careful+shard", "research", "research+shard", "auto", "auto+shard" (readonly/manual cannot be combined with a shard — the pairing is rejected however the shard intent arrives: `readonly+shard`/`manual+shard`, or `readonly`/`manual` with `shard=True`)
 - `model` (optional): Model to use ("sonnet", "opus", "haiku" for Claude; "flash", "pro" for Gemini; "thinking", "k2.6", "k2.5" for Kimi)
 - `timeout` (optional): Auto-kill after N seconds
 - `tags` (optional): Comma-separated tags for organization

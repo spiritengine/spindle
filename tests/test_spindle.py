@@ -1,6 +1,7 @@
 """Tests for Spindle MCP server."""
 
 import asyncio
+import contextlib
 import inspect
 import json
 import multiprocessing
@@ -25,13 +26,13 @@ from spindle import (
     MAX_CONCURRENT,
     PENDING_SPAWN_TIMEOUT,
     PERMISSION_PROFILES,
-    PINNED_INTERPRETERS,
+    READONLY_TOOLS,
     UNSPOOL_HEAD_CHARS,
     UNSPOOL_MAX_CHARS,
     UNSPOOL_TAIL_CHARS,
-    VENV_TOOLS,
     _budget_result,
     _check_and_finalize_spool,
+    _claude_permission_mode,
     _cleanup_shard,
     _codex_bwrap_wrap,
     _codex_respin_sync,
@@ -63,6 +64,7 @@ from spindle import (
     _parse_duration,
     _profile_spawn_env,
     _read_spool,
+    _readonly_shard_conflict_error,
     _recover_orphans,
     _refusal_category,
     _resolve_permission,
@@ -90,9 +92,11 @@ class TestPermissionProfiles:
     """Test permission profile resolution."""
 
     def test_default_permission_is_careful(self):
-        """No permission specified should default to careful."""
+        """No permission specified defaults to careful, which now resolves to None
+        (no allowlist — careful is an alias of auto)."""
         tools, shard = _resolve_permission(None, None)
         assert tools == PERMISSION_PROFILES["careful"]
+        assert tools is None
         assert shard is False
 
     def test_explicit_readonly(self):
@@ -104,12 +108,34 @@ class TestPermissionProfiles:
         assert "Write" not in tools
 
     def test_explicit_careful(self):
-        """Careful permission should return careful tools."""
+        """Careful now resolves to None: no allowlist (careful is an alias of auto)."""
         tools, shard = _resolve_permission("careful", None)
         assert tools == PERMISSION_PROFILES["careful"]
+        assert tools is None
         assert shard is False
-        assert "Write" in tools
-        assert "Edit" in tools
+
+    def test_manual_aliases_readonly_resolution(self):
+        """manual resolves to the readonly allowlist, no shard."""
+        tools, shard = _resolve_permission("manual", None)
+        assert tools == PERMISSION_PROFILES["readonly"]
+        assert shard is False
+
+    def test_readonly_shard_conflict_flags_all_forms(self):
+        """The no-write readonly/manual tier + a shard is flagged on the resolved
+        (tier, use_shard) pair, whatever spelling carried the shard intent; valid
+        tiers pass. This is the authoritative check every launch chokepoint uses."""
+        # readonly/manual tier + shard -> conflict (flag form and "+shard" string)
+        for perm in ("readonly", "manual", "readonly+shard", "manual+shard"):
+            msg = _readonly_shard_conflict_error(perm, True)
+            assert msg is not None, perm
+            assert "no write tools" in msg
+            assert "careful+shard or shard" in msg
+        # bare readonly/manual (no shard) is fine
+        assert _readonly_shard_conflict_error("readonly", False) is None
+        assert _readonly_shard_conflict_error("manual", False) is None
+        # every write-capable tier + shard is fine
+        for ok in ("careful+shard", "shard", "auto+shard", "research+shard", "careful", "full", None):
+            assert _readonly_shard_conflict_error(ok, True) is None, ok
 
     def test_full_permission(self):
         """Full permission should return None (no restrictions)."""
@@ -491,6 +517,300 @@ class TestPermissionProfiles:
 
         assert len(captured_cmd) == 1
         assert "--allowedTools" not in captured_cmd[0]
+
+
+def _spin_claude_cmd(tmp_path, permission, *, shard_info=None):
+    """Run _spin_sync (claude harness) with _spawn_detached stubbed, returning the
+    captured claude argv. Pass shard_info to exercise the shard path without git;
+    when bwrap is present the claude flags are still present in the wrapped argv."""
+    captured = []
+
+    def fake_detached(spool_id, cmd, cwd, env=None):
+        captured.append(list(cmd))
+        raise OSError("stop after capture")
+
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(patch("spindle.SPINDLE_DIR", tmp_path))
+        stack.enter_context(patch("spindle._count_running", return_value=0))
+        stack.enter_context(patch("spindle._spawn_detached", side_effect=fake_detached))
+        if shard_info is not None:
+            stack.enter_context(patch("spindle._detect_existing_shard", return_value=shard_info))
+            stack.enter_context(patch("spindle._has_skein", return_value=True))
+        _spin_sync(
+            prompt="task",
+            permission=permission,
+            shard=False,
+            system_prompt=None,
+            working_dir=str(tmp_path),
+            allowed_tools=None,
+            tags=None,
+            model=None,
+            timeout=None,
+            skeinless=True,
+            env=None,
+        )
+
+    assert len(captured) == 1
+    return captured[0]
+
+
+def _mode_of(cmd):
+    """The value passed to --permission-mode in a captured argv."""
+    return cmd[cmd.index("--permission-mode") + 1]
+
+
+def _allowed_tools_of(cmd):
+    """The --allowedTools value in a captured argv, or None when the flag is absent."""
+    if "--allowedTools" not in cmd:
+        return None
+    return cmd[cmd.index("--allowedTools") + 1]
+
+
+class TestClaudePermissionMode:
+    """The claude-harness permission-mode table (_claude_permission_mode)."""
+
+    @pytest.mark.parametrize(
+        "permission,expected",
+        [
+            (None, "auto"),
+            ("careful", "auto"),
+            ("auto", "auto"),
+            ("auto+shard", "auto"),
+            ("readonly", "acceptEdits"),
+            ("manual", "acceptEdits"),
+            ("research", "acceptEdits"),
+            ("full", "bypassPermissions"),
+            ("shard", "bypassPermissions"),
+            ("careful+shard", "bypassPermissions"),
+            ("research+shard", "bypassPermissions"),
+            ("unknown-profile", "auto"),
+        ],
+    )
+    def test_permission_mode_table(self, permission, expected):
+        assert _claude_permission_mode(permission) == expected
+
+
+class TestClaudePermissionCommandShape:
+    """The claude command each tier emits: --permission-mode + --allowedTools.
+
+    This is the contract from the careful-redesign brief: careful and the None
+    default are classifier-vetted auto with no allowlist; readonly/manual are the
+    tight allowlist tier; full/shard/careful+shard are bypassPermissions; and a
+    resume re-applies the original tier rather than degrading to a bare resume.
+    """
+
+    def test_careful_emits_auto_no_allowlist(self, tmp_path):
+        cmd = _spin_claude_cmd(tmp_path, "careful")
+        assert _mode_of(cmd) == "auto"
+        assert "--allowedTools" not in cmd
+
+    def test_default_emits_auto_no_allowlist(self, tmp_path):
+        cmd = _spin_claude_cmd(tmp_path, None)
+        assert _mode_of(cmd) == "auto"
+        assert "--allowedTools" not in cmd
+
+    def test_readonly_emits_acceptedits_with_allowlist(self, tmp_path):
+        cmd = _spin_claude_cmd(tmp_path, "readonly")
+        assert _mode_of(cmd) == "acceptEdits"
+        assert _allowed_tools_of(cmd) == PERMISSION_PROFILES["readonly"]
+
+    def test_manual_emits_acceptedits_with_readonly_allowlist(self, tmp_path):
+        cmd = _spin_claude_cmd(tmp_path, "manual")
+        assert _mode_of(cmd) == "acceptEdits"
+        assert _allowed_tools_of(cmd) == PERMISSION_PROFILES["readonly"]
+
+    def test_full_emits_bypass(self, tmp_path):
+        cmd = _spin_claude_cmd(tmp_path, "full")
+        assert _mode_of(cmd) == "bypassPermissions"
+        assert "--allowedTools" not in cmd
+
+    def test_shard_emits_bypass(self, tmp_path):
+        shard_info = {"worktree_path": str(tmp_path), "shard_id": "shard-test"}
+        cmd = _spin_claude_cmd(tmp_path, "shard", shard_info=shard_info)
+        assert _mode_of(cmd) == "bypassPermissions"
+        assert "--allowedTools" not in cmd
+
+    def test_careful_shard_emits_bypass_no_allowlist(self, tmp_path):
+        shard_info = {"worktree_path": str(tmp_path), "shard_id": "shard-test"}
+        cmd = _spin_claude_cmd(tmp_path, "careful+shard", shard_info=shard_info)
+        assert _mode_of(cmd) == "bypassPermissions"
+        assert "--allowedTools" not in cmd
+
+    def test_respin_careful_reemits_auto_not_bare_resume(self, tmp_path):
+        """A claude respin of a careful spool must re-apply --permission-mode auto,
+        not leave a bare `claude --resume` (which would silently change capability)."""
+        spool_id = "careful01"
+        session_id = "claude-session-careful"
+        captured_cmd = []
+
+        def fake_detached(sid, cmd, cwd, env=None):
+            captured_cmd.append(list(cmd))
+            return 4242
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool(
+                spool_id,
+                {
+                    "id": spool_id,
+                    "status": "complete",
+                    "session_id": session_id,
+                    "harness": "claude-code",
+                    "permission": "careful",
+                    "allowed_tools": None,
+                },
+            )
+            with patch("spindle._spawn_detached", side_effect=fake_detached):
+                with patch("spindle._count_running", return_value=0):
+                    with patch("spindle._monitor_spool"):
+                        result = _respin_sync(spool_id, "keep going")
+
+        assert not result.startswith("Error"), result
+        assert len(captured_cmd) == 1
+        cmd = captured_cmd[0]
+        assert cmd[cmd.index("--permission-mode") + 1] == "auto"
+        assert "--allowedTools" not in cmd
+
+    def test_respin_readonly_reemits_acceptedits_and_allowlist(self, tmp_path):
+        """A claude respin of a readonly spool must re-apply acceptEdits + the
+        stored allowlist so the resumed spool stays as tight as the original."""
+        spool_id = "readonly1"
+        session_id = "claude-session-readonly"
+        captured_cmd = []
+
+        def fake_detached(sid, cmd, cwd, env=None):
+            captured_cmd.append(list(cmd))
+            return 4242
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool(
+                spool_id,
+                {
+                    "id": spool_id,
+                    "status": "complete",
+                    "session_id": session_id,
+                    "harness": "claude-code",
+                    "permission": "readonly",
+                    "allowed_tools": PERMISSION_PROFILES["readonly"],
+                },
+            )
+            with patch("spindle._spawn_detached", side_effect=fake_detached):
+                with patch("spindle._count_running", return_value=0):
+                    with patch("spindle._monitor_spool"):
+                        result = _respin_sync(spool_id, "keep going")
+
+        assert not result.startswith("Error"), result
+        cmd = captured_cmd[0]
+        assert cmd[cmd.index("--permission-mode") + 1] == "acceptEdits"
+        assert cmd[cmd.index("--allowedTools") + 1] == PERMISSION_PROFILES["readonly"]
+
+    @pytest.mark.parametrize(
+        "permission,shard_flag",
+        [
+            ("readonly+shard", False),
+            ("manual+shard", False),
+            ("readonly", True),
+            ("manual", True),
+        ],
+    )
+    def test_readonly_manual_plus_shard_rejected_at_spin_entry(self, permission, shard_flag, tmp_path):
+        """spin() rejects the readonly/manual + shard pairing with a clear error and
+        launches no spool — whether the shard arrived as a "+shard" string or the
+        shard=True flag. Harness-agnostic: it fires before any harness routes."""
+        _spin = spin.fn if hasattr(spin, "fn") else spin
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            # If routing were reached, these would blow up — assert they are not.
+            with patch("spindle._spin_sync", side_effect=AssertionError("must not launch")):
+                with patch("spindle._codex_spin_sync", side_effect=AssertionError("must not launch")):
+                    result = asyncio.run(
+                        _spin(
+                            "do something",
+                            permission=permission,
+                            shard=shard_flag,
+                            working_dir=str(tmp_path),
+                            skeinless=True,
+                        )
+                    )
+        assert "no write tools" in result
+        assert "careful+shard or shard" in result
+        # No spool file was written (rejected before slot reservation).
+        assert list(tmp_path.glob("*.json")) == []
+
+    def test_spin_sync_chokepoint_rejects_flag_form_no_spool(self, tmp_path):
+        """The _spin_sync chokepoint (spin() claude AND spool_retry) rejects
+        readonly/manual + shard=True before reserving a slot."""
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle._spawn_detached", side_effect=AssertionError("must not launch")):
+                result = _spin_sync(
+                    prompt="task",
+                    permission="manual",
+                    shard=True,
+                    system_prompt=None,
+                    working_dir=str(tmp_path),
+                    allowed_tools=None,
+                    tags=None,
+                    model=None,
+                    timeout=None,
+                    skeinless=True,
+                    env=None,
+                )
+        assert result.startswith("Error")
+        assert "no write tools" in result
+        assert list(tmp_path.glob("*.json")) == []
+
+    def test_stored_manual_shard_cannot_be_respun(self, tmp_path):
+        """A stored permission='manual+shard' spool is rejected on respin — it must
+        not escalate to bypassPermissions via _claude_permission_mode."""
+        stored = dict(
+            id="stored01",
+            status="complete",
+            session_id="sess-x",
+            harness="claude-code",
+            permission="manual+shard",
+            allowed_tools=PERMISSION_PROFILES["readonly"],
+            shard=dict(worktree_path=str(tmp_path), shard_id="sh"),
+        )
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool("stored01", stored)
+            with patch("spindle._count_running", return_value=0):
+                with patch("spindle._monitor_spool"):
+                    with patch("spindle._spawn_detached", side_effect=AssertionError("must not launch")):
+                        result = _respin_sync("stored01", "go")
+        assert result.startswith("Error")
+        assert "no write tools" in result
+        assert set(p.name for p in tmp_path.glob("*.json")) == set(["stored01.json"])
+
+    def test_stored_manual_shard_cannot_be_retried(self, tmp_path):
+        """spool_retry of a stored manual+shard spool is rejected at the _spin_sync
+        chokepoint and launches no new spool."""
+        _retry = spool_retry.fn if hasattr(spool_retry, "fn") else spool_retry
+        stored = dict(
+            id="stored02",
+            status="error",
+            harness="claude-code",
+            permission="manual+shard",
+            allowed_tools=PERMISSION_PROFILES["readonly"],
+            working_dir=str(tmp_path),
+            shard=dict(worktree_path=str(tmp_path), shard_id="sh"),
+        )
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool("stored02", stored)
+            with patch("spindle._count_running", return_value=0):
+                with patch("spindle._spawn_detached", side_effect=AssertionError("must not launch")):
+                    result = asyncio.run(_retry("stored02"))
+        assert "no write tools" in result
+        assert set(p.name for p in tmp_path.glob("*.json")) == set(["stored02.json"])
+
+    def test_valid_shard_tiers_still_launch(self, tmp_path):
+        """careful+shard, shard, auto+shard still resolve and build a command (no
+        conflict); bare readonly/manual still emit acceptEdits + the readonly allowlist."""
+        shard_info = dict(worktree_path=str(tmp_path), shard_id="shard-test")
+        for perm in ("careful+shard", "shard", "auto+shard"):
+            cmd = _spin_claude_cmd(tmp_path, perm, shard_info=shard_info)
+            assert "--permission-mode" in cmd
+        for perm in ("readonly", "manual"):
+            cmd = _spin_claude_cmd(tmp_path, perm)
+            assert _mode_of(cmd) == "acceptEdits"
+            assert _allowed_tools_of(cmd) == PERMISSION_PROFILES["readonly"]
 
 
 class TestSpoolStorage:
@@ -1623,22 +1943,26 @@ class TestPermissionProfileContents:
         assert "Write" not in readonly
         assert "Edit" not in readonly
 
-    def test_careful_has_edit_tools(self):
-        """Careful should have Read, Write, Edit."""
-        careful = PERMISSION_PROFILES["careful"]
-        assert "Read" in careful
-        assert "Write" in careful
-        assert "Edit" in careful
-        assert "Grep" in careful
+    def test_careful_and_careful_shard_have_no_allowlist(self):
+        """careful is now an alias of auto: no allowlist string (None)."""
+        assert PERMISSION_PROFILES["careful"] is None
+        assert PERMISSION_PROFILES["careful+shard"] is None
 
-    def test_careful_has_common_bash(self):
-        """Careful should allow git, make, pytest, python, npm."""
-        careful = PERMISSION_PROFILES["careful"]
-        assert "Bash(git:*)" in careful
-        assert "Bash(make:*)" in careful
-        assert "Bash(pytest:*)" in careful
-        assert "Bash(python:*)" in careful
-        assert "Bash(npm:*)" in careful
+    def test_manual_is_exact_readonly_allowlist(self):
+        """manual is an exact alias of readonly. There is no manual+shard key — the
+        incoherent readonly/manual + shard combos are rejected at spin entry."""
+        assert PERMISSION_PROFILES["manual"] == PERMISSION_PROFILES["readonly"]
+        assert PERMISSION_PROFILES["manual"] == READONLY_TOOLS
+        assert "manual+shard" not in PERMISSION_PROFILES
+        assert "readonly+shard" not in PERMISSION_PROFILES
+
+    def test_manual_excludes_python_and_write(self):
+        """manual, like readonly, must exclude python execution and write tools."""
+        manual = PERMISSION_PROFILES["manual"]
+        assert "Bash(python:" not in manual
+        assert "Bash(python3:" not in manual
+        assert "Write" not in manual
+        assert "Edit" not in manual
 
     def test_readonly_excludes_python_bash(self):
         """Readonly must not allow Bash(python:*) — it is an arbitrary-execution escape hatch."""
@@ -1653,105 +1977,6 @@ class TestPermissionProfileContents:
         readonly = PERMISSION_PROFILES["readonly"]
         for tool in ["Read", "Grep", "Glob", "Bash(git status:*)", "Bash(ls:*)", "Bash(skein:*)"]:
             assert tool in readonly, f"readonly is missing inspection tool: {tool}"
-
-    @pytest.mark.parametrize(
-        "tool",
-        [
-            "Bash(python3:*)",
-            "Bash(npx:*)",
-            "Bash(node:*)",
-            "Bash(ruff:*)",
-            "Bash(black:*)",
-            "Bash(mypy:*)",
-            "Bash(pip:*)",
-            "Bash(uv:*)",
-        ],
-    )
-    def test_careful_includes_new_dev_tools(self, tool):
-        """Careful and careful+shard must include common dev tools."""
-        assert tool in PERMISSION_PROFILES["careful"], f"careful missing: {tool}"
-        assert tool in PERMISSION_PROFILES["careful+shard"], f"careful+shard missing: {tool}"
-
-    @pytest.mark.parametrize(
-        "tool",
-        [
-            "Bash(ls:*)",
-            "Bash(cat:*)",
-            "Bash(head:*)",
-            "Bash(tail:*)",
-            "Bash(wc:*)",
-            "Bash(diff:*)",
-        ],
-    )
-    def test_careful_includes_basic_unix_tools(self, tool):
-        """Careful and careful+shard must include basic Unix inspection tools."""
-        assert tool in PERMISSION_PROFILES["careful"], f"careful missing: {tool}"
-        assert tool in PERMISSION_PROFILES["careful+shard"], f"careful+shard missing: {tool}"
-
-    def test_careful_includes_python3(self):
-        """Careful and careful+shard must include python3 (most invocations use python3 explicitly)."""
-        assert "Bash(python3:*)" in PERMISSION_PROFILES["careful"]
-        assert "Bash(python3:*)" in PERMISSION_PROFILES["careful+shard"]
-
-    def test_careful_includes_pinned_abs_interpreters(self):
-        """Careful/careful+shard must allow the absolute-path pinned interpreters a
-        chain bundle runs by full path. Bare Bash(python3:*) does NOT match an
-        absolute path, so without these an acceptEdits-mode review spin can't run a
-        pinned interpreter and degrades to static analysis (friction-20260709-vfx2)."""
-        pyenv = "Bash(/home/patrick/.pyenv/versions/3.12.0/bin/python3.12:*)"
-        assert pyenv in PERMISSION_PROFILES["careful"]
-        assert pyenv in PERMISSION_PROFILES["careful+shard"]
-        # every pinned-interpreter entry is appended to both careful profiles
-        for entry in PINNED_INTERPRETERS.split(","):
-            assert entry in PERMISSION_PROFILES["careful"], f"careful missing {entry}"
-            assert entry in PERMISSION_PROFILES["careful+shard"], f"careful+shard missing {entry}"
-
-    def test_pinned_interpreters_are_exact_abs_prefix_rules(self):
-        """Each pinned interpreter must be an exact absolute-path Bash prefix rule
-        (Bash(/abs/path:*)) — Claude Code Bash rules do NOT honor mid-path globs, so
-        a wildcard like Bash(/a/*/bin/python*:*) would silently fail to match."""
-        for entry in PINNED_INTERPRETERS.split(","):
-            assert entry.startswith("Bash(/"), f"not an absolute-path rule: {entry}"
-            assert entry.endswith(":*)"), f"not a prefix (:*) rule: {entry}"
-            inner = entry[len("Bash(") : -len(":*)")]
-            assert "*" not in inner, f"mid-path glob won't match Claude Code's matcher: {entry}"
-
-    def test_pinned_interpreters_not_in_readonly_or_research(self):
-        """The pinned interpreters must NOT leak into readonly/research — those
-        intentionally exclude Python execution."""
-        for profile in ("readonly", "research"):
-            for entry in PINNED_INTERPRETERS.split(","):
-                assert entry not in PERMISSION_PROFILES[profile], f"{profile} leaked {entry}"
-
-    def test_careful_includes_venv_tools(self):
-        """Careful/careful+shard must allow project venv tool paths."""
-        assert "Bash(.venv/bin/python:*)" in PERMISSION_PROFILES["careful"]
-        assert "Bash(.venv/bin/pytest:*)" in PERMISSION_PROFILES["careful"]
-        for entry in VENV_TOOLS.split(","):
-            assert entry in PERMISSION_PROFILES["careful"], f"careful missing {entry}"
-            assert entry in PERMISSION_PROFILES["careful+shard"], f"careful+shard missing {entry}"
-
-    def test_venv_tools_are_relative_prefix_rules(self):
-        """Each venv tool must be an exact relative-path Bash prefix rule."""
-        for entry in VENV_TOOLS.split(","):
-            assert entry.startswith(("Bash(.venv/bin/", "Bash(venv/bin/")), f"not a venv rule: {entry}"
-            assert entry.endswith(":*)"), f"not a prefix (:*) rule: {entry}"
-            inner = entry[len("Bash(") : -len(":*)")]
-            assert "*" not in inner, f"mid-path glob won't match Claude Code's matcher: {entry}"
-
-    def test_venv_tools_not_in_readonly_or_research(self):
-        """The venv tools must NOT leak into readonly/research."""
-        for profile in ("readonly", "research"):
-            for entry in VENV_TOOLS.split(","):
-                assert entry not in PERMISSION_PROFILES[profile], f"{profile} leaked {entry}"
-
-    def test_bare_python_and_venv_python_matcher_contract(self):
-        """Bare and path-form Python rules must coexist because Claude Code matches the command as typed."""
-        careful = PERMISSION_PROFILES["careful"]
-        assert "Bash(python:*)" in careful
-        assert "Bash(.venv/bin/python:*)" in careful
-        assert "Bash(pytest:*)" in careful
-        assert "Bash(.venv/bin/pytest:*)" in careful
 
     def test_full_and_shard_unchanged_none(self):
         """Full and shard profiles must remain None (unrestricted)."""

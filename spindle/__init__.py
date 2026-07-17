@@ -130,67 +130,37 @@ CLAUDE_TASKS_DIR = Path.home() / ".claude" / "tasks"
 # Profiles ending with "+shard" auto-enable shard isolation
 RESEARCH_TOOLS = "Read,Grep,Glob,WebFetch,WebSearch,Bash(ls:*),Bash(cat:*),Bash(head:*),Bash(tail:*),Bash(git status:*),Bash(git log:*),Bash(git diff:*),Bash(curl:*),Bash(jq:*),Bash(skein:*)"
 
-# Absolute-path interpreters that mill/xgun chain bundles PIN — a bundle runs a
-# specific interpreter by FULL PATH (e.g. deep_code_audit's test suite under the
-# xgun pyenv). Bare Bash(python:*)/Bash(python3:*) do NOT match an absolute-path
-# command, and `careful` runs in acceptEdits mode (allowlist-enforced), so without
-# these a review/fell spin can't run a bundle's pinned interpreter and silently
-# degrades to static-only analysis (SKEIN friction-20260709-vfx2 — a Claude-
-# genotype reviewer that couldn't run the suite missed bugs the executing genotype
-# caught). Claude Code Bash rules match by exact command PREFIX and do NOT honor
-# mid-path globs (Bash(/a/*/bin/python*:*) falls through to approval — verified),
-# so each interpreter is listed by full path; add new pinned interpreters here.
-# Not a security widening: `careful` already allows arbitrary Python via
-# Bash(python:*)/Bash(python3:*); this only makes the absolute-path form work.
-PINNED_INTERPRETERS = (
-    "Bash(/home/patrick/.pyenv/versions/3.12.0/bin/python3.12:*),"
-    "Bash(/home/patrick/.pyenv/versions/3.12.0/bin/python3:*),"
-    "Bash(/home/patrick/.pyenv/versions/3.12.0/bin/python:*)"
-)
+# The one tight, inspectable, no-exec tier: Read/Grep/Glob plus a few safe
+# read-only Bash rules — no python, no find, no write. `readonly` and its alias
+# `manual` are the only Claude tiers whose capability is still governed by an
+# allowlist; every other tier is classifier-vetted (auto) or bwrap-contained
+# (shard/full).
+READONLY_TOOLS = "Read,Grep,Glob,Bash(ls:*),Bash(cat:*),Bash(head:*),Bash(tail:*),Bash(git status:*),Bash(git log:*),Bash(git diff:*),Bash(skein:*)"
 
-# Project-virtualenv tools invoked by their conventional RELATIVE path. A reviewer
-# following a project's test convention runs the pinned venv interpreter/tool by
-# path — e.g. mill's `.venv/bin/python -m pytest`, or `.venv/bin/pytest`,
-# `.venv/bin/ruff`. Claude Code matches an allowlist Bash rule against the command
-# string AS TYPED, and Bash(python:*)/Bash(pytest:*) match only when the command's
-# first token is exactly `python`/`pytest`; a path form like `.venv/bin/python`
-# shares no prefix with `python`, so it falls through to approval and, headless
-# (acceptEdits), is DENIED — degrading a careful Claude reviewer to static-only
-# while a bypass-mode codex reviewer runs the same suite. The agent's cwd is the
-# project root, so the `.venv/bin/...` string is project-independent — one static
-# rule set covers every project on the venv convention with no per-project config.
-# Not a security widening: `careful` already permits these exact tools bare
-# (Bash(python:*)/Bash(pytest:*)/Bash(ruff:*)/Bash(mypy:*)/Bash(black:*)); this only
-# makes the pinned-path form of the SAME tools resolve. `venv/bin` (non-dotted) is
-# included as the second most common layout at the same no-widening cost.
-VENV_TOOLS = (
-    "Bash(.venv/bin/python:*),"
-    "Bash(.venv/bin/python3:*),"
-    "Bash(.venv/bin/pytest:*),"
-    "Bash(.venv/bin/ruff:*),"
-    "Bash(.venv/bin/mypy:*),"
-    "Bash(.venv/bin/black:*),"
-    "Bash(venv/bin/python:*),"
-    "Bash(venv/bin/python3:*),"
-    "Bash(venv/bin/pytest:*),"
-    "Bash(venv/bin/ruff:*),"
-    "Bash(venv/bin/mypy:*),"
-    "Bash(venv/bin/black:*)"
-)
+# Claude-harness permission profiles map to an --allowedTools string, or None for
+# "no allowlist" (the classifier or bwrap governs instead). `careful` is now an
+# alias of `auto`: it resolves to None here and selects --permission-mode auto,
+# where Claude Code vets each tool call server-side on intent. The old careful
+# allowlist gated capability on command PHRASING, not security — it already
+# permitted arbitrary python/npm/etc, so `python3 -c ...` ran while
+# `PYTHONPATH=x python3 -c ...` or `.venv/bin/python` silently fell through to a
+# denial, degrading a reviewer to static analysis without saying so. `auto`
+# removes the phrasing gate entirely; the deleted PINNED_INTERPRETERS/VENV_TOOLS
+# scar tissue existed only to paper over it.
 PERMISSION_PROFILES = {
-    "readonly": "Read,Grep,Glob,Bash(ls:*),Bash(cat:*),Bash(head:*),Bash(tail:*),Bash(git status:*),Bash(git log:*),Bash(git diff:*),Bash(skein:*)",
-    "careful": "Read,Write,Edit,Grep,Glob,Bash(git:*),Bash(make:*),Bash(pytest:*),Bash(python:*),Bash(python3:*),Bash(npm:*),Bash(npx:*),Bash(node:*),Bash(ruff:*),Bash(black:*),Bash(mypy:*),Bash(pip:*),Bash(uv:*),Bash(ls:*),Bash(cat:*),Bash(head:*),Bash(tail:*),Bash(wc:*),Bash(diff:*),Bash(skein:*),Bash(muster:*),"
-    + VENV_TOOLS
-    + ","
-    + PINNED_INTERPRETERS,
+    "readonly": READONLY_TOOLS,
+    "manual": READONLY_TOOLS,  # exact alias of readonly — the tight/manual tier
+    # NOTE: no readonly+shard / manual+shard. The readonly/manual tier has no
+    # write tools, so pairing it with a shard (an isolated worktree for making
+    # changes) is incoherent. The pairing is rejected on the resolved (tier,
+    # use_shard) pair at every launch chokepoint (see _readonly_shard_conflict_error),
+    # so no spelling — string, shard=True flag, or a stored/respun form — resolves it.
+    "careful": None,  # alias of auto: no allowlist, classifier vets each call
+    "careful+shard": None,  # auto-vetted; bypassPermissions inside a bwrap-contained shard
     "research": RESEARCH_TOOLS,
     "full": None,  # None means no restrictions
     # Shard variants - same permissions but auto-enable worktree isolation
     "shard": None,  # Full permissions + shard isolation (common combo)
-    "careful+shard": "Read,Write,Edit,Grep,Glob,Bash(git:*),Bash(make:*),Bash(pytest:*),Bash(python:*),Bash(python3:*),Bash(npm:*),Bash(npx:*),Bash(node:*),Bash(ruff:*),Bash(black:*),Bash(mypy:*),Bash(pip:*),Bash(uv:*),Bash(ls:*),Bash(cat:*),Bash(head:*),Bash(tail:*),Bash(wc:*),Bash(diff:*),Bash(skein:*),Bash(muster:*),"
-    + VENV_TOOLS
-    + ","
-    + PINNED_INTERPRETERS,
     "research+shard": RESEARCH_TOOLS,
     # Classifier-vetted autonomous mode — CC vets each tool call server-side.
     # No allowedTools restriction: the classifier governs calls dynamically.
@@ -410,6 +380,77 @@ def _resolve_permission(
 
     # Unknown profile - use careful, preserve shard intent
     return PERMISSION_PROFILES["careful"], use_shard
+
+
+def _claude_permission_mode(permission: Optional[str]) -> str:
+    """Return the Claude Code --permission-mode for a permission profile.
+
+    This is the claude-harness tier table:
+      - auto / auto+shard              -> "auto"            (classifier-vetted)
+      - careful / None default         -> "auto"            (careful is now auto)
+      - readonly / manual / research   -> "acceptEdits"     (tight allowlist tiers)
+      - full / shard / careful+shard / research+shard
+                                       -> "bypassPermissions" (bwrap-contained)
+
+    The base tier drives the mode, not the "+shard" suffix alone: auto+shard is
+    still auto. Only the tiers that were already bypass-in-shard (careful+shard,
+    research+shard, shard) resolve to bypassPermissions via the "+shard"
+    fallthrough. The readonly/manual tier has no coherent +shard variant — the
+    pairing is rejected on the resolved (tier, use_shard) pair at the launch
+    chokepoints (see _readonly_shard_conflict_error), so a no-write tier + shard
+    never reaches this table (and so cannot fall through to bypassPermissions).
+    """
+    perm = permission or "careful"
+    if perm.startswith("auto"):
+        return "auto"
+    if perm in ("readonly", "manual", "research"):
+        return "acceptEdits"
+    if perm in ("full", "shard") or perm.endswith("+shard"):
+        return "bypassPermissions"
+    # careful, the None default, and any unknown profile fall back to careful
+    # semantics, which is now auto.
+    return "auto"
+
+
+# The readonly/manual tier is the tight, no-write inspection tier. Pairing it with
+# a shard (an isolated worktree for making CHANGES) is incoherent no matter how the
+# shard intent arrives: permission="readonly+shard"/"manual+shard", permission
+# "readonly"/"manual" with shard=True, or the CLI --shard flag. So the authoritative
+# check runs on the RESOLVED (tier, use_shard) pair at every launch chokepoint
+# (_spin_sync — the common path for spin() and spool_retry — and _respin_sync),
+# plus a friendly early copy at the harness-agnostic spin()/CLI entry. No door
+# reaches a launch, or _claude_permission_mode, with the pairing.
+NO_WRITE_TIERS = ("readonly", "manual")
+
+
+def _base_permission_tier(permission: Optional[str]) -> Optional[str]:
+    """The tier name without a trailing '+shard' (e.g. 'manual+shard' -> 'manual')."""
+    if permission and permission.endswith("+shard"):
+        return permission[: -len("+shard")]
+    return permission
+
+
+def _permission_implies_shard(permission: Optional[str]) -> bool:
+    """Whether a permission string alone carries shard intent (mirrors the use_shard
+    rule in _resolve_permission)."""
+    return bool(permission) and (permission == "shard" or permission.endswith("+shard"))
+
+
+def _readonly_shard_conflict_error(permission: Optional[str], use_shard: bool) -> Optional[str]:
+    """Return the incoherent-pairing error when the no-write readonly/manual tier is
+    combined with a shard, else None.
+
+    `use_shard` must already fold in shard intent from every source (the permission
+    string AND the shard flag), so this single check is spelling-agnostic — it fires
+    whether the shard arrived as "...+shard", shard=True, or --shard.
+    """
+    if use_shard and _base_permission_tier(permission) in NO_WRITE_TIERS:
+        return (
+            "the readonly/manual tier has no write tools; +shard (or shard=True) "
+            "adds a worktree it can't write in — use careful+shard or shard for "
+            "isolated write work."
+        )
+    return None
 
 
 def _detect_default_branch(working_dir: str) -> str:
@@ -2226,6 +2267,16 @@ def _spin_sync(
     except ValueError as exc:
         return f"Error: {exc}"
 
+    # Authoritative incoherence check on the RESOLVED (tier, use_shard) pair: the
+    # no-write readonly/manual tier + a shard, however the shard intent arrived
+    # (permission="...+shard", or readonly/manual with shard=True/--shard). This is
+    # the common launch chokepoint for spin() and spool_retry(); reject before a
+    # slot is reserved so no spool launches.
+    use_shard = shard or auto_shard
+    conflict = _readonly_shard_conflict_error(permission, use_shard)
+    if conflict:
+        return f"Error: {conflict}"
+
     # Generate spool ID after validation so rejected research spins don't reserve slots.
     spool_id = str(uuid.uuid4())[:8]
 
@@ -2239,10 +2290,7 @@ def _spin_sync(
 
     cwd = working_dir
 
-    # Use shard if explicitly requested OR if permission profile enables it
-    use_shard = shard or auto_shard
-
-    # Handle shard creation
+    # Handle shard creation (use_shard computed above)
     shard_info = None
     shard_error = None
     shard_newly_created = False
@@ -2304,15 +2352,11 @@ Your task:
         resolved_model = CLAUDE_MODEL_ALIASES.get(model, model)
         claude_cmd.extend(["--model", resolved_model])
 
-    # Auto-accept edits for non-interactive execution
-    # Use acceptEdits for careful mode, bypassPermissions for full/shard,
-    # and auto for classifier-vetted autonomous mode (no allowedTools restriction).
-    if permission and permission.startswith("auto"):
-        claude_cmd.extend(["--permission-mode", "auto"])
-    elif permission in ("full", "shard") or (permission and "+shard" in permission):
-        claude_cmd.extend(["--permission-mode", "bypassPermissions"])
-    else:
-        claude_cmd.extend(["--permission-mode", "acceptEdits"])
+    # Select the permission mode for this tier. careful and the None default
+    # resolve to auto (no allowlist); readonly/manual keep acceptEdits + their
+    # tight allowlist; full/shard/+shard get bypassPermissions. See
+    # _claude_permission_mode for the full table.
+    claude_cmd.extend(["--permission-mode", _claude_permission_mode(permission)])
 
     if system_prompt:
         claude_cmd.extend(["--system-prompt", system_prompt])
@@ -2499,13 +2543,19 @@ async def spin(
 
     Args:
         prompt: The task/question for the agent
-        permission: Permission profile. "readonly" for pure inspection/synthesis;
-                    "careful" (default) for most code work including reviews/fells;
+        permission: Permission profile (claude-code harness). "careful" (default)
+                    is now an alias of "auto" — classifier-vetted autonomous mode
+                    where CC vets each tool call server-side with no allowlist; use
+                    it for most code work including reviews/fells. "readonly" (alias
+                    "manual") is the one tight, no-exec tier: Read/Grep/Glob + a few
+                    safe read-only Bash rules, no python, enforced by an allowlist.
+                    It cannot be combined with a shard (no write tools) — readonly/
+                    manual + shard is rejected however the shard intent arrives.
                     "research" for web/file research with required research_target;
                     "full" for setup/install; "shard" or "careful+shard" for any
-                    code-modifying work (adds isolated git worktree);
-                    "auto" for classifier-vetted autonomous mode (CC vets each tool
-                    call server-side, no allowlist); "auto+shard" adds worktree isolation.
+                    code-modifying work (adds isolated git worktree, bypass inside
+                    the bwrap-contained shard); "auto"/"auto+shard" are explicit
+                    aliases of the careful default.
         research_target: Required for permission="research" or "research+shard".
                          Accepted forms: site:<id>, file:<absolute-path>, dir:<absolute-path>.
         shard: Run in isolated git worktree (SKEIN-aware with graceful fallback)
@@ -2549,6 +2599,15 @@ async def spin(
     """
     # Normalize harness parameter (case-insensitive)
     harness_lower = harness.lower() if harness else None
+
+    # Reject the incoherent readonly/manual + shard pairing up front, harness-
+    # agnostic, before any harness resolves or a slot is reserved. This is the
+    # friendly early copy (it also covers codex/gemini/kimi); the authoritative
+    # check runs again at the claude launch chokepoints (_spin_sync/_respin_sync)
+    # so the shard=True flag and retry/respin of a stored form cannot slip past.
+    conflict = _readonly_shard_conflict_error(permission, shard or _permission_implies_shard(permission))
+    if conflict:
+        return json.dumps({"error": conflict})
 
     # Resolve harness against built-ins and lodged profiles. Built-in names win
     # over a same-named profile (with a warning); otherwise a non-built-in name
@@ -3099,6 +3158,18 @@ def _respin_sync(handle: str, prompt: str) -> str:
         return _kimi_respin_sync(session_id, prompt, original_spool)
     else:
         # Claude Code harness (default)
+        # A stored readonly/manual tier paired with a shard is incoherent (round-2
+        # fell): the tier has no write tools, so a resumed worktree spool can't do
+        # useful work — and a stored "manual+shard" would otherwise escalate to
+        # bypassPermissions via _claude_permission_mode below. Reject on the resolved
+        # (tier, use_shard) pair before reserving a slot — the same authoritative
+        # check _spin_sync runs.
+        orig_permission = original_spool.get("permission")
+        orig_use_shard = _permission_implies_shard(orig_permission) or bool(original_spool.get("shard"))
+        conflict = _readonly_shard_conflict_error(orig_permission, orig_use_shard)
+        if conflict:
+            return f"Error: {conflict}"
+
         # Generate spool ID first
         spool_id = str(uuid.uuid4())[:8]
 
@@ -3112,6 +3183,18 @@ def _respin_sync(handle: str, prompt: str) -> str:
         # Try to resume with session_id first
         # If that fails (session expired), fall back to transcript injection
         cmd = ["claude", "-p", prompt, "--resume", session_id, "--output-format", "json"]
+
+        # A bare `claude --resume` sets NEITHER --permission-mode NOR --allowedTools,
+        # so a resumed spool silently changes capability from the original spin (a
+        # bare resume of a careful spool denies `python3 -c ...`, which careful=auto
+        # permits). Re-apply the tier the original spool ran under so a careful
+        # resume stays auto, a readonly resume keeps its allowlist, etc. The stored
+        # allowed_tools mirrors exactly what the original spin used, so no
+        # re-resolution (and no research-target re-validation) is needed here.
+        orig_allowed_tools = original_spool.get("allowed_tools")
+        cmd.extend(["--permission-mode", _claude_permission_mode(orig_permission)])
+        if orig_allowed_tools:
+            cmd.extend(["--allowedTools", orig_allowed_tools])
 
         cwd = os.getcwd()
 
@@ -3162,7 +3245,8 @@ def _respin_sync(handle: str, prompt: str) -> str:
             "result": None,
             "session_id": session_id,
             "working_dir": cwd,
-            "allowed_tools": None,
+            "allowed_tools": orig_allowed_tools,
+            "permission": orig_permission,
             "system_prompt": None,
             "transcript_fallback_available": transcript_available,
             "env": caller_env,
@@ -6198,6 +6282,7 @@ def main():
         "-p",
         choices=[
             "readonly",
+            "manual",
             "careful",
             "research",
             "full",
@@ -6207,7 +6292,7 @@ def main():
             "auto",
             "auto+shard",
         ],
-        help="Permission profile (default: careful)",
+        help="Permission profile (default: careful, which is classifier-vetted auto)",
     )
     spin_parser.add_argument(
         "--research-target",
@@ -6333,6 +6418,15 @@ def main():
     elif args.command == "spin":
         working_dir = os.path.abspath(args.working_dir or os.getcwd())
         harness_lower = args.harness.lower() if args.harness else None
+        conflict = _readonly_shard_conflict_error(
+            args.permission, args.shard or _permission_implies_shard(args.permission)
+        )
+        if conflict:
+            if args.human:
+                print(f"Error: {conflict}", file=sys.stderr)
+            else:
+                print(json.dumps({"error": conflict}))
+            sys.exit(1)
         if args.permission and args.permission.startswith("auto") and harness_lower and harness_lower != "claude-code":
             error_msg = f"permission={args.permission!r} requires harness='claude-code'; {harness_lower!r} has no classifier-vetted mode."
             if args.human:
