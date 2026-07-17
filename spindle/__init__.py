@@ -180,13 +180,17 @@ VENV_TOOLS = (
 PERMISSION_PROFILES = {
     "readonly": "Read,Grep,Glob,Bash(ls:*),Bash(cat:*),Bash(head:*),Bash(tail:*),Bash(git status:*),Bash(git log:*),Bash(git diff:*),Bash(skein:*)",
     "careful": "Read,Write,Edit,Grep,Glob,Bash(git:*),Bash(make:*),Bash(pytest:*),Bash(python:*),Bash(python3:*),Bash(npm:*),Bash(npx:*),Bash(node:*),Bash(ruff:*),Bash(black:*),Bash(mypy:*),Bash(pip:*),Bash(uv:*),Bash(ls:*),Bash(cat:*),Bash(head:*),Bash(tail:*),Bash(wc:*),Bash(diff:*),Bash(skein:*),Bash(muster:*),"
-    + VENV_TOOLS + "," + PINNED_INTERPRETERS,
+    + VENV_TOOLS
+    + ","
+    + PINNED_INTERPRETERS,
     "research": RESEARCH_TOOLS,
     "full": None,  # None means no restrictions
     # Shard variants - same permissions but auto-enable worktree isolation
     "shard": None,  # Full permissions + shard isolation (common combo)
     "careful+shard": "Read,Write,Edit,Grep,Glob,Bash(git:*),Bash(make:*),Bash(pytest:*),Bash(python:*),Bash(python3:*),Bash(npm:*),Bash(npx:*),Bash(node:*),Bash(ruff:*),Bash(black:*),Bash(mypy:*),Bash(pip:*),Bash(uv:*),Bash(ls:*),Bash(cat:*),Bash(head:*),Bash(tail:*),Bash(wc:*),Bash(diff:*),Bash(skein:*),Bash(muster:*),"
-    + VENV_TOOLS + "," + PINNED_INTERPRETERS,
+    + VENV_TOOLS
+    + ","
+    + PINNED_INTERPRETERS,
     "research+shard": RESEARCH_TOOLS,
     # Classifier-vetted autonomous mode — CC vets each tool call server-side.
     # No allowedTools restriction: the classifier governs calls dynamically.
