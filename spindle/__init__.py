@@ -152,8 +152,9 @@ PERMISSION_PROFILES = {
     "manual": READONLY_TOOLS,  # exact alias of readonly — the tight/manual tier
     # NOTE: no readonly+shard / manual+shard. The readonly/manual tier has no
     # write tools, so pairing it with a shard (an isolated worktree for making
-    # changes) is incoherent; both forms are rejected at spin entry by
-    # _incoherent_permission_error rather than resolving asymmetrically.
+    # changes) is incoherent. The pairing is rejected on the resolved (tier,
+    # use_shard) pair at every launch chokepoint (see _readonly_shard_conflict_error),
+    # so no spelling — string, shard=True flag, or a stored/respun form — resolves it.
     "careful": None,  # alias of auto: no allowlist, classifier vets each call
     "careful+shard": None,  # auto-vetted; bypassPermissions inside a bwrap-contained shard
     "research": RESEARCH_TOOLS,
@@ -394,9 +395,10 @@ def _claude_permission_mode(permission: Optional[str]) -> str:
     The base tier drives the mode, not the "+shard" suffix alone: auto+shard is
     still auto. Only the tiers that were already bypass-in-shard (careful+shard,
     research+shard, shard) resolve to bypassPermissions via the "+shard"
-    fallthrough. The readonly/manual tier has no coherent +shard variant —
-    readonly+shard/manual+shard are rejected at spin entry (see
-    _incoherent_permission_error), so they never reach this table.
+    fallthrough. The readonly/manual tier has no coherent +shard variant — the
+    pairing is rejected on the resolved (tier, use_shard) pair at the launch
+    chokepoints (see _readonly_shard_conflict_error), so a no-write tier + shard
+    never reaches this table (and so cannot fall through to bypassPermissions).
     """
     perm = permission or "careful"
     if perm.startswith("auto"):
@@ -410,26 +412,43 @@ def _claude_permission_mode(permission: Optional[str]) -> str:
     return "auto"
 
 
-# readonly/manual paired with a shard: the tight tier has no write tools, and a
-# shard is an isolated worktree for making changes, so the pairing is incoherent.
-# Left to resolve, the two spellings diverge (manual+shard -> tight acceptEdits;
-# readonly+shard falls through to bypassPermissions with no allowlist, a silent
-# escalation), so both are rejected identically at spin entry instead.
-INCOHERENT_PERMISSIONS = ("readonly+shard", "manual+shard")
+# The readonly/manual tier is the tight, no-write inspection tier. Pairing it with
+# a shard (an isolated worktree for making CHANGES) is incoherent no matter how the
+# shard intent arrives: permission="readonly+shard"/"manual+shard", permission
+# "readonly"/"manual" with shard=True, or the CLI --shard flag. So the authoritative
+# check runs on the RESOLVED (tier, use_shard) pair at every launch chokepoint
+# (_spin_sync — the common path for spin() and spool_retry — and _respin_sync),
+# plus a friendly early copy at the harness-agnostic spin()/CLI entry. No door
+# reaches a launch, or _claude_permission_mode, with the pairing.
+NO_WRITE_TIERS = ("readonly", "manual")
 
 
-def _incoherent_permission_error(permission: Optional[str]) -> Optional[str]:
-    """Return an error string if `permission` names an incoherent tier, else None.
+def _base_permission_tier(permission: Optional[str]) -> Optional[str]:
+    """The tier name without a trailing '+shard' (e.g. 'manual+shard' -> 'manual')."""
+    if permission and permission.endswith("+shard"):
+        return permission[: -len("+shard")]
+    return permission
 
-    Harness-agnostic: callers invoke this at spin entry (before any harness
-    launches) so readonly+shard and manual+shard are rejected the same way for
-    every harness rather than resolving asymmetrically.
+
+def _permission_implies_shard(permission: Optional[str]) -> bool:
+    """Whether a permission string alone carries shard intent (mirrors the use_shard
+    rule in _resolve_permission)."""
+    return bool(permission) and (permission == "shard" or permission.endswith("+shard"))
+
+
+def _readonly_shard_conflict_error(permission: Optional[str], use_shard: bool) -> Optional[str]:
+    """Return the incoherent-pairing error when the no-write readonly/manual tier is
+    combined with a shard, else None.
+
+    `use_shard` must already fold in shard intent from every source (the permission
+    string AND the shard flag), so this single check is spelling-agnostic — it fires
+    whether the shard arrived as "...+shard", shard=True, or --shard.
     """
-    if permission in INCOHERENT_PERMISSIONS:
+    if use_shard and _base_permission_tier(permission) in NO_WRITE_TIERS:
         return (
-            f"permission={permission!r} is not a valid tier: the readonly/manual "
-            "tier has no write tools; +shard adds a worktree it can't write in — "
-            "use careful+shard or shard for isolated write work."
+            "the readonly/manual tier has no write tools; +shard (or shard=True) "
+            "adds a worktree it can't write in — use careful+shard or shard for "
+            "isolated write work."
         )
     return None
 
@@ -2248,6 +2267,16 @@ def _spin_sync(
     except ValueError as exc:
         return f"Error: {exc}"
 
+    # Authoritative incoherence check on the RESOLVED (tier, use_shard) pair: the
+    # no-write readonly/manual tier + a shard, however the shard intent arrived
+    # (permission="...+shard", or readonly/manual with shard=True/--shard). This is
+    # the common launch chokepoint for spin() and spool_retry(); reject before a
+    # slot is reserved so no spool launches.
+    use_shard = shard or auto_shard
+    conflict = _readonly_shard_conflict_error(permission, use_shard)
+    if conflict:
+        return f"Error: {conflict}"
+
     # Generate spool ID after validation so rejected research spins don't reserve slots.
     spool_id = str(uuid.uuid4())[:8]
 
@@ -2261,10 +2290,7 @@ def _spin_sync(
 
     cwd = working_dir
 
-    # Use shard if explicitly requested OR if permission profile enables it
-    use_shard = shard or auto_shard
-
-    # Handle shard creation
+    # Handle shard creation (use_shard computed above)
     shard_info = None
     shard_error = None
     shard_newly_created = False
@@ -2522,8 +2548,9 @@ async def spin(
                     where CC vets each tool call server-side with no allowlist; use
                     it for most code work including reviews/fells. "readonly" (alias
                     "manual") is the one tight, no-exec tier: Read/Grep/Glob + a few
-                    safe read-only Bash rules, no python, enforced by an allowlist
-                    (it has no +shard form; readonly+shard/manual+shard are rejected).
+                    safe read-only Bash rules, no python, enforced by an allowlist.
+                    It cannot be combined with a shard (no write tools) — readonly/
+                    manual + shard is rejected however the shard intent arrives.
                     "research" for web/file research with required research_target;
                     "full" for setup/install; "shard" or "careful+shard" for any
                     code-modifying work (adds isolated git worktree, bypass inside
@@ -2573,11 +2600,14 @@ async def spin(
     # Normalize harness parameter (case-insensitive)
     harness_lower = harness.lower() if harness else None
 
-    # Reject incoherent readonly/manual + shard combos up front, harness-agnostic,
-    # before any harness resolves or a slot is reserved.
-    incoherent = _incoherent_permission_error(permission)
-    if incoherent:
-        return json.dumps({"error": incoherent})
+    # Reject the incoherent readonly/manual + shard pairing up front, harness-
+    # agnostic, before any harness resolves or a slot is reserved. This is the
+    # friendly early copy (it also covers codex/gemini/kimi); the authoritative
+    # check runs again at the claude launch chokepoints (_spin_sync/_respin_sync)
+    # so the shard=True flag and retry/respin of a stored form cannot slip past.
+    conflict = _readonly_shard_conflict_error(permission, shard or _permission_implies_shard(permission))
+    if conflict:
+        return json.dumps({"error": conflict})
 
     # Resolve harness against built-ins and lodged profiles. Built-in names win
     # over a same-named profile (with a warning); otherwise a non-built-in name
@@ -3128,6 +3158,18 @@ def _respin_sync(handle: str, prompt: str) -> str:
         return _kimi_respin_sync(session_id, prompt, original_spool)
     else:
         # Claude Code harness (default)
+        # A stored readonly/manual tier paired with a shard is incoherent (round-2
+        # fell): the tier has no write tools, so a resumed worktree spool can't do
+        # useful work — and a stored "manual+shard" would otherwise escalate to
+        # bypassPermissions via _claude_permission_mode below. Reject on the resolved
+        # (tier, use_shard) pair before reserving a slot — the same authoritative
+        # check _spin_sync runs.
+        orig_permission = original_spool.get("permission")
+        orig_use_shard = _permission_implies_shard(orig_permission) or bool(original_spool.get("shard"))
+        conflict = _readonly_shard_conflict_error(orig_permission, orig_use_shard)
+        if conflict:
+            return f"Error: {conflict}"
+
         # Generate spool ID first
         spool_id = str(uuid.uuid4())[:8]
 
@@ -3149,7 +3191,6 @@ def _respin_sync(handle: str, prompt: str) -> str:
         # resume stays auto, a readonly resume keeps its allowlist, etc. The stored
         # allowed_tools mirrors exactly what the original spin used, so no
         # re-resolution (and no research-target re-validation) is needed here.
-        orig_permission = original_spool.get("permission")
         orig_allowed_tools = original_spool.get("allowed_tools")
         cmd.extend(["--permission-mode", _claude_permission_mode(orig_permission)])
         if orig_allowed_tools:
@@ -6373,6 +6414,15 @@ def main():
     elif args.command == "spin":
         working_dir = os.path.abspath(args.working_dir or os.getcwd())
         harness_lower = args.harness.lower() if args.harness else None
+        conflict = _readonly_shard_conflict_error(
+            args.permission, args.shard or _permission_implies_shard(args.permission)
+        )
+        if conflict:
+            if args.human:
+                print(f"Error: {conflict}", file=sys.stderr)
+            else:
+                print(json.dumps({"error": conflict}))
+            sys.exit(1)
         if args.permission and args.permission.startswith("auto") and harness_lower and harness_lower != "claude-code":
             error_msg = f"permission={args.permission!r} requires harness='claude-code'; {harness_lower!r} has no classifier-vetted mode."
             if args.human:

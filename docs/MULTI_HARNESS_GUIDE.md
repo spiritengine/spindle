@@ -167,7 +167,7 @@ spool_id = spin(
 - `tags` - Organization tags
 
 **Claude-specific parameters:**
-- `permission` - "readonly" (alias "manual"), "careful" (default, = auto), "full", "shard", "careful+shard", "research", "research+shard", "auto", "auto+shard" (readonly/manual has no +shard form; readonly+shard/manual+shard are rejected)
+- `permission` - "readonly" (alias "manual"), "careful" (default, = auto), "full", "shard", "careful+shard", "research", "research+shard", "auto", "auto+shard" (readonly/manual cannot be combined with a shard — rejected however the shard intent arrives: readonly+shard/manual+shard, or readonly/manual with shard=True)
 - `shard` - Auto-create git worktree
 - `system_prompt` - Custom system instructions
 - `allowed_tools` - Explicit tool permissions

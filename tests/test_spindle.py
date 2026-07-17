@@ -52,7 +52,6 @@ from spindle import (
     _get_spool_path,
     _get_transcript_path,
     _handle_expired_session,
-    _incoherent_permission_error,
     _is_pid_alive,
     _is_review_tag,
     _kimi_respin_sync,
@@ -65,6 +64,7 @@ from spindle import (
     _parse_duration,
     _profile_spawn_env,
     _read_spool,
+    _readonly_shard_conflict_error,
     _recover_orphans,
     _refusal_category,
     _resolve_permission,
@@ -120,28 +120,22 @@ class TestPermissionProfiles:
         assert tools == PERMISSION_PROFILES["readonly"]
         assert shard is False
 
-    def test_incoherent_permission_error_flags_both_shard_forms(self):
-        """readonly+shard and manual+shard are flagged identically; valid tiers pass.
-
-        The readonly/manual tier has no write tools, so pairing it with a shard is
-        incoherent — both spellings must be rejected the same way rather than
-        resolving asymmetrically."""
-        for bad in ("readonly+shard", "manual+shard"):
-            msg = _incoherent_permission_error(bad)
-            assert msg is not None, bad
+    def test_readonly_shard_conflict_flags_all_forms(self):
+        """The no-write readonly/manual tier + a shard is flagged on the resolved
+        (tier, use_shard) pair, whatever spelling carried the shard intent; valid
+        tiers pass. This is the authoritative check every launch chokepoint uses."""
+        # readonly/manual tier + shard -> conflict (flag form and "+shard" string)
+        for perm in ("readonly", "manual", "readonly+shard", "manual+shard"):
+            msg = _readonly_shard_conflict_error(perm, True)
+            assert msg is not None, perm
             assert "no write tools" in msg
             assert "careful+shard or shard" in msg
-        for ok in (
-            None,
-            "readonly",
-            "manual",
-            "careful",
-            "careful+shard",
-            "shard",
-            "auto+shard",
-            "research+shard",
-        ):
-            assert _incoherent_permission_error(ok) is None, ok
+        # bare readonly/manual (no shard) is fine
+        assert _readonly_shard_conflict_error("readonly", False) is None
+        assert _readonly_shard_conflict_error("manual", False) is None
+        # every write-capable tier + shard is fine
+        for ok in ("careful+shard", "shard", "auto+shard", "research+shard", "careful", "full", None):
+            assert _readonly_shard_conflict_error(ok, True) is None, ok
 
     def test_full_permission(self):
         """Full permission should return None (no restrictions)."""
@@ -709,24 +703,114 @@ class TestClaudePermissionCommandShape:
         assert cmd[cmd.index("--permission-mode") + 1] == "acceptEdits"
         assert cmd[cmd.index("--allowedTools") + 1] == PERMISSION_PROFILES["readonly"]
 
-    @pytest.mark.parametrize("bad", ["readonly+shard", "manual+shard"])
-    def test_incoherent_shard_permission_rejected_at_spin_entry(self, bad, tmp_path):
-        """spin() rejects readonly+shard / manual+shard with a clear error and does
-        NOT launch a spool. The rejection is harness-agnostic (spin entry, before
-        any harness routes), so both forms fail identically."""
+    @pytest.mark.parametrize(
+        "permission,shard_flag",
+        [
+            ("readonly+shard", False),
+            ("manual+shard", False),
+            ("readonly", True),
+            ("manual", True),
+        ],
+    )
+    def test_readonly_manual_plus_shard_rejected_at_spin_entry(self, permission, shard_flag, tmp_path):
+        """spin() rejects the readonly/manual + shard pairing with a clear error and
+        launches no spool — whether the shard arrived as a "+shard" string or the
+        shard=True flag. Harness-agnostic: it fires before any harness routes."""
         _spin = spin.fn if hasattr(spin, "fn") else spin
         with patch("spindle.SPINDLE_DIR", tmp_path):
             # If routing were reached, these would blow up — assert they are not.
             with patch("spindle._spin_sync", side_effect=AssertionError("must not launch")):
                 with patch("spindle._codex_spin_sync", side_effect=AssertionError("must not launch")):
                     result = asyncio.run(
-                        _spin("do something", permission=bad, working_dir=str(tmp_path), skeinless=True)
+                        _spin(
+                            "do something",
+                            permission=permission,
+                            shard=shard_flag,
+                            working_dir=str(tmp_path),
+                            skeinless=True,
+                        )
                     )
-        assert "not a valid tier" in result
         assert "no write tools" in result
         assert "careful+shard or shard" in result
         # No spool file was written (rejected before slot reservation).
         assert list(tmp_path.glob("*.json")) == []
+
+    def test_spin_sync_chokepoint_rejects_flag_form_no_spool(self, tmp_path):
+        """The _spin_sync chokepoint (spin() claude AND spool_retry) rejects
+        readonly/manual + shard=True before reserving a slot."""
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle._spawn_detached", side_effect=AssertionError("must not launch")):
+                result = _spin_sync(
+                    prompt="task",
+                    permission="manual",
+                    shard=True,
+                    system_prompt=None,
+                    working_dir=str(tmp_path),
+                    allowed_tools=None,
+                    tags=None,
+                    model=None,
+                    timeout=None,
+                    skeinless=True,
+                    env=None,
+                )
+        assert result.startswith("Error")
+        assert "no write tools" in result
+        assert list(tmp_path.glob("*.json")) == []
+
+    def test_stored_manual_shard_cannot_be_respun(self, tmp_path):
+        """A stored permission='manual+shard' spool is rejected on respin — it must
+        not escalate to bypassPermissions via _claude_permission_mode."""
+        stored = dict(
+            id="stored01",
+            status="complete",
+            session_id="sess-x",
+            harness="claude-code",
+            permission="manual+shard",
+            allowed_tools=PERMISSION_PROFILES["readonly"],
+            shard=dict(worktree_path=str(tmp_path), shard_id="sh"),
+        )
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool("stored01", stored)
+            with patch("spindle._count_running", return_value=0):
+                with patch("spindle._monitor_spool"):
+                    with patch("spindle._spawn_detached", side_effect=AssertionError("must not launch")):
+                        result = _respin_sync("stored01", "go")
+        assert result.startswith("Error")
+        assert "no write tools" in result
+        assert set(p.name for p in tmp_path.glob("*.json")) == set(["stored01.json"])
+
+    def test_stored_manual_shard_cannot_be_retried(self, tmp_path):
+        """spool_retry of a stored manual+shard spool is rejected at the _spin_sync
+        chokepoint and launches no new spool."""
+        _retry = spool_retry.fn if hasattr(spool_retry, "fn") else spool_retry
+        stored = dict(
+            id="stored02",
+            status="error",
+            harness="claude-code",
+            permission="manual+shard",
+            allowed_tools=PERMISSION_PROFILES["readonly"],
+            working_dir=str(tmp_path),
+            shard=dict(worktree_path=str(tmp_path), shard_id="sh"),
+        )
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool("stored02", stored)
+            with patch("spindle._count_running", return_value=0):
+                with patch("spindle._spawn_detached", side_effect=AssertionError("must not launch")):
+                    result = asyncio.run(_retry("stored02"))
+        assert "no write tools" in result
+        assert set(p.name for p in tmp_path.glob("*.json")) == set(["stored02.json"])
+
+    def test_valid_shard_tiers_still_launch(self, tmp_path):
+        """careful+shard, shard, auto+shard still resolve and build a command (no
+        conflict); bare readonly/manual still emit acceptEdits + the readonly allowlist."""
+        shard_info = dict(worktree_path=str(tmp_path), shard_id="shard-test")
+        for perm in ("careful+shard", "shard", "auto+shard"):
+            cmd = _spin_claude_cmd(tmp_path, perm, shard_info=shard_info)
+            assert "--permission-mode" in cmd
+        for perm in ("readonly", "manual"):
+            cmd = _spin_claude_cmd(tmp_path, perm)
+            assert _mode_of(cmd) == "acceptEdits"
+            assert _allowed_tools_of(cmd) == PERMISSION_PROFILES["readonly"]
 
 
 class TestSpoolStorage:
