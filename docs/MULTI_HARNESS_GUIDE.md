@@ -167,7 +167,7 @@ spool_id = spin(
 - `tags` - Organization tags
 
 **Claude-specific parameters:**
-- `permission` - "readonly", "careful", "full", "shard", "careful+shard", "research", "research+shard"
+- `permission` - "readonly" (alias "manual"), "careful" (default, = auto), "full", "shard", "careful+shard", "manual+shard", "research", "research+shard", "auto", "auto+shard"
 - `shard` - Auto-create git worktree
 - `system_prompt` - Custom system instructions
 - `allowed_tools` - Explicit tool permissions
@@ -354,13 +354,15 @@ spin("Add input validation to the API endpoints", harness="kimi", working_dir="/
 
 ### Claude Code Permissions
 
-Claude uses a tool-based permission system:
+Claude maps each tier to a `--permission-mode` (and, for the tight tier, an `--allowedTools` allowlist):
 
-- **readonly** - Only read operations (Read, Grep, Glob, safe bash)
-- **careful** - Read/write with limited bash (default)
-- **full** - No restrictions
-- **shard** - Full permissions + isolated git worktree
-- **careful+shard** - Careful permissions + worktree
+- **readonly** (alias **manual**) - the one tight, no-exec tier: Read, Grep, Glob, safe bash (ls, cat, git status/log/diff). `acceptEdits` + an allowlist; no python, no find, no write.
+- **careful** (default) - now an alias of **auto**: `--permission-mode auto`, no allowlist. Claude Code vets each tool call server-side on intent. (Previously a Bash allowlist that gated capability on command phrasing rather than security; `auto` removes that gate.)
+- **full** - No restrictions (`bypassPermissions`)
+- **shard** - Full permissions + isolated git worktree (`bypassPermissions` inside the bwrap-contained shard)
+- **careful+shard** - `auto` semantics + worktree (`bypassPermissions` inside the bwrap-contained shard)
+- **manual+shard** - readonly allowlist + worktree (`acceptEdits`; the tight tier, isolated)
+- **auto** / **auto+shard** - explicit aliases of the careful default
 - **research** - WebFetch/WebSearch/curl/jq enabled; no python/find/Write/Edit; requires `research_target` (site:, file:, or dir: prefix)
 - **research+shard** - research tools + isolated git worktree
 
