@@ -407,13 +407,23 @@ regardless of flag order. `codex exec --full-auto --sandbox read-only` reports
 workspace. Spindle therefore never passes it; `codex exec` is already non-interactive
 (`approval: never`) without it.
 
-**Enforcement varies by codex version.** Under codex 0.144.4, a `sandbox_mode` in
-`~/.codex/config.toml` silently overrides `--sandbox` — a read-only spool runs at the
-config's more permissive tier with exit 0 and no warning. 0.125.0 gives the CLI flag
-precedence over that same config. Because PATH decides which codex runs (a login shell and
-the spindle server often resolve different installs), each spool records the resolved
-`codex_bin` and `codex_version`, and spindle prints a warning when the version is outside
-`CODEX_SANDBOX_VERIFIED_VERSIONS`.
+**Enforcement is not guaranteed and is not a property of the version string.** A
+`sandbox_mode` in `~/.codex/config.toml` can override `--sandbox`, and the vendored sandbox
+can fail to spawn — either way a read-only spool may run with no write boundary while the
+command line and the spool record still say read-only. The *same* codex version has been
+observed both enforcing and failing open, so a version allow/deny list cannot capture it.
+
+Spindle therefore decides by **behavior, not version**. `_codex_sandbox_enforces()` probes
+the resolved binary once (cached per path/version/mtime for the process lifetime) using
+codex's no-model `codex sandbox` subcommand under read-only: it runs a shell command that
+tries to write inside a scratch cwd and checks the write was blocked. It adds no model call
+and is off the per-spool hot path. When a **restrictive** tier (`read-only` /
+`workspace-write`) is requested and the probe reports the sandbox is not enforcing, the
+launch is **refused** — `_codex_spin_sync`/`_codex_respin_sync` return an error and persist a
+spool with `status: "error"` and a `sandbox_error` field (visible via `unspool`/`spool_info`)
+rather than silently running unsandboxed. `danger-full-access` (the `full` tier) asks for no
+sandbox, so it is never probed and never refused. Each spool still records the resolved
+`codex_bin` and `codex_version` for provenance, but they no longer gate anything.
 
 ## Spool Management
 
@@ -517,14 +527,18 @@ codex in its own sandbox must bind `~/.codex` read-write (spindle's `_codex_bwra
 does). Note codex refuses to create the helper when `CODEX_HOME` is under a temp dir
 (`Refusing to create helper binaries under temporary dir "/tmp"`).
 
-**Error:** a `readonly` spool wrote somewhere it should not have.
+**Error:** a restrictive codex spool was refused with a `REFUSED: codex sandbox is not
+enforcing …` error.
 
-**Cause:** the resolved codex does not honor `--sandbox`. Check what actually ran:
+**Cause:** the enforcement probe found that the resolved codex does not actually block writes
+under `--sandbox`, so spindle refused to launch rather than run the spool unsandboxed. Check
+what was resolved and why:
 ```bash
-spindle unspool <spool_id>   # the record carries codex_bin and codex_version
+spindle unspool <spool_id>   # the record carries codex_bin, codex_version, and sandbox_error
 ```
-Compare `codex_version` against `CODEX_SANDBOX_VERIFIED_VERSIONS`. Spindle warns on an
-unverified version, but the warning goes to the server log — the record is authoritative.
+Fix the codex install (or point PATH at a codex that enforces) and re-spin, or use
+`permission=full` to run intentionally without a sandbox. The probe fails closed, so an
+inconclusive probe (codex missing, `codex sandbox` erroring, a timeout) also refuses.
 
 ### Wrong Harness Used
 

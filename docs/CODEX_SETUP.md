@@ -52,9 +52,11 @@ on *its* PATH — a login shell and a long-lived server often resolve different 
 which codex && codex --version
 ```
 
-Enforcement is verified for the versions in `CODEX_SANDBOX_VERIFIED_VERSIONS`
-(`spindle/__init__.py`). Spindle warns on anything else and records the resolved
-`codex_bin` / `codex_version` on every spool.
+Enforcement is checked by behavior, not version: `_codex_sandbox_enforces()`
+(`spindle/__init__.py`) probes the resolved binary once with codex's no-model
+`codex sandbox` subcommand. A restrictive-tier spool whose binary does not actually enforce
+is refused rather than run unsandboxed. Every spool records the resolved `codex_bin` /
+`codex_version` for provenance.
 
 No kernel Landlock is required — see below.
 
@@ -368,15 +370,18 @@ cat ~/.spindle/<spool_id>.stderr
 
 ### Verify Sandbox Enforcement
 
-Check which codex spindle will resolve, and whether its enforcement is verified:
+Check which codex spindle will resolve, and whether it actually enforces (this runs the same
+behavioral probe spindle uses to decide whether to refuse a restrictive spool):
 ```python
-from spindle import CODEX_SANDBOX_VERIFIED_VERSIONS, _codex_cli_version, _resolve_codex_binary
+from spindle import _codex_cli_version, _codex_sandbox_enforces, _resolve_codex_binary
 
 binary = _resolve_codex_binary()
 version = _codex_cli_version(binary)
 print(f"codex: {binary} ({version})")
-print(f"enforcement verified: {version in CODEX_SANDBOX_VERIFIED_VERSIONS}")
+print(f"enforces sandbox: {_codex_sandbox_enforces(binary)}")
 ```
+If that prints `False`, spindle will refuse `readonly`/`careful` (and other restrictive)
+codex spools rather than run them unsandboxed.
 
 To confirm enforcement end-to-end, ask a read-only run to write and check nothing appears:
 ```bash
