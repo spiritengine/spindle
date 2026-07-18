@@ -123,6 +123,18 @@ class TestPermissionProfiles:
         assert tools == PERMISSION_PROFILES["readonly"]
         assert shard is False
 
+    def test_codex_sandbox_manual_maps_read_only(self):
+        """Finding A: on the codex path, manual maps to the read-only sandbox exactly
+        like readonly, not the workspace-write default. The base tier decides, so the
+        (chokepoint-rejected) readonly+shard / manual+shard spellings resolve here too."""
+        for perm in ("readonly", "manual", "readonly+shard", "manual+shard"):
+            assert _codex_sandbox_for_permission(perm, None) == "read-only", perm
+        # Write-capable tiers are unaffected by the fix.
+        assert _codex_sandbox_for_permission("careful", None) == "workspace-write"
+        assert _codex_sandbox_for_permission("shard", None) == "workspace-write"
+        assert _codex_sandbox_for_permission("full", None) == "danger-full-access"
+        assert _codex_sandbox_for_permission(None, None) == "workspace-write"
+
     def test_readonly_shard_conflict_flags_all_forms(self):
         """The no-write readonly/manual tier + a shard is flagged on the resolved
         (tier, use_shard) pair, whatever spelling carried the shard intent; valid
@@ -786,6 +798,45 @@ class TestClaudePermissionCommandShape:
         cmd = captured["cmd"]
         assert cmd[cmd.index("--permission-mode") + 1] == "auto"
         assert "--allowedTools" not in cmd
+
+    def test_expired_session_fallback_refuses_stored_manual_shard(self, tmp_path):
+        """Finding C: a stored readonly/manual + shard spool reaching the transcript
+        fallback is refused before spawning — it must not launch with bypassPermissions
+        via _claude_permission_mode. The failing spool is marked error, not retried.
+        The transcript is present, so a missing guard would spawn (and trip the guard
+        below) rather than silently bail."""
+        _write_spool(
+            "exp-orig-ms",
+            {
+                "id": "exp-orig-ms",
+                "status": "complete",
+                "session_id": "sess-exp-ms",
+                "harness": "claude-code",
+                "permission": "manual+shard",
+                "allowed_tools": PERMISSION_PROFILES["readonly"],
+                "shard": {"worktree_path": str(tmp_path), "shard_id": "sh"},
+                "working_dir": str(tmp_path),
+                "created_at": datetime.now().isoformat(),
+            },
+        )
+        transcript = _get_transcript_path("exp-orig-ms")
+        transcript.parent.mkdir(parents=True, exist_ok=True)
+        transcript.write_text("prior transcript")
+        failing = {
+            "id": "exp-fail-ms",
+            "status": "running",
+            "session_id": "sess-exp-ms",
+            "prompt": "Continue sess-exp-ms: keep going",
+            "working_dir": str(tmp_path),
+            "pid": None,
+        }
+
+        with patch("spindle._spawn_detached", side_effect=AssertionError("must not launch")):
+            assert _handle_expired_session("exp-fail-ms", failing) is True
+
+        refused = _read_spool("exp-fail-ms")
+        assert refused["status"] == "error"
+        assert "no write tools" in refused["error"]
 
     @pytest.mark.parametrize(
         "permission,shard_flag",
@@ -3485,6 +3536,79 @@ class TestSpinHarnesses:
         assert captured["sandbox"] == "workspace-write"
         assert captured["kwargs"]["require_research_target"] is True
 
+    def test_codex_manual_permission_maps_to_read_only_sandbox(self, tmp_path):
+        """Finding A: spin(harness='codex', permission='manual') resolves to the
+        read-only sandbox, exactly like readonly — not the workspace-write default."""
+        _spin = spin.fn if hasattr(spin, "fn") else spin
+        captured = {}
+
+        def fake_codex(prompt, working_dir, model, sandbox, timeout, tags, env, **kwargs):
+            captured["sandbox"] = sandbox
+            return "codex-manual"
+
+        with patch("spindle._codex_spin_sync", side_effect=fake_codex):
+            result = asyncio.run(
+                _spin(
+                    "inspect the tree",
+                    harness="codex",
+                    permission="manual",
+                    working_dir=str(tmp_path),
+                    skeinless=True,
+                )
+            )
+
+        assert result == "codex-manual"
+        assert captured["sandbox"] == "read-only"
+
+    def test_codex_spin_pins_sandbox_mode_config(self, tmp_path):
+        """Finding B: every codex exec launch pairs --sandbox <mode> with a matching
+        -c sandbox_mode=<mode>, so ~/.codex/config.toml can never widen the tier."""
+        captured_cmd = []
+
+        def fake_spawn(spool_id, cmd, cwd, env=None):
+            captured_cmd.extend(cmd)
+            return 12345
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle._count_running", return_value=0):
+                with patch("spindle._codex_sandbox_enforces", return_value=True):
+                    with patch("spindle._spawn_detached", side_effect=fake_spawn):
+                        result = _codex_spin_sync(
+                            prompt="inspect the tree",
+                            working_dir=str(tmp_path),
+                            model=None,
+                            sandbox="read-only",
+                            timeout=None,
+                            tags=None,
+                            env=None,
+                            permission="manual",
+                        )
+
+        assert result.startswith("codex-")
+        sandbox_idx = captured_cmd.index("--sandbox")
+        assert captured_cmd[sandbox_idx + 1] == "read-only"
+        # The matching -c sandbox_mode=read-only pins the tier against a config.toml override.
+        c_positions = [i for i, tok in enumerate(captured_cmd) if tok == "-c"]
+        assert any(captured_cmd[i + 1] == "sandbox_mode=read-only" for i in c_positions), captured_cmd
+
+    def test_codex_sandbox_probe_logs_fail_closed_reason(self, caplog):
+        """Finding D: a fail-closed probe logs why (the binary + read-only mode + the
+        reason) instead of swallowing it, so a refusal that blocks real spools is
+        debuggable. Here no CLI shape emits the marker, so the probe fails closed."""
+        import logging
+
+        # Every candidate shape returns clean output WITHOUT the probe marker, so the
+        # command is treated as never-having-run -> no known shape -> fail closed.
+        clean = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+        with caplog.at_level(logging.WARNING):
+            with patch("spindle.subprocess.run", return_value=clean):
+                result = spindle._codex_sandbox_probe("/fake/codex/bin")
+
+        assert result is False
+        assert "no known CLI shape" in caplog.text
+        assert "/fake/codex/bin" in caplog.text
+        assert "read-only" in caplog.text
+
     def test_auto_permission_on_codex_returns_error(self):
         """permission='auto' on codex must return an error, not silently degrade."""
         _spin = spin.fn if hasattr(spin, "fn") else spin
@@ -4480,6 +4604,42 @@ class TestCodexRespinPreservesGitAccess:
         resume_idx = cmd.index("resume")
         assert cd_idx < resume_idx, f"Expected --cd before resume in codex respin command, got {cmd!r}"
         assert cmd[cd_idx + 1] == str(worktree_path)
+
+    def test_codex_respin_pins_sandbox_mode_config(self, tmp_path):
+        """Finding B: a codex respin also pairs --sandbox <tier> with a matching
+        -c sandbox_mode=<tier>, so config.toml can't widen the resumed tier."""
+        session_id = "codex-session-pin"
+        original_spool = {
+            "id": "codex-original-pin",
+            "status": "complete",
+            "session_id": session_id,
+            "working_dir": str(tmp_path),
+            "harness": "codex",
+            "permission": "readonly",
+            "sandbox": "read-only",
+            "tags": ["codex"],
+        }
+        captured_cmd = []
+
+        def fake_detached(spool_id, cmd, cwd, env=None):
+            captured_cmd.append(list(cmd))
+            return 99999
+
+        spindle_state = tmp_path / "spindle_state"
+        spindle_state.mkdir()
+        with patch("spindle.SPINDLE_DIR", spindle_state):
+            _write_spool(original_spool["id"], original_spool)
+            with patch("spindle._spawn_detached", side_effect=fake_detached):
+                with patch("spindle._count_running", return_value=0):
+                    with patch("spindle._codex_sandbox_enforces", return_value=True):
+                        _codex_respin_sync(session_id, "follow up")
+
+        assert len(captured_cmd) == 1
+        cmd = captured_cmd[0]
+        sandbox_idx = cmd.index("--sandbox")
+        assert cmd[sandbox_idx + 1] == "read-only"
+        c_positions = [i for i, tok in enumerate(cmd) if tok == "-c"]
+        assert any(cmd[i + 1] == "sandbox_mode=read-only" for i in c_positions), cmd
 
     def _make_respin_spool(self, tmp_path, session_id, worktree_path):
         return {
