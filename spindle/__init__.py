@@ -21,6 +21,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -4966,25 +4967,33 @@ async def spool_info(spool_id: str) -> str:
 # ============================================================================
 
 
-# Codex CLI versions whose --sandbox flag is verified to actually enforce.
-#
 # Codex sandboxes with its own vendored bubblewrap + seccomp and does not need kernel
-# Landlock, so a pre-5.13 kernel is no reason to skip --sandbox. Verified 2026-07-16 on
-# kernel 5.4 (no Landlock): under 0.125.0, --sandbox read-only blocks writes outside the
-# workspace and --sandbox workspace-write permits them only inside cwd.
+# Landlock, so a pre-5.13 kernel is no reason to skip --sandbox. But enforcement is not a
+# property of the version string: the same codex version has been observed both enforcing
+# --sandbox correctly and silently running the command UNSANDBOXED (fail open) — e.g. a
+# sandbox_mode in ~/.codex/config.toml overriding the flag, or the vendored sandbox failing
+# to spawn. A read-only spool that fails open runs with no write boundary while the record
+# still says read-only: false provenance a reviewer cannot see.
 #
-# The set is pinned per-version because enforcement is not stable across upgrades: under
-# 0.144.4 a sandbox_mode in ~/.codex/config.toml silently overrides --sandbox, so a
-# read-only spool runs at the config's (more permissive) mode with no warning and exit 0.
-# 0.125.0 gives the CLI flag precedence over that same config. Which binary PATH resolves
-# therefore decides whether a spool is sandboxed at all — hence the per-spool record.
-CODEX_SANDBOX_VERIFIED_VERSIONS = {"0.125.0"}
-
-# Versions verified to NOT honor --sandbox. Warned about by name, since a silent
-# fail-open is the exact failure this recording is meant to make visible.
-CODEX_SANDBOX_KNOWN_BAD_VERSIONS = {"0.144.4"}
-
+# So enforcement is decided by BEHAVIOR, not version. _codex_sandbox_enforces() probes the
+# resolved binary once and a restrictive-tier launch is REFUSED when the probe says the
+# sandbox is not enforcing (see _codex_spin_sync / _codex_respin_sync). The version is still
+# recorded per spool, for provenance only — it no longer gates anything.
 _CODEX_VERSION_CACHE: Dict[str, Optional[str]] = {}
+
+# Cached enforcement-probe results, keyed by (path, version, mtime) so a reinstall or
+# upgrade re-probes. Process-lifetime only: the probe is a local no-model exec, so running
+# it at most once per binary keeps it off the per-spool hot path entirely.
+_CODEX_SANDBOX_ENFORCES_CACHE: Dict[tuple, bool] = {}
+
+# Printed by the sandboxed probe command to stdout. Its presence proves the command
+# actually executed under the sandbox, which is what separates "write was blocked"
+# (enforcing) from "the probe never ran" (inconclusive -> fail closed).
+_CODEX_SANDBOX_PROBE_MARKER = "SPINDLE_CODEX_SANDBOX_PROBE_RAN"
+
+# Tiers that promise a write boundary. danger-full-access asks for no sandbox, so there is
+# nothing to enforce and nothing to refuse.
+_CODEX_RESTRICTIVE_SANDBOX_MODES = frozenset({"read-only", "workspace-write"})
 
 
 def _resolve_codex_binary() -> Optional[str]:
@@ -5025,30 +5034,156 @@ def _codex_cli_version(binary: Optional[str]) -> Optional[str]:
     return version
 
 
-def _codex_sandbox_enforcement_warning(
-    binary: Optional[str],
-    version: Optional[str],
+def _codex_sandbox_probe_key(codex_bin: str) -> tuple:
+    """Cache key that changes when the binary is replaced, so an upgrade re-probes."""
+    try:
+        mtime = os.path.getmtime(codex_bin)
+    except OSError:
+        mtime = None
+    return (codex_bin, _codex_cli_version(codex_bin), mtime)
+
+
+def _codex_sandbox_probe_argvs(codex_bin: str, shell_cmd: str) -> list:
+    """Candidate no-model `codex sandbox` invocations, most-current CLI shape first.
+
+    codex's no-model sandbox-exec has changed shape across versions: 0.144.x runs the command
+    directly (`codex sandbox -- <cmd>`), while 0.125.x nests it under a platform subcommand
+    (`codex sandbox linux -- <cmd>`). Each is tried until one actually executes the command
+    (proven by the stdout marker); a shape that is wrong for this version simply never runs.
+    sandbox_mode is forced to read-only via -c so the reading does not depend on config.toml.
+    """
+    base = [codex_bin, "-c", "sandbox_mode=read-only", "sandbox"]
+    return [
+        base + ["--", "/bin/sh", "-c", shell_cmd],  # codex >= 0.144.x
+        base + ["linux", "--", "/bin/sh", "-c", shell_cmd],  # codex ~0.125.x
+    ]
+
+
+def _codex_sandbox_probe(codex_bin: str) -> bool:
+    """One uncached run of the enforcement probe. See _codex_sandbox_enforces.
+
+    True only on a definite "the sandbox blocked the write" reading. Any other outcome —
+    the write succeeded (fail open), no known CLI shape executed the command, an error or
+    timeout — returns False, so uncertainty fails closed.
+    """
+    probe_dir = None
+    try:
+        probe_dir = tempfile.mkdtemp(prefix="spindle-codex-probe-")
+        target = os.path.join(probe_dir, "enforce_probe.txt")
+        # `echo <marker>` proves the command executed under the sandbox; the write to the
+        # relative path (resolved against the probe cwd) is what read-only must block. This
+        # runs with NO model turn, so it never adds a model call.
+        shell_cmd = f"echo {_CODEX_SANDBOX_PROBE_MARKER}; printf BROKEN > enforce_probe.txt"
+        for argv in _codex_sandbox_probe_argvs(codex_bin, shell_cmd):
+            Path(target).unlink(missing_ok=True)  # no stale file from a prior shape
+            try:
+                proc = subprocess.run(argv, cwd=probe_dir, capture_output=True, text=True, timeout=30)
+            except Exception:
+                continue
+            if _CODEX_SANDBOX_PROBE_MARKER not in (proc.stdout or ""):
+                continue  # wrong CLI shape for this version — the command never ran
+            try:
+                wrote = os.path.getsize(target) > 0
+            except OSError:
+                wrote = False
+            # The command demonstrably ran: blocked write -> enforcing, landed write -> fail
+            # open. This shape is authoritative; do not fall through to another.
+            return not wrote
+        # No known CLI shape executed the probe — inconclusive.
+        return False
+    except Exception:
+        return False
+    finally:
+        if probe_dir:
+            shutil.rmtree(probe_dir, ignore_errors=True)
+
+
+def _codex_sandbox_enforces(codex_bin: Optional[str]) -> bool:
+    """Whether `codex_bin` actually enforces its sandbox right now.
+
+    Behavioral, not version-based: runs codex's no-model `codex sandbox` subcommand under
+    read-only, attempts a write inside a scratch cwd, and reports whether the write was
+    BLOCKED. Cached per (path, version, mtime) for the process lifetime, so it runs at most
+    once per binary — never per spool, never a model call.
+
+    Fails closed: a missing binary, an inconclusive probe, or any error returns False.
+    """
+    if not codex_bin:
+        return False
+
+    key = _codex_sandbox_probe_key(codex_bin)
+    cached = _CODEX_SANDBOX_ENFORCES_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    result = _codex_sandbox_probe(codex_bin)
+    _CODEX_SANDBOX_ENFORCES_CACHE[key] = result
+    return result
+
+
+def _codex_sandbox_refusal(
     sandbox: Optional[str],
+    permission: Optional[str],
+    codex_bin: Optional[str],
+    codex_version: Optional[str],
 ) -> Optional[str]:
-    """Warning text if `sandbox` may not be enforced by this binary, else None."""
-    if sandbox == "danger-full-access":
-        # Nothing to enforce; the tier asks for an unsandboxed run.
+    """Refusal message if a restrictive-tier launch must be blocked, else None.
+
+    A restrictive tier (read-only / workspace-write) promises a write boundary. If the
+    resolved codex binary does not actually enforce its sandbox, running the spool anyway
+    would silently drop that boundary while the record still claims it — so refuse loudly.
+    danger-full-access asks for no sandbox, so it is never refused.
+    """
+    if sandbox not in _CODEX_RESTRICTIVE_SANDBOX_MODES:
         return None
-    if version in CODEX_SANDBOX_VERIFIED_VERSIONS:
+    if _codex_sandbox_enforces(codex_bin):
         return None
 
-    verified = ", ".join(sorted(CODEX_SANDBOX_VERIFIED_VERSIONS))
-    if version in CODEX_SANDBOX_KNOWN_BAD_VERSIONS:
-        return (
-            f"[Spindle] WARNING: codex {version} ({binary}) is known to ignore --sandbox when "
-            f"~/.codex/config.toml sets sandbox_mode — this {sandbox!r} spool may run with no "
-            f"sandbox at all. Verified-enforcing versions: {verified}."
-        )
+    tier = permission or sandbox
     return (
-        f"[Spindle] WARNING: codex sandbox enforcement is unverified for version "
-        f"{version or 'unknown'} ({binary or 'codex not found on PATH'}) — this {sandbox!r} "
-        f"spool may not be enforced. Verified-enforcing versions: {verified}."
+        f"REFUSED: codex sandbox is not enforcing on {codex_bin or 'codex (not found on PATH)'} "
+        f"({codex_version or 'unknown version'}); refusing to run a {tier} spool (sandbox "
+        f"{sandbox}) unsandboxed. Fix the codex install or use permission=full to run without "
+        f"a sandbox."
     )
+
+
+def _persist_codex_sandbox_refusal(
+    spool_id: str,
+    message: str,
+    *,
+    sandbox: Optional[str],
+    permission: Optional[str],
+    codex_bin: Optional[str],
+    codex_version: Optional[str],
+    session_id: Optional[str] = None,
+) -> str:
+    """Record a refused (would-be-unsandboxed) launch as an error spool and return the error.
+
+    The refusal is visible both ways the brief requires: the returned string, and a
+    persisted spool with status "error" plus a `sandbox_error` field so unspool/spool_info
+    surface it. status "error" does not count against concurrency, so no slot leaks.
+    """
+    now = datetime.now().isoformat()
+    spool = {
+        "id": spool_id,
+        "status": "error",
+        "result": None,
+        "session_id": session_id,
+        "sandbox": sandbox,
+        "permission": permission,
+        "codex_bin": codex_bin,
+        "codex_version": codex_version,
+        "sandbox_error": message,
+        "error": message,
+        "harness": "codex",
+        "tags": ["codex"],
+        "pid": None,
+        "created_at": now,
+        "completed_at": now,
+    }
+    _write_spool(spool_id, spool)
+    return f"Error: {message} (spool {spool_id})"
 
 
 def _codex_bwrap_wrap(
@@ -5170,6 +5305,24 @@ def _codex_spin_sync(
     except ValueError as exc:
         return f"Error: {exc}"
 
+    # Fail closed: for a restrictive tier, refuse to launch when the resolved codex binary
+    # does not actually enforce its sandbox. Checked here — before any slot is reserved or
+    # shard created — so a refusal leaves nothing to clean up. The probe is cached per
+    # binary, so this is not a per-spool cost.
+    effective_sandbox = sandbox or "workspace-write"
+    codex_bin = _resolve_codex_binary()
+    codex_version = _codex_cli_version(codex_bin)
+    refusal = _codex_sandbox_refusal(effective_sandbox, permission, codex_bin, codex_version)
+    if refusal:
+        return _persist_codex_sandbox_refusal(
+            "codex-" + str(uuid.uuid4())[:8],
+            refusal,
+            sandbox=effective_sandbox,
+            permission=permission,
+            codex_bin=codex_bin,
+            codex_version=codex_version,
+        )
+
     # Generate spool ID
     spool_id = "codex-" + str(uuid.uuid4())[:8]
 
@@ -5244,13 +5397,8 @@ Your task:
     # --sandbox is always passed and always decides the tier. It is stated explicitly rather
     # than left to ~/.codex/config.toml's sandbox_mode, so a spool's isolation comes from the
     # permission it was spun with and not from whatever the local config happens to say.
-    effective_sandbox = sandbox or "workspace-write"
-
-    codex_bin = _resolve_codex_binary()
-    codex_version = _codex_cli_version(codex_bin)
-    enforcement_warning = _codex_sandbox_enforcement_warning(codex_bin, codex_version, effective_sandbox)
-    if enforcement_warning:
-        print(enforcement_warning)
+    # effective_sandbox / codex_bin / codex_version were resolved above, where the fail-closed
+    # enforcement check runs.
 
     # --json for structured output.
     #
@@ -5410,9 +5558,20 @@ def _codex_respin_sync(session_id: str, prompt: str) -> str:
 
     codex_bin = _resolve_codex_binary()
     codex_version = _codex_cli_version(codex_bin)
-    enforcement_warning = _codex_sandbox_enforcement_warning(codex_bin, codex_version, sandbox)
-    if enforcement_warning:
-        print(enforcement_warning)
+    # Fail closed: a respin at a restrictive tier is refused when the binary does not enforce
+    # its sandbox, exactly like a fresh spin. The reserved slot is reused for the error
+    # record (status "error" frees it), so no slot leaks.
+    refusal = _codex_sandbox_refusal(sandbox, permission, codex_bin, codex_version)
+    if refusal:
+        return _persist_codex_sandbox_refusal(
+            spool_id,
+            refusal,
+            sandbox=sandbox,
+            permission=permission,
+            codex_bin=codex_bin,
+            codex_version=codex_version,
+            session_id=session_id,
+        )
 
     # Re-grant the original run's writable research target; `resume` inherits neither the
     # sandbox tier nor its --add-dir grants, so without this a research respin runs

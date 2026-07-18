@@ -20,7 +20,6 @@ import spindle
 # Import the module to test
 from spindle import (
     CLAUDE_MODEL_ALIASES,
-    CODEX_SANDBOX_KNOWN_BAD_VERSIONS,
     DEFAULT_REVIEW_TIMEOUT,
     GEMINI_MODEL_ALIASES,
     KIMI_DEFAULT_MODEL,
@@ -3360,18 +3359,19 @@ class TestSpinHarnesses:
 
         with patch("spindle.SPINDLE_DIR", tmp_path):
             with patch("spindle._count_running", return_value=0):
-                with patch("spindle._spawn_detached", side_effect=fake_spawn):
-                    result = _codex_spin_sync(
-                        prompt="research a topic",
-                        working_dir=str(tmp_path),
-                        model=None,
-                        sandbox="workspace-write",
-                        timeout=None,
-                        tags=None,
-                        env=None,
-                        research_target=f"file:{target}",
-                        require_research_target=True,
-                    )
+                with patch("spindle._codex_sandbox_enforces", return_value=True):
+                    with patch("spindle._spawn_detached", side_effect=fake_spawn):
+                        result = _codex_spin_sync(
+                            prompt="research a topic",
+                            working_dir=str(tmp_path),
+                            model=None,
+                            sandbox="workspace-write",
+                            timeout=None,
+                            tags=None,
+                            env=None,
+                            research_target=f"file:{target}",
+                            require_research_target=True,
+                        )
 
         assert result.startswith("codex-")
         sandbox_idx = captured_cmd.index("--sandbox")
@@ -3931,16 +3931,17 @@ class TestDetectExistingShard:
                 with patch("spindle._spawn_shard", side_effect=tracking_spawn):
                     with patch("spindle._spawn_detached", side_effect=fake_detached):
                         with patch("spindle._count_running", return_value=0):
-                            _codex_spin_sync(
-                                "pwd",
-                                wt_path,
-                                None,
-                                None,
-                                None,
-                                None,
-                                None,
-                                shard=True,
-                            )
+                            with patch("spindle._codex_sandbox_enforces", return_value=True):
+                                _codex_spin_sync(
+                                    "pwd",
+                                    wt_path,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    shard=True,
+                                )
 
         assert spawn_calls == [], (
             f"_spawn_shard called {len(spawn_calls)} time(s); _codex_spin_sync "
@@ -4072,17 +4073,18 @@ class TestShardSpawnPreamblesAndCodexCd:
                 with patch("spindle._has_skein", return_value=True):
                     with patch("spindle._spawn_shard", return_value=(fake_shard, None)):
                         with patch("spindle._detect_existing_shard", return_value=None):
-                            with patch("spindle._spawn_detached", side_effect=fake_detached):
-                                _codex_spin_sync(
-                                    "do codex shard work",
-                                    str(tmp_path),
-                                    None,
-                                    None,
-                                    None,
-                                    None,
-                                    None,
-                                    shard=True,
-                                )
+                            with patch("spindle._codex_sandbox_enforces", return_value=True):
+                                with patch("spindle._spawn_detached", side_effect=fake_detached):
+                                    _codex_spin_sync(
+                                        "do codex shard work",
+                                        str(tmp_path),
+                                        None,
+                                        None,
+                                        None,
+                                        None,
+                                        None,
+                                        shard=True,
+                                    )
 
         assert len(captured_cmd) == 1
         cmd = captured_cmd[0]
@@ -4109,17 +4111,18 @@ class TestShardSpawnPreamblesAndCodexCd:
                     with patch("spindle._spawn_shard", return_value=(fake_shard, None)):
                         with patch("spindle._detect_existing_shard", return_value=None):
                             with patch("shutil.which", return_value="/usr/bin/bwrap"):
-                                with patch("spindle._spawn_detached", side_effect=fake_detached):
-                                    _codex_spin_sync(
-                                        "do codex shard work",
-                                        str(tmp_path),
-                                        None,
-                                        None,
-                                        None,
-                                        None,
-                                        None,
-                                        shard=True,
-                                    )
+                                with patch("spindle._codex_sandbox_enforces", return_value=True):
+                                    with patch("spindle._spawn_detached", side_effect=fake_detached):
+                                        _codex_spin_sync(
+                                            "do codex shard work",
+                                            str(tmp_path),
+                                            None,
+                                            None,
+                                            None,
+                                            None,
+                                            None,
+                                            shard=True,
+                                        )
 
         assert len(captured_cmd) == 1
         cmd = captured_cmd[0]
@@ -4154,17 +4157,18 @@ class TestShardSpawnPreamblesAndCodexCd:
                     with patch("spindle._spawn_shard", return_value=(fake_shard, None)):
                         with patch("spindle._detect_existing_shard", return_value=None):
                             with patch("shutil.which", return_value=None):
-                                with patch("spindle._spawn_detached", side_effect=fake_detached):
-                                    _codex_spin_sync(
-                                        "do codex shard work",
-                                        str(tmp_path),
-                                        None,
-                                        None,
-                                        None,
-                                        None,
-                                        None,
-                                        shard=True,
-                                    )
+                                with patch("spindle._codex_sandbox_enforces", return_value=True):
+                                    with patch("spindle._spawn_detached", side_effect=fake_detached):
+                                        _codex_spin_sync(
+                                            "do codex shard work",
+                                            str(tmp_path),
+                                            None,
+                                            None,
+                                            None,
+                                            None,
+                                            None,
+                                            shard=True,
+                                        )
 
         assert len(captured_cmd) == 1
         cmd = captured_cmd[0]
@@ -4322,7 +4326,8 @@ class TestCodexRespinPreservesGitAccess:
             _write_spool(original_id, original_spool)
             with patch("spindle._spawn_detached", side_effect=fake_detached):
                 with patch("spindle._count_running", return_value=0):
-                    _codex_respin_sync(session_id, "follow up")
+                    with patch("spindle._codex_sandbox_enforces", return_value=True):
+                        _codex_respin_sync(session_id, "follow up")
 
         assert len(captured_cmd) == 1, "Expected one spawn for codex respin"
         cmd = captured_cmd[0]
@@ -4384,7 +4389,8 @@ class TestCodexRespinPreservesGitAccess:
             _write_spool(original_spool["id"], original_spool)
             with patch("spindle._spawn_detached", side_effect=fake_detached):
                 with patch("spindle._count_running", return_value=0):
-                    _codex_respin_sync(session_id, "follow up")
+                    with patch("spindle._codex_sandbox_enforces", return_value=True):
+                        _codex_respin_sync(session_id, "follow up")
 
         assert len(captured_cmd) == 1, "Expected one spawn for codex respin"
         cmd = captured_cmd[0]
@@ -4428,7 +4434,8 @@ class TestCodexRespinPreservesGitAccess:
             with patch("spindle._spawn_detached", side_effect=fake_detached):
                 with patch("spindle._count_running", return_value=0):
                     with patch("shutil.which", return_value="/usr/bin/bwrap"):
-                        _codex_respin_sync(session_id, "follow up")
+                        with patch("spindle._codex_sandbox_enforces", return_value=True):
+                            _codex_respin_sync(session_id, "follow up")
 
         assert len(captured_cmd) == 1, "Expected one spawn for codex respin"
         cmd = captured_cmd[0]
@@ -4462,7 +4469,8 @@ class TestCodexRespinPreservesGitAccess:
             with patch("spindle._spawn_detached", side_effect=fake_detached):
                 with patch("spindle._count_running", return_value=0):
                     with patch("shutil.which", return_value=None):
-                        _codex_respin_sync(session_id, "follow up")
+                        with patch("spindle._codex_sandbox_enforces", return_value=True):
+                            _codex_respin_sync(session_id, "follow up")
 
         assert len(captured_cmd) == 1
         cmd = captured_cmd[0]
@@ -4481,22 +4489,26 @@ class TestCodexSandboxEnforcement:
     """
 
     @contextmanager
-    def _captured_codex_spin(self, tmp_path, verified_version=True):
-        """Run _codex_spin_sync with a stable codex binary, capturing the spawned argv."""
+    def _captured_codex_spin(self, tmp_path, enforces=True):
+        """Run _codex_spin_sync with a stable codex binary, capturing the spawned argv.
+
+        The enforcement probe is stubbed (default: enforcing) so these tests never shell out
+        to a real codex; set enforces=False to drive the fail-closed refusal path.
+        """
         captured_cmd = []
 
         def fake_detached(spool_id, cmd, cwd, env=None):
             captured_cmd.append(list(cmd))
             return 99999
 
-        version = "0.125.0" if verified_version else "9.9.9-unverified"
         with patch("spindle.SPINDLE_DIR", tmp_path):
             with patch("spindle._count_running", return_value=0):
                 with patch("spindle._has_skein", return_value=False):
                     with patch("spindle._resolve_codex_binary", return_value="/fake/bin/codex"):
-                        with patch("spindle._codex_cli_version", return_value=version):
-                            with patch("spindle._spawn_detached", side_effect=fake_detached):
-                                yield captured_cmd
+                        with patch("spindle._codex_cli_version", return_value="0.125.0"):
+                            with patch("spindle._codex_sandbox_enforces", return_value=enforces):
+                                with patch("spindle._spawn_detached", side_effect=fake_detached):
+                                    yield captured_cmd
 
     @pytest.mark.parametrize(
         "permission,expected_sandbox",
@@ -4604,42 +4616,70 @@ class TestCodexSandboxEnforcement:
         assert spool["codex_bin"] == "/fake/bin/codex"
         assert spool["codex_version"] == "0.125.0"
 
-    def test_unverified_version_warns_loudly(self, tmp_path, capsys):
-        """An unverified codex must not silently drop enforcement."""
-        with self._captured_codex_spin(tmp_path, verified_version=False):
-            _codex_spin_sync("do work", str(tmp_path), None, "read-only", None, None, None, permission="readonly")
+    @pytest.mark.parametrize(
+        "permission,sandbox",
+        [("readonly", "read-only"), ("careful", "workspace-write"), (None, "workspace-write")],
+    )
+    def test_spin_refuses_restrictive_tier_when_sandbox_not_enforcing(self, tmp_path, permission, sandbox):
+        """A fail-open codex must not run a restrictive spool: refuse, launch nothing, record why."""
+        with self._captured_codex_spin(tmp_path, enforces=False) as captured_cmd:
+            result = _codex_spin_sync("do work", str(tmp_path), None, sandbox, None, None, None, permission=permission)
 
-        out = capsys.readouterr().out
-        assert "WARNING" in out
-        assert "9.9.9-unverified" in out
+        # No process launched.
+        assert captured_cmd == [], f"expected no launch on refusal, got {captured_cmd!r}"
 
-    def test_known_bad_version_is_named_in_the_warning(self, tmp_path, capsys):
-        """0.144.4 lets config.toml override --sandbox; say so rather than just 'unverified'."""
-        known_bad = sorted(CODEX_SANDBOX_KNOWN_BAD_VERSIONS)[0]
+        # The refusal is in the returned value...
+        assert "REFUSED" in result
+        assert "not enforcing" in result
+
+        # ...and persisted in the spool record so unspool/spool_info surface it.
+        spool_id = result.split("spool ")[-1].rstrip(")")
         with patch("spindle.SPINDLE_DIR", tmp_path):
-            with patch("spindle._count_running", return_value=0):
-                with patch("spindle._has_skein", return_value=False):
-                    with patch("spindle._resolve_codex_binary", return_value="/fake/bin/codex"):
-                        with patch("spindle._codex_cli_version", return_value=known_bad):
-                            with patch("spindle._spawn_detached", return_value=99999):
-                                _codex_spin_sync(
-                                    "do work", str(tmp_path), None, "read-only", None, None, None, permission="readonly"
-                                )
+            spool = _read_spool(spool_id)
+        assert spool["status"] == "error"
+        assert "REFUSED" in spool["sandbox_error"]
+        assert "REFUSED" in spool["error"]
+        assert spool["sandbox"] == sandbox
+        assert spool["codex_bin"] == "/fake/bin/codex"
 
-        out = capsys.readouterr().out
-        assert "WARNING" in out
-        assert known_bad in out
-        assert "config.toml" in out
+    def test_spin_does_not_refuse_full_access_when_sandbox_not_enforcing(self, tmp_path):
+        """danger-full-access asks for no sandbox, so a fail-open probe must not block it."""
+        with self._captured_codex_spin(tmp_path, enforces=False) as captured_cmd:
+            result = _codex_spin_sync(
+                "do work", str(tmp_path), None, "danger-full-access", None, None, None, permission="full"
+            )
 
-    def test_full_access_tier_does_not_warn(self, tmp_path, capsys):
-        """danger-full-access asks for no sandbox, so there is no enforcement to warn about."""
-        with self._captured_codex_spin(tmp_path, verified_version=False):
-            _codex_spin_sync("do work", str(tmp_path), None, "danger-full-access", None, None, None, permission="full")
+        assert "REFUSED" not in result
+        assert len(captured_cmd) == 1
+        cmd = captured_cmd[0]
+        assert cmd[cmd.index("--sandbox") + 1] == "danger-full-access"
 
-        assert "WARNING" not in capsys.readouterr().out
+    def test_spin_does_not_probe_for_full_access(self, tmp_path):
+        """The enforcement probe must not even run for a tier that expects no sandbox."""
+        with self._captured_codex_spin(tmp_path) as _:
+            with patch("spindle._codex_sandbox_enforces", side_effect=AssertionError("must not probe")):
+                result = _codex_spin_sync(
+                    "do work", str(tmp_path), None, "danger-full-access", None, None, None, permission="full"
+                )
+        assert result.startswith("codex-"), f"expected a spool id, got {result!r}"
 
-    def _respin_with_spool(self, tmp_path, original_spool):
-        """Run _codex_respin_sync against a stored spool, capturing the spawned argv."""
+    def test_enforcing_binary_is_not_refused(self, tmp_path):
+        """The healthy path: an enforcing binary runs a restrictive spool normally, no refusal."""
+        with self._captured_codex_spin(tmp_path, enforces=True) as captured_cmd:
+            result = _codex_spin_sync(
+                "do work", str(tmp_path), None, "read-only", None, None, None, permission="readonly"
+            )
+        assert result.startswith("codex-")
+        assert "REFUSED" not in result
+        assert len(captured_cmd) == 1
+
+    def _respin_with_spool(self, tmp_path, original_spool, enforces=True):
+        """Run _codex_respin_sync against a stored spool, capturing the spawned argv.
+
+        The enforcement probe is stubbed (default: enforcing); set enforces=False to drive
+        the fail-closed refusal path. When refused nothing spawns, so callers that expect a
+        refusal read the returned value / spool record rather than captured_cmd.
+        """
         captured_cmd = []
 
         def fake_detached(spool_id, cmd, cwd, env=None):
@@ -4652,10 +4692,12 @@ class TestCodexSandboxEnforcement:
             _write_spool(original_spool["id"], original_spool)
             with patch("spindle._resolve_codex_binary", return_value="/fake/bin/codex"):
                 with patch("spindle._codex_cli_version", return_value="0.125.0"):
-                    with patch("spindle._spawn_detached", side_effect=fake_detached):
-                        with patch("spindle._count_running", return_value=0):
-                            spool_id = _codex_respin_sync(original_spool["session_id"], "follow up")
-        return captured_cmd[0], spool_id, state
+                    with patch("spindle._codex_sandbox_enforces", return_value=enforces):
+                        with patch("spindle._spawn_detached", side_effect=fake_detached):
+                            with patch("spindle._count_running", return_value=0):
+                                result = _codex_respin_sync(original_spool["session_id"], "follow up")
+        cmd = captured_cmd[0] if captured_cmd else None
+        return cmd, result, state
 
     def test_respin_carries_the_tier(self, tmp_path):
         """A respin of a readonly session must stay read-only."""
@@ -4755,6 +4797,182 @@ class TestCodexSandboxEnforcement:
         cmd, _, _ = self._respin_with_spool(tmp_path, original)
 
         assert cmd[cmd.index("--sandbox") + 1] == "danger-full-access", f"got {cmd!r}"
+
+    def test_respin_refuses_restrictive_tier_when_sandbox_not_enforcing(self, tmp_path):
+        """A respin of a readonly session on a fail-open codex must refuse, like a fresh spin."""
+        original = {
+            "id": "codex-orig-refuse",
+            "status": "complete",
+            "session_id": "sess-refuse",
+            "working_dir": str(tmp_path),
+            "sandbox": "read-only",
+            "permission": "readonly",
+            "harness": "codex",
+            "tags": ["codex"],
+        }
+        cmd, result, state = self._respin_with_spool(tmp_path, original, enforces=False)
+
+        assert cmd is None, f"expected no launch on refusal, got {cmd!r}"
+        assert "REFUSED" in result
+        spool_id = result.split("spool ")[-1].rstrip(")")
+        with patch("spindle.SPINDLE_DIR", state):
+            spool = _read_spool(spool_id)
+        assert spool["status"] == "error"
+        assert "REFUSED" in spool["sandbox_error"]
+        assert spool["sandbox"] == "read-only"
+        assert spool["session_id"] == "sess-refuse"
+
+    def test_respin_does_not_refuse_full_access_when_sandbox_not_enforcing(self, tmp_path):
+        """A danger-full-access session respins normally even when the probe reports fail-open."""
+        original = {
+            "id": "codex-orig-full-noref",
+            "status": "complete",
+            "session_id": "sess-full-noref",
+            "working_dir": str(tmp_path),
+            "sandbox": "danger-full-access",
+            "permission": "full",
+            "harness": "codex",
+            "tags": ["codex"],
+        }
+        cmd, result, _ = self._respin_with_spool(tmp_path, original, enforces=False)
+
+        assert cmd is not None, "danger-full-access respin must not be refused"
+        assert "REFUSED" not in result
+        assert cmd[cmd.index("--sandbox") + 1] == "danger-full-access"
+
+
+class TestCodexSandboxEnforcesProbe:
+    """The behavioral sandbox probe (_codex_sandbox_enforces) and the fail-closed refusal.
+
+    Enforcement is decided by running codex's no-model `codex sandbox` under read-only and
+    checking a cwd write was BLOCKED — not by a version string. The probe must fail closed on
+    any inconclusive outcome, cache per binary, and never refuse a danger-full-access tier.
+    """
+
+    def _proc(self, stdout, returncode=0):
+        proc = MagicMock()
+        proc.stdout = stdout
+        proc.returncode = returncode
+        return proc
+
+    def test_probe_true_when_write_blocked_and_command_ran(self):
+        """Marker on stdout proves the command ran; a missing file means the write was blocked."""
+        with patch("spindle.subprocess.run", return_value=self._proc(f"{spindle._CODEX_SANDBOX_PROBE_MARKER}\n")):
+            assert spindle._codex_sandbox_probe("/fake/codex") is True
+
+    def test_probe_false_when_write_succeeded(self):
+        """Fail open: the command ran, but its write to cwd landed — the sandbox did not block."""
+
+        def run(cmd, **kwargs):
+            with open(os.path.join(kwargs["cwd"], "enforce_probe.txt"), "w") as fh:
+                fh.write("BROKEN")
+            return self._proc(f"{spindle._CODEX_SANDBOX_PROBE_MARKER}\n")
+
+        with patch("spindle.subprocess.run", side_effect=run):
+            assert spindle._codex_sandbox_probe("/fake/codex") is False
+
+    def test_probe_false_when_command_never_ran(self):
+        """No marker: the missing file is not evidence of a boundary — treat as not enforcing."""
+        with patch("spindle.subprocess.run", return_value=self._proc("codex: some error\n", returncode=1)):
+            assert spindle._codex_sandbox_probe("/fake/codex") is False
+
+    def test_probe_false_on_exception(self):
+        """A timeout or any error during the probe fails closed."""
+        with patch("spindle.subprocess.run", side_effect=subprocess.TimeoutExpired("codex", 30)):
+            assert spindle._codex_sandbox_probe("/fake/codex") is False
+
+    def test_probe_falls_through_to_next_cli_shape(self):
+        """When the first CLI shape does not run (wrong for this version), a later shape decides."""
+        calls = []
+
+        def run(cmd, **kwargs):
+            calls.append(cmd)
+            if len(calls) == 1:
+                # First shape: codex rejects it, the command never runs (no marker).
+                return self._proc("error: unrecognized subcommand\n", returncode=2)
+            # Second shape runs and the sandbox blocks the write (marker, no file).
+            return self._proc(f"{spindle._CODEX_SANDBOX_PROBE_MARKER}\n")
+
+        with patch("spindle.subprocess.run", side_effect=run):
+            assert spindle._codex_sandbox_probe("/fake/codex") is True
+        assert len(calls) == 2, "must try the next CLI shape when the first does not run"
+
+    def test_probe_fail_open_does_not_fall_through(self):
+        """A shape that runs and writes is authoritative fail-open — do not try another shape."""
+        calls = []
+
+        def run(cmd, **kwargs):
+            calls.append(cmd)
+            with open(os.path.join(kwargs["cwd"], "enforce_probe.txt"), "w") as fh:
+                fh.write("BROKEN")
+            return self._proc(f"{spindle._CODEX_SANDBOX_PROBE_MARKER}\n")
+
+        with patch("spindle.subprocess.run", side_effect=run):
+            assert spindle._codex_sandbox_probe("/fake/codex") is False
+        assert len(calls) == 1, "a definitive fail-open reading must not fall through"
+
+    def test_enforces_false_for_missing_binary(self):
+        assert spindle._codex_sandbox_enforces(None) is False
+
+    def test_enforces_is_cached_per_binary(self):
+        """The probe runs at most once per binary — never per spool."""
+        spindle._CODEX_SANDBOX_ENFORCES_CACHE.clear()
+        calls = []
+
+        def probe(codex_bin):
+            calls.append(codex_bin)
+            return True
+
+        with patch("spindle._codex_sandbox_probe", side_effect=probe):
+            with patch("spindle._codex_sandbox_probe_key", return_value=("/fake/codex", "0.144.4", 123.0)):
+                assert spindle._codex_sandbox_enforces("/fake/codex") is True
+                assert spindle._codex_sandbox_enforces("/fake/codex") is True
+        assert len(calls) == 1, f"probe must run at most once per binary, ran {len(calls)}x"
+        spindle._CODEX_SANDBOX_ENFORCES_CACHE.clear()
+
+    def test_enforces_reprobes_when_binary_changes(self):
+        """A changed mtime (reinstall/upgrade) invalidates the cache and re-probes."""
+        spindle._CODEX_SANDBOX_ENFORCES_CACHE.clear()
+        calls = []
+        keys = iter([("/fake/codex", "0.144.4", 1.0), ("/fake/codex", "0.144.4", 2.0)])
+
+        def probe(codex_bin):
+            calls.append(codex_bin)
+            return True
+
+        with patch("spindle._codex_sandbox_probe", side_effect=probe):
+            with patch("spindle._codex_sandbox_probe_key", side_effect=lambda b: next(keys)):
+                spindle._codex_sandbox_enforces("/fake/codex")
+                spindle._codex_sandbox_enforces("/fake/codex")
+        assert len(calls) == 2, "a changed binary must re-probe"
+        spindle._CODEX_SANDBOX_ENFORCES_CACHE.clear()
+
+    def test_refusal_none_for_danger_full_access_without_probing(self):
+        """danger-full-access expects no sandbox: never probe, never refuse."""
+        with patch("spindle._codex_sandbox_enforces", side_effect=AssertionError("must not probe")):
+            assert spindle._codex_sandbox_refusal("danger-full-access", "full", "/fake/codex", "0.144.4") is None
+
+    @pytest.mark.parametrize("sandbox", ["read-only", "workspace-write"])
+    def test_refusal_none_when_enforcing(self, sandbox):
+        with patch("spindle._codex_sandbox_enforces", return_value=True):
+            assert spindle._codex_sandbox_refusal(sandbox, "readonly", "/fake/codex", "0.144.4") is None
+
+    @pytest.mark.parametrize("sandbox", ["read-only", "workspace-write"])
+    def test_refusal_message_when_not_enforcing(self, sandbox):
+        with patch("spindle._codex_sandbox_enforces", return_value=False):
+            msg = spindle._codex_sandbox_refusal(sandbox, "readonly", "/fake/codex", "0.144.4")
+        assert msg is not None
+        assert "REFUSED" in msg
+        assert sandbox in msg
+        assert "/fake/codex" in msg
+        assert "0.144.4" in msg
+
+    @pytest.mark.skipif(spindle._resolve_codex_binary() is None, reason="codex not on PATH")
+    def test_real_codex_binary_enforces(self):
+        """Healthy path on this box: a real codex actually enforces, so it is never false-refused."""
+        spindle._CODEX_SANDBOX_ENFORCES_CACHE.clear()
+        assert spindle._codex_sandbox_enforces(spindle._resolve_codex_binary()) is True
+        spindle._CODEX_SANDBOX_ENFORCES_CACHE.clear()
 
 
 class TestDetectDefaultBranch:
