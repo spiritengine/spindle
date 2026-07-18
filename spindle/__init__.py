@@ -335,7 +335,11 @@ def _codex_sandbox_for_permission(
         if _research_target_is_file_or_dir(research_target):
             return "workspace-write"
         return "read-only"
-    if permission == "readonly":
+    if _base_permission_tier(permission) in NO_WRITE_TIERS:
+        # readonly and its alias manual are the tight, no-write inspection tier -> codex
+        # read-only. Match on the BASE tier so manual maps exactly like readonly (the
+        # incoherent readonly+shard / manual+shard spellings resolve here too, though the
+        # conflict check rejects them at every launch chokepoint before this is reached).
         return "read-only"
     if permission == "full" or (cli_shard_full_access and permission == "shard"):
         return "danger-full-access"
@@ -2090,6 +2094,23 @@ def _handle_expired_session(spool_id: str, spool: dict) -> bool:
     if not original_spool:
         return False
 
+    # Defense-in-depth: refuse a stored readonly/manual + shard spool before spawning, the
+    # same authoritative check _spin_sync/_respin_sync run at creation. Reachability is
+    # near-zero (creation rejects the pairing), but the transcript fallback below re-applies
+    # the tier via _claude_permission_mode, where a stored "manual+shard"/"readonly+shard"
+    # would resolve to bypassPermissions — so guard this chokepoint too instead of trusting an
+    # upstream check. Mark the spool error (loud, surfaced by unspool/spool_info) and stop.
+    orig_permission = original_spool.get("permission")
+    orig_use_shard = _permission_implies_shard(orig_permission) or bool(original_spool.get("shard"))
+    conflict = _readonly_shard_conflict_error(orig_permission, orig_use_shard)
+    if conflict:
+        logger.warning("spindle: expired-session fallback refused for %s: %s", spool_id, conflict)
+        spool["status"] = "error"
+        spool["error"] = f"Refused: {conflict}"
+        spool["completed_at"] = datetime.now().isoformat()
+        _write_spool(spool_id, spool)
+        return True
+
     # Check for transcript
     transcript_path = _get_transcript_path(original_spool["id"])
     if not transcript_path.exists():
@@ -2205,7 +2226,7 @@ def _monitor_spool(spool_id: str) -> None:
                     if "No conversation found with session ID" in stderr_content:
                         # Session expired - try transcript fallback
                         if _handle_expired_session(spool_id, spool):
-                            break  # Successfully retried with transcript
+                            break  # Handled: retried with transcript, or refused terminally
                 except IOError:
                     pass
 
@@ -5046,7 +5067,8 @@ def _codex_cli_version(binary: Optional[str]) -> Optional[str]:
         match = re.search(r"codex-cli\s+(\S+)", proc.stdout or "")
         if match:
             version = match.group(1)
-    except Exception:
+    except Exception as exc:
+        logger.warning("spindle: codex --version failed for %s: %s", binary, exc)
         version = None
 
     _CODEX_VERSION_CACHE[binary] = version
@@ -5057,7 +5079,8 @@ def _codex_sandbox_probe_key(codex_bin: str) -> tuple:
     """Cache key that changes when the binary is replaced, so an upgrade re-probes."""
     try:
         mtime = os.path.getmtime(codex_bin)
-    except OSError:
+    except OSError as exc:
+        logger.debug("spindle: codex sandbox probe-key mtime unavailable for %s: %s", codex_bin, exc)
         mtime = None
     return (codex_bin, _codex_cli_version(codex_bin), mtime)
 
@@ -5069,7 +5092,13 @@ def _codex_sandbox_probe_argvs(codex_bin: str, shell_cmd: str) -> list:
     directly (`codex sandbox -- <cmd>`), while 0.125.x nests it under a platform subcommand
     (`codex sandbox linux -- <cmd>`). Each is tried until one actually executes the command
     (proven by the stdout marker); a shape that is wrong for this version simply never runs.
-    sandbox_mode is forced to read-only via -c so the reading does not depend on config.toml.
+
+    read-only is forced via `-c sandbox_mode=read-only`, the SAME config override the real
+    spin/respin launch now pairs with its `--sandbox` flag (see _codex_spin_sync): a
+    command-line -c beats config.toml, so both probe and real launch resolve the tier the same
+    config-proof way and "probe enforces" faithfully predicts "real spin enforces". The
+    `codex sandbox` subcommand does not accept `--sandbox` (only `codex exec` does), so the tier
+    is pinned via `-c` alone here — do not add `--sandbox`, it errors and the shape never runs.
     """
     base = [codex_bin, "-c", "sandbox_mode=read-only", "sandbox"]
     return [
@@ -5097,20 +5126,35 @@ def _codex_sandbox_probe(codex_bin: str) -> bool:
             Path(target).unlink(missing_ok=True)  # no stale file from a prior shape
             try:
                 proc = subprocess.run(argv, cwd=probe_dir, capture_output=True, text=True, timeout=30)
-            except Exception:
+            except Exception as exc:
+                logger.warning("spindle: codex sandbox probe (read-only) argv failed on %s: %s", codex_bin, exc)
                 continue
             if _CODEX_SANDBOX_PROBE_MARKER not in (proc.stdout or ""):
                 continue  # wrong CLI shape for this version — the command never ran
             try:
                 wrote = os.path.getsize(target) > 0
-            except OSError:
+            except OSError as exc:
+                logger.warning(
+                    "spindle: codex sandbox probe (read-only) could not stat target on %s: %s",
+                    codex_bin,
+                    exc,
+                )
                 wrote = False
             # The command demonstrably ran: blocked write -> enforcing, landed write -> fail
             # open. This shape is authoritative; do not fall through to another.
             return not wrote
         # No known CLI shape executed the probe — inconclusive.
+        logger.warning(
+            "spindle: codex sandbox probe (read-only) ran no known CLI shape on %s; failing closed",
+            codex_bin,
+        )
         return False
-    except Exception:
+    except Exception as exc:
+        logger.warning(
+            "spindle: codex sandbox probe (read-only) errored on %s: %s; failing closed",
+            codex_bin,
+            exc,
+        )
         return False
     finally:
         if probe_dir:
@@ -5413,11 +5457,16 @@ Your task:
 
     # Build codex exec command.
     #
-    # --sandbox is always passed and always decides the tier. It is stated explicitly rather
-    # than left to ~/.codex/config.toml's sandbox_mode, so a spool's isolation comes from the
-    # permission it was spun with and not from whatever the local config happens to say.
-    # effective_sandbox / codex_bin / codex_version were resolved above, where the fail-closed
-    # enforcement check runs.
+    # --sandbox is always passed and always decides the tier, and it is paired with a matching
+    # `-c sandbox_mode=<tier>` so ~/.codex/config.toml's sandbox_mode can never override it: a
+    # command-line -c beats config.toml (verified on codex 0.144.5: config.toml sandbox_mode is
+    # ignored once -c sandbox_mode is on the CLI). The two always agree, so this is a no-op on
+    # versions where the flag already wins and closes the hole on any version where config.toml
+    # could widen a restrictive spool. A spool's isolation comes from the permission it was spun
+    # with, not from whatever the local config happens to say. This is the same -c sandbox_mode
+    # pin the enforcement probe validates (see _codex_sandbox_probe_argvs), so "probe enforces"
+    # faithfully predicts "this launch enforces". effective_sandbox / codex_bin / codex_version
+    # were resolved above, where the fail-closed enforcement check runs.
 
     # --json for structured output.
     #
@@ -5433,7 +5482,7 @@ Your task:
     if resolved_model:
         codex_cmd.extend(["--model", resolved_model])
 
-    codex_cmd.extend(["--sandbox", effective_sandbox])
+    codex_cmd.extend(["--sandbox", effective_sandbox, "-c", f"sandbox_mode={effective_sandbox}"])
 
     if shard_info:
         codex_cmd.extend(["--cd", shard_info["worktree_path"]])
@@ -5603,8 +5652,10 @@ def _codex_respin_sync(session_id: str, prompt: str) -> str:
 
     # Build codex exec resume command.
     # --sandbox, --cd and --add-dir are `codex exec` flags that `codex exec resume` does not
-    # accept, so they must all precede the `resume` subcommand.
-    codex_cmd = ["codex", "exec", "--sandbox", sandbox]
+    # accept, so they must all precede the `resume` subcommand. --sandbox is paired with a
+    # matching `-c sandbox_mode=<tier>` so config.toml can't widen the tier on a respin either
+    # (see the note in _codex_spin_sync).
+    codex_cmd = ["codex", "exec", "--sandbox", sandbox, "-c", f"sandbox_mode={sandbox}"]
     if shard_info:
         codex_cmd.extend(["--cd", shard_info["worktree_path"]])
 
