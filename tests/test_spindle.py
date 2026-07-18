@@ -706,6 +706,87 @@ class TestClaudePermissionCommandShape:
         assert cmd[cmd.index("--permission-mode") + 1] == "acceptEdits"
         assert cmd[cmd.index("--allowedTools") + 1] == PERMISSION_PROFILES["readonly"]
 
+    def test_expired_session_fallback_reemits_readonly_tier(self, tmp_path):
+        """The transcript-injection fallback (a claude --resume whose session expired)
+        must re-apply the original tier, not spawn a bare `claude -p`. A readonly
+        original keeps acceptEdits + its allowlist on the expiry path."""
+        _write_spool(
+            "exp-orig-ro",
+            {
+                "id": "exp-orig-ro",
+                "status": "complete",
+                "session_id": "sess-exp-ro",
+                "harness": "claude-code",
+                "permission": "readonly",
+                "allowed_tools": PERMISSION_PROFILES["readonly"],
+                "working_dir": str(tmp_path),
+                "created_at": datetime.now().isoformat(),
+            },
+        )
+        transcript = _get_transcript_path("exp-orig-ro")
+        transcript.parent.mkdir(parents=True, exist_ok=True)
+        transcript.write_text("prior transcript")
+        failing = {
+            "id": "exp-fail-ro",
+            "status": "running",
+            "session_id": "sess-exp-ro",
+            "prompt": "Continue sess-exp-ro: keep going",
+            "working_dir": str(tmp_path),
+            "pid": None,
+        }
+        captured = {}
+
+        def fake_spawn(spool_id, cmd, cwd, env=None):
+            captured["cmd"] = cmd
+            return 1
+
+        with patch("spindle._spawn_detached", side_effect=fake_spawn):
+            assert _handle_expired_session("exp-fail-ro", failing) is True
+
+        cmd = captured["cmd"]
+        assert cmd[cmd.index("--permission-mode") + 1] == "acceptEdits"
+        assert cmd[cmd.index("--allowedTools") + 1] == PERMISSION_PROFILES["readonly"]
+
+    def test_expired_session_fallback_reemits_careful_auto_no_allowlist(self, tmp_path):
+        """A careful original re-emits --permission-mode auto on the expiry fallback and,
+        having no allowlist, adds no --allowedTools."""
+        _write_spool(
+            "exp-orig-careful",
+            {
+                "id": "exp-orig-careful",
+                "status": "complete",
+                "session_id": "sess-exp-careful",
+                "harness": "claude-code",
+                "permission": "careful",
+                "allowed_tools": None,
+                "working_dir": str(tmp_path),
+                "created_at": datetime.now().isoformat(),
+            },
+        )
+        transcript = _get_transcript_path("exp-orig-careful")
+        transcript.parent.mkdir(parents=True, exist_ok=True)
+        transcript.write_text("prior transcript")
+        failing = {
+            "id": "exp-fail-careful",
+            "status": "running",
+            "session_id": "sess-exp-careful",
+            "prompt": "Continue sess-exp-careful: keep going",
+            "working_dir": str(tmp_path),
+            "pid": None,
+        }
+        captured = {}
+
+        def fake_spawn(spool_id, cmd, cwd, env=None):
+            captured["cmd"] = cmd
+            return 1
+
+        with patch("spindle._spawn_detached", side_effect=fake_spawn):
+            assert _handle_expired_session("exp-fail-careful", failing) is True
+
+        cmd = captured["cmd"]
+        assert cmd[cmd.index("--permission-mode") + 1] == "auto"
+        assert "--allowedTools" not in cmd
+
     @pytest.mark.parametrize(
         "permission,shard_flag",
         [
@@ -4479,6 +4560,63 @@ class TestCodexRespinPreservesGitAccess:
         assert "WARNING" in out
         assert "bwrap" in out.lower()
 
+    def test_codex_respin_research_shard_binds_output_dir_writable(self, tmp_path):
+        """A research+shard respin must bind its research OUTPUT dir writable in the
+        outer bwrap, not the worktree root — mirroring _codex_spin_sync. Without
+        research_target_info flowing to _codex_bwrap_wrap, codex --add-dir grants the
+        output dir but bwrap only binds the worktree root, so the write is blocked at
+        the bwrap layer even though codex was granted it."""
+        worktree_path = tmp_path / "worktrees" / "codex-respin-research"
+        worktree_path.mkdir(parents=True)
+        output_dir = tmp_path / "research-out"
+        output_dir.mkdir()
+        session_id = "codex-session-research"
+        original_spool = {
+            "id": "codex-original-research",
+            "status": "complete",
+            "session_id": session_id,
+            "working_dir": str(worktree_path),
+            "shard": {
+                "worktree_path": str(worktree_path),
+                "branch_name": "shard-codex-respin-research",
+                "shard_id": "codex-respin-research",
+            },
+            "permission": "research+shard",
+            "research_target": f"dir:{output_dir}",
+            "harness": "codex",
+            "tags": ["codex"],
+        }
+        captured_cmd = []
+
+        def fake_detached(spool_id, cmd, cwd, env=None):
+            captured_cmd.append(list(cmd))
+            return 99999
+
+        spindle_state = tmp_path / "spindle_state"
+        spindle_state.mkdir()
+        with patch("spindle.SPINDLE_DIR", spindle_state):
+            _write_spool(original_spool["id"], original_spool)
+            with patch("spindle._spawn_detached", side_effect=fake_detached):
+                with patch("spindle._count_running", return_value=0):
+                    with patch("shutil.which", return_value="/usr/bin/bwrap"):
+                        with patch("spindle._codex_sandbox_enforces", return_value=True):
+                            _codex_respin_sync(session_id, "follow up")
+
+        assert len(captured_cmd) == 1
+        cmd = captured_cmd[0]
+        assert cmd[0] == "bwrap", f"expected bwrap wrapper, got {cmd[0]!r}"
+        out = str(output_dir)
+        wt = str(worktree_path)
+        # The research output dir is the writable bind...
+        out_bound = any(cmd[i] == "--bind" and cmd[i + 1] == out and cmd[i + 2] == out for i in range(len(cmd) - 2))
+        assert out_bound, f"research output dir must be bound writable (--bind {out} {out}): {cmd!r}"
+        # ...not the worktree root (which the non-research path binds instead).
+        wt_bound = any(cmd[i] == "--bind" and cmd[i + 1] == wt and cmd[i + 2] == wt for i in range(len(cmd) - 2))
+        assert not wt_bound, f"worktree root must not be the writable bind for a research respin: {cmd!r}"
+        # And codex still gets the --add-dir grant for that dir.
+        add_dirs = [cmd[i + 1] for i, tok in enumerate(cmd) if tok == "--add-dir"]
+        assert out in add_dirs, f"codex must --add-dir the research output dir {out}: {add_dirs!r}"
+
 
 class TestCodexSandboxEnforcement:
     """Codex must actually run at the sandbox tier its permission asks for.
@@ -4839,6 +4977,52 @@ class TestCodexSandboxEnforcement:
         assert cmd is not None, "danger-full-access respin must not be refused"
         assert "REFUSED" not in result
         assert cmd[cmd.index("--sandbox") + 1] == "danger-full-access"
+
+    def test_codex_retry_preserves_research_target_grant(self, tmp_path):
+        """spool_retry re-launches a codex spool through _codex_spin_sync and must
+        thread the stored research_target + permission — otherwise a retried research
+        spool loses its --add-dir output grant and runs plain workspace-write with no
+        way to write its output. (The sandbox tier already survives via stored sandbox.)"""
+        _retry = spool_retry.fn if hasattr(spool_retry, "fn") else spool_retry
+        output_dir = tmp_path / "research-out"
+        output_dir.mkdir()
+        stored = {
+            "id": "codex-research-stored",
+            "status": "error",
+            "prompt": "research the thing",
+            "harness": "codex",
+            "permission": "research",
+            "research_target": f"dir:{output_dir}",
+            "sandbox": "workspace-write",
+            "working_dir": str(tmp_path),
+            "model": "gpt-5.6-sol",
+            "tags": ["codex"],
+        }
+        captured_cmd = []
+
+        def fake_detached(spool_id, cmd, cwd, env=None):
+            captured_cmd.append(list(cmd))
+            return 99999
+
+        with patch("spindle._count_running", return_value=0):
+            _write_spool("codex-research-stored", stored)
+            with patch("spindle._resolve_codex_binary", return_value="/fake/bin/codex"):
+                with patch("spindle._codex_cli_version", return_value="0.125.0"):
+                    with patch("spindle._codex_sandbox_enforces", return_value=True):
+                        with patch("spindle._spawn_detached", side_effect=fake_detached):
+                            result = asyncio.run(_retry("codex-research-stored"))
+
+        assert not result.startswith("Error"), result
+        assert len(captured_cmd) == 1
+        cmd = captured_cmd[0]
+        add_dirs = [cmd[i + 1] for i, tok in enumerate(cmd) if tok == "--add-dir"]
+        assert str(output_dir) in add_dirs, (
+            f"retried codex research spool must keep its --add-dir {output_dir} grant; got {add_dirs!r}"
+        )
+        # The new spool record carries the research target + permission forward.
+        retry_spool = _read_spool(result)
+        assert retry_spool["research_target"] == f"dir:{output_dir}"
+        assert retry_spool["permission"] == "research"
 
 
 class TestCodexSandboxEnforcesProbe:
