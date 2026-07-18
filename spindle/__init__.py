@@ -2124,6 +2124,19 @@ Continue from above. New message: {spool["prompt"].split(": ", 1)[-1]}"""
     # Spawn new process without --resume flag, with transcript as context
     cmd = ["claude", "-p", context_prompt, "--output-format", "json"]
 
+    # A bare `claude -p` (this transcript fallback) sets NEITHER --permission-mode
+    # NOR --allowedTools, so the resumed spool silently changes capability from the
+    # original spin — the same tier-drop as a bare `--resume`, surviving on the
+    # expiry path only. Re-apply the tier the original spool ran under, exactly as
+    # _respin_sync does: a careful resume stays auto, a readonly/manual resume keeps
+    # its allowlist. This fallback creates no shard, so there is no readonly+shard
+    # concern to guard against here.
+    orig_permission = original_spool.get("permission")
+    orig_allowed_tools = original_spool.get("allowed_tools")
+    cmd.extend(["--permission-mode", _claude_permission_mode(orig_permission)])
+    if orig_allowed_tools:
+        cmd.extend(["--allowedTools", orig_allowed_tools])
+
     # Profile spools: rebuild the alt endpoint/key spawn env fresh and re-inject
     # --model/extra_args so the transcript fallback hits the same endpoint as the
     # original spin instead of the default api.anthropic.com. The recorded
@@ -4019,6 +4032,12 @@ async def spool_retry(spool_id: str) -> str:
             spool.get("env"),
             shard=bool(spool.get("shard")),
             base_branch=retry_base_branch,
+            # Carry the research target + permission so a retried research/file spool
+            # keeps its --add-dir grant and target preamble (the sandbox tier already
+            # survives via the stored `sandbox` above). Without these a retry runs a
+            # plain workspace-write spool that can't write its output.
+            research_target=spool.get("research_target"),
+            permission=spool.get("permission"),
         )
     elif harness_lower == "gemini":
         return await asyncio.to_thread(
@@ -5618,9 +5637,11 @@ def _codex_respin_sync(session_id: str, prompt: str) -> str:
 
     # Wrap in bwrap sandbox for shards - worktree writable, rest read-only.
     # Codex's own bubblewrap sandbox nests inside this one, so both layers run as
-    # defense-in-depth.
+    # defense-in-depth. A research+shard respin binds its output dir writable (not
+    # the worktree root) — mirror _codex_spin_sync so the --add-dir grant above is
+    # actually bindable at the outer bwrap layer.
     if shard_info:
-        cmd = _codex_bwrap_wrap(codex_cmd, shard_info, working_dir)
+        cmd = _codex_bwrap_wrap(codex_cmd, shard_info, working_dir, research_target_info=research_target_info)
     else:
         cmd = codex_cmd
 
