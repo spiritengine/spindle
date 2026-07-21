@@ -1758,6 +1758,23 @@ def _is_pid_alive(pid: int) -> bool:
     return True
 
 
+def _is_process_group_alive(process_group_id: int) -> bool:
+    """Whether any process remains in a detached spool's process group.
+
+    ``_spawn_detached`` uses ``start_new_session=True``, making the child PID
+    its process-group ID. A leader may exit while descendants still write into
+    the shard, so destructive cleanup must prove the whole group is gone.
+    Permission errors fail closed because they still prove the group exists.
+    """
+    try:
+        os.killpg(process_group_id, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except (OSError, PermissionError):
+        return True
+
+
 def _parse_duration(time_str: str) -> Optional[int]:
     """
     Parse a duration string into seconds.
@@ -1923,11 +1940,7 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
                                 event = json.loads(line)
                             except json.JSONDecodeError:
                                 continue
-                            if isinstance(event, dict) and event.get("type") in {
-                                "turn.completed",
-                                "turn.failed",
-                                "error",
-                            }:
+                            if isinstance(event, dict) and event.get("type") == "turn.completed":
                                 output_complete = True
                                 break
                     else:
@@ -1974,26 +1987,12 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
             except IOError:
                 pass
 
-        codex_failure_message = _codex_failure_message(stdout) if spool.get("harness") == "codex" else None
-
         # Capture (and reap) the child's exit code if we still hold its handle.
         # poll() returns None if the process hasn't actually exited yet (e.g.
         # output is complete but the CLI lingers); that's fine - exit_code stays
         # unknown for that case. None when there's no handle (orphan recovery).
         proc = _PROC_HANDLES.pop(spool_id, None)
         exit_code = proc.poll() if proc is not None else None
-        if codex_failure_message and proc is not None and exit_code is None:
-            # turn.failed is terminal. Stop a known lingering child before any
-            # clean-shard reclamation; never signal a PID when this process no
-            # longer owns its Popen handle (for example after server restart).
-            try:
-                proc.terminate()
-                exit_code = proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                exit_code = proc.wait(timeout=5)
-            except OSError:
-                exit_code = proc.poll()
         if exit_code is not None:
             spool["exit_code"] = exit_code
         # Suffix for the "no output" fallbacks so a silent failure reports the
@@ -2014,6 +2013,7 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
                     extracted = _extract_codex_result(stdout)
                     spool["result"] = extracted if extracted is not None else stdout
 
+                    codex_failure_message = _codex_failure_message(stdout)
                     for line in stdout.strip().split("\n"):
                         try:
                             event = json.loads(line)
@@ -2168,7 +2168,12 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
         # Reclaim only a shard created for this exact spool, and only when Git
         # proves no work exists. Reused shards and failed shards containing
         # edits/commits are preserved so an API failure can never discard work.
-        if spool.get("status") == "error" and spool.get("shard_created_by_spool") and not _is_pid_alive(pid):
+        if (
+            spool.get("status") == "error"
+            and spool.get("shard_created_by_spool")
+            and not _is_pid_alive(pid)
+            and not _is_process_group_alive(pid)
+        ):
             shard_info = spool.get("shard") or {}
             cleanup_dir = spool.get("shard_source_dir")
             if cleanup_dir:
@@ -5199,6 +5204,10 @@ async def spool_info(spool_id: str) -> str:
 # recorded per spool, for provenance only — it no longer gates anything.
 _CODEX_VERSION_CACHE: Dict[str, Optional[str]] = {}
 
+# `codex login status` is stable for a server process and contains no secrets.
+# Cache per binary so auth-aware compatibility aliases stay off the hot path.
+_CODEX_AUTH_MODE_CACHE: Dict[str, str] = {}
+
 # Cached enforcement-probe results, keyed by (path, version, mtime) so a reinstall or
 # upgrade re-probes. Process-lifetime only: the probe is a local no-model exec, so running
 # it at most once per binary keeps it off the per-spool hot path entirely.
@@ -5251,6 +5260,31 @@ def _codex_cli_version(binary: Optional[str]) -> Optional[str]:
 
     _CODEX_VERSION_CACHE[binary] = version
     return version
+
+
+def _codex_auth_mode(binary: Optional[str]) -> str:
+    """Return ``chatgpt``, ``api``, or ``unknown`` for the resolved Codex CLI."""
+    if not binary:
+        return "unknown"
+    if binary in _CODEX_AUTH_MODE_CACHE:
+        return _CODEX_AUTH_MODE_CACHE[binary]
+    mode = "unknown"
+    try:
+        proc = subprocess.run(
+            [binary, "login", "status"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        status = f"{proc.stdout}\n{proc.stderr}".lower()
+        if proc.returncode == 0 and "logged in using chatgpt" in status:
+            mode = "chatgpt"
+        elif proc.returncode == 0 and ("api key" in status or "api-key" in status):
+            mode = "api"
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        pass
+    _CODEX_AUTH_MODE_CACHE[binary] = mode
+    return mode
 
 
 def _codex_sandbox_probe_key(codex_bin: str) -> tuple:
@@ -5534,12 +5568,6 @@ def _codex_spin_sync(
     if not working_dir:
         return "Error: working_dir required. Pass the project directory."
 
-    # Resolve model alias. When no model is given, fall back to the codex
-    # harness default (gpt-5.6-sol) instead of None — otherwise no --model is
-    # passed and codex picks its own default, so the harness default_model would
-    # never actually apply. Mirrors the gemini/kimi harnesses.
-    resolved_model = CODEX_MODEL_ALIASES.get(model, model) if model else "gpt-5.6-sol"
-
     try:
         research_target_info = (
             _validate_research_target(research_target, working_dir)
@@ -5556,6 +5584,17 @@ def _codex_spin_sync(
     effective_sandbox = sandbox or "workspace-write"
     codex_bin = _resolve_codex_binary()
     codex_version = _codex_cli_version(codex_bin)
+    codex_auth_mode = _codex_auth_mode(codex_bin)
+
+    # Short aliases are installation-independent. The official umbrella model
+    # `gpt-5.6` needs one compatibility exception: this box's ChatGPT-account
+    # route rejects it while serving the concrete Sol tier. Preserve an explicit
+    # umbrella request for API-key and unknown auth rather than silently changing
+    # semantics on installations where the official model works.
+    resolved_model = CODEX_MODEL_ALIASES.get(model, model) if model else "gpt-5.6-sol"
+    if model == "gpt-5.6" and codex_auth_mode == "chatgpt":
+        resolved_model = "gpt-5.6-sol"
+
     refusal = _codex_sandbox_refusal(effective_sandbox, permission, codex_bin, codex_version)
     if refusal:
         return _persist_codex_sandbox_refusal(
@@ -5718,6 +5757,7 @@ Your task:
         # Which codex actually ran: enforcement varies by version, and PATH decides.
         "codex_bin": codex_bin,
         "codex_version": codex_version,
+        "codex_auth_mode": codex_auth_mode,
         "research_target": research_target,
         "tags": tag_list,
         "timeout": timeout,
@@ -5976,10 +6016,6 @@ CODEX_MODEL_ALIASES = {
     # above). Sol/Terra/Luna are durable capability tiers (flagship /
     # balanced mini-like / fast nano-like); no separate "-codex" variant.
     "5.6": "gpt-5.6-sol",
-    # Official Codex guidance also uses the family spelling `gpt-5.6`, but the
-    # ChatGPT-account route on this installation rejects that umbrella ID while
-    # serving the concrete Sol tier. Treat both spellings as the default tier.
-    "gpt-5.6": "gpt-5.6-sol",
     "5.6-sol": "gpt-5.6-sol",
     "sol": "gpt-5.6-sol",
     "5.6-terra": "gpt-5.6-terra",

@@ -123,9 +123,10 @@ spin(
 ```
 
 Available models:
-- `gpt-5.6-sol` (default) — flagship tier; `gpt-5.6`, `5.6`, `sol`, and `codex`
-  normalize to this concrete model because the umbrella `gpt-5.6` ID is rejected by the
-  ChatGPT-account route used on this installation
+- `gpt-5.6-sol` (default) — flagship tier; `5.6`, `sol`, and `codex` normalize to it
+- `gpt-5.6` — official umbrella model; preserved for API-key or unknown authentication,
+  but mapped to `gpt-5.6-sol` when `codex login status` reports ChatGPT authentication
+  because that route rejects the umbrella ID on this installation
 - `gpt-5.6-terra` / `gpt-5.6-luna` — explicit faster tiers; aliases `terra` and `luna`
 - `gpt-5.5` — prior default and working compatibility choice
 - `gpt-5.3-codex` and other `-codex` ids — API-only; 400 on ChatGPT-account auth

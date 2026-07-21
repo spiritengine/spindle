@@ -23,7 +23,7 @@ Spawn a Codex CLI agent to handle a task. Returns immediately with spool_id.
 spool_id = spin(
     prompt="Write a function to parse CSV files",
     working_dir="/path/to/project",
-    model="gpt-5.6",  # Optional; gpt-5.6 normalizes to the default Sol tier
+    model="gpt-5.6",  # Optional; ChatGPT auth normalizes this to the default Sol tier
     harness="codex",  # Use Codex instead of Claude Code
     permission="full",  # Mapped to sandbox policy
     timeout=300,  # Optional, seconds
@@ -163,7 +163,7 @@ result2 = unspool(spool_id2)
 | Shard support | Full (via `permission="shard"`) | Not yet implemented |
 | SKEIN integration | Full | Not yet implemented |
 | Permission modes | careful, readonly, full, shard | Mapped to sandbox policies (read-only, workspace-write, danger-full-access) |
-| Model selection | sonnet, opus, haiku | gpt-5.6-sol default; gpt-5.6 normalizes to Sol |
+| Model selection | sonnet, opus, haiku | gpt-5.6-sol default; ChatGPT auth maps gpt-5.6 to Sol |
 | Session resume | `--resume` flag | `codex resume` command |
 
 ## Future Enhancements

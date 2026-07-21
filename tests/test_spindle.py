@@ -1408,12 +1408,9 @@ class TestCodexResultExtraction:
             assert cleanup_kwargs == {"spool_id": spool_id}
             assert _get_transcript_path(spool_id).read_text() == stream
 
-    def test_finalize_treats_turn_failed_as_terminal_and_stops_known_lingering_child(self, tmp_path):
+    def test_finalize_waits_for_process_exit_after_failure_event(self, tmp_path):
         spool_id = "codex-terminal-failure"
         stream = json.dumps({"type": "turn.failed", "error": {"message": "provider failed"}})
-        proc = MagicMock()
-        proc.poll.return_value = None
-        proc.wait.return_value = -signal.SIGTERM
         with patch("spindle.SPINDLE_DIR", tmp_path):
             _write_spool(
                 spool_id,
@@ -1427,18 +1424,47 @@ class TestCodexResultExtraction:
                 },
             )
             _get_output_path(spool_id).write_text(stream)
-            spindle._PROC_HANDLES[spool_id] = proc
-            try:
-                assert _check_and_finalize_spool(spool_id) is True
-            finally:
-                spindle._PROC_HANDLES.pop(spool_id, None)
+            assert _check_and_finalize_spool(spool_id) is False
+            assert _read_spool(spool_id)["status"] == "running"
 
-            spool = _read_spool(spool_id)
-            assert spool["status"] == "error"
-            assert spool["error"] == "provider failed"
-            assert spool["exit_code"] == -signal.SIGTERM
-            proc.terminate.assert_called_once_with()
-            proc.wait.assert_called_once_with(timeout=5)
+    def test_process_group_liveness_sees_descendant_after_leader_exit(self):
+        proc = subprocess.Popen(
+            ["/bin/sh", "-c", "sleep 30 </dev/null >/dev/null 2>&1 & exit 0"],
+            start_new_session=True,
+        )
+        proc.wait(timeout=5)
+        try:
+            assert spindle._is_process_group_alive(proc.pid) is True
+        finally:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+    def test_finalize_preserves_failed_shard_while_process_group_lives(self, tmp_path):
+        spool_id = "codex-live-group"
+        stream = json.dumps({"type": "turn.failed", "error": {"message": "provider failed"}})
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool(
+                spool_id,
+                {
+                    "id": spool_id,
+                    "status": "running",
+                    "harness": "codex",
+                    "prompt": "work",
+                    "pid": 999999999,
+                    "created_at": datetime.now().isoformat(),
+                    "shard": {"worktree_path": str(tmp_path / "worktree")},
+                    "shard_created_by_spool": True,
+                    "shard_source_dir": str(tmp_path / "repo"),
+                },
+            )
+            _get_output_path(spool_id).write_text(stream)
+            with patch("spindle._is_process_group_alive", return_value=True):
+                with patch("spindle._cleanup_shard") as cleanup:
+                    assert _check_and_finalize_spool(spool_id) is True
+            cleanup.assert_not_called()
+            assert _read_spool(spool_id)["status"] == "error"
 
     @pytest.mark.parametrize(
         "other_spool",
@@ -5148,7 +5174,7 @@ class TestCodexSandboxEnforcement:
     """
 
     @contextmanager
-    def _captured_codex_spin(self, tmp_path, enforces=True):
+    def _captured_codex_spin(self, tmp_path, enforces=True, auth_mode="chatgpt"):
         """Run _codex_spin_sync with a stable codex binary, capturing the spawned argv.
 
         The enforcement probe is stubbed (default: enforcing) so these tests never shell out
@@ -5165,9 +5191,10 @@ class TestCodexSandboxEnforcement:
                 with patch("spindle._has_skein", return_value=False):
                     with patch("spindle._resolve_codex_binary", return_value="/fake/bin/codex"):
                         with patch("spindle._codex_cli_version", return_value="0.125.0"):
-                            with patch("spindle._codex_sandbox_enforces", return_value=enforces):
-                                with patch("spindle._spawn_detached", side_effect=fake_detached):
-                                    yield captured_cmd
+                            with patch("spindle._codex_auth_mode", return_value=auth_mode):
+                                with patch("spindle._codex_sandbox_enforces", return_value=enforces):
+                                    with patch("spindle._spawn_detached", side_effect=fake_detached):
+                                        yield captured_cmd
 
     @pytest.mark.parametrize(
         "permission,expected_sandbox",
@@ -5229,6 +5256,18 @@ class TestCodexSandboxEnforcement:
         assert cmd[cmd.index("--model") + 1] == expected
         spool = json.loads(next(tmp_path.glob("codex-*.json")).read_text())
         assert spool["model"] == expected
+
+    @pytest.mark.parametrize("auth_mode", ["api", "unknown"])
+    def test_explicit_gpt_56_is_preserved_outside_chatgpt_auth(self, tmp_path, auth_mode):
+        with self._captured_codex_spin(tmp_path, auth_mode=auth_mode) as captured_cmd:
+            with patch("spindle.threading.Thread"):
+                _codex_spin_sync("do work", str(tmp_path), "gpt-5.6", "read-only", None, None, None)
+
+        cmd = captured_cmd[0]
+        assert cmd[cmd.index("--model") + 1] == "gpt-5.6"
+        spool = json.loads(next(tmp_path.glob("codex-*.json")).read_text())
+        assert spool["model"] == "gpt-5.6"
+        assert spool["codex_auth_mode"] == auth_mode
 
     def test_spin_never_passes_full_auto(self, tmp_path):
         """--full-auto silently overrides --sandbox with its own workspace-write tier.
@@ -5580,6 +5619,22 @@ class TestCodexSandboxEnforcesProbe:
         proc.stdout = stdout
         proc.returncode = returncode
         return proc
+
+    @pytest.mark.parametrize(
+        "stdout,returncode,expected",
+        [
+            ("Logged in using ChatGPT\n", 0, "chatgpt"),
+            ("Logged in using an API key\n", 0, "api"),
+            ("not logged in\n", 1, "unknown"),
+        ],
+    )
+    def test_codex_auth_mode_is_detected_and_cached(self, stdout, returncode, expected):
+        spindle._CODEX_AUTH_MODE_CACHE.clear()
+        with patch("spindle.subprocess.run", return_value=self._proc(stdout, returncode)) as run:
+            assert spindle._codex_auth_mode("/fake/codex") == expected
+            assert spindle._codex_auth_mode("/fake/codex") == expected
+        run.assert_called_once_with(["/fake/codex", "login", "status"], capture_output=True, text=True, timeout=10)
+        spindle._CODEX_AUTH_MODE_CACHE.clear()
 
     def test_probe_true_when_write_blocked_and_command_ran(self, caplog):
         """Marker on stdout proves the command ran; a missing file means the write was blocked."""
