@@ -886,7 +886,9 @@ def _shard_has_other_active_spool(spool_id: str, shard_info: dict) -> bool:
 
     Any other pending spool is conservatively blocking: it has reserved a slot
     but may not have persisted its final working directory yet. A running spool
-    blocks only when its working directory is the shard root or a descendant.
+    blocks when its working directory is the shard root or a descendant. A
+    terminal spool at that path also blocks while its detached process group is
+    still alive: Codex may emit its terminal event before descendants exit.
     Call this while holding ``_concurrency_lock`` so a new pending spool cannot
     appear between the check and worktree removal.
     """
@@ -900,15 +902,52 @@ def _shard_has_other_active_spool(spool_id: str, shard_info: dict) -> bool:
         status = other.get("status")
         if status == "pending":
             return True
-        if status != "running":
-            continue
         other_working_dir = other.get("working_dir")
         if not other_working_dir:
             continue
         other_path = Path(other_working_dir).resolve()
-        if other_path == worktree or worktree in other_path.parents:
+        if other_path != worktree and worktree not in other_path.parents:
+            continue
+        if status == "running":
+            return True
+        other_pid = other.get("pid")
+        if other_pid and (_is_pid_alive(other_pid) or _is_process_group_alive(other_pid)):
             return True
     return False
+
+
+def _cleanup_failed_spool_shard(spool: dict) -> bool:
+    """Safely reclaim a pristine shard created for a failed spool.
+
+    Every deletion path comes through here. Uncertain Git state, a live owner
+    or reuser process group, or another pending/running reservation preserves
+    the worktree. On successful cleanup, repair ``working_dir`` so retry starts
+    from the surviving source repository.
+    """
+    if spool.get("status") != "error" or not spool.get("shard_created_by_spool"):
+        return False
+
+    pid = spool.get("pid")
+    if pid and (_is_pid_alive(pid) or _is_process_group_alive(pid)):
+        return False
+
+    shard_info = spool.get("shard") or {}
+    cleanup_dir = spool.get("shard_source_dir")
+    if not cleanup_dir:
+        return False
+
+    with _concurrency_lock():
+        if _shard_has_other_active_spool(spool.get("id", ""), shard_info):
+            return False
+        if not _shard_is_pristine_for_cleanup(spool):
+            return False
+        if not _cleanup_shard(shard_info, cleanup_dir, spool_id=spool.get("id")):
+            return False
+
+    shard_info["startup_failure_cleaned"] = True
+    spool["shard"] = shard_info
+    spool["working_dir"] = cleanup_dir
+    return True
 
 
 def _get_spool_path(spool_id: str) -> Path:
@@ -1927,23 +1966,16 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
         stdout_path = _get_output_path(spool_id)
         stderr_path = _get_stderr_path(spool_id)
 
-        # Check if output has complete JSON result (CLI may not exit promptly)
+        # Check if output has a complete JSON result for harnesses whose CLI may
+        # linger after publishing its final object. Codex is intentionally not
+        # finalized from stdout alone: its exit status is authoritative, and a
+        # terminal event can precede a nonzero process exit.
         output_complete = False
         if stdout_path.exists():
             try:
                 content = stdout_path.read_text()
                 if content.strip():
-                    if spool.get("harness") == "codex":
-                        # Codex uses newline-delimited JSON with "turn.completed" event
-                        for line in content.strip().split("\n"):
-                            try:
-                                event = json.loads(line)
-                            except json.JSONDecodeError:
-                                continue
-                            if isinstance(event, dict) and event.get("type") == "turn.completed":
-                                output_complete = True
-                                break
-                    else:
+                    if spool.get("harness") != "codex":
                         # Claude Code / Gemini output
                         data = json.loads(content)
                         cc_result = _extract_cc_result(data)
@@ -1963,8 +1995,14 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
             except IOError:
                 pass
 
-        # If PID alive and no complete output yet, still running
-        if _is_pid_alive(pid) and not output_complete:
+        # Poll our child handle before the generic PID probe. This preserves its
+        # real exit status; _is_pid_alive may reap a zombie via waitpid.
+        proc = _PROC_HANDLES.get(spool_id)
+        observed_exit_code = proc.poll() if proc is not None else None
+        process_alive = observed_exit_code is None if proc is not None else _is_pid_alive(pid)
+
+        # If PID alive and no complete output yet, still running.
+        if process_alive and not output_complete:
             return False
 
         # Process finished or output complete - finalize
@@ -1992,7 +2030,7 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
         # output is complete but the CLI lingers); that's fine - exit_code stays
         # unknown for that case. None when there's no handle (orphan recovery).
         proc = _PROC_HANDLES.pop(spool_id, None)
-        exit_code = proc.poll() if proc is not None else None
+        exit_code = observed_exit_code if proc is not None else None
         if exit_code is not None:
             spool["exit_code"] = exit_code
         # Suffix for the "no output" fallbacks so a silent failure reports the
@@ -2014,6 +2052,7 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
                     spool["result"] = extracted if extracted is not None else stdout
 
                     codex_failure_message = _codex_failure_message(stdout)
+                    turn_completed = False
                     for line in stdout.strip().split("\n"):
                         try:
                             event = json.loads(line)
@@ -2024,6 +2063,7 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
                         if event.get("type") == "thread.started":
                             spool["session_id"] = event.get("thread_id")
                         elif event.get("type") == "turn.completed":
+                            turn_completed = True
                             usage = event.get("usage", {})
                             if usage:
                                 spool["cost"] = usage
@@ -2031,6 +2071,12 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
                     if codex_failure_message:
                         spool["status"] = "error"
                         spool["error"] = codex_failure_message
+                    elif exit_code not in (None, 0):
+                        spool["status"] = "error"
+                        spool["error"] = stderr.strip()[:500] or f"Codex exited with code {exit_code}"
+                    elif not turn_completed:
+                        spool["status"] = "error"
+                        spool["error"] = "Codex exited without a completed turn"
                     else:
                         spool["status"] = "complete"
                 elif stderr.strip():
@@ -2042,7 +2088,12 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
             except Exception:
                 if stdout.strip():
                     spool["result"] = stdout
-                    spool["status"] = "complete"
+                    spool["status"] = "error"
+                    spool["error"] = stderr.strip()[:500] or (
+                        f"Codex exited with code {exit_code}"
+                        if exit_code not in (None, 0)
+                        else "Failed to parse Codex output"
+                    )
                 else:
                     spool["status"] = "error"
                     spool["error"] = "Failed to parse Codex output"
@@ -2165,32 +2216,10 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
                 pass  # Non-critical, continue
 
         # A provider can reject a Codex turn after Spindle has created its shard.
-        # Reclaim only a shard created for this exact spool, and only when Git
-        # proves no work exists. Reused shards and failed shards containing
-        # edits/commits are preserved so an API failure can never discard work.
-        if (
-            spool.get("status") == "error"
-            and spool.get("shard_created_by_spool")
-            and not _is_pid_alive(pid)
-            and not _is_process_group_alive(pid)
-        ):
-            shard_info = spool.get("shard") or {}
-            cleanup_dir = spool.get("shard_source_dir")
-            if cleanup_dir:
-                # Serialize with new slot reservation. Any other pending spool
-                # could be about to resolve this worktree, while a running one
-                # may already be using it. Git inspection also fails closed:
-                # only an authoritative no_changes result permits deletion.
-                with _concurrency_lock():
-                    safe_to_clean = not _shard_has_other_active_spool(spool_id, shard_info)
-                    safe_to_clean = safe_to_clean and _shard_is_pristine_for_cleanup(spool)
-                    if safe_to_clean and _cleanup_shard(shard_info, cleanup_dir, spool_id=spool_id):
-                        shard_info["startup_failure_cleaned"] = True
-                        spool["shard"] = shard_info
-                        # spool_retry must launch from the surviving source repo,
-                        # not the worktree path that cleanup just removed.
-                        spool["working_dir"] = cleanup_dir
-                        _write_spool(spool_id, spool)
+        # The shared helper is also used by immediate spawn failures, so every
+        # destructive path has the same liveness, concurrency, and Git checks.
+        if _cleanup_failed_spool_shard(spool):
+            _write_spool(spool_id, spool)
 
         # Clean up output files
         if stdout_path.exists():
@@ -2391,10 +2420,7 @@ def _spawn_detached(spool_id: str, cmd: list, cwd: str, env: Optional[Dict[str, 
     stdout_path = _get_output_path(spool_id)
     stderr_path = _get_stderr_path(spool_id)
 
-    # Start with current environment, then merge in any custom vars
-    process_env = os.environ.copy()
-    if env:
-        process_env.update(env)
+    process_env = _process_env(env)
 
     with open(stdout_path, "w") as stdout_file, open(stderr_path, "w") as stderr_file:
         proc = subprocess.Popen(
@@ -5204,13 +5230,8 @@ async def spool_info(spool_id: str) -> str:
 # recorded per spool, for provenance only — it no longer gates anything.
 _CODEX_VERSION_CACHE: Dict[str, Optional[str]] = {}
 
-# `codex login status` is stable for a server process and contains no secrets.
-# Cache per binary so auth-aware compatibility aliases stay off the hot path.
-_CODEX_AUTH_MODE_CACHE: Dict[str, str] = {}
-
-# Cached enforcement-probe results, keyed by (path, version, mtime) so a reinstall or
-# upgrade re-probes. Process-lifetime only: the probe is a local no-model exec, so running
-# it at most once per binary keeps it off the per-spool hot path entirely.
+# Cached enforcement-probe results, keyed by binary and Codex config context so a reinstall,
+# upgrade, CODEX_HOME/HOME change, or config edit re-probes. The probe is a local no-model exec.
 _CODEX_SANDBOX_ENFORCES_CACHE: Dict[tuple, bool] = {}
 
 # Printed by the sandboxed probe command to stdout. Its presence proves the command
@@ -5223,16 +5244,25 @@ _CODEX_SANDBOX_PROBE_MARKER = "SPINDLE_CODEX_SANDBOX_PROBE_RAN"
 _CODEX_RESTRICTIVE_SANDBOX_MODES = frozenset({"read-only", "workspace-write"})
 
 
-def _resolve_codex_binary() -> Optional[str]:
-    """Absolute path that `codex` resolves to on PATH, or None if absent.
+def _process_env(overrides: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    """The exact environment passed to a detached child process."""
+    process_env = os.environ.copy()
+    if overrides:
+        process_env.update(overrides)
+    return process_env
+
+
+def _resolve_codex_binary(process_env: Optional[Dict[str, str]] = None) -> Optional[str]:
+    """Absolute path that `codex` resolves to in the child environment, or None.
 
     Recorded per spool: spindle's PATH and a login shell's often resolve different
     codex installs, and they do not enforce --sandbox alike.
     """
-    return shutil.which("codex")
+    path = process_env.get("PATH") if process_env is not None else None
+    return shutil.which("codex", path=path)
 
 
-def _codex_cli_version(binary: Optional[str]) -> Optional[str]:
+def _codex_cli_version(binary: Optional[str], process_env: Optional[Dict[str, str]] = None) -> Optional[str]:
     """Version of a codex binary (e.g. "0.125.0"), or None if it can't be determined.
 
     Cached per path: this shells out, and spin is on the hot path.
@@ -5249,6 +5279,7 @@ def _codex_cli_version(binary: Optional[str]) -> Optional[str]:
             capture_output=True,
             text=True,
             timeout=10,
+            env=process_env,
         )
         # e.g. "codex-cli 0.125.0"
         match = re.search(r"codex-cli\s+(\S+)", proc.stdout or "")
@@ -5262,12 +5293,14 @@ def _codex_cli_version(binary: Optional[str]) -> Optional[str]:
     return version
 
 
-def _codex_auth_mode(binary: Optional[str]) -> str:
-    """Return ``chatgpt``, ``api``, or ``unknown`` for the resolved Codex CLI."""
+def _codex_auth_mode(binary: Optional[str], process_env: Optional[Dict[str, str]] = None) -> str:
+    """Return ``chatgpt``, ``api``, or ``unknown`` in the launch environment.
+
+    This intentionally runs for each fresh spin. Login state can change while
+    the server remains alive, and CODEX_HOME/HOME may vary between callers.
+    """
     if not binary:
         return "unknown"
-    if binary in _CODEX_AUTH_MODE_CACHE:
-        return _CODEX_AUTH_MODE_CACHE[binary]
     mode = "unknown"
     try:
         proc = subprocess.run(
@@ -5275,6 +5308,7 @@ def _codex_auth_mode(binary: Optional[str]) -> str:
             capture_output=True,
             text=True,
             timeout=10,
+            env=process_env,
         )
         status = f"{proc.stdout}\n{proc.stderr}".lower()
         if proc.returncode == 0 and "logged in using chatgpt" in status:
@@ -5283,18 +5317,26 @@ def _codex_auth_mode(binary: Optional[str]) -> str:
             mode = "api"
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
         pass
-    _CODEX_AUTH_MODE_CACHE[binary] = mode
     return mode
 
 
-def _codex_sandbox_probe_key(codex_bin: str) -> tuple:
-    """Cache key that changes when the binary is replaced, so an upgrade re-probes."""
+def _codex_sandbox_probe_key(codex_bin: str, process_env: Optional[Dict[str, str]] = None) -> tuple:
+    """Cache key that changes with the binary or its effective Codex config."""
     try:
         mtime = os.path.getmtime(codex_bin)
     except OSError as exc:
         logger.debug("spindle: codex sandbox probe-key mtime unavailable for %s: %s", codex_bin, exc)
         mtime = None
-    return (codex_bin, _codex_cli_version(codex_bin), mtime)
+    effective_env = process_env or os.environ
+    home = effective_env.get("HOME", str(Path.home()))
+    codex_home = effective_env.get("CODEX_HOME") or str(Path(home) / ".codex")
+    config_path = Path(codex_home) / "config.toml"
+    try:
+        config_stat = config_path.stat()
+        config_signature = (config_stat.st_mtime_ns, config_stat.st_size)
+    except OSError:
+        config_signature = None
+    return (codex_bin, _codex_cli_version(codex_bin, process_env), mtime, codex_home, config_signature)
 
 
 def _codex_sandbox_probe_argvs(codex_bin: str, shell_cmd: str) -> list:
@@ -5319,7 +5361,7 @@ def _codex_sandbox_probe_argvs(codex_bin: str, shell_cmd: str) -> list:
     ]
 
 
-def _codex_sandbox_probe(codex_bin: str) -> bool:
+def _codex_sandbox_probe(codex_bin: str, process_env: Optional[Dict[str, str]] = None) -> bool:
     """One uncached run of the enforcement probe. See _codex_sandbox_enforces.
 
     True only on a definite "the sandbox blocked the write" reading. Any other outcome —
@@ -5337,7 +5379,14 @@ def _codex_sandbox_probe(codex_bin: str) -> bool:
         for argv in _codex_sandbox_probe_argvs(codex_bin, shell_cmd):
             Path(target).unlink(missing_ok=True)  # no stale file from a prior shape
             try:
-                proc = subprocess.run(argv, cwd=probe_dir, capture_output=True, text=True, timeout=30)
+                proc = subprocess.run(
+                    argv,
+                    cwd=probe_dir,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    env=process_env,
+                )
             except Exception as exc:
                 logger.warning("spindle: codex sandbox probe (read-only) argv failed on %s: %s", codex_bin, exc)
                 continue
@@ -5376,25 +5425,25 @@ def _codex_sandbox_probe(codex_bin: str) -> bool:
             shutil.rmtree(probe_dir, ignore_errors=True)
 
 
-def _codex_sandbox_enforces(codex_bin: Optional[str]) -> bool:
+def _codex_sandbox_enforces(codex_bin: Optional[str], process_env: Optional[Dict[str, str]] = None) -> bool:
     """Whether `codex_bin` actually enforces its sandbox right now.
 
     Behavioral, not version-based: runs codex's no-model `codex sandbox` subcommand under
     read-only, attempts a write inside a scratch cwd, and reports whether the write was
-    BLOCKED. Cached per (path, version, mtime) for the process lifetime, so it runs at most
-    once per binary — never per spool, never a model call.
+    BLOCKED. Cached per binary/config context for the process lifetime, so identical launch
+    contexts reuse the result. It is never a model call.
 
     Fails closed: a missing binary, an inconclusive probe, or any error returns False.
     """
     if not codex_bin:
         return False
 
-    key = _codex_sandbox_probe_key(codex_bin)
+    key = _codex_sandbox_probe_key(codex_bin, process_env)
     cached = _CODEX_SANDBOX_ENFORCES_CACHE.get(key)
     if cached is not None:
         return cached
 
-    result = _codex_sandbox_probe(codex_bin)
+    result = _codex_sandbox_probe(codex_bin, process_env)
     _CODEX_SANDBOX_ENFORCES_CACHE[key] = result
     return result
 
@@ -5404,6 +5453,7 @@ def _codex_sandbox_refusal(
     permission: Optional[str],
     codex_bin: Optional[str],
     codex_version: Optional[str],
+    process_env: Optional[Dict[str, str]] = None,
 ) -> Optional[str]:
     """Refusal message if a restrictive-tier launch must be blocked, else None.
 
@@ -5414,7 +5464,7 @@ def _codex_sandbox_refusal(
     """
     if sandbox not in _CODEX_RESTRICTIVE_SANDBOX_MODES:
         return None
-    if _codex_sandbox_enforces(codex_bin):
+    if _codex_sandbox_enforces(codex_bin, process_env):
         return None
 
     tier = permission or sandbox
@@ -5579,12 +5629,13 @@ def _codex_spin_sync(
 
     # Fail closed: for a restrictive tier, refuse to launch when the resolved codex binary
     # does not actually enforce its sandbox. Checked here — before any slot is reserved or
-    # shard created — so a refusal leaves nothing to clean up. The probe is cached per
-    # binary, so this is not a per-spool cost.
+    # shard created — so a refusal leaves nothing to clean up. The probe is cached for an
+    # unchanged binary/config context, so repeated callers in that context reuse it.
     effective_sandbox = sandbox or "workspace-write"
-    codex_bin = _resolve_codex_binary()
-    codex_version = _codex_cli_version(codex_bin)
-    codex_auth_mode = _codex_auth_mode(codex_bin)
+    process_env = _process_env(env)
+    codex_bin = _resolve_codex_binary(process_env)
+    codex_version = _codex_cli_version(codex_bin, process_env)
+    codex_auth_mode = _codex_auth_mode(codex_bin, process_env)
 
     # Short aliases are installation-independent. The official umbrella model
     # `gpt-5.6` needs one compatibility exception: this box's ChatGPT-account
@@ -5595,7 +5646,7 @@ def _codex_spin_sync(
     if model == "gpt-5.6" and codex_auth_mode == "chatgpt":
         resolved_model = "gpt-5.6-sol"
 
-    refusal = _codex_sandbox_refusal(effective_sandbox, permission, codex_bin, codex_version)
+    refusal = _codex_sandbox_refusal(effective_sandbox, permission, codex_bin, codex_version, process_env)
     if refusal:
         return _persist_codex_sandbox_refusal(
             "codex-" + str(uuid.uuid4())[:8],
@@ -5697,7 +5748,7 @@ Your task:
     # "--sandbox read-only". It is not needed for non-interactive use either — `codex exec`
     # already reports "approval: never" on its own. Verified against codex 0.125.0,
     # 2026-07-16. Re-adding it silently disables every tier below workspace-write.
-    codex_cmd = ["codex", "exec", "--json"]
+    codex_cmd = [codex_bin or "codex", "exec", "--json"]
 
     if resolved_model:
         codex_cmd.extend(["--model", resolved_model])
@@ -5779,16 +5830,15 @@ Your task:
 
     # Spawn detached process
     try:
-        pid = _spawn_detached(spool_id, cmd, cwd, env)
+        pid = _spawn_detached(spool_id, cmd, cwd, process_env)
     except Exception as e:
         # Spawn failed - mark spool as error so the slot is freed
         spool["status"] = "error"
         spool["error"] = f"spawn failed: {e}"
         spool["completed_at"] = datetime.now().isoformat()
         _write_spool(spool_id, spool)
-        # Clean up shard worktree only if we created it; don't destroy pre-existing shards
-        if shard_newly_created:
-            _cleanup_shard(shard_info, working_dir)
+        if _cleanup_failed_spool_shard(spool):
+            _write_spool(spool_id, spool)
         return f"Error: Failed to spawn process: {e}"
 
     # Update spool with PID and status
@@ -5849,12 +5899,13 @@ def _codex_respin_sync(session_id: str, prompt: str) -> str:
     permission = original_spool.get("permission") if original_spool else None
     sandbox = _codex_respin_sandbox(original_spool)
 
-    codex_bin = _resolve_codex_binary()
-    codex_version = _codex_cli_version(codex_bin)
+    process_env = _process_env(env)
+    codex_bin = _resolve_codex_binary(process_env)
+    codex_version = _codex_cli_version(codex_bin, process_env)
     # Fail closed: a respin at a restrictive tier is refused when the binary does not enforce
     # its sandbox, exactly like a fresh spin. The reserved slot is reused for the error
     # record (status "error" frees it), so no slot leaks.
-    refusal = _codex_sandbox_refusal(sandbox, permission, codex_bin, codex_version)
+    refusal = _codex_sandbox_refusal(sandbox, permission, codex_bin, codex_version, process_env)
     if refusal:
         return _persist_codex_sandbox_refusal(
             spool_id,
@@ -5880,7 +5931,7 @@ def _codex_respin_sync(session_id: str, prompt: str) -> str:
     # accept, so they must all precede the `resume` subcommand. --sandbox is paired with a
     # matching `-c sandbox_mode=<tier>` so config.toml can't widen the tier on a respin either
     # (see the note in _codex_spin_sync).
-    codex_cmd = ["codex", "exec", "--sandbox", sandbox, "-c", f"sandbox_mode={sandbox}"]
+    codex_cmd = [codex_bin or "codex", "exec", "--sandbox", sandbox, "-c", f"sandbox_mode={sandbox}"]
     if shard_info:
         codex_cmd.extend(["--cd", shard_info["worktree_path"]])
 
@@ -5951,7 +6002,7 @@ def _codex_respin_sync(session_id: str, prompt: str) -> str:
 
     # Spawn detached process
     try:
-        pid = _spawn_detached(spool_id, cmd, working_dir, env)
+        pid = _spawn_detached(spool_id, cmd, working_dir, process_env)
     except Exception as e:
         spool["status"] = "error"
         spool["error"] = f"spawn failed: {e}"

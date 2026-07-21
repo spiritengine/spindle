@@ -54,6 +54,7 @@ from spindle import (
     _get_harnesses,
     _get_output_path,
     _get_spool_path,
+    _get_stderr_path,
     _get_transcript_path,
     _handle_expired_session,
     _is_pid_alive,
@@ -1427,6 +1428,89 @@ class TestCodexResultExtraction:
             assert _check_and_finalize_spool(spool_id) is False
             assert _read_spool(spool_id)["status"] == "running"
 
+    def test_finalize_waits_for_process_exit_after_completed_event(self, tmp_path):
+        spool_id = "codex-terminal-success-live"
+        stream = json.dumps({"type": "turn.completed", "usage": {}})
+        live_proc = MagicMock()
+        live_proc.poll.return_value = None
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            spindle._PROC_HANDLES[spool_id] = live_proc
+            _write_spool(
+                spool_id,
+                {
+                    "id": spool_id,
+                    "status": "running",
+                    "harness": "codex",
+                    "prompt": "work",
+                    "pid": 12345,
+                    "created_at": datetime.now().isoformat(),
+                },
+            )
+            _get_output_path(spool_id).write_text(stream)
+            assert _check_and_finalize_spool(spool_id) is False
+            assert _read_spool(spool_id)["status"] == "running"
+            assert spindle._PROC_HANDLES.pop(spool_id) is live_proc
+
+    @pytest.mark.parametrize(
+        "stream",
+        [
+            json.dumps({"type": "thread.started", "thread_id": "partial"}),
+            json.dumps({"type": "turn.completed", "usage": {}}),
+        ],
+    )
+    def test_nonzero_codex_exit_with_stdout_is_error(self, tmp_path, stream):
+        spool_id = "codex-nonzero-partial"
+        failed_proc = MagicMock()
+        failed_proc.poll.return_value = 7
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            spindle._PROC_HANDLES[spool_id] = failed_proc
+            _write_spool(
+                spool_id,
+                {
+                    "id": spool_id,
+                    "status": "running",
+                    "harness": "codex",
+                    "prompt": "work",
+                    "pid": 12345,
+                    "created_at": datetime.now().isoformat(),
+                },
+            )
+            _get_output_path(spool_id).write_text(stream)
+            _get_stderr_path(spool_id).write_text("codex crashed")
+            assert _check_and_finalize_spool(spool_id) is True
+            spool = _read_spool(spool_id)
+
+        assert spool["status"] == "error"
+        assert spool["error"] == "codex crashed"
+        assert spool["exit_code"] == 7
+        assert spool["result"] == stream
+
+    def test_zero_codex_exit_without_completed_turn_is_error(self, tmp_path):
+        spool_id = "codex-zero-partial"
+        partial_proc = MagicMock()
+        partial_proc.poll.return_value = 0
+        stream = json.dumps({"type": "thread.started", "thread_id": "partial"})
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            spindle._PROC_HANDLES[spool_id] = partial_proc
+            _write_spool(
+                spool_id,
+                {
+                    "id": spool_id,
+                    "status": "running",
+                    "harness": "codex",
+                    "prompt": "work",
+                    "pid": 12345,
+                    "created_at": datetime.now().isoformat(),
+                },
+            )
+            _get_output_path(spool_id).write_text(stream)
+            assert _check_and_finalize_spool(spool_id) is True
+            spool = _read_spool(spool_id)
+
+        assert spool["status"] == "error"
+        assert spool["error"] == "Codex exited without a completed turn"
+        assert spool["exit_code"] == 0
+
     def test_process_group_liveness_sees_descendant_after_leader_exit(self):
         proc = subprocess.Popen(
             ["/bin/sh", "-c", "sleep 30 </dev/null >/dev/null 2>&1 & exit 0"],
@@ -1501,6 +1585,44 @@ class TestCodexResultExtraction:
             with patch("spindle._shard_is_pristine_for_cleanup", return_value=True):
                 with patch("spindle._cleanup_shard") as cleanup:
                     assert _check_and_finalize_spool(spool_id) is True
+            cleanup.assert_not_called()
+            assert _read_spool(spool_id)["status"] == "error"
+
+    def test_finalize_preserves_failed_shard_for_terminal_reuser_with_live_group(self, tmp_path):
+        spool_id = "codex-owner-terminal-reuser"
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        stream = json.dumps({"type": "turn.failed", "error": {"message": "provider failed"}})
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool(
+                "other-complete",
+                {
+                    "id": "other-complete",
+                    "status": "complete",
+                    "working_dir": str(worktree / "subdir"),
+                    "pid": 22222,
+                },
+            )
+            _write_spool(
+                spool_id,
+                {
+                    "id": spool_id,
+                    "status": "running",
+                    "harness": "codex",
+                    "prompt": "work",
+                    "pid": 11111,
+                    "created_at": datetime.now().isoformat(),
+                    "shard": {"worktree_path": str(worktree)},
+                    "shard_created_by_spool": True,
+                    "shard_source_dir": str(tmp_path / "repo"),
+                },
+            )
+            _get_output_path(spool_id).write_text(stream)
+            with patch("spindle._is_pid_alive", return_value=False):
+                with patch("spindle._is_process_group_alive", side_effect=lambda pid: pid == 22222):
+                    with patch("spindle._shard_is_pristine_for_cleanup", return_value=True):
+                        with patch("spindle._cleanup_shard") as cleanup:
+                            assert _check_and_finalize_spool(spool_id) is True
             cleanup.assert_not_called()
             assert _read_spool(spool_id)["status"] == "error"
 
@@ -4122,6 +4244,103 @@ class TestSpawnFailureRecovery:
             assert spool["status"] == "error"
             assert "spawn failed" in spool["error"]
 
+    def test_codex_spawn_failure_really_cleans_pristine_shard_and_repairs_retry_dir(self, tmp_path):
+        repo = tmp_path / "repo"
+        worktree = tmp_path / "worktree"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+        (repo / "README.md").write_text("base\n")
+        subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-m", "base"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "worktree", "add", "-b", "shard-spawn-failure", str(worktree), "main"],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+        )
+        shard = {
+            "worktree_path": str(worktree),
+            "branch_name": "shard-spawn-failure",
+            "shard_id": "spawn-failure",
+        }
+        spool_dir = tmp_path / "spools"
+
+        with patch("spindle.SPINDLE_DIR", spool_dir):
+            with patch("spindle._count_running", return_value=0):
+                with patch("spindle._has_skein", return_value=False):
+                    with patch("spindle._detect_existing_shard", return_value=None):
+                        with patch("spindle._spawn_shard", return_value=(shard, None)):
+                            with patch("spindle._resolve_codex_binary", return_value="/fake/codex"):
+                                with patch("spindle._codex_sandbox_enforces", return_value=True):
+                                    with patch("spindle._spawn_detached", side_effect=OSError("boom")):
+                                        result = _codex_spin_sync(
+                                            "do work",
+                                            str(repo),
+                                            None,
+                                            "workspace-write",
+                                            None,
+                                            None,
+                                            None,
+                                            shard=True,
+                                            base_branch="main",
+                                        )
+
+            assert result.startswith("Error: Failed to spawn process")
+            spool = _list_spools()[0]
+            assert spool["status"] == "error"
+            assert spool["working_dir"] == str(repo)
+            assert spool["shard"]["startup_failure_cleaned"] is True
+
+        assert not worktree.exists()
+        assert (
+            subprocess.run(
+                ["git", "show-ref", "--verify", "--quiet", "refs/heads/shard-spawn-failure"], cwd=repo
+            ).returncode
+            != 0
+        )
+
+    def test_codex_spawn_failure_preserves_shard_used_by_running_spool(self, tmp_path):
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        shard = {
+            "worktree_path": str(worktree),
+            "branch_name": "shard-spawn-failure",
+            "shard_id": "spawn-failure",
+        }
+        spool_dir = tmp_path / "spools"
+        with patch("spindle.SPINDLE_DIR", spool_dir):
+            _write_spool(
+                "other-running",
+                {
+                    "id": "other-running",
+                    "status": "running",
+                    "working_dir": str(worktree),
+                    "pid": 22222,
+                },
+            )
+            with patch("spindle._count_running", return_value=0):
+                with patch("spindle._has_skein", return_value=False):
+                    with patch("spindle._detect_existing_shard", return_value=None):
+                        with patch("spindle._spawn_shard", return_value=(shard, None)):
+                            with patch("spindle._resolve_codex_binary", return_value="/fake/codex"):
+                                with patch("spindle._codex_sandbox_enforces", return_value=True):
+                                    with patch("spindle._spawn_detached", side_effect=OSError("boom")):
+                                        with patch("spindle._shard_is_pristine_for_cleanup", return_value=True):
+                                            with patch("spindle._cleanup_shard") as cleanup:
+                                                _codex_spin_sync(
+                                                    "do work",
+                                                    str(tmp_path),
+                                                    None,
+                                                    "workspace-write",
+                                                    None,
+                                                    None,
+                                                    None,
+                                                    shard=True,
+                                                )
+            cleanup.assert_not_called()
+
 
 class TestRecoverOrphansPending:
     """Test that _recover_orphans cleans up stale pending spools."""
@@ -4703,18 +4922,19 @@ class TestShardSpawnPreamblesAndCodexCd:
                     with patch("spindle._spawn_shard", return_value=(fake_shard, None)):
                         with patch("spindle._detect_existing_shard", return_value=None):
                             with patch("shutil.which", return_value="/usr/bin/bwrap"):
-                                with patch("spindle._codex_sandbox_enforces", return_value=True):
-                                    with patch("spindle._spawn_detached", side_effect=fake_detached):
-                                        _codex_spin_sync(
-                                            "do codex shard work",
-                                            str(tmp_path),
-                                            None,
-                                            None,
-                                            None,
-                                            None,
-                                            None,
-                                            shard=True,
-                                        )
+                                with patch("spindle._resolve_codex_binary", return_value="/usr/bin/codex"):
+                                    with patch("spindle._codex_sandbox_enforces", return_value=True):
+                                        with patch("spindle._spawn_detached", side_effect=fake_detached):
+                                            _codex_spin_sync(
+                                                "do codex shard work",
+                                                str(tmp_path),
+                                                None,
+                                                None,
+                                                None,
+                                                None,
+                                                None,
+                                                shard=True,
+                                            )
 
         assert len(captured_cmd) == 1
         cmd = captured_cmd[0]
@@ -4731,7 +4951,7 @@ class TestShardSpawnPreamblesAndCodexCd:
         assert "--dev" in cmd, f"Expected --dev in bwrap command: {cmd!r}"
         assert "--proc" in cmd, f"Expected --proc in bwrap command: {cmd!r}"
         assert "--chdir" in cmd, f"Expected --chdir in bwrap command: {cmd!r}"
-        assert "codex" in cmd, f"Expected codex in bwrap-wrapped command: {cmd!r}"
+        assert "/usr/bin/codex" in cmd, f"Expected resolved codex in bwrap-wrapped command: {cmd!r}"
 
     def test_codex_spin_sync_warns_when_bwrap_unavailable_for_shard(self, tmp_path, capsys):
         """When bwrap is not available for a shard, log a warning and run without it."""
@@ -5062,8 +5282,9 @@ class TestCodexRespinPreservesGitAccess:
             with patch("spindle._spawn_detached", side_effect=fake_detached):
                 with patch("spindle._count_running", return_value=0):
                     with patch("shutil.which", return_value="/usr/bin/bwrap"):
-                        with patch("spindle._codex_sandbox_enforces", return_value=True):
-                            _codex_respin_sync(session_id, "follow up")
+                        with patch("spindle._resolve_codex_binary", return_value="/usr/bin/codex"):
+                            with patch("spindle._codex_sandbox_enforces", return_value=True):
+                                _codex_respin_sync(session_id, "follow up")
 
         assert len(captured_cmd) == 1, "Expected one spawn for codex respin"
         cmd = captured_cmd[0]
@@ -5076,7 +5297,7 @@ class TestCodexRespinPreservesGitAccess:
         )
         assert rw_bind_found, f"Expected '--bind {worktree_root} {worktree_root}' in respin cmd: {cmd!r}"
         assert "--chdir" in cmd
-        assert "codex" in cmd
+        assert "/usr/bin/codex" in cmd
 
     def test_codex_respin_sync_warns_when_bwrap_unavailable_for_shard(self, tmp_path, capsys):
         """Warning is logged when bwrap is absent for a respin shard."""
@@ -5268,6 +5489,54 @@ class TestCodexSandboxEnforcement:
         spool = json.loads(next(tmp_path.glob("codex-*.json")).read_text())
         assert spool["model"] == "gpt-5.6"
         assert spool["codex_auth_mode"] == auth_mode
+
+    def test_spin_probes_and_launches_codex_from_caller_environment(self, tmp_path):
+        bin_dir = tmp_path / "custom-bin"
+        codex_home = tmp_path / "custom-codex-home"
+        bin_dir.mkdir()
+        codex_home.mkdir()
+        codex = bin_dir / "codex"
+        codex.write_text(
+            "#!/bin/sh\n"
+            'if [ "$1" = "--version" ]; then echo \'codex-cli 9.9.9\'; exit 0; fi\n'
+            'if [ "$1" = "login" ]; then echo \'Logged in using ChatGPT\'; exit 0; fi\n'
+        )
+        codex.chmod(0o755)
+        caller_env = {"PATH": str(bin_dir), "CODEX_HOME": str(codex_home)}
+        captured = []
+
+        def fake_detached(spool_id, cmd, cwd, env=None):
+            captured.append((list(cmd), dict(env)))
+            return 99999
+
+        with patch("spindle.SPINDLE_DIR", tmp_path / "spools"):
+            with patch("spindle._count_running", return_value=0):
+                with patch("spindle._has_skein", return_value=False):
+                    with patch("spindle._codex_sandbox_enforces", return_value=True) as enforces:
+                        with patch("spindle._spawn_detached", side_effect=fake_detached):
+                            with patch("spindle.threading.Thread"):
+                                spool_id = _codex_spin_sync(
+                                    "do work",
+                                    str(tmp_path),
+                                    "gpt-5.6",
+                                    "read-only",
+                                    None,
+                                    None,
+                                    caller_env,
+                                )
+
+            spool = _read_spool(spool_id)
+
+        cmd, launched_env = captured[0]
+        assert cmd[0] == str(codex)
+        assert cmd[cmd.index("--model") + 1] == "gpt-5.6-sol"
+        assert launched_env["PATH"] == str(bin_dir)
+        assert launched_env["CODEX_HOME"] == str(codex_home)
+        assert spool["codex_bin"] == str(codex)
+        assert spool["codex_version"] == "9.9.9"
+        assert spool["codex_auth_mode"] == "chatgpt"
+        assert enforces.call_args.args[0] == str(codex)
+        assert enforces.call_args.args[1]["CODEX_HOME"] == str(codex_home)
 
     def test_spin_never_passes_full_auto(self, tmp_path):
         """--full-auto silently overrides --sandbox with its own workspace-write tier.
@@ -5611,7 +5880,8 @@ class TestCodexSandboxEnforcesProbe:
 
     Enforcement is decided by running codex's no-model `codex sandbox` under read-only and
     checking a cwd write was BLOCKED — not by a version string. The probe must fail closed on
-    any inconclusive outcome, cache per binary, and never refuse a danger-full-access tier.
+    any inconclusive outcome, cache per binary/config context, and never refuse a
+    danger-full-access tier.
     """
 
     def _proc(self, stdout, returncode=0):
@@ -5628,13 +5898,19 @@ class TestCodexSandboxEnforcesProbe:
             ("not logged in\n", 1, "unknown"),
         ],
     )
-    def test_codex_auth_mode_is_detected_and_cached(self, stdout, returncode, expected):
-        spindle._CODEX_AUTH_MODE_CACHE.clear()
+    def test_codex_auth_mode_is_detected_fresh_in_launch_environment(self, stdout, returncode, expected):
+        process_env = {"PATH": "/custom/bin", "CODEX_HOME": "/custom/codex-home"}
         with patch("spindle.subprocess.run", return_value=self._proc(stdout, returncode)) as run:
-            assert spindle._codex_auth_mode("/fake/codex") == expected
-            assert spindle._codex_auth_mode("/fake/codex") == expected
-        run.assert_called_once_with(["/fake/codex", "login", "status"], capture_output=True, text=True, timeout=10)
-        spindle._CODEX_AUTH_MODE_CACHE.clear()
+            assert spindle._codex_auth_mode("/fake/codex", process_env) == expected
+            assert spindle._codex_auth_mode("/fake/codex", process_env) == expected
+        assert run.call_count == 2
+        run.assert_called_with(
+            ["/fake/codex", "login", "status"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            env=process_env,
+        )
 
     def test_probe_true_when_write_blocked_and_command_ran(self, caplog):
         """Marker on stdout proves the command ran; a missing file means the write was blocked."""
@@ -5704,11 +5980,11 @@ class TestCodexSandboxEnforcesProbe:
         assert spindle._codex_sandbox_enforces(None) is False
 
     def test_enforces_is_cached_per_binary(self):
-        """The probe runs at most once per binary — never per spool."""
+        """The probe runs once for an unchanged binary/config context."""
         spindle._CODEX_SANDBOX_ENFORCES_CACHE.clear()
         calls = []
 
-        def probe(codex_bin):
+        def probe(codex_bin, process_env=None):
             calls.append(codex_bin)
             return True
 
@@ -5716,7 +5992,7 @@ class TestCodexSandboxEnforcesProbe:
             with patch("spindle._codex_sandbox_probe_key", return_value=("/fake/codex", "0.144.4", 123.0)):
                 assert spindle._codex_sandbox_enforces("/fake/codex") is True
                 assert spindle._codex_sandbox_enforces("/fake/codex") is True
-        assert len(calls) == 1, f"probe must run at most once per binary, ran {len(calls)}x"
+        assert len(calls) == 1, f"probe must be reused for an unchanged context, ran {len(calls)}x"
         spindle._CODEX_SANDBOX_ENFORCES_CACHE.clear()
 
     def test_enforces_reprobes_when_binary_changes(self):
@@ -5725,15 +6001,34 @@ class TestCodexSandboxEnforcesProbe:
         calls = []
         keys = iter([("/fake/codex", "0.144.4", 1.0), ("/fake/codex", "0.144.4", 2.0)])
 
-        def probe(codex_bin):
+        def probe(codex_bin, process_env=None):
             calls.append(codex_bin)
             return True
 
         with patch("spindle._codex_sandbox_probe", side_effect=probe):
-            with patch("spindle._codex_sandbox_probe_key", side_effect=lambda b: next(keys)):
+            with patch("spindle._codex_sandbox_probe_key", side_effect=lambda b, env=None: next(keys)):
                 spindle._codex_sandbox_enforces("/fake/codex")
                 spindle._codex_sandbox_enforces("/fake/codex")
         assert len(calls) == 2, "a changed binary must re-probe"
+        spindle._CODEX_SANDBOX_ENFORCES_CACHE.clear()
+
+    def test_enforces_reprobes_when_codex_home_changes(self):
+        spindle._CODEX_SANDBOX_ENFORCES_CACHE.clear()
+        calls = []
+
+        def probe(codex_bin, process_env=None):
+            calls.append(process_env["CODEX_HOME"])
+            return True
+
+        def key(codex_bin, process_env=None):
+            return (codex_bin, process_env["CODEX_HOME"])
+
+        with patch("spindle._codex_sandbox_probe", side_effect=probe):
+            with patch("spindle._codex_sandbox_probe_key", side_effect=key):
+                assert spindle._codex_sandbox_enforces("/fake/codex", {"CODEX_HOME": "/one"})
+                assert spindle._codex_sandbox_enforces("/fake/codex", {"CODEX_HOME": "/two"})
+
+        assert calls == ["/one", "/two"]
         spindle._CODEX_SANDBOX_ENFORCES_CACHE.clear()
 
     def test_refusal_none_for_danger_full_access_without_probing(self):
