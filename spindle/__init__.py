@@ -75,6 +75,8 @@ BUILTIN_HARNESSES = {"claude-code", "codex", "gemini", "kimi"}
 # Live subprocess handles keyed by spool_id, populated by _spawn_detached so
 # finalization can capture the child's exit code. Process-local; not persisted.
 _PROC_HANDLES: Dict[str, "subprocess.Popen"] = {}
+_DEFERRED_CLEANUP_MONITORS: set[str] = set()
+_DEFERRED_CLEANUP_MONITORS_LOCK = threading.Lock()
 
 # Set while a drain-then-restart is queued (spindle_reload without force), so a
 # second reload call doesn't stack another waiter. Process-local. The check-then-
@@ -822,6 +824,7 @@ def _cleanup_shard(
     if not worktree_path:
         return False
 
+    worktree_removed = False
     try:
         # Remove worktree
         result = subprocess.run(
@@ -838,6 +841,7 @@ def _cleanup_shard(
                 + f": {result.stderr.strip()}"
             )
             return False
+        worktree_removed = True
 
         # Optionally delete branch
         if not keep_branch and branch_name:
@@ -871,14 +875,14 @@ def _cleanup_shard(
             + (f" (spool {spool_id})" if spool_id else "")
             + f": {e}"
         )
-        return False
+        return worktree_removed
     except (FileNotFoundError, OSError) as e:
         logger.error(
             f"Error during shard cleanup for worktree {worktree_path}"
             + (f" (spool {spool_id})" if spool_id else "")
             + f": {e}"
         )
-        return False
+        return worktree_removed
 
 
 def _shard_has_other_active_spool(spool_id: str, shard_info: dict) -> bool:
@@ -927,27 +931,51 @@ def _cleanup_failed_spool_shard(spool: dict) -> bool:
     if spool.get("status") != "error" or not spool.get("shard_created_by_spool"):
         return False
 
+    def defer(reason: str) -> bool:
+        spool["shard_cleanup_pending"] = True
+        spool["shard_cleanup_pending_reason"] = reason
+        return False
+
+    def cleaned() -> bool:
+        shard_info["startup_failure_cleaned"] = True
+        spool["shard"] = shard_info
+        spool["working_dir"] = cleanup_dir
+        spool.pop("shard_cleanup_pending", None)
+        spool.pop("shard_cleanup_pending_reason", None)
+        return True
+
     pid = spool.get("pid")
     if pid and (_is_pid_alive(pid) or _is_process_group_alive(pid)):
-        return False
+        return defer("owner process group still alive")
 
     shard_info = spool.get("shard") or {}
     cleanup_dir = spool.get("shard_source_dir")
     if not cleanup_dir:
         return False
 
+    worktree_path = shard_info.get("worktree_path")
+    if worktree_path and not Path(worktree_path).exists():
+        # A previous cleanup may have removed the worktree before branch prune
+        # failed. There is no worktree data left to protect; repair retry now.
+        return cleaned()
+
     with _concurrency_lock():
         if _shard_has_other_active_spool(spool.get("id", ""), shard_info):
+            return defer("another spool may still use the worktree")
+        cleanup_state = _shard_cleanup_state(spool)
+        if cleanup_state == "changed":
+            spool["shard_cleanup_preserved"] = True
+            spool.pop("shard_cleanup_pending", None)
+            spool.pop("shard_cleanup_pending_reason", None)
             return False
-        if not _shard_is_pristine_for_cleanup(spool):
-            return False
+        if cleanup_state != "pristine":
+            return defer("Git cleanup state is uncertain")
         if not _cleanup_shard(shard_info, cleanup_dir, spool_id=spool.get("id")):
-            return False
+            if worktree_path and not Path(worktree_path).exists():
+                return cleaned()
+            return defer("worktree cleanup failed")
 
-    shard_info["startup_failure_cleaned"] = True
-    spool["shard"] = shard_info
-    spool["working_dir"] = cleanup_dir
-    return True
+    return cleaned()
 
 
 def _get_spool_path(spool_id: str) -> Path:
@@ -963,6 +991,19 @@ def _get_output_path(spool_id: str) -> Path:
 def _get_stderr_path(spool_id: str) -> Path:
     """Get path to stderr file for a spool."""
     return SPINDLE_DIR / f"{spool_id}.stderr"
+
+
+def _get_exit_path(spool_id: str) -> Path:
+    """Get path to the detached wrapper's persisted exit status."""
+    return SPINDLE_DIR / f"{spool_id}.exit"
+
+
+def _read_exit_code(spool_id: str) -> Optional[int]:
+    """Read a detached child's persisted exit status, or None if unavailable."""
+    try:
+        return int(_get_exit_path(spool_id).read_text().strip())
+    except (FileNotFoundError, OSError, ValueError):
+        return None
 
 
 def _get_transcript_path(spool_id: str) -> Path:
@@ -1672,16 +1713,14 @@ def _extract_codex_result(stdout: str) -> Optional[str]:
     return "\n\n".join(messages)
 
 
-def _codex_failure_message(stdout: str) -> Optional[str]:
-    """Return the final terminal Codex turn failure, if the stream has one.
+def _codex_turn_state(stdout: str) -> tuple[Optional[str], object]:
+    """Return the final Codex turn state and its raw failure payload.
 
-    Codex sometimes exits successfully at the process level after emitting a
-    ``turn.failed`` JSONL event (for example, an account/model HTTP 400). The
-    event, rather than the process exit code or the mere presence of stdout,
-    is therefore authoritative. Its message may itself be a serialized API
-    error object; unwrap that so callers get the actionable provider message.
+    ``turn.started`` resets an earlier terminal state. Without that transition,
+    a stream ending ``turn.completed`` then ``turn.started`` would falsely look
+    successful even though its newest turn never terminated.
     """
-    terminal_type = None
+    state = None
     failure = None
     for line in stdout.splitlines():
         try:
@@ -1691,24 +1730,36 @@ def _codex_failure_message(stdout: str) -> Optional[str]:
         if not isinstance(event, dict):
             continue
         event_type = event.get("type")
-        if event_type == "turn.completed":
-            terminal_type = event_type
+        if event_type == "turn.started":
+            state = "running"
+            failure = None
+        elif event_type == "turn.completed":
+            state = "complete"
             failure = None
         elif event_type in {"turn.failed", "error"}:
-            terminal_type = event_type
-            error = event.get("error")
-            if error is None:
-                error = event.get("message")
-            if isinstance(error, dict):
-                failure = error.get("message")
-                details = {key: value for key, value in error.items() if key != "message" and value is not None}
-                if not failure and details:
-                    failure = json.dumps(details, sort_keys=True)
-            else:
-                failure = error
+            state = "failed"
+            failure = event.get("error")
+            if failure is None:
+                failure = event.get("message")
+    return state, failure
 
-    if terminal_type not in {"turn.failed", "error"}:
+
+def _codex_failure_message(stdout: str) -> Optional[str]:
+    """Return the final failed Codex turn message, if the stream has one.
+
+    Codex sometimes exits successfully at the process level after emitting a
+    ``turn.failed`` JSONL event (for example, an account/model HTTP 400). The
+    event, rather than the process exit code or the mere presence of stdout,
+    is therefore authoritative. Its message may itself be a serialized API
+    error object; unwrap that so callers get the actionable provider message.
+    """
+    state, failure = _codex_turn_state(stdout)
+    if state != "failed":
         return None
+    if isinstance(failure, dict):
+        message = failure.get("message")
+        details = {key: value for key, value in failure.items() if key != "message" and value is not None}
+        failure = message or (json.dumps(details, sort_keys=True) if details else None)
     if not failure:
         return "Codex failed without an error message"
     if not isinstance(failure, str):
@@ -1814,6 +1865,29 @@ def _is_process_group_alive(process_group_id: int) -> bool:
         return True
 
 
+def _terminate_process_group(process_group_id: int, grace_seconds: float) -> None:
+    """Terminate a detached spool and every descendant in its process group."""
+    try:
+        os.killpg(process_group_id, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    except OSError:
+        try:
+            os.kill(process_group_id, signal.SIGTERM)
+        except (ProcessLookupError, OSError):
+            return
+    time.sleep(grace_seconds)
+    if not _is_process_group_alive(process_group_id):
+        return
+    try:
+        os.killpg(process_group_id, signal.SIGKILL)
+    except OSError:
+        try:
+            os.kill(process_group_id, signal.SIGKILL)
+        except (ProcessLookupError, OSError):
+            pass
+
+
 def _parse_duration(time_str: str) -> Optional[int]:
     """
     Parse a duration string into seconds.
@@ -1910,11 +1984,14 @@ def _cleanup_old_spools() -> None:
                     # Also clean up output, lock, and transcript files
                     stdout_path = _get_output_path(spool_id)
                     stderr_path = _get_stderr_path(spool_id)
+                    exit_path = _get_exit_path(spool_id)
                     lock_path = _get_lock_path(spool_id)
                     if stdout_path.exists():
                         stdout_path.unlink()
                     if stderr_path.exists():
                         stderr_path.unlink()
+                    if exit_path.exists():
+                        exit_path.unlink()
                     if lock_path.exists():
                         lock_path.unlink()
         except Exception:
@@ -2030,7 +2107,7 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
         # output is complete but the CLI lingers); that's fine - exit_code stays
         # unknown for that case. None when there's no handle (orphan recovery).
         proc = _PROC_HANDLES.pop(spool_id, None)
-        exit_code = observed_exit_code if proc is not None else None
+        exit_code = observed_exit_code if proc is not None else _read_exit_code(spool_id)
         if exit_code is not None:
             spool["exit_code"] = exit_code
         # Suffix for the "no output" fallbacks so a silent failure reports the
@@ -2051,8 +2128,8 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
                     extracted = _extract_codex_result(stdout)
                     spool["result"] = extracted if extracted is not None else stdout
 
+                    codex_turn_state, _ = _codex_turn_state(stdout)
                     codex_failure_message = _codex_failure_message(stdout)
-                    turn_completed = False
                     for line in stdout.strip().split("\n"):
                         try:
                             event = json.loads(line)
@@ -2063,7 +2140,6 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
                         if event.get("type") == "thread.started":
                             spool["session_id"] = event.get("thread_id")
                         elif event.get("type") == "turn.completed":
-                            turn_completed = True
                             usage = event.get("usage", {})
                             if usage:
                                 spool["cost"] = usage
@@ -2071,10 +2147,13 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
                     if codex_failure_message:
                         spool["status"] = "error"
                         spool["error"] = codex_failure_message
-                    elif exit_code not in (None, 0):
+                    elif exit_code is None:
+                        spool["status"] = "error"
+                        spool["error"] = "Codex exit status unavailable"
+                    elif exit_code != 0:
                         spool["status"] = "error"
                         spool["error"] = stderr.strip()[:500] or f"Codex exited with code {exit_code}"
-                    elif not turn_completed:
+                    elif codex_turn_state != "complete":
                         spool["status"] = "error"
                         spool["error"] = "Codex exited without a completed turn"
                     else:
@@ -2218,14 +2297,19 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
         # A provider can reject a Codex turn after Spindle has created its shard.
         # The shared helper is also used by immediate spawn failures, so every
         # destructive path has the same liveness, concurrency, and Git checks.
-        if _cleanup_failed_spool_shard(spool):
-            _write_spool(spool_id, spool)
+        _cleanup_failed_spool_shard(spool)
+        _write_spool(spool_id, spool)
+        if spool.get("shard_cleanup_pending"):
+            _schedule_deferred_shard_cleanup(spool_id)
 
         # Clean up output files
         if stdout_path.exists():
             stdout_path.unlink()
         if stderr_path.exists():
             stderr_path.unlink()
+        exit_path = _get_exit_path(spool_id)
+        if exit_path.exists():
+            exit_path.unlink()
 
         return True
 
@@ -2239,6 +2323,8 @@ def _recover_orphans() -> None:
     for spool in _list_spools():
         if spool.get("status") == "running":
             _check_and_finalize_spool(spool["id"])
+        elif spool.get("status") == "error" and spool.get("shard_cleanup_pending"):
+            _schedule_deferred_shard_cleanup(spool["id"])
         elif spool.get("status") == "pending" and not spool.get("pid"):
             # Check if this pending spool has been stuck too long
             created_at = spool.get("created_at")
@@ -2290,13 +2376,7 @@ def _handle_expired_session(spool_id: str, spool: dict) -> bool:
     # Kill the failing process
     pid = spool.get("pid")
     if pid and _is_pid_alive(pid):
-        try:
-            os.kill(pid, signal.SIGTERM)
-            time.sleep(0.2)
-            if _is_pid_alive(pid):
-                os.kill(pid, signal.SIGKILL)
-        except (ProcessLookupError, OSError):
-            pass
+        _terminate_process_group(pid, 0.2)
 
     # Read transcript
     try:
@@ -2360,6 +2440,36 @@ Continue from above. New message: {spool["prompt"].split(": ", 1)[-1]}"""
         return False
 
 
+def _monitor_deferred_shard_cleanup(spool_id: str) -> None:
+    """Retry a transiently blocked failed-shard cleanup until it resolves."""
+    try:
+        while True:
+            time.sleep(max(5.0, MONITOR_POLL_INTERVAL))
+            with _spool_lock(spool_id, blocking=False) as acquired:
+                if not acquired:
+                    continue
+                spool = _read_spool(spool_id)
+                if not spool or not spool.get("shard_cleanup_pending"):
+                    return
+                _cleanup_failed_spool_shard(spool)
+                _write_spool(spool_id, spool)
+                if not spool.get("shard_cleanup_pending"):
+                    return
+    finally:
+        with _DEFERRED_CLEANUP_MONITORS_LOCK:
+            _DEFERRED_CLEANUP_MONITORS.discard(spool_id)
+
+
+def _schedule_deferred_shard_cleanup(spool_id: str) -> None:
+    """Ensure one daemon monitor is retrying this spool's deferred cleanup."""
+    with _DEFERRED_CLEANUP_MONITORS_LOCK:
+        if spool_id in _DEFERRED_CLEANUP_MONITORS:
+            return
+        _DEFERRED_CLEANUP_MONITORS.add(spool_id)
+    monitor = threading.Thread(target=_monitor_deferred_shard_cleanup, args=(spool_id,), daemon=True)
+    monitor.start()
+
+
 def _monitor_spool(spool_id: str) -> None:
     """Background thread that monitors a spool until completion."""
     while True:
@@ -2373,19 +2483,14 @@ def _monitor_spool(spool_id: str) -> None:
                 # Kill the process
                 pid = spool.get("pid")
                 if pid and _is_pid_alive(pid):
-                    try:
-                        os.kill(pid, signal.SIGTERM)
-                        time.sleep(0.5)
-                        if _is_pid_alive(pid):
-                            os.kill(pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
+                    _terminate_process_group(pid, 0.5)
                 # Mark as timeout
                 spool["status"] = "timeout"
                 spool["error"] = f"Timeout after {spool['timeout']}s"
                 spool["completed_at"] = datetime.now().isoformat()
                 _write_spool(spool_id, spool)
                 _PROC_HANDLES.pop(spool_id, None)
+                _get_exit_path(spool_id).unlink(missing_ok=True)
                 break
 
         # For respin spools, check for "session not found" error early
@@ -2419,12 +2524,32 @@ def _spawn_detached(spool_id: str, cmd: list, cwd: str, env: Optional[Dict[str, 
     """
     stdout_path = _get_output_path(spool_id)
     stderr_path = _get_stderr_path(spool_id)
+    exit_path = _get_exit_path(spool_id)
+    exit_path.unlink(missing_ok=True)
 
     process_env = _process_env(env)
+    executable = str(cmd[0]) if cmd else ""
+    resolved_executable = (
+        executable if os.path.isabs(executable) else shutil.which(executable, path=process_env.get("PATH"))
+    )
+    if not resolved_executable or not os.access(resolved_executable, os.X_OK):
+        raise FileNotFoundError(f"executable not found or not runnable: {executable}")
+
+    # A Popen handle is process-local and disappears when the Spindle server
+    # restarts. Keep a tiny detached shell as the process-group leader so it can
+    # atomically persist the real child exit status for orphan recovery. `"$@"`
+    # passes every argv item literally; prompts never enter shell source.
+    wrapper_script = (
+        'status_file="$1"; shift; "$@"; rc=$?; '
+        'tmp_file="${status_file}.tmp.$$"; '
+        'printf "%s\\n" "$rc" > "$tmp_file" && /bin/mv "$tmp_file" "$status_file"; '
+        'exit "$rc"'
+    )
+    wrapped_cmd = ["/bin/sh", "-c", wrapper_script, "spindle-exit-status", str(exit_path), *cmd]
 
     with open(stdout_path, "w") as stdout_file, open(stderr_path, "w") as stderr_file:
         proc = subprocess.Popen(
-            cmd,
+            wrapped_cmd,
             stdout=stdout_file,
             stderr=stderr_file,
             cwd=cwd,
@@ -2432,9 +2557,8 @@ def _spawn_detached(spool_id: str, cmd: list, cwd: str, env: Optional[Dict[str, 
             start_new_session=True,  # Detach from parent
         )
 
-    # Keep the handle so finalize can read the exit code (and reap the child
-    # rather than leaving a zombie). Only valid within this server process; an
-    # orphan recovered after a restart simply has no handle and no exit code.
+    # Keep the handle for fast-path polling and reaping. The exit-status file is
+    # authoritative after a restart when this in-memory handle no longer exists.
     _PROC_HANDLES[spool_id] = proc
     return proc.pid
 
@@ -3186,6 +3310,7 @@ def _spin_drop_sync(spool_id: str) -> str:
         stdout_path.unlink()
     if stderr_path.exists():
         stderr_path.unlink()
+    _get_exit_path(spool_id).unlink(missing_ok=True)
 
     return f"Dropped spool {spool_id}"
 
@@ -3854,6 +3979,7 @@ async def spin_drop(spool_id: str) -> str:
         stdout_path.unlink()
     if stderr_path.exists():
         stderr_path.unlink()
+    _get_exit_path(spool_id).unlink(missing_ok=True)
 
     return f"Dropped spool {spool_id}"
 
@@ -4388,18 +4514,20 @@ def _get_shard_commit_status(spool: dict) -> Optional[str]:
         return "unknown"
 
 
-def _shard_is_pristine_for_cleanup(spool: dict) -> bool:
-    """Prove a failed spool's shard contains no user or generated work.
+def _shard_cleanup_state(spool: dict) -> str:
+    """Return ``pristine``, ``changed``, ``missing``, or ``unknown``.
 
-    This predicate authorizes destructive cleanup, so every uncertainty fails
-    closed. Unlike the display-oriented commit-status helper, ignored files are
-    work too: reports, build output, or other artifacts must never be discarded
-    merely because ``.gitignore`` hides them.
+    Unlike the display-oriented commit-status helper, ignored files are work
+    too: reports or generated artifacts must never be discarded merely because
+    ``.gitignore`` hides them. Callers may retry ``unknown`` but must preserve
+    ``changed``.
     """
     shard_info = spool.get("shard") or {}
     worktree_path = shard_info.get("worktree_path")
-    if not worktree_path or not Path(worktree_path).exists():
-        return False
+    if not worktree_path:
+        return "unknown"
+    if not Path(worktree_path).exists():
+        return "missing"
     base_branch = _shard_base_branch(spool)
     try:
         status = subprocess.run(
@@ -4409,8 +4537,10 @@ def _shard_is_pristine_for_cleanup(spool: dict) -> bool:
             cwd=worktree_path,
             timeout=10,
         )
-        if status.returncode != 0 or status.stdout.strip():
-            return False
+        if status.returncode != 0:
+            return "unknown"
+        if status.stdout.strip():
+            return "changed"
         commits = subprocess.run(
             ["git", "rev-list", "--count", f"{base_branch}..HEAD"],
             capture_output=True,
@@ -4419,10 +4549,15 @@ def _shard_is_pristine_for_cleanup(spool: dict) -> bool:
             timeout=10,
         )
         if commits.returncode != 0:
-            return False
-        return int(commits.stdout.strip()) == 0
+            return "unknown"
+        return "pristine" if int(commits.stdout.strip()) == 0 else "changed"
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError, ValueError):
-        return False
+        return "unknown"
+
+
+def _shard_is_pristine_for_cleanup(spool: dict) -> bool:
+    """Prove a failed spool's shard contains no user or generated work."""
+    return _shard_cleanup_state(spool) == "pristine"
 
 
 def _get_shard_change_stats(spool: dict) -> Optional[dict]:
@@ -5372,10 +5507,12 @@ def _codex_sandbox_probe(codex_bin: str, process_env: Optional[Dict[str, str]] =
     try:
         probe_dir = tempfile.mkdtemp(prefix="spindle-codex-probe-")
         target = os.path.join(probe_dir, "enforce_probe.txt")
-        # `echo <marker>` proves the command executed under the sandbox; the write to the
-        # relative path (resolved against the probe cwd) is what read-only must block. This
-        # runs with NO model turn, so it never adds a model call.
-        shell_cmd = f"echo {_CODEX_SANDBOX_PROBE_MARKER}; printf BROKEN > enforce_probe.txt"
+        # The marker is emitted only after the relative write was attempted. Its presence
+        # proves that attempt completed under the sandbox; any target existence then proves
+        # the read-only boundary failed. This runs with no model turn.
+        shell_cmd = (
+            f"printf BROKEN > enforce_probe.txt; write_rc=$?; echo {_CODEX_SANDBOX_PROBE_MARKER}; exit $write_rc"
+        )
         for argv in _codex_sandbox_probe_argvs(codex_bin, shell_cmd):
             Path(target).unlink(missing_ok=True)  # no stale file from a prior shape
             try:
@@ -5393,7 +5530,8 @@ def _codex_sandbox_probe(codex_bin: str, process_env: Optional[Dict[str, str]] =
             if _CODEX_SANDBOX_PROBE_MARKER not in (proc.stdout or ""):
                 continue  # wrong CLI shape for this version — the command never ran
             try:
-                wrote = os.path.getsize(target) > 0
+                os.stat(target)
+                wrote = True
             except FileNotFoundError:
                 # Expected success case: read-only prevented creation entirely.
                 wrote = False
@@ -5519,23 +5657,26 @@ def _codex_bwrap_wrap(
     shard_info: dict,
     cwd: str,
     research_target_info: Optional[Dict[str, str]] = None,
+    process_env: Optional[Dict[str, str]] = None,
 ) -> list:
     """Wrap codex_cmd in bwrap for shard isolation.
 
     Returns the (possibly bwrap-wrapped) command. If bwrap is not available,
     logs a warning and returns codex_cmd unchanged.
     """
-    if not shutil.which("bwrap"):
+    bwrap_bin = shutil.which("bwrap")
+    if not bwrap_bin:
         print(
             "[Spindle] WARNING: bwrap not available — codex shard isolation is "
             "advisory only (prompt-enforced, not OS-enforced). Install bwrap for enforcement."
         )
         return codex_cmd
 
-    home = str(Path.home())
+    effective_env = process_env or os.environ
+    home = effective_env.get("HOME", str(Path.home()))
     worktree_root = shard_info["worktree_path"]
     cmd = [
-        "bwrap",
+        bwrap_bin,
         "--ro-bind",
         "/",
         "/",
@@ -5577,19 +5718,28 @@ def _codex_bwrap_wrap(
                     logs_refs_heads = main_git / "logs" / "refs" / "heads"
                     if logs_refs_heads.exists():
                         cmd.extend(["--bind", str(logs_refs_heads), str(logs_refs_heads)])
-    for config_item in [
-        ".claude",
-        ".claude.json",
-        ".anthropic",
-        ".codex",
-        ".gemini",
-        ".spindle",
-        ".config",
-        ".cache",
-    ]:
-        path = f"{home}/{config_item}"
-        if Path(path).exists():
+    config_paths = [
+        Path(home) / config_item
+        for config_item in [
+            ".claude",
+            ".claude.json",
+            ".anthropic",
+            ".codex",
+            ".gemini",
+            ".spindle",
+            ".config",
+            ".cache",
+        ]
+    ]
+    codex_home = effective_env.get("CODEX_HOME")
+    if codex_home:
+        config_paths.append(Path(codex_home))
+    seen_paths = set()
+    for config_path in config_paths:
+        path = str(config_path)
+        if path not in seen_paths and config_path.exists():
             cmd.extend(["--bind", path, path])
+            seen_paths.add(path)
     cmd.extend(codex_cmd)
     return cmd
 
@@ -5784,7 +5934,13 @@ Your task:
     # Codex's own bubblewrap sandbox nests inside this one, so both layers run as
     # defense-in-depth.
     if shard_info:
-        cmd = _codex_bwrap_wrap(codex_cmd, shard_info, cwd, research_target_info=research_target_info)
+        cmd = _codex_bwrap_wrap(
+            codex_cmd,
+            shard_info,
+            cwd,
+            research_target_info=research_target_info,
+            process_env=process_env,
+        )
     else:
         cmd = codex_cmd
 
@@ -5837,8 +5993,10 @@ Your task:
         spool["error"] = f"spawn failed: {e}"
         spool["completed_at"] = datetime.now().isoformat()
         _write_spool(spool_id, spool)
-        if _cleanup_failed_spool_shard(spool):
-            _write_spool(spool_id, spool)
+        _cleanup_failed_spool_shard(spool)
+        _write_spool(spool_id, spool)
+        if spool.get("shard_cleanup_pending"):
+            _schedule_deferred_shard_cleanup(spool_id)
         return f"Error: Failed to spawn process: {e}"
 
     # Update spool with PID and status
@@ -5968,7 +6126,13 @@ def _codex_respin_sync(session_id: str, prompt: str) -> str:
     # the worktree root) — mirror _codex_spin_sync so the --add-dir grant above is
     # actually bindable at the outer bwrap layer.
     if shard_info:
-        cmd = _codex_bwrap_wrap(codex_cmd, shard_info, working_dir, research_target_info=research_target_info)
+        cmd = _codex_bwrap_wrap(
+            codex_cmd,
+            shard_info,
+            working_dir,
+            research_target_info=research_target_info,
+            process_env=process_env,
+        )
     else:
         cmd = codex_cmd
 
@@ -6351,7 +6515,13 @@ Your task:
         gemini_cmd[2] = combined_prompt
 
     if shard_info:
-        gemini_cmd = _codex_bwrap_wrap(gemini_cmd, shard_info, cwd, research_target_info=research_target_info)
+        gemini_cmd = _codex_bwrap_wrap(
+            gemini_cmd,
+            shard_info,
+            cwd,
+            research_target_info=research_target_info,
+            process_env=_process_env(env),
+        )
 
     # Parse tags
     tag_list = [t.strip() for t in tags.split(",")] if tags else []
@@ -6621,7 +6791,13 @@ Your task:
         kimi_cmd[prompt_idx] = combined_prompt
 
     if shard_info:
-        kimi_cmd = _codex_bwrap_wrap(kimi_cmd, shard_info, cwd, research_target_info=research_target_info)
+        kimi_cmd = _codex_bwrap_wrap(
+            kimi_cmd,
+            shard_info,
+            cwd,
+            research_target_info=research_target_info,
+            process_env=_process_env(env),
+        )
 
     # Parse tags
     tag_list = [t.strip() for t in tags.split(",")] if tags else []

@@ -51,6 +51,7 @@ from spindle import (
     _gemini_spin_sync,
     _gemini_unspool_sync,
     _get_cc_bg_tasks,
+    _get_exit_path,
     _get_harnesses,
     _get_output_path,
     _get_spool_path,
@@ -1353,6 +1354,7 @@ class TestCodexResultExtraction:
                 },
             )
             _get_output_path(spool_id).write_text(stream)
+            _get_exit_path(spool_id).write_text("0\n")
             assert _check_and_finalize_spool(spool_id) is True
             spool = _read_spool(spool_id)
 
@@ -1376,6 +1378,7 @@ class TestCodexResultExtraction:
             "branch_name": "shard-codex-failed-model",
         }
         with patch("spindle.SPINDLE_DIR", tmp_path):
+            (tmp_path / "worktree").mkdir()
             _write_spool(
                 spool_id,
                 {
@@ -1391,7 +1394,7 @@ class TestCodexResultExtraction:
                 },
             )
             _get_output_path(spool_id).write_text(stream)
-            with patch("spindle._shard_is_pristine_for_cleanup", return_value=True):
+            with patch("spindle._shard_cleanup_state", return_value="pristine"):
                 with patch("spindle._cleanup_shard", return_value=True) as cleanup:
                     assert _check_and_finalize_spool(spool_id) is True
 
@@ -1504,12 +1507,99 @@ class TestCodexResultExtraction:
                 },
             )
             _get_output_path(spool_id).write_text(stream)
+            _get_exit_path(spool_id).write_text("0\n")
             assert _check_and_finalize_spool(spool_id) is True
             spool = _read_spool(spool_id)
 
         assert spool["status"] == "error"
         assert spool["error"] == "Codex exited without a completed turn"
         assert spool["exit_code"] == 0
+
+    def test_new_turn_after_completion_requires_its_own_terminal_event(self, tmp_path):
+        spool_id = "codex-complete-then-started"
+        finished_proc = MagicMock()
+        finished_proc.poll.return_value = 0
+        stream = "\n".join(
+            [
+                json.dumps({"type": "turn.completed", "usage": {}}),
+                json.dumps({"type": "turn.started"}),
+            ]
+        )
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            spindle._PROC_HANDLES[spool_id] = finished_proc
+            _write_spool(
+                spool_id,
+                {
+                    "id": spool_id,
+                    "status": "running",
+                    "harness": "codex",
+                    "prompt": "work",
+                    "pid": 12345,
+                    "created_at": datetime.now().isoformat(),
+                },
+            )
+            _get_output_path(spool_id).write_text(stream)
+            assert _check_and_finalize_spool(spool_id) is True
+            spool = _read_spool(spool_id)
+
+        assert spindle._codex_failure_message(stream) is None
+        assert spool["status"] == "error"
+        assert spool["error"] == "Codex exited without a completed turn"
+
+    def test_orphan_recovery_reads_persisted_nonzero_exit_status(self, tmp_path):
+        spool_id = "codex-orphan-nonzero"
+        stream = json.dumps({"type": "turn.completed", "usage": {}})
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool(
+                spool_id,
+                {
+                    "id": spool_id,
+                    "status": "running",
+                    "harness": "codex",
+                    "prompt": "work",
+                    "pid": None,
+                    "created_at": datetime.now().isoformat(),
+                },
+            )
+            pid = spindle._spawn_detached(
+                spool_id,
+                ["/bin/sh", "-c", 'printf "%s\\n" "$1"; exit 7', "child", stream],
+                str(tmp_path),
+            )
+            proc = spindle._PROC_HANDLES.pop(spool_id)
+            assert proc.wait(timeout=5) == 7
+            spool = _read_spool(spool_id)
+            spool["pid"] = pid
+            _write_spool(spool_id, spool)
+
+            assert _check_and_finalize_spool(spool_id) is True
+            spool = _read_spool(spool_id)
+
+        assert spool["status"] == "error"
+        assert spool["exit_code"] == 7
+        assert "code 7" in spool["error"]
+
+    def test_orphan_recovery_fails_closed_without_exit_status(self, tmp_path):
+        spool_id = "codex-orphan-no-status"
+        stream = json.dumps({"type": "turn.completed", "usage": {}})
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool(
+                spool_id,
+                {
+                    "id": spool_id,
+                    "status": "running",
+                    "harness": "codex",
+                    "prompt": "work",
+                    "pid": 999999999,
+                    "created_at": datetime.now().isoformat(),
+                },
+            )
+            _get_output_path(spool_id).write_text(stream)
+            assert _check_and_finalize_spool(spool_id) is True
+            spool = _read_spool(spool_id)
+
+        assert spool["status"] == "error"
+        assert spool["error"] == "Codex exit status unavailable"
 
     def test_process_group_liveness_sees_descendant_after_leader_exit(self):
         proc = subprocess.Popen(
@@ -1582,7 +1672,7 @@ class TestCodexResultExtraction:
                 },
             )
             _get_output_path(spool_id).write_text(stream)
-            with patch("spindle._shard_is_pristine_for_cleanup", return_value=True):
+            with patch("spindle._shard_cleanup_state", return_value="pristine"):
                 with patch("spindle._cleanup_shard") as cleanup:
                     assert _check_and_finalize_spool(spool_id) is True
             cleanup.assert_not_called()
@@ -1620,11 +1710,68 @@ class TestCodexResultExtraction:
             _get_output_path(spool_id).write_text(stream)
             with patch("spindle._is_pid_alive", return_value=False):
                 with patch("spindle._is_process_group_alive", side_effect=lambda pid: pid == 22222):
-                    with patch("spindle._shard_is_pristine_for_cleanup", return_value=True):
+                    with patch("spindle._shard_cleanup_state", return_value="pristine"):
                         with patch("spindle._cleanup_shard") as cleanup:
                             assert _check_and_finalize_spool(spool_id) is True
             cleanup.assert_not_called()
             assert _read_spool(spool_id)["status"] == "error"
+
+    def test_deferred_cleanup_retries_after_transient_reuser_clears(self, tmp_path):
+        spool_id = "codex-deferred-cleanup"
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        spool = {
+            "id": spool_id,
+            "status": "error",
+            "pid": None,
+            "working_dir": str(worktree),
+            "shard": {"worktree_path": str(worktree), "branch_name": "shard-deferred"},
+            "shard_created_by_spool": True,
+            "shard_source_dir": str(tmp_path / "repo"),
+        }
+        with patch("spindle.SPINDLE_DIR", tmp_path / "spools"):
+            with patch("spindle._shard_has_other_active_spool", return_value=True):
+                assert spindle._cleanup_failed_spool_shard(spool) is False
+            assert spool["shard_cleanup_pending"] is True
+            _write_spool(spool_id, spool)
+
+            with patch("spindle.time.sleep"):
+                with patch("spindle._shard_has_other_active_spool", return_value=False):
+                    with patch("spindle._shard_cleanup_state", return_value="pristine"):
+                        with patch("spindle._cleanup_shard", return_value=True) as cleanup:
+                            spindle._monitor_deferred_shard_cleanup(spool_id)
+
+            repaired = _read_spool(spool_id)
+        cleanup.assert_called_once()
+        assert repaired["working_dir"] == str(tmp_path / "repo")
+        assert repaired["shard"]["startup_failure_cleaned"] is True
+        assert "shard_cleanup_pending" not in repaired
+
+    def test_changed_failed_shard_is_preserved_without_deferred_deletion(self, tmp_path):
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        spool = {
+            "id": "codex-changed-preserved",
+            "status": "error",
+            "pid": None,
+            "shard": {"worktree_path": str(worktree)},
+            "shard_created_by_spool": True,
+            "shard_source_dir": str(tmp_path / "repo"),
+        }
+        with patch("spindle.SPINDLE_DIR", tmp_path / "spools"):
+            with patch("spindle._shard_cleanup_state", return_value="changed"):
+                assert spindle._cleanup_failed_spool_shard(spool) is False
+        assert spool["shard_cleanup_preserved"] is True
+        assert "shard_cleanup_pending" not in spool
+
+    def test_cleanup_reports_success_if_branch_step_times_out_after_worktree_removal(self, tmp_path):
+        shard = {"worktree_path": str(tmp_path / "worktree"), "branch_name": "shard-partial"}
+        removed = MagicMock(returncode=0, stdout="", stderr="")
+        with patch(
+            "spindle.subprocess.run",
+            side_effect=[removed, subprocess.TimeoutExpired("git branch", 10)],
+        ):
+            assert _cleanup_shard(shard, str(tmp_path)) is True
 
     @pytest.mark.parametrize("created_by_spool,pristine", [(False, True), (True, False)])
     def test_finalize_preserves_reused_or_changed_failed_shard(self, tmp_path, created_by_spool, pristine):
@@ -1646,7 +1793,8 @@ class TestCodexResultExtraction:
                 },
             )
             _get_output_path(spool_id).write_text(stream)
-            with patch("spindle._shard_is_pristine_for_cleanup", return_value=pristine):
+            state = "pristine" if pristine else "changed"
+            with patch("spindle._shard_cleanup_state", return_value=state):
                 with patch("spindle._cleanup_shard") as cleanup:
                     assert _check_and_finalize_spool(spool_id) is True
             cleanup.assert_not_called()
@@ -1705,6 +1853,7 @@ class TestCodexResultExtraction:
                 },
             )
             _get_output_path(spool_id).write_text(stream)
+            _get_exit_path(spool_id).write_text("0\n")
             assert _check_and_finalize_spool(spool_id) is True
 
         assert worktree.exists()
@@ -1737,6 +1886,7 @@ class TestCodexResultExtraction:
                 },
             )
             _get_output_path(spool_id).write_text(stream)
+            _get_exit_path(spool_id).write_text("0\n")
             assert _check_and_finalize_spool(spool_id) is True
 
             spool = _read_spool(spool_id)
@@ -1780,6 +1930,7 @@ class TestCodexResultExtraction:
                 },
             )
             _get_output_path(spool_id).write_text(stream)
+            _get_exit_path(spool_id).write_text("0\n")
             assert _check_and_finalize_spool(spool_id) is True
             spool = _read_spool(spool_id)
             assert spool["status"] == "complete"
@@ -1805,6 +1956,7 @@ class TestCodexResultExtraction:
                 },
             )
             _get_output_path(spool_id).write_text(stream)
+            _get_exit_path(spool_id).write_text("0\n")
 
             assert _check_and_finalize_spool(spool_id) is True
 
@@ -3395,20 +3547,47 @@ class TestGeminiHarness:
         }
 
         with patch("shutil.which", return_value="/usr/bin/bwrap"):
-            with patch.object(Path, "home", return_value=fake_home):
-                cmd = _codex_bwrap_wrap(
-                    ["gemini", "-p", "test", "-s", "-o", "json"],
-                    shard_info,
-                    str(worktree_path),
-                )
+            cmd = _codex_bwrap_wrap(
+                ["gemini", "-p", "test", "-s", "-o", "json"],
+                shard_info,
+                str(worktree_path),
+                process_env={"HOME": str(fake_home)},
+            )
 
         gemini_dir_str = str(gemini_dir)
         bind_triple_found = any(
             cmd[i] == "--bind" and cmd[i + 1] == gemini_dir_str and cmd[i + 2] == gemini_dir_str
             for i in range(len(cmd) - 2)
         )
-        assert cmd[0] == "bwrap", f"Expected bwrap wrapper, got {cmd[0]!r}"
+        assert cmd[0] == "/usr/bin/bwrap", f"Expected resolved bwrap wrapper, got {cmd[0]!r}"
         assert bind_triple_found, f"Expected '--bind {gemini_dir_str} {gemini_dir_str}' in bwrap cmd: {cmd!r}"
+
+    def test_bwrap_uses_resolved_binary_and_caller_home_context(self, tmp_path):
+        caller_home = tmp_path / "caller-home"
+        codex_home = tmp_path / "caller-codex"
+        host_home = tmp_path / "host-home"
+        worktree = tmp_path / "worktree"
+        for path in [caller_home / ".config", codex_home, host_home / ".codex", worktree]:
+            path.mkdir(parents=True)
+        shard_info = {"worktree_path": str(worktree), "branch_name": "shard-env"}
+
+        with patch("shutil.which", return_value="/usr/bin/bwrap"):
+            cmd = _codex_bwrap_wrap(
+                ["/caller/bin/codex", "exec"],
+                shard_info,
+                str(worktree),
+                process_env={
+                    "HOME": str(caller_home),
+                    "CODEX_HOME": str(codex_home),
+                    "PATH": "/caller/bin",
+                },
+            )
+
+        binds = {(cmd[index + 1], cmd[index + 2]) for index, item in enumerate(cmd[:-2]) if item == "--bind"}
+        assert cmd[0] == "/usr/bin/bwrap"
+        assert (str(caller_home / ".config"), str(caller_home / ".config")) in binds
+        assert (str(codex_home), str(codex_home)) in binds
+        assert (str(host_home / ".codex"), str(host_home / ".codex")) not in binds
 
 
 class TestKimiHarness:
@@ -4327,7 +4506,7 @@ class TestSpawnFailureRecovery:
                             with patch("spindle._resolve_codex_binary", return_value="/fake/codex"):
                                 with patch("spindle._codex_sandbox_enforces", return_value=True):
                                     with patch("spindle._spawn_detached", side_effect=OSError("boom")):
-                                        with patch("spindle._shard_is_pristine_for_cleanup", return_value=True):
+                                        with patch("spindle._shard_cleanup_state", return_value="pristine"):
                                             with patch("spindle._cleanup_shard") as cleanup:
                                                 _codex_spin_sync(
                                                     "do work",
@@ -4938,7 +5117,7 @@ class TestShardSpawnPreamblesAndCodexCd:
 
         assert len(captured_cmd) == 1
         cmd = captured_cmd[0]
-        assert cmd[0] == "bwrap", f"Expected bwrap wrapper for shard, got {cmd[0]!r}"
+        assert cmd[0] == "/usr/bin/bwrap", f"Expected bwrap wrapper for shard, got {cmd[0]!r}"
         assert "--ro-bind" in cmd
         worktree_root = str(fake_shard_path)
         # Verify the read-write bind for the worktree exists as a specific triple,
@@ -5288,7 +5467,7 @@ class TestCodexRespinPreservesGitAccess:
 
         assert len(captured_cmd) == 1, "Expected one spawn for codex respin"
         cmd = captured_cmd[0]
-        assert cmd[0] == "bwrap", f"Expected bwrap wrapper for respin shard, got {cmd[0]!r}"
+        assert cmd[0] == "/usr/bin/bwrap", f"Expected bwrap wrapper for respin shard, got {cmd[0]!r}"
         assert "--ro-bind" in cmd
         worktree_root = str(worktree_path)
         rw_bind_found = any(
@@ -5372,7 +5551,7 @@ class TestCodexRespinPreservesGitAccess:
 
         assert len(captured_cmd) == 1
         cmd = captured_cmd[0]
-        assert cmd[0] == "bwrap", f"expected bwrap wrapper, got {cmd[0]!r}"
+        assert cmd[0] == "/usr/bin/bwrap", f"expected bwrap wrapper, got {cmd[0]!r}"
         out = str(output_dir)
         wt = str(worktree_path)
         # The research output dir is the writable bind...
@@ -5921,7 +6100,7 @@ class TestCodexSandboxEnforcesProbe:
     def test_probe_fails_closed_on_unexpected_stat_error(self, caplog):
         """Only a missing target proves the write was blocked; other stat errors are inconclusive."""
         with patch("spindle.subprocess.run", return_value=self._proc(f"{spindle._CODEX_SANDBOX_PROBE_MARKER}\n")):
-            with patch("spindle.os.path.getsize", side_effect=PermissionError("denied")):
+            with patch("spindle.os.stat", side_effect=PermissionError("denied")):
                 assert spindle._codex_sandbox_probe("/fake/codex") is False
         assert "could not stat target" in caplog.text
 
@@ -5932,6 +6111,16 @@ class TestCodexSandboxEnforcesProbe:
             with open(os.path.join(kwargs["cwd"], "enforce_probe.txt"), "w") as fh:
                 fh.write("BROKEN")
             return self._proc(f"{spindle._CODEX_SANDBOX_PROBE_MARKER}\n")
+
+        with patch("spindle.subprocess.run", side_effect=run):
+            assert spindle._codex_sandbox_probe("/fake/codex") is False
+
+    def test_probe_false_when_zero_byte_file_was_created(self):
+        """Any created target violates read-only, even if it has no content."""
+
+        def run(cmd, **kwargs):
+            Path(kwargs["cwd"], "enforce_probe.txt").touch()
+            return self._proc(f"{spindle._CODEX_SANDBOX_PROBE_MARKER}\n", returncode=1)
 
         with patch("spindle.subprocess.run", side_effect=run):
             assert spindle._codex_sandbox_probe("/fake/codex") is False
