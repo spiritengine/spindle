@@ -34,18 +34,35 @@ and run alongside another install without confusing the two.
   whatever answered, so a fresh install reported another install's service as
   its own. It now uses the resolved host/port, needs no `curl`, and says when
   the responding service is a different install or a skewed version.
-- `install-service` will not silently overwrite a service file that does not
-  carry spindle's marker: without `--force` it refuses, and with `--force` it
-  writes a timestamped backup beside the file first. Ownership cannot be
-  inferred — the shape spindle generates is also the shape users copy out of
-  `examples/` and then edit — so it keeps a copy rather than guess.
-- Generated units quote their `Environment=` values and escape `%`. systemd
+- `install-service` writes a timestamped backup before replacing any existing
+  service file, and refuses without `--force`. A regenerated unit is built from
+  the command line, so hand-added directives are dropped by `--force` whether or
+  not spindle wrote the file; and ownership cannot be inferred anyway, since the
+  shape spindle generates is the shape users copy out of `examples/` and edit.
+  It also carries the existing unit's `SPINDLE_HOME` forward when the new
+  invocation does not name one — otherwise re-running it from a shell without
+  `SPINDLE_HOME` (which is what doctor's own stale-PATH remedy tells you to do)
+  moved the service onto `~/.spindle` and stranded every spool in its old store.
+- Generated units record `SPINDLE_SERVICE_NAME`, so the `spindle_reload` MCP
+  tool restarts the unit its own service was installed as. It hardcoded
+  `spindle.service`, so an agent calling it from a second install restarted the
+  first one — interrupting that service's in-flight spools while leaving the
+  caller's unreloaded.
+- `spindle reload` refuses (rather than warning and proceeding) when the service
+  it would restart uses a different spool store: a drain that cannot see the
+  queue it promised to protect is worse than no drain. `--force` still restarts.
+- `install-service` checks `systemctl daemon-reload` and `systemctl enable` exit
+  codes instead of printing "Reloaded"/"Enabled" and exiting 0 underneath
+  systemd's own error, and writes units to `$XDG_CONFIG_HOME/systemd/user` when
+  that is set, rather than a hardcoded `~/.config` systemd may never read.
+- Generated units quote their `Environment=` values and escape `%` and `\`. systemd
   splits an unquoted assignment on whitespace and expands `%` specifiers, so a
   `PATH` containing `/mnt/c/Program Files/...` (the WSL default) silently
   truncated at the space, and any `%` in a path made systemd drop the whole
   assignment and fall back to its minimal `PATH`. Both start cleanly and answer
-  `/health`; only the spawned agents die. `ExecStart` and `SPINDLE_HOME` are
-  quoted for the same reason.
+  `/health`; only the spawned agents die. A value ending in a backslash escaped
+  its own closing quote and dropped the assignment the same way. `ExecStart` and
+  `SPINDLE_HOME` are quoted for the same reasons.
 - The launchd plist XML-escapes every interpolated value. One `&` in a directory
   name produced a plist that would not parse, which launchd reports only by
   never starting the service. `install-service` now also checks `launchctl

@@ -6652,29 +6652,34 @@ async def spindle_reload(force: bool = False) -> str:
     spools and leave them to orphan recovery on the next boot. This is the old
     behavior.
 
-    Uses systemctl --user restart spindle. Requires the spindle systemd service.
+    Restarts the unit THIS service was installed as, which install-service bakes
+    into the unit as SPINDLE_SERVICE_NAME. Assuming "spindle" meant that a second
+    install (say spindle-release on its own port) restarted the *default* one
+    instead: the caller's own service went unreloaded while another install's
+    in-flight spools were interrupted.
 
     Returns:
         Status message
     """
     global _reload_pending
 
-    # Check if systemd service exists (even if not running)
-    result = subprocess.run(
-        ["systemctl", "--user", "list-unit-files", "spindle.service"], capture_output=True, text=True
-    )
+    service = _own_service_name()
+    unit = f"{service}.service"
 
-    if "spindle.service" not in result.stdout:
-        return "Error: spindle.service not found. Restart manually."
+    # Check if systemd service exists (even if not running)
+    result = subprocess.run(["systemctl", "--user", "list-unit-files", unit], capture_output=True, text=True)
+
+    if unit not in result.stdout:
+        return f"Error: {unit} not found. Restart manually."
 
     # Check if currently active
-    is_active = subprocess.run(["systemctl", "--user", "is-active", "spindle"], capture_output=True).returncode == 0
+    is_active = subprocess.run(["systemctl", "--user", "is-active", service], capture_output=True).returncode == 0
 
     def _do_restart():
         action = "restart" if is_active else "start"
         # We've already returned to the caller, so surface a failed restart to
         # the server log rather than letting it vanish in the daemon thread.
-        proc = subprocess.run(["systemctl", "--user", action, "spindle"], capture_output=True, text=True)
+        proc = subprocess.run(["systemctl", "--user", action, service], capture_output=True, text=True)
         if proc.returncode != 0:
             print(
                 f"[spindle] reload {action} failed (exit {proc.returncode}): {proc.stderr.strip()}",
@@ -6799,10 +6804,22 @@ def _script_interpreter(path: str) -> Optional[str]:
     if not parts:
         return None
     if os.path.basename(parts[0]) == "env":
-        # Skip `env` and any VAR=value assignments it was given.
+        # Skip `env` itself, its options, and any VAR=value assignments. What is
+        # left is a bare command name, which must be resolved through PATH before
+        # anyone compares it as a path — `Path("python3").parent` is ".", which
+        # equals no interpreter directory, so an unresolved name reports every
+        # install as foreign.
+        skip_next = False
         for token in parts[1:]:
-            if "=" not in token and not token.startswith("-"):
-                return token
+            if skip_next:
+                skip_next = False
+                continue
+            if token in ("-u", "--unset", "-C", "--chdir", "-S", "--split-string"):
+                skip_next = True
+                continue
+            if token.startswith("-") or "=" in token:
+                continue
+            return shutil.which(token) or token
         return None
     return parts[0]
 
@@ -7045,7 +7062,11 @@ def _probe_command(command: str, timeout: float = 5.0) -> Tuple[Optional[str], O
         return path, None
 
 
-def _doctor_harness_check(service_path: Optional[str] = None, service_name: Optional[str] = None) -> dict:
+def _doctor_harness_check(
+    service_path: Optional[str] = None,
+    service_name: Optional[str] = None,
+    service_port: Optional[int] = None,
+) -> dict:
     """Report which harness CLIs are actually installed, plus lodged profiles.
 
     Presence only. Whether the CLI is *logged in* cannot be read off the binary,
@@ -7090,7 +7111,10 @@ def _doctor_harness_check(service_path: Optional[str] = None, service_name: Opti
 
     # Drift between this shell's PATH and the service's baked one.
     unreachable = []
-    if service_path:
+    if service_path is not None:
+        # `is not None`, not truthiness: a service reporting an EMPTY PATH can
+        # resolve nothing at all, which is the loudest version of this failure
+        # and used to be the one case that skipped the check.
         for harness, info in detected.items():
             if not shutil.which(info["command"], path=service_path):
                 unreachable.append(harness)
@@ -7101,10 +7125,11 @@ def _doctor_harness_check(service_path: Optional[str] = None, service_name: Opti
         # is `spindle-b` on 8042 would rewrite (or create) the wrong one and leave
         # the stale service exactly as it was.
         suffix = f" --name {service_name}" if service_name and service_name != "spindle" else ""
+        where = f" --port {service_port}" if service_port else ""
         lines.append(
             f"the running service cannot find {', '.join(sorted(unreachable))} — its PATH was baked at "
             "install time and has gone stale; spools it spawns will fail at launch. "
-            f"Re-run `spindle install-service{suffix} --port <its port> --force` from a shell with the right "
+            f"Re-run `spindle install-service{suffix}{where} --force` from a shell with the right "
             f"PATH, then `spindle reload{suffix}`."
         )
 
@@ -7213,6 +7238,11 @@ def _doctor_smoke_check(harness: str, timeout: int = 240, model: Optional[str] =
             status = "skip" if "concurrent" in spool_id.lower() else "fail"
             return _doctor_result(name, status, f"could not spawn: {spool_id}", harness=harness)
 
+        # From here an agent is alive in that directory. Keep it until the spool
+        # is known to have finished — a Ctrl-C or an exception mid-poll would
+        # otherwise delete the working dir out from under a running process.
+        keep_working_dir = True
+
         deadline = time.time() + timeout
         spool = None
         while time.time() < deadline:
@@ -7223,14 +7253,15 @@ def _doctor_smoke_check(harness: str, timeout: int = 240, model: Optional[str] =
             time.sleep(2)
 
         status = (spool or {}).get("status")
-        if status not in _TERMINAL_SPOOL_STATUSES:
+        if status in _TERMINAL_SPOOL_STATUSES:
+            keep_working_dir = False
+        else:
             # _spin_drop_sync sends SIGTERM and marks the spool terminal; it does
             # not wait or escalate. Say what was actually done rather than claim
             # the process is gone, and leave the agent's working dir in place —
             # deleting it out from under a process that may still be alive is how
             # a hung smoke turns into something worse.
             _spin_drop_sync(spool_id)
-            keep_working_dir = True
             return _doctor_result(
                 name,
                 "fail",
@@ -7274,30 +7305,89 @@ def _doctor_smoke_check(harness: str, timeout: int = 240, model: Optional[str] =
             shutil.rmtree(working_dir, ignore_errors=True)
 
 
+def _positive_seconds(value: str) -> int:
+    """argparse type for a timeout that must actually allow work to happen.
+
+    A non-positive smoke timeout means "no timeout" to the spin contract while
+    the poll loop exits at once — spawning a real, billable agent and abandoning
+    or immediately killing it. Reject it at the parser instead.
+    """
+    import argparse as _argparse
+
+    try:
+        seconds = int(value)
+    except ValueError:
+        raise _argparse.ArgumentTypeError(f"{value!r} is not a whole number of seconds")
+    if seconds < 1:
+        raise _argparse.ArgumentTypeError("must be at least 1 second")
+    return seconds
+
+
+def _own_service_name() -> str:
+    """The systemd unit this process was started as.
+
+    `install-service` bakes SPINDLE_SERVICE_NAME into the unit, so a service
+    knows which unit is its own. Without it, anything that restarts "spindle"
+    from inside a second install restarts the first install instead.
+    """
+    name = os.environ.get("SPINDLE_SERVICE_NAME", "").strip()
+    return name if _valid_service_name(name) else "spindle"
+
+
+def _systemd_user_dir() -> Path:
+    """Directory systemd reads user units from.
+
+    XDG_CONFIG_HOME, not a hardcoded ~/.config: with it set elsewhere, every unit
+    written to ~/.config/systemd/user is somewhere systemd never looks, so
+    install-service reports success and the service never starts.
+    """
+    base = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+    return Path(base) / "systemd" / "user"
+
+
 def _unit_file_path(name: str) -> Path:
     """Path of the systemd user unit for a service name."""
-    return Path.home() / ".config" / "systemd" / "user" / f"{name}.service"
+    return _systemd_user_dir() / f"{name}.service"
+
+
+def _env_from_unit(name: str, var: str) -> Optional[str]:
+    """Read one Environment= value out of a named unit, quoted or not."""
+    try:
+        text = _unit_file_path(name).read_text(errors="replace")
+    except OSError:
+        return None
+    match = re.search(rf'^Environment=(?:"{var}=(.*?)"|{var}=(\S*))\s*$', text, re.MULTILINE)
+    if not match:
+        return None
+    value = match.group(1) if match.group(1) is not None else match.group(2)
+    # Undo the escaping _systemd_quote applied.
+    return value.replace("%%", "%").replace('\\"', '"').replace("\\\\", "\\")
 
 
 def _port_from_unit(name: str) -> Optional[int]:
-    """Read SPINDLE_PORT out of a named unit, or None.
+    """Read the port a named unit binds, or None.
 
     `reload --name X` has to probe the service it is about to restart, and the
     operator's shell env says nothing about which port that unit bound — the
     unit's own SPINDLE_PORT is the service's environment, not theirs. Guessing
     the default instead means probing a *different* service, whose store happens
     to match, so the wrong-store warning stays silent exactly when it matters.
+
+    ExecStart wins over the Environment line: it is what the service actually
+    binds, so if someone edited only one of the two, that is the truthful one.
     """
-    unit = _unit_file_path(name)
     try:
-        text = unit.read_text(errors="replace")
+        text = _unit_file_path(name).read_text(errors="replace")
     except OSError:
         return None
-    match = re.search(r"^Environment=\"?SPINDLE_PORT=(\d+)", text, re.MULTILINE)
+    match = re.search(r"serve\s+--http\s+--port\s+(\d+)", text)
     if match:
         return int(match.group(1))
-    match = re.search(r"serve\s+--http\s+--port\s+(\d+)", text)
-    return int(match.group(1)) if match else None
+    value = _env_from_unit(name, "SPINDLE_PORT")
+    try:
+        return int(value) if value else None
+    except ValueError:
+        return None
 
 
 def _reload_warn_on_store_mismatch(host: str, port: int) -> Optional[str]:
@@ -7359,7 +7449,7 @@ def _doctor_run(
         _doctor_cli_check(),
         service,
         _doctor_storage_check(),
-        _doctor_harness_check(service_path=service_path, service_name=service_name),
+        _doctor_harness_check(service_path=service_path, service_name=service_name, service_port=port),
         _doctor_shard_check(),
     ]
 
@@ -7458,6 +7548,24 @@ def _valid_service_name(name: str) -> bool:
     return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", name or ""))
 
 
+def _systemd_quote(value: str) -> str:
+    """Quote one value for a systemd unit's Environment=/ExecStart= line.
+
+    Three characters are special and all three have bitten this file:
+
+    - whitespace splits an unquoted assignment into several, so the tail is lost;
+    - `%` starts a specifier, and an unresolvable one makes systemd drop the
+      entire assignment and fall back to its minimal environment;
+    - `\\` escapes inside a quoted string, so a value ending in one escapes the
+      closing quote and unterminates the string — dropping the assignment again.
+
+    Order matters: backslashes are doubled first, or the backslash this function
+    inserts in front of a quote would be doubled in turn.
+    """
+    escaped = str(value).replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%")
+    return f'"{escaped}"'
+
+
 def _service_path_env(path_env: Optional[str] = None) -> str:
     """PATH to bake into a service file, de-duplicated and pruned.
 
@@ -7514,15 +7622,13 @@ def _systemd_unit_text(
     and answer /health; only the spawned agents die.
     """
 
-    def q(value: str) -> str:
-        # systemd: %% is a literal %, and quoting keeps whitespace in one value.
-        return '"' + str(value).replace("%", "%%").replace('"', '\\"') + '"'
-
     env_lines = [f"Environment=SPINDLE_PORT={port}"]
+    env_lines.append(f"Environment={_systemd_quote('SPINDLE_SERVICE_NAME=' + str(name))}")
     if home:
-        env_lines.append(f"Environment={q('SPINDLE_HOME=' + str(home))}")
-    env_lines.append(f"Environment={q('PATH=' + _service_path_env(path_env))}")
+        env_lines.append(f"Environment={_systemd_quote('SPINDLE_HOME=' + str(home))}")
+    env_lines.append(f"Environment={_systemd_quote('PATH=' + _service_path_env(path_env))}")
     env_block = "\n".join(env_lines)
+    q = _systemd_quote
     return f"""\
 # {SERVICE_MARKER} (spindle {__version__})
 [Unit]
@@ -7646,7 +7752,12 @@ def main():
         help="Restart immediately instead of draining (may interrupt in-flight spools)",
     )
     _reload_parser.add_argument("--name", default="spindle", help="systemd unit name (default: spindle)")
-    _reload_parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="Port of the service being restarted")
+    _reload_parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="Port of the service being restarted (default: read from its unit file)",
+    )
     _reload_parser.add_argument("--host", default=DEFAULT_HOST, help="Host of the service being restarted")
 
     # status command
@@ -7658,7 +7769,12 @@ def main():
 
     # doctor command - diagnose this install
     doctor_parser = subparsers.add_parser("doctor", help="Diagnose this spindle install")
-    doctor_parser.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"Service port (default: {DEFAULT_PORT})")
+    doctor_parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help=f"Service port (default: read from the named unit, else {DEFAULT_PORT})",
+    )
     doctor_parser.add_argument("--host", default=DEFAULT_HOST, help=f"Service host (default: {DEFAULT_HOST})")
     doctor_parser.add_argument(
         "--smoke",
@@ -7669,7 +7785,12 @@ def main():
         "--harness",
         help=f"Comma-separated harnesses to smoke (default: {','.join(DOCTOR_SMOKE_HARNESSES)})",
     )
-    doctor_parser.add_argument("--smoke-timeout", type=int, default=240, help="Seconds to wait per smoke spool")
+    doctor_parser.add_argument(
+        "--smoke-timeout",
+        type=_positive_seconds,
+        default=240,
+        help="Seconds to wait per smoke spool (must be positive)",
+    )
     doctor_parser.add_argument(
         "--name",
         default="spindle",
@@ -7824,10 +7945,19 @@ def main():
         if not args.force:
             # The drain reads THIS process's store. If the unit being restarted
             # serves a different one, "no spools running" is a statement about
-            # the wrong store, and the restart would interrupt live agents. Ask
-            # the unit which port it bound rather than the shell that ran us.
-            probe_port = _port_from_unit(args.name) or args.port
-            _reload_warn_on_store_mismatch(args.host, probe_port)
+            # the wrong store. Ask the unit which port it bound rather than the
+            # shell that ran us — but honor an explicitly passed --port, which is
+            # how an operator works around a unit file they know is stale.
+            probe_port = args.port if args.port is not None else (_port_from_unit(args.name) or DEFAULT_PORT)
+            if _reload_warn_on_store_mismatch(args.host, probe_port):
+                # Warning and restarting anyway is the worst of both: a drain that
+                # promised to protect in-flight agents interrupts them instead.
+                print(
+                    "Refusing to restart: this would be an undrained restart of that service. "
+                    "Re-run with the matching SPINDLE_HOME, or --force to restart regardless.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
             active = _count_running()
             if active:
                 # flush: this is the last output before a potentially long block,
@@ -7852,10 +7982,13 @@ def main():
         print(json.dumps(health))
         svc_version = health.get("version")
         svc_package = health.get("package")
-        if svc_version is None:
+        if svc_version is None or not svc_package:
+            # Same standard as doctor: a version without a package path is not
+            # identity, and presenting it as this install is the confusion the
+            # release exists to remove.
             print(
-                f"note: that service does not report a version, so it cannot be confirmed to be "
-                f"this install (spindle {__version__} at {_package_path()})",
+                f"note: that service does not report which install it is, so it cannot be confirmed to be "
+                f"this one (spindle {__version__} at {_package_path()})",
                 file=sys.stderr,
             )
         elif svc_package and Path(svc_package).resolve() != Path(_package_path()).resolve():
@@ -7874,9 +8007,12 @@ def main():
 
     elif args.command == "doctor":
         smoke_harnesses = [h.strip() for h in args.harness.split(",") if h.strip()] if args.harness else None
+        # --name and --port describe the same service; if only the name is given,
+        # read the port out of that unit rather than probing the default one.
+        doctor_port = args.port if args.port is not None else (_port_from_unit(args.name) or DEFAULT_PORT)
         report = _doctor_run(
             host=args.host,
-            port=args.port,
+            port=doctor_port,
             smoke=args.smoke,
             smoke_harnesses=smoke_harnesses,
             service_name=args.name,
@@ -8111,7 +8247,16 @@ def main():
             else:
                 spindle_path = str(Path.home() / ".local" / "bin" / "spindle")
 
-        service_home = args.home or os.environ.get("SPINDLE_HOME")
+        # Carry the existing unit's spool store forward when this run does not
+        # name one. Regeneration is built from argv and the ambient environment,
+        # so re-running install-service from a shell without SPINDLE_HOME set —
+        # which is exactly what doctor's own stale-PATH remedy tells you to do —
+        # used to drop the store the service was installed with, silently moving
+        # it onto ~/.spindle and stranding every spool in the old store.
+        inherited_home = _env_from_unit(args.name, "SPINDLE_HOME")
+        service_home = args.home or os.environ.get("SPINDLE_HOME") or inherited_home
+        if service_home and service_home == inherited_home and not (args.home or os.environ.get("SPINDLE_HOME")):
+            print(f"Keeping the spool store already in {args.name}.service: {service_home}")
 
         # The name becomes a filename in the unit/agent directory; `../../x` would
         # write outside it.
@@ -8149,7 +8294,7 @@ def main():
                 sys.exit(1)
 
             service_content = _systemd_unit_text(spindle_path, args.port, home=service_home, name=args.name)
-            service_dir = Path.home() / ".config" / "systemd" / "user"
+            service_dir = _systemd_user_dir()
             service_file = service_dir / f"{args.name}.service"
 
             unmanaged = service_file.exists() and not _service_file_is_marked(service_file)
@@ -8157,28 +8302,41 @@ def main():
                 print(f"Service file already exists: {service_file}")
                 if unmanaged:
                     print("It does not carry spindle's marker, so spindle did not write it (or you edited it).")
-                    print("--force will replace it, keeping a timestamped backup beside it first.")
                     print(f"To leave it alone: spindle install-service --name {args.name}-2 --port <other-port>")
-                else:
-                    print("Use --force to overwrite")
+                print("--force replaces it, keeping a timestamped backup beside it first.")
                 sys.exit(1)
 
             service_dir.mkdir(parents=True, exist_ok=True)
-            if unmanaged:
+            # Back up on EVERY replace, not only for files spindle did not write.
+            # A regenerated unit is built from argv, so a marked unit's hand-added
+            # directives (an EnvironmentFile, an extra Environment=) are dropped
+            # by --force just as surely as an unmarked one's — being spindle's
+            # file says nothing about whether it was edited since.
+            if service_file.exists():
                 backup = _backup_service_file(service_file)
                 if backup is None:
-                    print(f"Refusing to replace {service_file}: it is not spindle's and could not be backed up.")
+                    print(f"Refusing to replace {service_file}: it could not be backed up first.")
                     sys.exit(1)
-                print(f"{service_file} was not written by spindle; backed it up to {backup}")
+                origin = "was not written by spindle" if unmanaged else "is being regenerated"
+                print(f"{service_file} {origin}; backed it up to {backup}")
             service_file.write_text(service_content)
             print(f"Wrote {service_file} (port {args.port}, spindle {__version__})")
             if service_home:
                 print(f"Spool store baked into the unit: {service_home}")
 
-            subprocess.run(["systemctl", "--user", "daemon-reload"])
+            # Check both exit codes. Printing "Reloaded"/"Enabled" regardless
+            # put spindle's success claim directly beneath systemd's error and
+            # still exited 0.
+            reloaded = subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True, text=True)
+            if reloaded.returncode != 0:
+                print(f"systemctl daemon-reload failed (exit {reloaded.returncode}): {(reloaded.stderr or '').strip()}")
+                sys.exit(1)
             print("Reloaded systemd")
 
-            subprocess.run(["systemctl", "--user", "enable", args.name])
+            enabled = subprocess.run(["systemctl", "--user", "enable", args.name], capture_output=True, text=True)
+            if enabled.returncode != 0:
+                print(f"systemctl enable failed (exit {enabled.returncode}): {(enabled.stderr or '').strip()}")
+                sys.exit(1)
             print(f"Enabled {args.name} service")
 
             print(f"\nTo start now: spindle start --name {args.name}")
