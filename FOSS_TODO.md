@@ -5,10 +5,7 @@ Preparing Spindle for open-source release.
 ## High Priority
 
 ### Licensing
-- [ ] **Add LICENSE file** - Pending decision on MIT vs Apache 2.0
-  - MIT: Simple, permissive, widely used
-  - Apache 2.0: Includes patent grant, more corporate-friendly
-  - **ACTION NEEDED**: Patrick to decide on license
+- [x] **Add LICENSE file** - MIT (see LICENSE, `license = "MIT"` in pyproject.toml)
 
 ### Package Metadata
 - [x] **Enhance pyproject.toml**
@@ -61,7 +58,7 @@ Preparing Spindle for open-source release.
 ### Nice to Have
 - [ ] Add type hints throughout (partially present)
 - [ ] Add docstrings to all public functions
-- [ ] Consider adding a CHANGELOG.md
+- [x] Add a CHANGELOG.md - added for 1.2.0
 - [x] Add example systemd service file to repo + `spindle install-service` command
 
 ### Configuration
@@ -81,6 +78,5 @@ Preparing Spindle for open-source release.
 - GitHub Actions CI
 
 **Remaining:**
-- LICENSE file (needs Patrick's decision on MIT vs Apache 2.0)
-- Uncomment license/URL fields in pyproject.toml after repo is set up
-- Uncomment badges in README after CI is running
+- Uncomment badges in README after CI is running publicly
+- Publish to PyPI (name `spindle-mcp`) and tag the release

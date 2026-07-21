@@ -17,17 +17,40 @@ MCP server for multi-harness AI agent delegation. Spawn background agents (Claud
 - **Model selection** - Route tasks to different models per-agent
 - **Session continuity** - Resume conversations with child agents (auto-recovers expired sessions)
 - **Rich querying** - Search, filter, peek at running output, export results
+- **`spindle doctor`** - One command to check the install: versions, paths, spool store, detected harnesses, and an optional live read-only smoke
 
 ## Requirements
 
 - Python 3.10+
-- [Claude CLI](https://docs.anthropic.com/en/docs/claude-code) installed and authenticated
+- At least one harness CLI, installed and already authenticated. Spindle shells
+  out to the CLI you already use and inherits its login — it never asks for an
+  API key of its own:
+  - [Claude CLI](https://docs.anthropic.com/en/docs/claude-code) (`claude`) — the default harness
+  - [Codex CLI](https://developers.openai.com/codex/cli/) (`codex`)
+  - [Gemini CLI](https://github.com/google-gemini/gemini-cli) (`gemini`)
+  - [Kimi CLI](https://github.com/MoonshotAI/kimi-cli) (`kimi-cli`)
 - Git (for shard/worktree functionality)
+- `bwrap` (bubblewrap), on Linux, if you want shard worktrees filesystem-contained
 
 ## Install
 
 ```bash
 pip install spindle-mcp
+```
+
+Check what the install can actually see and do:
+
+```bash
+spindle doctor
+```
+
+Doctor reports this CLI's version and path, whether the service on the port is
+this same install, whether the spool store is writable, and which harness CLIs
+it found. Add `--smoke` to have it spawn one real read-only headless agent per
+harness and verify the answer comes back:
+
+```bash
+spindle doctor --smoke
 ```
 
 Add to Claude Code's MCP config (`~/.claude.json`):
@@ -41,6 +64,42 @@ Add to Claude Code's MCP config (`~/.claude.json`):
   }
 }
 ```
+
+That runs spindle over stdio, which needs no background service. Run a service
+only if you want the HTTP transport or a shared long-lived instance — see
+[Background service](#background-service).
+
+## Command line
+
+The core spawn-and-collect loop is available as subcommands, so you can drive
+spindle from a shell or a script without an MCP client. (The querying tools —
+search, grep, stats, export, and the shard commands — are MCP-only for now.)
+Commands print JSON by default; `--human` prints text.
+
+```bash
+# Spawn an agent (returns a spool id immediately)
+spindle spin "Summarize this module" --harness codex --permission readonly -d /path/to/project
+
+# Any built-in harness or lodged profile name works
+spindle spin "Quick pass" --harness claude-code --model haiku
+spindle spin "Alt endpoint" --harness my-profile
+
+# Collect
+spindle unspool <spool_id>
+spindle spools --human
+spindle peek <spool_id> -n 100
+spindle wait <id1>,<id2> --mode yield
+spindle drop <spool_id>
+
+# This install
+spindle --version
+spindle doctor [--smoke] [--json] [--port N]
+spindle status [--port N]
+```
+
+`spindle spin` takes the same harness names as the `spin` tool: the four
+built-ins plus any lodged profile. An unknown name is an error, not a silent
+fallback to Claude Code.
 
 ## Usage
 
@@ -468,14 +527,15 @@ Spools persist to `~/.spindle/spools/{spool_id}.json`:
 }
 ```
 
-## CLI Commands
+## Service commands
 
 ```bash
 spindle install-service  # Install background service (Linux/macOS)
 spindle start            # Start via systemd (or background if no service)
 spindle reload           # Drain (wait for spools to finish), then restart
-spindle reload --force    # Restart immediately, interrupting in-flight spools
-spindle status           # Check if running (hits /health endpoint)
+spindle reload --force   # Restart immediately, interrupting in-flight spools
+spindle status           # Health of the service on this port
+spindle doctor           # Diagnose this install (see Install, above)
 spindle serve --http     # Run MCP server directly
 ```
 
@@ -495,7 +555,34 @@ spindle start
 
 **macOS**: Writes a launchd plist to `~/Library/LaunchAgents/com.spindle.server.plist` and loads it immediately
 
-Use `--force` to overwrite an existing service file. Then `spindle reload` restarts the service to pick up code changes.
+The generated unit bakes in the current `PATH`, `SPINDLE_PORT`, and
+`SPINDLE_HOME`. `PATH` matters: a systemd user unit otherwise starts with a
+minimal one and cannot find `claude`/`codex`/`gemini`, which shows up much later
+as a spool that fails at spawn.
+
+Use `--force` to overwrite a service file spindle wrote earlier. A service file
+spindle did *not* write is never overwritten, `--force` or not — it may be the
+one already serving the machine.
+
+Then `spindle reload` restarts the service to pick up code changes.
+
+### Two installs on one machine
+
+A released wheel and a working checkout can serve at once, as long as the second
+gets its own service name, port, and spool store:
+
+```bash
+SPINDLE_HOME=~/.spindle-release spindle install-service --name spindle-release --port 8042
+spindle start --name spindle-release
+spindle doctor --port 8042
+```
+
+`spindle status` and `spindle doctor` compare the version and package path the
+service reports at `/health` against the CLI that is asking. A service that is a
+different install, or the same install running older code, is reported as such
+rather than counted as healthy — so a fresh install cannot mistake an existing
+service for its own. Point either command at a specific service with `--port`,
+or set `SPINDLE_PORT` once in the environment.
 
 ### Windows
 
@@ -526,12 +613,16 @@ Environment variables:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `SPINDLE_HOME` | `~/.spindle` | Spool store (`$SPINDLE_HOME/spools`) and lodged profiles |
+| `SPINDLE_PORT` | `8002` | Port used by `serve --http`, `status`, and `doctor` |
+| `SPINDLE_HOST` | `127.0.0.1` | Host used by the same |
 | `SPINDLE_MAX_CONCURRENT` | `15` | Maximum concurrent spools |
 | `SPINDLE_UNSPOOL_MAX_CHARS` | `50000` | Results longer than this are truncated to head+tail by `unspool()` |
 | `SPINDLE_UNSPOOL_HEAD_CHARS` | `12000` | Chars kept from the start of a truncated result |
 | `SPINDLE_UNSPOOL_TAIL_CHARS` | `12000` | Chars kept from the end of a truncated result |
 
-Storage location: `~/.spindle/spools/`
+Storage location: `~/.spindle/spools/`, or `$SPINDLE_HOME/spools/` when set.
+`spindle doctor` reports the store it resolved and whether it is writable.
 
 ## How It Works
 

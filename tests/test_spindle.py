@@ -4,9 +4,11 @@ import asyncio
 import contextlib
 import inspect
 import json
+import logging
 import multiprocessing
 import os
 import subprocess
+import sys
 import threading
 from contextlib import contextmanager
 from datetime import datetime, timedelta
@@ -7492,3 +7494,633 @@ class TestProfiles:
         _make_profile(profiles_root, "p3", {"model": 42})
         with pytest.raises(ValueError):
             _resolve_profile_overrides(_load_profile("p3"))
+
+
+# ---------------------------------------------------------------------------
+# Release identity: version single-sourcing, /health identity, spindle doctor,
+# and the service files install-service writes.
+#
+# These tests reference symbols through the `spindle` module rather than the
+# top-of-file import list, so they stay independent of it.
+# ---------------------------------------------------------------------------
+
+
+class TestVersionSingleSource:
+    """The version must have exactly one source, or CLI and service can skew."""
+
+    def test_version_exposed(self):
+        assert isinstance(spindle.__version__, str)
+        assert spindle.__version__.strip() == spindle.__version__
+        # PEP 440-ish: at least major.minor
+        assert spindle.__version__.count(".") >= 1
+        from spindle import _version
+
+        assert _version.__version__ == spindle.__version__
+
+    def test_version_module_has_no_imports(self):
+        """_version.py must stay import-free so setuptools can read it statically.
+
+        The build reads the version with `attr:`, which only avoids importing the
+        package while the value is a plain literal in a module it can parse.
+        """
+        source = Path(spindle.__file__).parent / "_version.py"
+        text = source.read_text()
+        assert "\nimport " not in text
+        assert "\nfrom " not in text
+
+    def test_pyproject_reads_the_version_from_the_package(self):
+        """A static version in pyproject would let the wheel disagree with the code."""
+        pyproject = Path(spindle.__file__).parent.parent / "pyproject.toml"
+        if not pyproject.exists():  # installed wheel, not a checkout
+            pytest.skip("no pyproject.toml (running against an installed wheel)")
+        tomllib = pytest.importorskip("tomllib")  # 3.11+; the check is skipped on 3.10
+        data = tomllib.loads(pyproject.read_text())
+        assert "version" in data["project"]["dynamic"]
+        assert "version" not in data["project"]  # no static version to drift
+        assert data["tool"]["setuptools"]["dynamic"]["version"]["attr"] == "spindle._version.__version__"
+
+
+class TestHealthIdentity:
+    """/health must carry enough identity for a client to recognize the install."""
+
+    def _health(self):
+        return asyncio.run(spindle.health_check(MagicMock()))
+
+    def test_health_reports_identity(self):
+        payload = json.loads(self._health().body)
+        assert payload["status"] == "healthy"
+        assert payload["version"] == spindle.__version__
+        assert payload["package"] == str(Path(spindle.__file__).resolve())
+        assert payload["pid"] == os.getpid()
+        assert payload["spool_dir"] == str(spindle.SPINDLE_DIR)
+
+    def test_health_keeps_legacy_fields(self):
+        """Existing monitors read these; adding identity must not drop them."""
+        payload = json.loads(self._health().body)
+        for key in ("status", "uptime_seconds", "running_spools", "max_concurrent"):
+            assert key in payload
+
+
+class TestDoctorServiceIdentity:
+    """The check that stops a fresh install reporting another one's service as its own."""
+
+    def _check(self, monkeypatch, payload, error=None):
+        monkeypatch.setattr(spindle, "_fetch_health", lambda host, port, timeout=2.0: (payload, error))
+        return spindle._doctor_service_check("127.0.0.1", 8002)
+
+    def _healthy(self, **overrides):
+        payload = {
+            "status": "healthy",
+            "uptime_seconds": 10,
+            "running_spools": 0,
+            "max_concurrent": 15,
+            "version": spindle.__version__,
+            "package": str(Path(spindle.__file__).resolve()),
+            "pid": 4242,
+            "spool_dir": str(spindle.SPINDLE_DIR),
+        }
+        payload.update(overrides)
+        return payload
+
+    def test_no_service_is_a_warning_not_a_failure(self, monkeypatch):
+        result = self._check(monkeypatch, None, error="connection refused")
+        assert result["status"] == "warn"
+        assert result["data"]["running"] is False
+
+    def test_same_install_is_ok(self, monkeypatch):
+        result = self._check(monkeypatch, self._healthy())
+        assert result["status"] == "ok"
+        assert "same install" in result["detail"]
+
+    def test_foreign_install_on_the_port_fails(self, monkeypatch):
+        """The dev-service confusion: another spindle answering our port."""
+        result = self._check(monkeypatch, self._healthy(package="/opt/other/spindle/__init__.py"))
+        assert result["status"] == "fail"
+        assert "DIFFERENT" in result["detail"]
+        assert any("/opt/other/spindle/__init__.py" in line for line in result["lines"])
+
+    def test_version_skew_fails(self, monkeypatch):
+        result = self._check(monkeypatch, self._healthy(version="0.0.1"))
+        assert result["status"] == "fail"
+        assert "skew" in result["detail"]
+        assert "0.0.1" in result["detail"]
+
+    def test_unversioned_service_is_never_claimed_as_ours(self, monkeypatch):
+        """A pre-1.2.0 service reports no version; that is 'unknown', not 'match'."""
+        payload = self._healthy()
+        del payload["version"]
+        del payload["package"]
+        result = self._check(monkeypatch, payload)
+        assert result["status"] == "warn"
+        assert "does not report its version" in result["detail"]
+
+    def test_divergent_spool_store_warns(self, monkeypatch):
+        result = self._check(monkeypatch, self._healthy(spool_dir="/somewhere/else/spools"))
+        assert result["status"] == "warn"
+        assert any("not be visible to this CLI" in line for line in result["lines"])
+
+    def test_unhealthy_payload_fails(self, monkeypatch):
+        result = self._check(monkeypatch, {"status": "starting"})
+        assert result["status"] == "fail"
+
+    def test_fetch_health_on_a_closed_port_reports_an_error(self):
+        import socket
+
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        sock.close()
+        payload, err = spindle._fetch_health("127.0.0.1", port, timeout=0.5)
+        assert payload is None
+        assert err
+
+
+class TestDoctorStorage:
+    def test_writable_store_is_ok(self, tmp_path, monkeypatch):
+        store = tmp_path / "spools"
+        monkeypatch.setattr(spindle, "SPINDLE_DIR", store)
+        spindle._write_spool("abc12345", {"id": "abc12345", "status": "complete"})
+        result = spindle._doctor_storage_check()
+        assert result["status"] == "ok"
+        assert result["data"]["spools"] == 1
+        assert not list(store.glob(".doctor-probe-*"))  # probe cleaned up
+
+    def test_uncreatable_store_fails(self, tmp_path, monkeypatch):
+        blocker = tmp_path / "not-a-dir"
+        blocker.write_text("")
+        monkeypatch.setattr(spindle, "SPINDLE_DIR", blocker / "spools")
+        result = spindle._doctor_storage_check()
+        assert result["status"] == "fail"
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+    def test_unwritable_store_fails(self, tmp_path, monkeypatch):
+        store = tmp_path / "spools"
+        store.mkdir()
+        store.chmod(0o500)
+        monkeypatch.setattr(spindle, "SPINDLE_DIR", store)
+        try:
+            result = spindle._doctor_storage_check()
+        finally:
+            store.chmod(0o700)
+        assert result["status"] == "fail"
+        assert "not writable" in result["detail"]
+
+
+class TestDoctorHarnesses:
+    def test_no_harness_is_a_failure(self, monkeypatch):
+        monkeypatch.setattr(spindle, "_probe_command", lambda cmd, timeout=5.0: (None, None))
+        monkeypatch.setattr(spindle, "_discover_profiles", lambda: {})
+        result = spindle._doctor_harness_check()
+        assert result["status"] == "fail"
+        assert result["data"]["detected"] == {}
+
+    def test_detected_harnesses_are_reported_with_paths(self, monkeypatch):
+        def fake_probe(cmd, timeout=5.0):
+            table = {"claude": ("/bin/claude", "2.1.216"), "codex": ("/bin/codex", "codex-cli 0.144.5")}
+            return table.get(cmd, (None, None))
+
+        monkeypatch.setattr(spindle, "_probe_command", fake_probe)
+        monkeypatch.setattr(spindle, "_discover_profiles", lambda: {"mimo": {}})
+        result = spindle._doctor_harness_check()
+        assert result["status"] == "ok"
+        assert set(result["data"]["detected"]) == {"claude-code", "codex"}
+        assert result["data"]["profiles"] == ["mimo"]
+        assert any("gemini: not found" in line for line in result["lines"])
+        assert any("mimo" in line for line in result["lines"])
+
+    def test_single_harness_warns(self, monkeypatch):
+        monkeypatch.setattr(
+            spindle,
+            "_probe_command",
+            lambda cmd, timeout=5.0: ("/bin/claude", "2.1") if cmd == "claude" else (None, None),
+        )
+        monkeypatch.setattr(spindle, "_discover_profiles", lambda: {})
+        assert spindle._doctor_harness_check()["status"] == "warn"
+
+    def test_harness_commands_cover_every_builtin(self):
+        assert set(spindle.HARNESS_COMMANDS) == spindle.BUILTIN_HARNESSES
+
+
+class TestDoctorSmoke:
+    """The smoke runs real agents, so these tests stub the spawn and drive the states."""
+
+    def _seed(self, spool_id, status, result):
+        spindle._write_spool(spool_id, {"id": spool_id, "status": status, "result": result, "prompt": "x"})
+
+    def _no_finalize(self, monkeypatch):
+        monkeypatch.setattr(spindle, "_check_and_finalize_spool", lambda spool_id: True)
+
+    def test_token_match_is_ok(self, monkeypatch):
+        self._no_finalize(monkeypatch)
+        self._seed("smoke001", "complete", spindle.DOCTOR_SMOKE_TOKEN)
+        monkeypatch.setattr(spindle, "_doctor_smoke_spin", lambda *a, **k: "smoke001")
+        result = spindle._doctor_smoke_check("codex", timeout=5)
+        assert result["status"] == "ok"
+        assert result["data"]["spool_id"] == "smoke001"
+
+    def test_missing_token_fails(self, monkeypatch):
+        self._no_finalize(monkeypatch)
+        self._seed("smoke002", "complete", "I cannot comply")
+        monkeypatch.setattr(spindle, "_doctor_smoke_spin", lambda *a, **k: "smoke002")
+        result = spindle._doctor_smoke_check("codex", timeout=5)
+        assert result["status"] == "fail"
+        assert "smoke token" in result["detail"]
+
+    def test_errored_spool_fails(self, monkeypatch):
+        self._no_finalize(monkeypatch)
+        self._seed("smoke003", "error", "")
+        monkeypatch.setattr(spindle, "_doctor_smoke_spin", lambda *a, **k: "smoke003")
+        assert spindle._doctor_smoke_check("codex", timeout=5)["status"] == "fail"
+
+    def test_spawn_error_fails(self, monkeypatch):
+        monkeypatch.setattr(spindle, "_doctor_smoke_spin", lambda *a, **k: "Error: codex CLI not found")
+        result = spindle._doctor_smoke_check("codex", timeout=5)
+        assert result["status"] == "fail"
+        assert "codex CLI not found" in result["detail"]
+
+    def test_hung_spool_is_dropped_and_failed(self, monkeypatch):
+        self._no_finalize(monkeypatch)
+        self._seed("smoke004", "running", "")
+        monkeypatch.setattr(spindle, "_doctor_smoke_spin", lambda *a, **k: "smoke004")
+        dropped = []
+        monkeypatch.setattr(spindle, "_spin_drop_sync", lambda spool_id: dropped.append(spool_id) or "dropped")
+        monkeypatch.setattr(spindle.time, "sleep", lambda seconds: None)
+        result = spindle._doctor_smoke_check("codex", timeout=0)
+        assert result["status"] == "fail"
+        assert dropped == ["smoke004"]
+
+    def test_smoke_is_limited_to_harnesses_with_a_read_only_tier(self):
+        """kimi runs --yolo and gemini has no enforced read-only tier: no 'harmless' smoke."""
+        assert spindle.DOCTOR_SMOKE_HARNESSES == ("claude-code", "codex")
+        for harness in ("kimi", "gemini"):
+            assert spindle._doctor_smoke_check(harness)["status"] == "skip"
+
+    def test_smoke_working_dir_is_temporary(self, monkeypatch):
+        """A smoke must not run inside the user's repo."""
+        self._no_finalize(monkeypatch)
+        self._seed("smoke005", "complete", spindle.DOCTOR_SMOKE_TOKEN)
+        seen = {}
+
+        def fake_spin(harness, working_dir, model, timeout):
+            seen["working_dir"] = working_dir
+            return "smoke005"
+
+        monkeypatch.setattr(spindle, "_doctor_smoke_spin", fake_spin)
+        spindle._doctor_smoke_check("codex", timeout=5)
+        assert "spindle-doctor-" in seen["working_dir"]
+        assert not Path(seen["working_dir"]).exists()  # cleaned up
+
+
+class TestDoctorRun:
+    def _stub_all(self, monkeypatch, service_status="ok"):
+        monkeypatch.setattr(spindle, "_doctor_cli_check", lambda: spindle._doctor_result("cli", "ok", "cli"))
+        monkeypatch.setattr(
+            spindle,
+            "_doctor_service_check",
+            lambda host, port, timeout=2.0: spindle._doctor_result("service", service_status, "service"),
+        )
+        monkeypatch.setattr(spindle, "_doctor_storage_check", lambda: spindle._doctor_result("storage", "ok", "store"))
+        monkeypatch.setattr(
+            spindle, "_doctor_harness_check", lambda: spindle._doctor_result("harnesses", "ok", "harnesses")
+        )
+        monkeypatch.setattr(spindle, "_doctor_shard_check", lambda: spindle._doctor_result("shards", "ok", "shards"))
+
+    def test_clean_run_is_ok_and_offers_the_smoke(self, monkeypatch):
+        self._stub_all(monkeypatch)
+        report = spindle._doctor_run()
+        assert report["ok"] is True
+        assert report["version"] == spindle.__version__
+        smoke = [c for c in report["checks"] if c["name"] == "smoke"][0]
+        assert smoke["status"] == "skip"
+        assert "--smoke" in smoke["detail"]
+
+    def test_a_failing_check_fails_the_report(self, monkeypatch):
+        self._stub_all(monkeypatch, service_status="fail")
+        report = spindle._doctor_run()
+        assert report["ok"] is False
+        assert report["failed"] == ["service"]
+
+    def test_warnings_do_not_fail_the_report(self, monkeypatch):
+        self._stub_all(monkeypatch, service_status="warn")
+        assert spindle._doctor_run()["ok"] is True
+
+    def test_smoke_runs_per_requested_harness(self, monkeypatch):
+        self._stub_all(monkeypatch)
+        ran = []
+
+        def fake_smoke(harness, timeout=240, model=None):
+            ran.append(harness)
+            return spindle._doctor_result(f"smoke:{harness}", "ok", "smoked")
+
+        monkeypatch.setattr(spindle, "_doctor_smoke_check", fake_smoke)
+        report = spindle._doctor_run(smoke=True, smoke_harnesses=["codex"])
+        assert ran == ["codex"]
+        assert [c["name"] for c in report["checks"] if c["name"].startswith("smoke")] == ["smoke:codex"]
+
+    def test_render_is_one_line_per_status(self, monkeypatch):
+        self._stub_all(monkeypatch, service_status="fail")
+        text = spindle._doctor_render(spindle._doctor_run())
+        lines = text.splitlines()
+        assert lines[0].startswith("spindle doctor")
+        assert any(line.startswith("fail: service") for line in lines)
+        assert lines[-1].startswith("FAILED: service")
+        assert "|" not in text  # plain text, no table columns
+
+
+class TestServiceFileGeneration:
+    def test_unit_carries_marker_port_and_home(self):
+        unit = spindle._systemd_unit_text("/opt/venv/bin/spindle", 8042, home="/tmp/store", name="spindle-release")
+        assert spindle.SERVICE_MARKER in unit
+        assert "ExecStart=/opt/venv/bin/spindle serve --http --port 8042" in unit
+        assert "Environment=SPINDLE_PORT=8042" in unit
+        assert "Environment=SPINDLE_HOME=/tmp/store" in unit
+        assert "spindle-release" in unit
+
+    def test_unit_omits_home_when_not_set(self):
+        unit = spindle._systemd_unit_text("/opt/venv/bin/spindle", 8002)
+        assert "SPINDLE_HOME" not in unit
+
+    def test_plist_carries_marker_and_port(self):
+        plist = spindle._launchd_plist_text("com.spindle.server", "/usr/local/bin/spindle", 8042, home="/tmp/store")
+        assert spindle.SERVICE_MARKER in plist
+        assert "<string>8042</string>" in plist
+        assert "SPINDLE_HOME" in plist
+
+    def test_foreign_service_file_is_detected(self, tmp_path):
+        missing = tmp_path / "none.service"
+        assert spindle._service_file_is_foreign(missing) is False
+
+        ours = tmp_path / "ours.service"
+        ours.write_text(spindle._systemd_unit_text("/bin/spindle", 8002))
+        assert spindle._service_file_is_foreign(ours) is False
+
+        theirs = tmp_path / "theirs.service"
+        theirs.write_text("[Unit]\nDescription=Hand-written spindle\n")
+        assert spindle._service_file_is_foreign(theirs) is True
+
+    def test_service_path_env_dedupes_and_prunes(self, tmp_path):
+        real = tmp_path / "bin"
+        real.mkdir()
+        gone = tmp_path / "vanished"
+        raw = os.pathsep.join([str(real), str(gone), str(real), ""])
+        resolved = spindle._service_path_env(raw)
+        assert resolved.split(os.pathsep) == [str(real)]
+
+    def test_service_path_env_never_empty(self, tmp_path):
+        assert spindle._service_path_env(str(tmp_path / "nope"))
+
+
+class TestPortResolution:
+    def test_default_port(self, monkeypatch):
+        monkeypatch.delenv("SPINDLE_PORT", raising=False)
+        assert spindle._default_port() == 8002
+
+    def test_port_from_env(self, monkeypatch):
+        monkeypatch.setenv("SPINDLE_PORT", "8042")
+        assert spindle._default_port() == 8042
+
+    def test_bad_port_falls_back(self, monkeypatch):
+        monkeypatch.setenv("SPINDLE_PORT", "not-a-port")
+        assert spindle._default_port() == 8002
+
+
+class TestHarnessSelectionSharedByCliAndTool:
+    """`spindle spin --harness X` must accept exactly what the spin tool accepts."""
+
+    @pytest.fixture
+    def profiles_root(self, tmp_path, monkeypatch):
+        root = tmp_path / "profiles"
+        root.mkdir()
+        monkeypatch.setattr(spindle, "SPINDLE_PROFILES_DIR", root)
+        monkeypatch.chdir(tmp_path)
+        return root
+
+    def test_builtin_passes_through(self):
+        harness, model, env, extra, name = spindle._resolve_harness_selection("CODEX", "gpt-5.6-sol", None)
+        assert harness == "codex"
+        assert model == "gpt-5.6-sol"
+        assert (extra, name) == (None, None)
+
+    def test_no_harness_is_none(self):
+        assert spindle._resolve_harness_selection(None, None, None)[0] is None
+
+    def test_unknown_harness_raises(self, profiles_root):
+        with pytest.raises(ValueError) as exc:
+            spindle._resolve_harness_selection("nope", None, None)
+        assert "Unknown harness or profile" in str(exc.value)
+
+    def test_profile_resolves_to_claude_code_with_its_env(self, profiles_root):
+        _make_profile(
+            profiles_root,
+            "alt",
+            {"base_url": "https://alt.example/v1", "api_key": "k", "model": "alt-default", "extra_args": ["--flag"]},
+        )
+        harness, model, env, extra, name = spindle._resolve_harness_selection("alt", None, None)
+        assert harness == "claude-code"
+        assert name == "alt"
+        assert model == "alt-default"
+        assert extra == ["--flag"]
+        assert env["ANTHROPIC_BASE_URL"] == "https://alt.example/v1"
+
+    def test_cli_spin_rejects_unknown_harness(self, profiles_root, capsys):
+        """Regression: the CLI used to run plain Claude Code for any unknown --harness."""
+        argv = ["spindle", "spin", "hello", "--harness", "nope", "--working-dir", str(profiles_root)]
+        with patch.object(spindle.sys, "argv", argv):
+            with pytest.raises(SystemExit) as exc:
+                spindle.main()
+        assert exc.value.code == 1
+        assert "Unknown harness or profile" in json.loads(capsys.readouterr().out)["error"]
+
+    def test_cli_spin_routes_a_profile_through_the_profile_path(self, profiles_root, capsys):
+        """Regression: a lodged profile name used to fall through to plain Claude Code."""
+        _make_profile(profiles_root, "alt", {"base_url": "https://alt.example/v1", "model": "alt-default"})
+        captured = {}
+
+        def fake_spin_sync(**kwargs):
+            captured.update(kwargs)
+            return "abc12345"
+
+        with patch.object(spindle, "_spin_sync", fake_spin_sync):
+            argv = ["spindle", "spin", "hello", "--harness", "alt", "--working-dir", str(profiles_root)]
+            with patch.object(spindle.sys, "argv", argv):
+                with pytest.raises(SystemExit) as exc:
+                    spindle.main()
+        assert exc.value.code == 0
+        assert captured["profile"] == "alt"
+        assert captured["model"] == "alt-default"
+        assert captured["spawn_env"]["ANTHROPIC_BASE_URL"] == "https://alt.example/v1"
+        assert json.loads(capsys.readouterr().out)["spool_id"] == "abc12345"
+
+
+class TestCliDoctorCommand:
+    def test_doctor_exit_code_and_json(self, monkeypatch, capsys):
+        report = {"ok": False, "version": spindle.__version__, "failed": ["service"], "checks": [], "endpoint": "x"}
+        monkeypatch.setattr(spindle, "_doctor_run", lambda **kwargs: report)
+        with patch.object(spindle.sys, "argv", ["spindle", "doctor", "--json"]):
+            with pytest.raises(SystemExit) as exc:
+                spindle.main()
+        assert exc.value.code == 1
+        assert json.loads(capsys.readouterr().out)["failed"] == ["service"]
+
+    def test_doctor_passes_flags_through(self, monkeypatch, capsys):
+        seen = {}
+
+        def fake_run(**kwargs):
+            seen.update(kwargs)
+            return {"ok": True, "version": spindle.__version__, "failed": [], "checks": [], "endpoint": "x"}
+
+        monkeypatch.setattr(spindle, "_doctor_run", fake_run)
+        argv = ["spindle", "doctor", "--smoke", "--harness", "codex,claude-code", "--port", "8042"]
+        with patch.object(spindle.sys, "argv", argv):
+            with pytest.raises(SystemExit) as exc:
+                spindle.main()
+        assert exc.value.code == 0
+        assert seen["smoke"] is True
+        assert seen["smoke_harnesses"] == ["codex", "claude-code"]
+        assert seen["port"] == 8042
+        capsys.readouterr()
+
+    def test_status_flags_a_foreign_service(self, monkeypatch, capsys):
+        """`spindle status` must not present another install's health as its own."""
+        payload = {"status": "healthy", "version": "9.9.9", "package": "/opt/other/spindle/__init__.py"}
+        monkeypatch.setattr(spindle, "_fetch_health", lambda host, port, timeout=2.0: (payload, None))
+        with patch.object(spindle.sys, "argv", ["spindle", "status"]):
+            with pytest.raises(SystemExit):
+                spindle.main()
+        captured = capsys.readouterr()
+        assert json.loads(captured.out)["version"] == "9.9.9"
+        assert "different install" in captured.err
+
+    def test_status_reports_not_running(self, monkeypatch, capsys):
+        monkeypatch.setattr(spindle, "_fetch_health", lambda host, port, timeout=2.0: (None, "refused"))
+        with patch.object(spindle.sys, "argv", ["spindle", "status"]):
+            with pytest.raises(SystemExit):
+                spindle.main()
+        assert "Not running" in capsys.readouterr().out
+
+
+class TestDoctorCliIdentity:
+    """ "Is the `spindle` on PATH the one I'm running?" - the two-installs question."""
+
+    def test_console_script_mismatch_warns(self, tmp_path, monkeypatch):
+        theirs = tmp_path / "theirs" / "spindle"
+        theirs.parent.mkdir()
+        theirs.write_text("#!/usr/bin/python3\n")
+        ours = tmp_path / "ours" / "spindle"
+        ours.parent.mkdir()
+        ours.write_text("#!/usr/bin/python3\n")
+        monkeypatch.setattr(spindle.shutil, "which", lambda cmd: str(theirs))
+        result = spindle._doctor_cli_check(argv0=str(ours))
+        assert result["status"] == "warn"
+        assert any("DIFFERENT install" in line for line in result["lines"])
+
+    def test_same_console_script_is_ok(self, tmp_path, monkeypatch):
+        script = tmp_path / "spindle"
+        script.write_text("#!/usr/bin/python3\n")
+        monkeypatch.setattr(spindle.shutil, "which", lambda cmd: str(script))
+        assert spindle._doctor_cli_check(argv0=str(script))["status"] == "ok"
+
+    def test_module_invocation_compares_interpreter_dirs(self, tmp_path, monkeypatch):
+        """A venv python resolves to its base interpreter, so compare bin dirs."""
+        script = tmp_path / "spindle"
+        script.write_text("#!/opt/other-venv/bin/python3\n")
+        monkeypatch.setattr(spindle.shutil, "which", lambda cmd: str(script))
+        result = spindle._doctor_cli_check(argv0=str(tmp_path / "spindle" / "__main__.py"))
+        assert result["status"] == "warn"
+
+        script.write_text(f"#!{Path(sys.executable).parent / 'python3'}\n")
+        assert spindle._doctor_cli_check(argv0="/some/pkg/__main__.py")["status"] == "ok"
+
+    def test_missing_console_script_warns(self, monkeypatch):
+        monkeypatch.setattr(spindle.shutil, "which", lambda cmd: None)
+        result = spindle._doctor_cli_check()
+        assert result["status"] == "warn"
+        assert result["data"]["console_script"] is None
+        assert result["data"]["version"] == spindle.__version__
+
+
+def test_cli_import_emits_no_third_party_deprecation_noise():
+    """Every CLI command used to print an authlib deprecation warning first.
+
+    Import spindle in a clean subprocess with warnings enabled and assert stderr
+    stays quiet: the filter has to be registered before fastmcp is imported, so a
+    reordering of the imports would silently bring the noise back.
+    """
+    proc = subprocess.run(
+        [sys.executable, "-W", "default", "-c", "import spindle"],
+        capture_output=True,
+        text=True,
+        cwd=str(Path(spindle.__file__).parent.parent),
+        timeout=120,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "authlib" not in proc.stderr
+
+
+class TestImportNoiseSuppression:
+    """authlib's import-time deprecation used to precede every command's output."""
+
+    def test_authlib_message_is_dropped(self, monkeypatch):
+        seen = []
+        monkeypatch.setattr(spindle, "_real_showwarning", lambda *args: seen.append(args))
+        spindle._showwarning_without_authlib_noise(
+            "authlib.jose module is deprecated, please use joserfc instead.",
+            DeprecationWarning,
+            "authlib/jose.py",
+            10,
+        )
+        assert seen == []
+
+    def test_other_warnings_still_surface(self, monkeypatch):
+        seen = []
+        monkeypatch.setattr(spindle, "_real_showwarning", lambda *args: seen.append(args))
+        spindle._showwarning_without_authlib_noise("something you should know", UserWarning, "x.py", 1)
+        assert len(seen) == 1
+
+    def test_warnings_machinery_is_handed_back(self):
+        """The shim must only be installed for the duration of the fastmcp import."""
+        import warnings as warnings_module
+
+        assert warnings_module.showwarning is not spindle._showwarning_without_authlib_noise
+
+
+class TestCodexProbeLogging:
+    """The blocked-write outcome is the probe PASSING; it must not look like a failure."""
+
+    def _proc(self, stdout, returncode=0):
+        proc = MagicMock()
+        proc.stdout = stdout
+        proc.returncode = returncode
+        return proc
+
+    def test_blocked_write_does_not_warn(self, caplog):
+        """A missing target means the sandbox held. Warning about it alarmed every first run."""
+        with patch("spindle.subprocess.run", return_value=self._proc(f"{spindle._CODEX_SANDBOX_PROBE_MARKER}\n")):
+            with caplog.at_level(logging.WARNING, logger="spindle"):
+                assert spindle._codex_sandbox_probe("/fake/codex") is True
+        assert caplog.records == []
+
+    def test_a_real_stat_error_still_warns(self, caplog):
+        """Anything other than "the file isn't there" is still worth surfacing."""
+
+        def boom(path):
+            raise PermissionError("denied")
+
+        with patch("spindle.subprocess.run", return_value=self._proc(f"{spindle._CODEX_SANDBOX_PROBE_MARKER}\n")):
+            with patch("spindle.os.path.getsize", side_effect=boom):
+                with caplog.at_level(logging.WARNING, logger="spindle"):
+                    assert spindle._codex_sandbox_probe("/fake/codex") is True
+        assert any("could not stat target" in r.message for r in caplog.records)
+
+
+def test_harness_check_says_presence_is_not_authentication(monkeypatch):
+    """Installed-but-not-logged-in is the likeliest fresh-machine failure."""
+    monkeypatch.setattr(
+        spindle,
+        "_probe_command",
+        lambda cmd, timeout=5.0: (f"/bin/{cmd}", "1.0") if cmd != "kimi-cli" else (None, None),
+    )
+    monkeypatch.setattr(spindle, "_discover_profiles", lambda: {})
+    result = spindle._doctor_harness_check()
+    assert any("not the same as logged in" in line for line in result["lines"])
+    assert any("--smoke" in line for line in result["lines"])

@@ -25,14 +25,38 @@ import tempfile
 import threading
 import time
 import uuid
+import warnings
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, Generator, Optional, Tuple
 
-from fastmcp import Context, FastMCP
-from starlette.requests import Request
-from starlette.responses import JSONResponse
+# fastmcp imports authlib, which announces a deprecation of its own internals as
+# it loads — three lines of stderr in front of the output of every single CLI
+# command, about something no spindle user can act on. A warnings filter can't
+# stop it: authlib itself calls warnings.simplefilter("always", ...) at import,
+# which takes precedence over anything registered earlier. So drop that one
+# message for the duration of the import and hand the machinery straight back.
+# (The E402s below are the cost of having to sit in front of the import.)
+_AUTHLIB_IMPORT_NOISE = "authlib.jose module is deprecated"
+_real_showwarning = warnings.showwarning
+
+
+def _showwarning_without_authlib_noise(message, category, filename, lineno, file=None, line=None):
+    if _AUTHLIB_IMPORT_NOISE in str(message):
+        return
+    _real_showwarning(message, category, filename, lineno, file, line)
+
+
+warnings.showwarning = _showwarning_without_authlib_noise
+try:
+    from fastmcp import Context, FastMCP  # noqa: E402
+    from starlette.requests import Request  # noqa: E402
+    from starlette.responses import JSONResponse  # noqa: E402
+finally:
+    warnings.showwarning = _real_showwarning
+
+from ._version import __version__  # noqa: E402
 
 mcp = FastMCP("spindle")
 
@@ -42,10 +66,30 @@ logger = logging.getLogger(__name__)
 # Track server start time for uptime calculation
 _server_start_time = datetime.now()
 
+# Port the serving process actually bound, set by main() before mcp.run(). None
+# in a CLI process (which serves nothing) and in stdio mode (no port at all).
+_server_port: Optional[int] = None
+
+
+def _package_path() -> str:
+    """Absolute path of this module - the identity of *which* install this is.
+
+    Two spindles on one machine (a repo checkout and a released wheel) report
+    different paths here, which is how `spindle doctor` tells the service it is
+    talking to apart from the CLI asking.
+    """
+    return str(Path(__file__).resolve())
+
 
 @mcp.custom_route("/health", methods=["GET"])
 async def health_check(request: Request) -> JSONResponse:
-    """Health check endpoint for monitoring and systemd watchdog."""
+    """Health check endpoint for monitoring, systemd watchdog, and doctor.
+
+    The identity fields (version/package/pid/spool_dir) let a client decide
+    whether the service answering this port is the same install it is running
+    from. Older services answer without them; doctor treats a missing `version`
+    as "unidentifiable", never as "matches".
+    """
     uptime_seconds = (datetime.now() - _server_start_time).total_seconds()
     running_count = _count_running()
 
@@ -55,6 +99,12 @@ async def health_check(request: Request) -> JSONResponse:
             "uptime_seconds": int(uptime_seconds),
             "running_spools": running_count,
             "max_concurrent": MAX_CONCURRENT,
+            "version": __version__,
+            "package": _package_path(),
+            "pid": os.getpid(),
+            "python": sys.executable,
+            "spool_dir": str(SPINDLE_DIR),
+            "port": _server_port,
         }
     )
 
@@ -71,6 +121,36 @@ SPINDLE_PROFILES_DIR = Path(os.environ.get("SPINDLE_HOME", str(Path.home() / ".s
 
 # Built-in harness names. These always win over a same-named lodged profile.
 BUILTIN_HARNESSES = {"claude-code", "codex", "gemini", "kimi"}
+
+# Executable each built-in harness shells out to, in the order doctor reports
+# them. The value is what has to be on PATH for that harness to run at all.
+HARNESS_COMMANDS = {
+    "claude-code": "claude",
+    "codex": "codex",
+    "gemini": "gemini",
+    "kimi": "kimi-cli",
+}
+
+# HTTP endpoint of the spindle service. Both are env-overridable so a second
+# install can serve its own port instead of fighting the first for 8002 - the
+# systemd unit written by `spindle install-service --port N` sets SPINDLE_PORT,
+# so `spindle status`/`spindle doctor` in that environment resolve the same port
+# the service bound.
+DEFAULT_HOST = os.environ.get("SPINDLE_HOST", "127.0.0.1")
+
+
+def _default_port() -> int:
+    """Service port from SPINDLE_PORT, falling back to 8002 on a bad value."""
+    raw = os.environ.get("SPINDLE_PORT", "")
+    if raw:
+        try:
+            return int(raw)
+        except ValueError:
+            logger.warning("spindle: ignoring non-numeric SPINDLE_PORT=%r, using 8002", raw)
+    return 8002
+
+
+DEFAULT_PORT = _default_port()
 
 # Live subprocess handles keyed by spool_id, populated by _spawn_detached so
 # finalization can capture the child's exit code. Process-local; not persisted.
@@ -1320,6 +1400,60 @@ def _profile_spawn_env(
         model = overrides["model_aliases"][model]
 
     return spawn_env, model, overrides["extra_args"], True
+
+
+def _resolve_harness_selection(
+    harness: Optional[str],
+    model: Optional[str],
+    caller_env: Optional[Dict[str, str]],
+) -> Tuple[Optional[str], Optional[str], Optional[Dict[str, str]], Optional[list], Optional[str]]:
+    """Resolve a caller's ``harness`` name against built-ins and lodged profiles.
+
+    Shared by the ``spin`` MCP tool and the ``spindle spin`` CLI so both accept
+    exactly the same harness names. Before this was shared, the CLI compared the
+    name against codex/gemini/kimi and fell through to Claude Code for anything
+    else — so ``spindle spin --harness mimo`` silently ran plain Claude Code
+    with no profile env, and ``--harness typo`` ran a spool instead of erroring.
+
+    Built-in names win over a same-named profile (with a warning). A non-built-in
+    name must match a lodged profile. A resolved profile always routes through
+    the Claude Code path (base harness is enforced to claude-code in v1) and
+    contributes its spawn env, model, and extra CLI args.
+
+    Returns ``(harness_lower, model, spawn_env, profile_extra_args, profile_name)``.
+    Raises ``ValueError`` with a caller-facing message for an unknown name or a
+    malformed profile.
+    """
+    harness_lower = harness.lower() if harness else None
+
+    profile = None
+    if harness:
+        if harness_lower in BUILTIN_HARNESSES:
+            if _load_profile(harness) is not None:
+                logger.warning(
+                    "spindle: profile %r shadows built-in harness %r; using the built-in",
+                    harness,
+                    harness_lower,
+                )
+        else:
+            profile = _load_profile(harness)
+            if profile is None:
+                valid = sorted(BUILTIN_HARNESSES | set(_discover_profiles().keys()))
+                raise ValueError(
+                    f"Unknown harness or profile: {harness!r}. Valid: {', '.join(valid)}. "
+                    "Use spin_harnesses() to see details."
+                )
+
+    if profile is None:
+        return harness_lower, model, caller_env, None, None
+
+    # Reconstruct the child spawn env (carrying fresh secrets), effective model
+    # (caller model wins / alias-mapped / profile default), and extra CLI args.
+    # strict=True surfaces a malformed profile to the caller instead of silently
+    # degrading. caller_env stays the only env safe to persist.
+    profile_name = profile["_name"]
+    spawn_env, model, profile_extra_args, _ = _profile_spawn_env(profile_name, caller_env, model=model, strict=True)
+    return "claude-code", model, spawn_env, profile_extra_args, profile_name
 
 
 def _get_cc_bg_tasks(session_id: str) -> list:
@@ -2671,56 +2805,17 @@ async def spin(
     if conflict:
         return json.dumps({"error": conflict})
 
-    # Resolve harness against built-ins and lodged profiles. Built-in names win
-    # over a same-named profile (with a warning); otherwise a non-built-in name
-    # must match a lodged profile or it's an error.
-    profile = None
-    profile_extra_args = None
-    profile_name = None
-    if harness:
-        if harness_lower in BUILTIN_HARNESSES:
-            if _load_profile(harness) is not None:
-                logger.warning(
-                    "spindle: profile %r shadows built-in harness %r; using the built-in",
-                    harness,
-                    harness_lower,
-                )
-        else:
-            profile = _load_profile(harness)
-            if profile is None:
-                valid = sorted(BUILTIN_HARNESSES | set(_discover_profiles().keys()))
-                return json.dumps(
-                    {
-                        "error": f"Unknown harness or profile: {harness!r}. Valid: {', '.join(valid)}. Use spin_harnesses() to see details.",
-                    }
-                )
-
     # The caller's explicit env is the only env safe to persist on the spool
     # record. Profile-resolved env (which carries ANTHROPIC_API_KEY and any
     # op://-resolved secrets) must never hit disk, so it is built into a
     # separate spawn_env that goes only to the child process.
     caller_env = env
-    spawn_env = env
-
-    # Apply profile overrides: resolve its base harness, build the injected env,
-    # fold in the profile-scoped model alias / default model, and capture its
-    # extra CLI args. base harness is enforced to claude-code in v1, so a
-    # resolved profile always routes through the Claude Code path below.
-    if profile is not None:
-        profile_name = profile["_name"]
-        # Reconstruct the child spawn env (carrying fresh secrets), effective
-        # model (caller model wins / alias-mapped / profile default), and extra
-        # CLI args. strict=True surfaces a malformed profile to the caller
-        # instead of silently degrading. caller_env stays the only persisted env.
-        try:
-            spawn_env, model, profile_extra_args, _ = _profile_spawn_env(
-                profile_name, caller_env, model=model, strict=True
-            )
-        except ValueError as exc:
-            return json.dumps({"error": str(exc)})
-        # base harness is enforced to claude-code in v1 (_resolve_profile_overrides
-        # raises otherwise), so a resolved profile always routes through CC.
-        harness_lower = "claude-code"
+    try:
+        harness_lower, model, spawn_env, profile_extra_args, profile_name = _resolve_harness_selection(
+            harness, model, caller_env
+        )
+    except ValueError as exc:
+        return json.dumps({"error": str(exc)})
 
     # auto/auto+shard is CC-specific; non-CC harnesses have no classifier-vetted mode
     if permission and permission.startswith("auto") and harness_lower and harness_lower != "claude-code":
@@ -5133,6 +5228,15 @@ def _codex_sandbox_probe(codex_bin: str) -> bool:
                 continue  # wrong CLI shape for this version — the command never ran
             try:
                 wrote = os.path.getsize(target) > 0
+            except FileNotFoundError:
+                # The expected healthy outcome: the sandbox blocked the write, so the
+                # target was never created. Logged at debug — as a warning it read like
+                # a probe failure and greeted every clean install's first codex spin.
+                logger.debug(
+                    "spindle: codex sandbox probe (read-only) target absent on %s — write was blocked",
+                    codex_bin,
+                )
+                wrote = False
             except OSError as exc:
                 logger.warning(
                     "spindle: codex sandbox probe (read-only) could not stat target on %s: %s",
@@ -6601,22 +6705,671 @@ async def spindle_reload(force: bool = False) -> str:
     )
 
 
+# ---------------------------------------------------------------------------
+# spindle doctor
+#
+# One command that answers "is this install actually working, and is the thing
+# on the port actually *this* install?". The second half matters on any machine
+# that already runs a spindle from a checkout: a fresh wheel install used to
+# report the older service's health as its own, because `spindle status` curled
+# a hardcoded 127.0.0.1:8002 and printed whatever answered.
+# ---------------------------------------------------------------------------
+
+# Sentinel the smoke asks for and checks. Deliberately not a word an agent would
+# emit spontaneously, so a matching result means the agent really answered.
+DOCTOR_SMOKE_TOKEN = "spindle-doctor-ok"
+DOCTOR_SMOKE_PROMPT = f"Reply with exactly this token and nothing else: {DOCTOR_SMOKE_TOKEN}"
+
+# Harnesses the smoke will run. Restricted to the two with a real read-only
+# tier: codex gets sandbox=read-only, claude-code gets the allowlisted readonly
+# profile. Gemini has no enforced read-only tier here and kimi runs --yolo, so a
+# "harmless read-only smoke" through them would be a lie.
+DOCTOR_SMOKE_HARNESSES = ("claude-code", "codex")
+
+# Statuses that end a spool, i.e. stop the smoke's poll loop.
+_TERMINAL_SPOOL_STATUSES = {"complete", "error", "killed", "timeout"}
+
+
+def _doctor_result(name: str, status: str, detail: str, lines: Optional[list] = None, **data) -> dict:
+    """One doctor check outcome.
+
+    status is "ok", "warn", "fail", or "skip". Only "fail" makes doctor exit 1;
+    a warn is something to know about, not something that stops the install
+    working (no service running is normal for stdio-only MCP use).
+    """
+    return {
+        "name": name,
+        "status": status,
+        "detail": detail,
+        "lines": lines or [],
+        "data": data,
+    }
+
+
+def _fetch_health(host: str, port: int, timeout: float = 2.0) -> Tuple[Optional[dict], Optional[str]]:
+    """GET /health from a spindle service. Returns (payload, error_message)."""
+    import urllib.error
+    import urllib.request
+
+    url = f"http://{host}:{port}/health"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        return None, f"HTTP {exc.code} from {url}"
+    except urllib.error.URLError as exc:
+        return None, f"{url} unreachable: {exc.reason}"
+    except OSError as exc:
+        return None, f"{url} unreachable: {exc}"
+
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        return None, f"{url} answered with non-JSON ({body[:80]!r})"
+    if not isinstance(payload, dict):
+        return None, f"{url} answered with non-object JSON"
+    return payload, None
+
+
+def _script_interpreter(path: str) -> Optional[str]:
+    """Interpreter from a console script's shebang, or None if unreadable."""
+    try:
+        with open(path, "r", errors="replace") as fh:
+            first = fh.readline().strip()
+    except OSError:
+        return None
+    if not first.startswith("#!"):
+        return None
+    return first[2:].strip().split()[0] if first[2:].strip() else None
+
+
+def _doctor_cli_check(argv0: Optional[str] = None) -> dict:
+    """Identify the CLI that is running: version, module path, python, PATH entry.
+
+    Also answers "if I type `spindle` in a shell, do I get *this* one?" — the
+    answer is no whenever a checkout and a wheel are both installed, and that
+    mismatch explains most "I fixed it but nothing changed" confusion.
+    """
+    module_path = _package_path()
+    lines = [f"python {sys.version.split()[0]} at {sys.executable}"]
+    status = "ok"
+
+    on_path = shutil.which("spindle")
+    if not on_path:
+        status = "warn"
+        lines.append("no 'spindle' console script on PATH (run it via `python -m spindle`, or fix PATH)")
+    else:
+        lines.append(f"console script on PATH: {on_path}")
+        invoked = argv0 if argv0 is not None else (sys.argv[0] if sys.argv else "")
+        invoked_path = Path(invoked) if invoked else None
+        foreign = None
+        if invoked_path is not None and invoked_path.name == "spindle" and invoked_path.exists():
+            # Invoked as a console script: compare the actual files.
+            if invoked_path.resolve() != Path(on_path).resolve():
+                foreign = f"you ran {invoked_path.resolve()}"
+        else:
+            # Invoked some other way (python -m spindle, a test, an import).
+            # Compare the interpreter directory the PATH script points at with
+            # ours: comparing the interpreters themselves is useless, since a
+            # venv python resolves to the base interpreter it was created from.
+            interp = _script_interpreter(on_path)
+            if interp and Path(interp).parent != Path(sys.executable).parent:
+                foreign = f"it runs {interp}; this process runs {sys.executable}"
+        if foreign:
+            status = "warn"
+            lines.append(
+                f"the `spindle` on PATH is a DIFFERENT install from the one running this check "
+                f"({foreign}) — typing `spindle ...` will not reach this install"
+            )
+
+    return _doctor_result(
+        "cli",
+        status,
+        f"spindle {__version__} ({module_path})",
+        lines,
+        version=__version__,
+        package=module_path,
+        python=sys.executable,
+        console_script=on_path,
+    )
+
+
+def _doctor_service_check(host: str, port: int, timeout: float = 2.0) -> dict:
+    """Probe the service on host:port and decide whether it is *this* install.
+
+    The identity comparison is the point. A service is only "ok" when it reports
+    the same version AND the same package path as the CLI asking. Anything else
+    is reported as what it is: a foreign install, a stale build, or a service too
+    old to identify itself.
+    """
+    endpoint = f"http://{host}:{port}/health"
+    health, err = _fetch_health(host, port, timeout)
+    if err:
+        return _doctor_result(
+            "service",
+            "warn",
+            f"no spindle service answering on {endpoint}",
+            [
+                err,
+                "this is fine for stdio MCP use; start one with `spindle start` (HTTP mode)",
+            ],
+            endpoint=endpoint,
+            running=False,
+        )
+
+    if health.get("status") != "healthy":
+        return _doctor_result(
+            "service",
+            "fail",
+            f"{endpoint} answered but is not a healthy spindle service",
+            [f"payload: {json.dumps(health)[:200]}"],
+            endpoint=endpoint,
+            running=True,
+            health=health,
+        )
+
+    svc_version = health.get("version")
+    svc_package = health.get("package")
+    svc_pid = health.get("pid")
+    svc_spool_dir = health.get("spool_dir")
+    # Only report fields the service actually sent — an older service omits
+    # most of them, and "pid None" reads as a fact rather than a gap.
+    facts = []
+    if svc_pid is not None:
+        facts.append(f"pid {svc_pid}")
+    facts.append(f"uptime {health.get('uptime_seconds')}s")
+    facts.append(f"{health.get('running_spools')} running spool(s)")
+    facts.append(f"max {health.get('max_concurrent')}")
+    lines = [", ".join(facts)]
+    if svc_package:
+        lines.append(f"service package: {svc_package}")
+    if svc_spool_dir:
+        lines.append(f"service spool dir: {svc_spool_dir}")
+
+    def result(status: str, detail: str, extra: Optional[list] = None) -> dict:
+        return _doctor_result(
+            "service",
+            status,
+            detail,
+            lines + (extra or []),
+            endpoint=endpoint,
+            running=True,
+            service_version=svc_version,
+            service_package=svc_package,
+            cli_version=__version__,
+            cli_package=_package_path(),
+            health=health,
+        )
+
+    if svc_version is None:
+        return result(
+            "warn",
+            f"a spindle service is running on {endpoint} but does not report its version",
+            [
+                "it predates version reporting (spindle < 1.2.0), so it cannot be confirmed "
+                "to be this install — restart it with `spindle reload` after upgrading",
+            ],
+        )
+
+    cli_package = Path(_package_path()).resolve()
+    if svc_package and Path(svc_package).resolve() != cli_package:
+        return result(
+            "fail",
+            f"{endpoint} is served by a DIFFERENT spindle install (not the one you are running)",
+            [
+                f"service: {svc_version} from {svc_package}",
+                f"this CLI: {__version__} from {cli_package}",
+                "use a separate port for this install: `spindle install-service --name <name> --port <port>` "
+                "and set SPINDLE_PORT, or point this check at the right port with `--port`",
+            ],
+        )
+
+    if svc_version != __version__:
+        return result(
+            "fail",
+            f"version skew: service {svc_version}, CLI {__version__}",
+            ["the service is running older code from the same install — restart it with `spindle reload`"],
+        )
+
+    extra = []
+    status = "ok"
+    if svc_spool_dir and Path(svc_spool_dir).resolve() != Path(SPINDLE_DIR).resolve():
+        status = "warn"
+        extra.append(
+            f"the service stores spools in {svc_spool_dir} but this CLI reads {SPINDLE_DIR} — "
+            "spools spun through the service will not be visible to this CLI (SPINDLE_HOME differs)"
+        )
+    return result(status, f"spindle {svc_version} on {endpoint} — same install as this CLI", extra)
+
+
+def _doctor_storage_check() -> dict:
+    """Confirm the spool store exists and is actually writable."""
+    store = Path(SPINDLE_DIR)
+    try:
+        store.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return _doctor_result("storage", "fail", f"cannot create spool store {store}: {exc}", spool_dir=str(store))
+
+    probe = store / f".doctor-probe-{os.getpid()}"
+    try:
+        probe.write_text("ok")
+        probe.read_text()
+    except OSError as exc:
+        return _doctor_result("storage", "fail", f"spool store {store} is not writable: {exc}", spool_dir=str(store))
+    finally:
+        try:
+            probe.unlink()
+        except OSError:
+            pass
+
+    count = len(list(store.glob("*.json")))
+    return _doctor_result(
+        "storage",
+        "ok",
+        f"{store} writable, {count} spool record(s)",
+        [
+            f"override with SPINDLE_HOME (currently {os.environ.get('SPINDLE_HOME', '<unset>, defaulting to ~/.spindle')})"
+        ],
+        spool_dir=str(store),
+        spools=count,
+    )
+
+
+def _probe_command(command: str, timeout: float = 5.0) -> Tuple[Optional[str], Optional[str]]:
+    """Locate a harness CLI and read its version. Returns (path, version)."""
+    path = shutil.which(command)
+    if not path:
+        return None, None
+    try:
+        proc = subprocess.run([command, "--version"], capture_output=True, text=True, timeout=timeout)
+        out = (proc.stdout or proc.stderr or "").strip().splitlines()
+        return path, out[0].strip() if out else None
+    except (OSError, subprocess.SubprocessError):
+        return path, None
+
+
+def _doctor_harness_check() -> dict:
+    """Report which harness CLIs are actually installed, plus lodged profiles.
+
+    Presence only. Whether the CLI is *logged in* cannot be read off the binary,
+    and an installed-but-unauthenticated harness is the likeliest first-run
+    failure on a fresh machine — so this check says what it knows and points at
+    --smoke, which is the part that actually proves a spool can run.
+    """
+    lines = []
+    detected = {}
+    for harness in ("claude-code", "codex", "gemini", "kimi"):
+        command = HARNESS_COMMANDS[harness]
+        path, version = _probe_command(command)
+        if path:
+            detected[harness] = {"command": command, "path": path, "version": version}
+            lines.append(f"{harness}: {version or 'version unknown'} ({path})")
+        else:
+            lines.append(f"{harness}: not found — `{command}` is not on PATH")
+
+    profiles = sorted(_discover_profiles().keys())
+    if profiles:
+        lines.append(f"lodged profiles: {', '.join(profiles)}")
+    else:
+        lines.append("lodged profiles: none")
+
+    if not detected:
+        return _doctor_result(
+            "harnesses",
+            "fail",
+            "no harness CLI found — spindle cannot spawn anything",
+            lines + ["install at least one: claude, codex, gemini, or kimi-cli"],
+            detected=detected,
+            profiles=profiles,
+        )
+
+    status = "ok" if len(detected) > 1 else "warn"
+    lines.append("found on PATH is not the same as logged in — `spindle doctor --smoke` checks that a spool runs")
+    return _doctor_result(
+        "harnesses",
+        status,
+        f"{len(detected)} of 4 harness CLIs detected: {', '.join(sorted(detected))}",
+        lines,
+        detected=detected,
+        profiles=profiles,
+    )
+
+
+def _doctor_shard_check() -> dict:
+    """git and bwrap: shard isolation and its containment both depend on them."""
+    lines = []
+    status = "ok"
+    git_path, git_version = _probe_command("git")
+    if git_path:
+        lines.append(f"git: {git_version or 'version unknown'} ({git_path})")
+    else:
+        status = "warn"
+        lines.append("git: not found — shards (isolated worktrees) will not work")
+
+    bwrap_path = shutil.which("bwrap")
+    if bwrap_path:
+        lines.append(f"bwrap: {bwrap_path} — shard containment available")
+    else:
+        status = "warn"
+        lines.append(
+            "bwrap: not found — shard worktrees are created but NOT filesystem-contained; "
+            "do not treat `careful+shard` as containment on this machine"
+        )
+
+    detail = "git and bwrap present" if status == "ok" else "shard support is incomplete"
+    return _doctor_result("shards", status, detail, lines, git=git_path, bwrap=bwrap_path)
+
+
+def _doctor_smoke_spin(harness: str, working_dir: str, model: Optional[str], timeout: int) -> str:
+    """Spawn one read-only smoke spool. Returns a spool_id or an 'Error: ...'."""
+    if harness == "codex":
+        return _codex_spin_sync(
+            DOCTOR_SMOKE_PROMPT,
+            working_dir,
+            model,
+            "read-only",
+            timeout,
+            "doctor,smoke",
+            None,
+            permission="readonly",
+        )
+    return _spin_sync(
+        DOCTOR_SMOKE_PROMPT,
+        "readonly",
+        False,
+        None,
+        working_dir,
+        None,
+        "doctor,smoke",
+        model,
+        timeout,
+        True,  # skeinless: a smoke needs no SKEIN context
+        None,
+    )
+
+
+def _doctor_smoke_check(harness: str, timeout: int = 240, model: Optional[str] = None) -> dict:
+    """Run one harmless read-only headless spool end to end and check the answer.
+
+    This is the only check that proves the whole path: spawn a real headless
+    agent with the installed CLI's own code, persist the spool, finalize it, and
+    read the result back. Runs in a throwaway working dir so no repo is touched.
+    """
+    name = f"smoke:{harness}"
+    if harness not in DOCTOR_SMOKE_HARNESSES:
+        return _doctor_result(
+            name,
+            "skip",
+            f"no read-only smoke for {harness} (only {', '.join(DOCTOR_SMOKE_HARNESSES)} have an enforced read-only tier)",
+        )
+
+    working_dir = tempfile.mkdtemp(prefix="spindle-doctor-")
+    try:
+        spool_id = _doctor_smoke_spin(harness, working_dir, model, timeout)
+        if spool_id.startswith("Error:"):
+            return _doctor_result(name, "fail", f"could not spawn: {spool_id}", harness=harness)
+
+        deadline = time.time() + timeout
+        spool = None
+        while time.time() < deadline:
+            _check_and_finalize_spool(spool_id)
+            spool = _read_spool(spool_id)
+            if spool and spool.get("status") in _TERMINAL_SPOOL_STATUSES:
+                break
+            time.sleep(2)
+
+        status = (spool or {}).get("status")
+        if status not in _TERMINAL_SPOOL_STATUSES:
+            _spin_drop_sync(spool_id)
+            return _doctor_result(
+                name,
+                "fail",
+                f"spool {spool_id} did not finish within {timeout}s (dropped)",
+                harness=harness,
+                spool_id=spool_id,
+            )
+
+        result = (spool or {}).get("result") or ""
+        if status != "complete":
+            return _doctor_result(
+                name,
+                "fail",
+                f"spool {spool_id} ended {status}: {_format_spool_failure(spool_id, spool)[:200]}",
+                harness=harness,
+                spool_id=spool_id,
+            )
+        if DOCTOR_SMOKE_TOKEN not in result:
+            return _doctor_result(
+                name,
+                "fail",
+                f"spool {spool_id} completed but did not return the smoke token",
+                [f"result: {result[:200]!r}"],
+                harness=harness,
+                spool_id=spool_id,
+            )
+        return _doctor_result(
+            name,
+            "ok",
+            f"read-only headless spool {spool_id} returned the smoke token",
+            [f"retrieve it with: spindle unspool {spool_id}"],
+            harness=harness,
+            spool_id=spool_id,
+        )
+    finally:
+        shutil.rmtree(working_dir, ignore_errors=True)
+
+
+def _doctor_run(
+    host: str = DEFAULT_HOST,
+    port: Optional[int] = None,
+    smoke: bool = False,
+    smoke_harnesses: Optional[list] = None,
+    smoke_timeout: int = 240,
+    service_timeout: float = 2.0,
+) -> dict:
+    """Run every doctor check and return the full report."""
+    port = DEFAULT_PORT if port is None else port
+    checks = [
+        _doctor_cli_check(),
+        _doctor_service_check(host, port, service_timeout),
+        _doctor_storage_check(),
+        _doctor_harness_check(),
+        _doctor_shard_check(),
+    ]
+
+    requested = list(smoke_harnesses) if smoke_harnesses else list(DOCTOR_SMOKE_HARNESSES)
+    if smoke:
+        for harness in requested:
+            checks.append(_doctor_smoke_check(harness, timeout=smoke_timeout))
+    else:
+        # Offer it explicitly rather than running an agent nobody asked for.
+        checks.append(
+            _doctor_result(
+                "smoke",
+                "skip",
+                "no headless smoke run (add --smoke to actually spawn one)",
+                [
+                    f"`spindle doctor --smoke` spins one read-only spool per harness "
+                    f"({', '.join(requested)}) in a temp dir and checks the answer",
+                ],
+            )
+        )
+
+    failed = [c["name"] for c in checks if c["status"] == "fail"]
+    return {
+        "ok": not failed,
+        "version": __version__,
+        "package": _package_path(),
+        "endpoint": f"http://{host}:{port}/health",
+        "failed": failed,
+        "checks": checks,
+    }
+
+
+# Marker written into every generated unit/plist. `install-service` refuses to
+# overwrite a service file that lacks it, even with --force: a hand-written unit
+# (or another tool's) is not ours to clobber, and clobbering the one already
+# serving a machine's spools is not a recoverable mistake.
+SERVICE_MARKER = "managed-by: spindle install-service"
+
+
+def _service_file_is_foreign(path: Path) -> bool:
+    """True if a service file exists that spindle did not write."""
+    if not path.exists():
+        return False
+    try:
+        return SERVICE_MARKER not in path.read_text(errors="replace")
+    except OSError:
+        return True
+
+
+def _service_path_env(path_env: Optional[str] = None) -> str:
+    """PATH to bake into a service file, de-duplicated and pruned.
+
+    The calling shell's PATH is the right starting point (it is what makes
+    `claude`/`codex`/`gemini` resolvable for the service, which a bare systemd
+    user unit's minimal PATH would not), but it routinely carries duplicates and
+    per-process temp dirs that will not exist when the service starts. Those are
+    dropped so the unit stays readable and honest about what it points at.
+    """
+    raw = path_env if path_env is not None else os.environ.get("PATH", "")
+    kept = []
+    seen = set()
+    for entry in raw.split(os.pathsep):
+        if not entry or entry in seen:
+            continue
+        seen.add(entry)
+        try:
+            if not Path(entry).is_dir():
+                continue
+        except OSError:
+            continue
+        kept.append(entry)
+    return os.pathsep.join(kept) or "/usr/local/bin:/usr/bin:/bin"
+
+
+def _systemd_unit_text(
+    spindle_path: str,
+    port: int,
+    home: Optional[str] = None,
+    path_env: Optional[str] = None,
+    name: str = "spindle",
+) -> str:
+    """Render a systemd user unit for this install.
+
+    PATH is baked in from the calling shell because a systemd user unit
+    otherwise inherits a minimal PATH and cannot find `claude`/`codex`/`gemini`,
+    which fails at spawn time with a confusing "not found". SPINDLE_PORT and
+    SPINDLE_HOME are set so `spindle status`/`doctor` in the same environment
+    resolve the same port and store the service uses.
+    """
+    env_lines = [f"Environment=SPINDLE_PORT={port}"]
+    if home:
+        env_lines.append(f"Environment=SPINDLE_HOME={home}")
+    env_lines.append(f"Environment=PATH={_service_path_env(path_env)}")
+    env_block = "\n".join(env_lines)
+    return f"""\
+# {SERVICE_MARKER} (spindle {__version__})
+[Unit]
+Description=Spindle MCP Server ({name}, port {port})
+After=network.target
+
+[Service]
+Type=simple
+ExecStart={spindle_path} serve --http --port {port}
+Restart=on-failure
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+{env_block}
+
+[Install]
+WantedBy=default.target
+"""
+
+
+def _launchd_plist_text(
+    label: str,
+    spindle_path: str,
+    port: int,
+    home: Optional[str] = None,
+    path_env: Optional[str] = None,
+) -> str:
+    """Render a launchd plist for this install (macOS counterpart of the unit)."""
+    env_entries = [("SPINDLE_PORT", str(port)), ("PYTHONUNBUFFERED", "1")]
+    if home:
+        env_entries.append(("SPINDLE_HOME", home))
+    env_entries.append(("PATH", _service_path_env(path_env)))
+    env_xml = "\n".join(f"        <key>{k}</key>\n        <string>{v}</string>" for k, v in env_entries)
+    log_path = Path.home() / ".spindle" / f"{label.split('.')[-1] or 'spindle'}.log"
+    return f"""\
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- {SERVICE_MARKER} (spindle {__version__}) -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{label}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{spindle_path}</string>
+        <string>serve</string>
+        <string>--http</string>
+        <string>--port</string>
+        <string>{port}</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+{env_xml}
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>{log_path}</string>
+    <key>StandardErrorPath</key>
+    <string>{log_path}</string>
+</dict>
+</plist>
+"""
+
+
+def _doctor_render(report: dict) -> str:
+    """Plain-text report: one status per line, no columns, no tables."""
+    out = [f"spindle doctor — spindle {report['version']}"]
+    for check in report["checks"]:
+        out.append(f"{check['status']}: {check['name']} — {check['detail']}")
+        for line in check["lines"]:
+            out.append(f"    {line}")
+    out.append("ok" if report["ok"] else f"FAILED: {', '.join(report['failed'])}")
+    return "\n".join(out)
+
+
 def main():
     import argparse
     import atexit
     import traceback
 
     parser = argparse.ArgumentParser(description="Spindle MCP server")
+    parser.add_argument("--version", "-V", action="version", version=f"spindle {__version__}")
     subparsers = parser.add_subparsers(dest="command")
 
     # serve command (default)
     serve_parser = subparsers.add_parser("serve", help="Run the MCP server")
     serve_parser.add_argument("--http", action="store_true", help="Run as HTTP server instead of stdio")
-    serve_parser.add_argument("--port", type=int, default=8002, help="HTTP port (default: 8002)")
-    serve_parser.add_argument("--host", default="127.0.0.1", help="HTTP host (default: 127.0.0.1)")
+    serve_parser.add_argument(
+        "--port", type=int, default=DEFAULT_PORT, help=f"HTTP port (default: {DEFAULT_PORT}, or $SPINDLE_PORT)"
+    )
+    serve_parser.add_argument(
+        "--host", default=DEFAULT_HOST, help=f"HTTP host (default: {DEFAULT_HOST}, or $SPINDLE_HOST)"
+    )
 
     # start command - start via systemd or background
     _start_parser = subparsers.add_parser("start", help="Start spindle (via systemd if available)")
+    _start_parser.add_argument("--name", default="spindle", help="systemd unit name (default: spindle)")
+    _start_parser.add_argument(
+        "--port", type=int, default=DEFAULT_PORT, help="Port for the background fallback (no systemd unit)"
+    )
 
     # reload command - restart spindle
     _reload_parser = subparsers.add_parser("reload", help="Reload spindle to pick up code changes")
@@ -6625,13 +7378,46 @@ def main():
         action="store_true",
         help="Restart immediately instead of draining (may interrupt in-flight spools)",
     )
+    _reload_parser.add_argument("--name", default="spindle", help="systemd unit name (default: spindle)")
 
     # status command
     _status_parser = subparsers.add_parser("status", help="Check spindle status")
+    _status_parser.add_argument(
+        "--port", type=int, default=DEFAULT_PORT, help=f"Service port (default: {DEFAULT_PORT})"
+    )
+    _status_parser.add_argument("--host", default=DEFAULT_HOST, help=f"Service host (default: {DEFAULT_HOST})")
+
+    # doctor command - diagnose this install
+    doctor_parser = subparsers.add_parser("doctor", help="Diagnose this spindle install")
+    doctor_parser.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"Service port (default: {DEFAULT_PORT})")
+    doctor_parser.add_argument("--host", default=DEFAULT_HOST, help=f"Service host (default: {DEFAULT_HOST})")
+    doctor_parser.add_argument(
+        "--smoke",
+        action="store_true",
+        help="Actually run a read-only headless spool per harness (spawns real agents)",
+    )
+    doctor_parser.add_argument(
+        "--harness",
+        help=f"Comma-separated harnesses to smoke (default: {','.join(DOCTOR_SMOKE_HARNESSES)})",
+    )
+    doctor_parser.add_argument("--smoke-timeout", type=int, default=240, help="Seconds to wait per smoke spool")
+    doctor_parser.add_argument("--json", action="store_true", help="Machine-readable report instead of plain text")
 
     # install-service command
-    install_service_parser = subparsers.add_parser("install-service", help="Install systemd user service")
+    install_service_parser = subparsers.add_parser("install-service", help="Install systemd/launchd user service")
     install_service_parser.add_argument("--force", action="store_true", help="Overwrite existing service file")
+    install_service_parser.add_argument(
+        "--name",
+        default="spindle",
+        help="Service name (default: spindle). Use a distinct name to run a second install alongside the first.",
+    )
+    install_service_parser.add_argument(
+        "--port", type=int, default=DEFAULT_PORT, help=f"Port the service binds (default: {DEFAULT_PORT})"
+    )
+    install_service_parser.add_argument(
+        "--home",
+        help="SPINDLE_HOME to bake into the unit (default: the current SPINDLE_HOME, if set)",
+    )
 
     # spin command - spawn an agent
     spin_parser = subparsers.add_parser("spin", help="Spawn an agent to handle a task")
@@ -6716,37 +7502,37 @@ def main():
 
     # Legacy flags for backward compat
     parser.add_argument("--http", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--port", type=int, default=8002, help=argparse.SUPPRESS)
-    parser.add_argument("--host", default="127.0.0.1", help=argparse.SUPPRESS)
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT, help=argparse.SUPPRESS)
+    parser.add_argument("--host", default=DEFAULT_HOST, help=argparse.SUPPRESS)
 
     args = parser.parse_args()
 
     # Handle subcommands
     if args.command == "start":
+        unit = f"{args.name}.service"
         # Check if systemd service exists
-        result = subprocess.run(
-            ["systemctl", "--user", "list-unit-files", "spindle.service"], capture_output=True, text=True
-        )
-        if "spindle.service" in result.stdout:
-            subprocess.run(["systemctl", "--user", "start", "spindle"])
-            print("Started via systemd")
+        result = subprocess.run(["systemctl", "--user", "list-unit-files", unit], capture_output=True, text=True)
+        if unit in result.stdout:
+            subprocess.run(["systemctl", "--user", "start", args.name])
+            print(f"Started {unit} via systemd")
         else:
-            # Start in background
+            # Start in background. Launch the package by module name, not by
+            # __file__: an installed wheel's __init__.py run as a script has no
+            # package context, so `python -m spindle` is the portable form.
             subprocess.Popen(
-                [sys.executable, __file__, "serve", "--http"],
+                [sys.executable, "-m", "spindle", "serve", "--http", "--port", str(args.port)],
                 start_new_session=True,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-            print("Started in background (no systemd service found)")
+            print(f"Started in background on port {args.port} (no {unit} systemd unit found)")
         sys.exit(0)
 
     elif args.command == "reload":
+        unit = f"{args.name}.service"
         # Check if systemd service exists
-        result = subprocess.run(
-            ["systemctl", "--user", "list-unit-files", "spindle.service"], capture_output=True, text=True
-        )
-        if "spindle.service" not in result.stdout:
+        result = subprocess.run(["systemctl", "--user", "list-unit-files", unit], capture_output=True, text=True)
+        if unit not in result.stdout:
             print("No systemd service. Kill and run: spindle start")
             sys.exit(0)
         # Drain by default: wait for the queue to empty so in-flight spools
@@ -6759,24 +7545,58 @@ def main():
                 # and stdout is block-buffered when redirected (not a tty).
                 print(f"Draining: waiting for {active} spool(s) to finish (--force to restart now)...", flush=True)
             _wait_until_idle()
-        proc = subprocess.run(["systemctl", "--user", "restart", "spindle"], capture_output=True, text=True)
+        proc = subprocess.run(["systemctl", "--user", "restart", args.name], capture_output=True, text=True)
         if proc.returncode == 0:
-            print("Restarted via systemd")
+            print(f"Restarted {unit} via systemd")
             sys.exit(0)
         print(f"Restart failed (exit {proc.returncode}): {proc.stderr.strip()}", file=sys.stderr)
         sys.exit(1)
 
     elif args.command == "status":
-        result = subprocess.run(["curl", "-s", "http://127.0.0.1:8002/health"], capture_output=True, text=True)
-        if result.returncode == 0:
-            print(result.stdout)
-        else:
-            print("Not running")
+        # Ask the port directly (stdlib, no curl) and say whose service answered.
+        # Printing a foreign install's health as if it were ours is exactly the
+        # confusion this used to cause on a machine running two spindles.
+        health, err = _fetch_health(args.host, args.port)
+        if err:
+            print(f"Not running ({err})")
+            sys.exit(0)
+        print(json.dumps(health))
+        svc_version = health.get("version")
+        svc_package = health.get("package")
+        if svc_version is None:
+            print(
+                f"note: that service does not report a version, so it cannot be confirmed to be "
+                f"this install (spindle {__version__} at {_package_path()})",
+                file=sys.stderr,
+            )
+        elif svc_package and Path(svc_package).resolve() != Path(_package_path()).resolve():
+            print(
+                f"note: port {args.port} is served by a different install "
+                f"({svc_version} at {svc_package}), not this one "
+                f"({__version__} at {_package_path()}). Run `spindle doctor` for details.",
+                file=sys.stderr,
+            )
+        elif svc_version != __version__:
+            print(
+                f"note: version skew — service {svc_version}, CLI {__version__}. Run `spindle reload`.",
+                file=sys.stderr,
+            )
         sys.exit(0)
+
+    elif args.command == "doctor":
+        smoke_harnesses = [h.strip() for h in args.harness.split(",") if h.strip()] if args.harness else None
+        report = _doctor_run(
+            host=args.host,
+            port=args.port,
+            smoke=args.smoke,
+            smoke_harnesses=smoke_harnesses,
+            smoke_timeout=args.smoke_timeout,
+        )
+        print(json.dumps(report, indent=2) if args.json else _doctor_render(report))
+        sys.exit(0 if report["ok"] else 1)
 
     elif args.command == "spin":
         working_dir = os.path.abspath(args.working_dir or os.getcwd())
-        harness_lower = args.harness.lower() if args.harness else None
         conflict = _readonly_shard_conflict_error(
             args.permission, args.shard or _permission_implies_shard(args.permission)
         )
@@ -6785,6 +7605,19 @@ def main():
                 print(f"Error: {conflict}", file=sys.stderr)
             else:
                 print(json.dumps({"error": conflict}))
+            sys.exit(1)
+        # Same resolution the MCP spin tool uses, so --harness accepts exactly
+        # the same names (built-ins AND lodged profiles) and rejects unknown
+        # ones instead of quietly running plain Claude Code.
+        try:
+            harness_lower, model, spawn_env, profile_extra_args, profile_name = _resolve_harness_selection(
+                args.harness, args.model, None
+            )
+        except ValueError as exc:
+            if args.human:
+                print(f"Error: {exc}", file=sys.stderr)
+            else:
+                print(json.dumps({"error": str(exc)}))
             sys.exit(1)
         if args.permission and args.permission.startswith("auto") and harness_lower and harness_lower != "claude-code":
             error_msg = f"permission={args.permission!r} requires harness='claude-code'; {harness_lower!r} has no classifier-vetted mode."
@@ -6803,7 +7636,7 @@ def main():
             result = _codex_spin_sync(
                 args.prompt,
                 working_dir,
-                args.model,
+                model,
                 sandbox,
                 args.timeout,
                 args.tags,
@@ -6820,7 +7653,7 @@ def main():
             result = _gemini_spin_sync(
                 args.prompt,
                 working_dir,
-                args.model,
+                model,
                 args.system_prompt,
                 args.timeout,
                 args.tags,
@@ -6837,7 +7670,7 @@ def main():
             result = _kimi_spin_sync(
                 args.prompt,
                 working_dir,
-                args.model,
+                model,
                 args.system_prompt,
                 args.timeout,
                 args.tags,
@@ -6858,12 +7691,15 @@ def main():
                 working_dir=working_dir,
                 allowed_tools=args.allowed_tools,
                 tags=args.tags,
-                model=args.model,
+                model=model,
                 timeout=args.timeout,
                 skeinless=args.skeinless,
                 base_branch=args.base_branch or _detect_default_branch(working_dir),
                 research_target=args.research_target,
                 env=None,
+                extra_args=profile_extra_args,
+                profile=profile_name,
+                spawn_env=spawn_env,
             )
         if result.startswith("Error:"):
             if args.human:
@@ -6964,12 +7800,15 @@ def main():
 
     elif args.command == "install-service":
         import platform
-        import shutil
 
         system = platform.system()
 
-        # Find spindle executable path
-        spindle_path = shutil.which("spindle")
+        # Find spindle executable path. Prefer the console script that belongs
+        # to THIS interpreter (a venv install is next to its own python) over
+        # whatever `spindle` PATH happens to resolve to — the unit must start
+        # the install the user just ran install-service from, not another one.
+        sibling = Path(sys.executable).with_name("spindle")
+        spindle_path = str(sibling) if sibling.exists() else shutil.which("spindle")
         if not spindle_path:
             if system == "Darwin":
                 # Common locations on macOS
@@ -6981,6 +7820,8 @@ def main():
                     spindle_path = "/usr/local/bin/spindle"
             else:
                 spindle_path = str(Path.home() / ".local" / "bin" / "spindle")
+
+        service_home = args.home or os.environ.get("SPINDLE_HOME")
 
         if system == "Linux":
             # Check if systemd is actually running (important for WSL)
@@ -7007,24 +7848,16 @@ def main():
                     print("Run spindle manually: spindle serve --http")
                 sys.exit(1)
 
-            service_content = f"""\
-[Unit]
-Description=Spindle MCP Server
-After=network.target
-
-[Service]
-Type=simple
-ExecStart={spindle_path} serve --http
-Restart=on-failure
-RestartSec=5
-Environment=PATH=%h/.local/bin:/usr/bin
-
-[Install]
-WantedBy=default.target
-"""
+            service_content = _systemd_unit_text(spindle_path, args.port, home=service_home, name=args.name)
             service_dir = Path.home() / ".config" / "systemd" / "user"
-            service_file = service_dir / "spindle.service"
+            service_file = service_dir / f"{args.name}.service"
 
+            if _service_file_is_foreign(service_file):
+                print(f"Refusing to touch {service_file}: spindle did not write it.")
+                print("It may be the unit already serving this machine. Either:")
+                print(f"  install alongside it: spindle install-service --name {args.name}-2 --port <other-port>")
+                print("  or remove/rename it yourself first.")
+                sys.exit(1)
             if service_file.exists() and not args.force:
                 print(f"Service file already exists: {service_file}")
                 print("Use --force to overwrite")
@@ -7032,45 +7865,32 @@ WantedBy=default.target
 
             service_dir.mkdir(parents=True, exist_ok=True)
             service_file.write_text(service_content)
-            print(f"Wrote {service_file}")
+            print(f"Wrote {service_file} (port {args.port}, spindle {__version__})")
+            if service_home:
+                print(f"Spool store baked into the unit: {service_home}")
 
             subprocess.run(["systemctl", "--user", "daemon-reload"])
             print("Reloaded systemd")
 
-            subprocess.run(["systemctl", "--user", "enable", "spindle"])
-            print("Enabled spindle service")
+            subprocess.run(["systemctl", "--user", "enable", args.name])
+            print(f"Enabled {args.name} service")
 
-            print("\nTo start now: spindle start")
-            print("To check status: spindle status")
+            print(f"\nTo start now: spindle start --name {args.name}")
+            print(f"To check status: spindle status --port {args.port}")
+            print(f"To verify the install: spindle doctor --port {args.port}")
 
         elif system == "Darwin":
-            plist_content = f"""\
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.spindle.server</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>{spindle_path}</string>
-        <string>serve</string>
-        <string>--http</string>
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>StandardOutPath</key>
-    <string>{Path.home()}/.spindle/spindle.log</string>
-    <key>StandardErrorPath</key>
-    <string>{Path.home()}/.spindle/spindle.log</string>
-</dict>
-</plist>
-"""
+            label = f"com.{args.name}.server"
+            plist_content = _launchd_plist_text(label, spindle_path, args.port, home=service_home)
             launch_agents = Path.home() / "Library" / "LaunchAgents"
-            plist_file = launch_agents / "com.spindle.server.plist"
+            plist_file = launch_agents / f"{label}.plist"
 
+            if _service_file_is_foreign(plist_file):
+                print(f"Refusing to touch {plist_file}: spindle did not write it.")
+                print("It may be the agent already serving this machine. Either:")
+                print(f"  install alongside it: spindle install-service --name {args.name}-2 --port <other-port>")
+                print("  or remove/rename it yourself first.")
+                sys.exit(1)
             if plist_file.exists() and not args.force:
                 print(f"Plist already exists: {plist_file}")
                 print("Use --force to overwrite")
@@ -7082,7 +7902,7 @@ WantedBy=default.target
 
             launch_agents.mkdir(parents=True, exist_ok=True)
             plist_file.write_text(plist_content)
-            print(f"Wrote {plist_file}")
+            print(f"Wrote {plist_file} (port {args.port}, spindle {__version__})")
 
             # Ensure log directory exists
             (Path.home() / ".spindle").mkdir(parents=True, exist_ok=True)
@@ -7092,8 +7912,9 @@ WantedBy=default.target
             print("Loaded launchd service")
 
             print("\nService is now running.")
-            print("To check status: spindle status")
-            print("To stop: launchctl unload ~/Library/LaunchAgents/com.spindle.server.plist")
+            print(f"To check status: spindle status --port {args.port}")
+            print(f"To verify the install: spindle doctor --port {args.port}")
+            print(f"To stop: launchctl unload {plist_file}")
 
         else:
             print(f"Service installation not supported on {system}.")
@@ -7118,9 +7939,12 @@ WantedBy=default.target
     # Ensure spindle directory exists
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Log startup
+    # Log startup. Record the bound port so /health can report it — that's how a
+    # client tells which of several services on a machine it just reached.
+    global _server_port
+    _server_port = args.port if args.http else None
     mode = f"HTTP {args.host}:{args.port}" if args.http else "stdio"
-    log(f"STARTUP pid={os.getpid()} mode={mode}")
+    log(f"STARTUP pid={os.getpid()} version={__version__} mode={mode} spools={SPINDLE_DIR}")
 
     # Log uncaught exceptions
     def exception_handler(exc_type, exc_value, exc_tb):
