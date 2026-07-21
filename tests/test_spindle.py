@@ -1247,6 +1247,105 @@ class TestCodexResultExtraction:
         stream = "\n".join(json.dumps(e) for e in events)
         assert _extract_codex_result(stream) == "Turn one.\n\nTurn two."
 
+    def test_failure_message_unwraps_provider_error(self):
+        provider_error = json.dumps(
+            {
+                "type": "error",
+                "status": 400,
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": "The 'gpt-5.6' model is not supported when using Codex with a ChatGPT account.",
+                },
+            }
+        )
+        stream = "\n".join(
+            [
+                json.dumps({"type": "thread.started", "thread_id": "thread-failed"}),
+                json.dumps({"type": "turn.failed", "error": {"message": provider_error}}),
+            ]
+        )
+
+        assert spindle._codex_failure_message(stream) == (
+            "The 'gpt-5.6' model is not supported when using Codex with a ChatGPT account."
+        )
+
+    def test_finalize_marks_turn_failed_error_and_cleans_unchanged_new_shard(self, tmp_path):
+        provider_error = json.dumps(
+            {"status": 400, "error": {"message": "The requested model is not supported for this account."}}
+        )
+        stream = "\n".join(
+            [
+                json.dumps({"type": "thread.started", "thread_id": "thread-failed"}),
+                json.dumps({"type": "turn.failed", "error": {"message": provider_error}}),
+            ]
+        )
+        spool_id = "codex-failed-model"
+        shard = {
+            "worktree_path": str(tmp_path / "worktree"),
+            "branch_name": "shard-codex-failed-model",
+        }
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool(
+                spool_id,
+                {
+                    "id": spool_id,
+                    "status": "running",
+                    "harness": "codex",
+                    "prompt": "work",
+                    "pid": 999999999,
+                    "created_at": datetime.now().isoformat(),
+                    "shard": shard,
+                    "shard_created_by_spool": True,
+                    "shard_source_dir": str(tmp_path / "repo"),
+                },
+            )
+            _get_output_path(spool_id).write_text(stream)
+            with patch("spindle._get_shard_commit_status", return_value="no_changes"):
+                with patch("spindle._cleanup_shard", return_value=True) as cleanup:
+                    assert _check_and_finalize_spool(spool_id) is True
+
+            spool = _read_spool(spool_id)
+            assert spool["status"] == "error"
+            assert spool["error"] == "The requested model is not supported for this account."
+            assert spool["result"] == stream
+            assert spool["session_id"] == "thread-failed"
+            assert spool["shard"]["startup_failure_cleaned"] is True
+            cleanup.assert_called_once()
+            cleanup_args, cleanup_kwargs = cleanup.call_args
+            assert cleanup_args[0]["worktree_path"] == shard["worktree_path"]
+            assert cleanup_args[1] == str(tmp_path / "repo")
+            assert cleanup_kwargs == {"spool_id": spool_id}
+            assert _get_transcript_path(spool_id).read_text() == stream
+
+    @pytest.mark.parametrize(
+        "created_by_spool,commit_status",
+        [(False, "no_changes"), (True, "uncommitted"), (True, "has_commit"), (True, "unknown")],
+    )
+    def test_finalize_preserves_reused_or_changed_failed_shard(self, tmp_path, created_by_spool, commit_status):
+        spool_id = f"codex-preserve-{created_by_spool}-{commit_status}"
+        stream = json.dumps({"type": "turn.failed", "error": {"message": "provider failed"}})
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool(
+                spool_id,
+                {
+                    "id": spool_id,
+                    "status": "running",
+                    "harness": "codex",
+                    "prompt": "work",
+                    "pid": 999999999,
+                    "created_at": datetime.now().isoformat(),
+                    "shard": {"worktree_path": str(tmp_path / "worktree")},
+                    "shard_created_by_spool": created_by_spool,
+                    "shard_source_dir": str(tmp_path / "repo"),
+                },
+            )
+            _get_output_path(spool_id).write_text(stream)
+            with patch("spindle._get_shard_commit_status", return_value=commit_status):
+                with patch("spindle._cleanup_shard") as cleanup:
+                    assert _check_and_finalize_spool(spool_id) is True
+            cleanup.assert_not_called()
+            assert _read_spool(spool_id)["status"] == "error"
+
     def test_finalize_falls_back_to_raw_stream_when_no_messages(self, tmp_path):
         # No agent_message items, but valid session/cost events and a non-dict
         # line that must not break session_id extraction.
@@ -4848,6 +4947,27 @@ class TestCodexSandboxEnforcement:
         cmd = captured_cmd[0]
         assert "--dangerously-bypass-approvals-and-sandbox" not in cmd, f"got {cmd!r}"
 
+    @pytest.mark.parametrize(
+        "requested,expected",
+        [
+            (None, "gpt-5.6-sol"),
+            ("gpt-5.6", "gpt-5.6-sol"),
+            ("5.6", "gpt-5.6-sol"),
+            ("sol", "gpt-5.6-sol"),
+            ("gpt-5.6-terra", "gpt-5.6-terra"),
+            ("gpt-5.6-luna", "gpt-5.6-luna"),
+        ],
+    )
+    def test_gpt_56_family_spelling_normalizes_to_concrete_tier(self, tmp_path, requested, expected):
+        with self._captured_codex_spin(tmp_path) as captured_cmd:
+            with patch("spindle.threading.Thread"):
+                _codex_spin_sync("do work", str(tmp_path), requested, "read-only", None, None, None)
+
+        cmd = captured_cmd[0]
+        assert cmd[cmd.index("--model") + 1] == expected
+        spool = json.loads(next(tmp_path.glob("codex-*.json")).read_text())
+        assert spool["model"] == expected
+
     def test_spin_never_passes_full_auto(self, tmp_path):
         """--full-auto silently overrides --sandbox with its own workspace-write tier.
 
@@ -5199,10 +5319,18 @@ class TestCodexSandboxEnforcesProbe:
         proc.returncode = returncode
         return proc
 
-    def test_probe_true_when_write_blocked_and_command_ran(self):
+    def test_probe_true_when_write_blocked_and_command_ran(self, caplog):
         """Marker on stdout proves the command ran; a missing file means the write was blocked."""
         with patch("spindle.subprocess.run", return_value=self._proc(f"{spindle._CODEX_SANDBOX_PROBE_MARKER}\n")):
             assert spindle._codex_sandbox_probe("/fake/codex") is True
+        assert "could not stat target" not in caplog.text
+
+    def test_probe_fails_closed_on_unexpected_stat_error(self, caplog):
+        """Only a missing target proves the write was blocked; other stat errors are inconclusive."""
+        with patch("spindle.subprocess.run", return_value=self._proc(f"{spindle._CODEX_SANDBOX_PROBE_MARKER}\n")):
+            with patch("spindle.os.path.getsize", side_effect=PermissionError("denied")):
+                assert spindle._codex_sandbox_probe("/fake/codex") is False
+        assert "could not stat target" in caplog.text
 
     def test_probe_false_when_write_succeeded(self):
         """Fail open: the command ran, but its write to cwd landed — the sandbox did not block."""

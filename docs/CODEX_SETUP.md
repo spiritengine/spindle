@@ -123,10 +123,16 @@ spin(
 ```
 
 Available models:
-- `gpt-5.5` (default) — current working default on ChatGPT-account codex; alias `codex`
-- `gpt-5.6-sol` / `gpt-5.6-terra` / `gpt-5.6-luna` — staged aliases; NOT yet reachable
-  via the released codex CLI (API 400s "requires a newer version of Codex")
+- `gpt-5.6-sol` (default) — flagship tier; `gpt-5.6`, `5.6`, `sol`, and `codex`
+  normalize to this concrete model because the umbrella `gpt-5.6` ID is rejected by the
+  ChatGPT-account route used on this installation
+- `gpt-5.6-terra` / `gpt-5.6-luna` — explicit faster tiers; aliases `terra` and `luna`
+- `gpt-5.5` — prior default and working compatibility choice
 - `gpt-5.3-codex` and other `-codex` ids — API-only; 400 on ChatGPT-account auth
+
+Spindle cannot infer every account's model entitlements. Unknown full model IDs pass through
+to Codex, and a structured `turn.failed` response is recorded as a spool error. API-key-backed
+installations may expose models that ChatGPT-authenticated installations do not.
 
 See `spin_harnesses()` for the full alias list.
 

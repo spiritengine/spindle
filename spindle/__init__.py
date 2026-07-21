@@ -1597,6 +1597,45 @@ def _extract_codex_result(stdout: str) -> Optional[str]:
     return "\n\n".join(messages)
 
 
+def _codex_failure_message(stdout: str) -> Optional[str]:
+    """Return the last structured Codex turn failure, if the stream has one.
+
+    Codex sometimes exits successfully at the process level after emitting a
+    ``turn.failed`` JSONL event (for example, an account/model HTTP 400). The
+    event, rather than the process exit code or the mere presence of stdout,
+    is therefore authoritative. Its message may itself be a serialized API
+    error object; unwrap that so callers get the actionable provider message.
+    """
+    failure = None
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict) or event.get("type") != "turn.failed":
+            continue
+        error = event.get("error")
+        failure = error.get("message") if isinstance(error, dict) else error
+
+    if not failure:
+        return None
+    if not isinstance(failure, str):
+        return str(failure)
+
+    try:
+        nested = json.loads(failure)
+    except json.JSONDecodeError:
+        return failure
+    if not isinstance(nested, dict):
+        return failure
+    api_error = nested.get("error")
+    if isinstance(api_error, dict) and api_error.get("message"):
+        return str(api_error["message"])
+    if nested.get("message"):
+        return str(nested["message"])
+    return failure
+
+
 def _extract_kimi_result(stdout: str) -> Optional[str]:
     """Extract the agent's prose from Kimi's stream-json (JSONL) output.
 
@@ -1904,6 +1943,7 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
                     extracted = _extract_codex_result(stdout)
                     spool["result"] = extracted if extracted is not None else stdout
 
+                    failure_message = _codex_failure_message(stdout)
                     for line in stdout.strip().split("\n"):
                         try:
                             event = json.loads(line)
@@ -1918,7 +1958,11 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
                             if usage:
                                 spool["cost"] = usage
 
-                    spool["status"] = "complete"
+                    if failure_message:
+                        spool["status"] = "error"
+                        spool["error"] = failure_message
+                    else:
+                        spool["status"] = "complete"
                 elif stderr.strip():
                     spool["status"] = "error"
                     spool["error"] = stderr[:500]
@@ -2049,6 +2093,22 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
                 transcript_path.write_text(stdout)
             except IOError:
                 pass  # Non-critical, continue
+
+        # A provider can reject a Codex turn after Spindle has created its shard.
+        # Reclaim only a shard created for this exact spool, and only when Git
+        # proves no work exists. Reused shards and failed shards containing
+        # edits/commits are preserved so an API failure can never discard work.
+        if (
+            spool.get("status") == "error"
+            and spool.get("shard_created_by_spool")
+            and _get_shard_commit_status(spool) == "no_changes"
+        ):
+            shard_info = spool.get("shard") or {}
+            cleanup_dir = spool.get("shard_source_dir")
+            if cleanup_dir and _cleanup_shard(shard_info, cleanup_dir, spool_id=spool_id):
+                shard_info["startup_failure_cleaned"] = True
+                spool["shard"] = shard_info
+                _write_spool(spool_id, spool)
 
         # Clean up output files
         if stdout_path.exists():
@@ -5133,13 +5193,16 @@ def _codex_sandbox_probe(codex_bin: str) -> bool:
                 continue  # wrong CLI shape for this version — the command never ran
             try:
                 wrote = os.path.getsize(target) > 0
+            except FileNotFoundError:
+                # Expected success case: read-only prevented creation entirely.
+                wrote = False
             except OSError as exc:
                 logger.warning(
                     "spindle: codex sandbox probe (read-only) could not stat target on %s: %s",
                     codex_bin,
                     exc,
                 )
-                wrote = False
+                return False
             # The command demonstrably ran: blocked write -> enforcing, landed write -> fail
             # open. This shape is authoritative; do not fall through to another.
             return not wrote
@@ -5542,6 +5605,10 @@ Your task:
         "timeout": timeout,
         "env": env,
         "shard": shard_info,
+        # Lets finalization reclaim a clean worktree after an immediate provider
+        # failure without ever touching a pre-existing or changed shard.
+        "shard_created_by_spool": shard_newly_created,
+        "shard_source_dir": working_dir if shard_newly_created else None,
         "base_branch": base_branch,
         "created_at": datetime.now().isoformat(),
         "completed_at": None,
@@ -5791,6 +5858,10 @@ CODEX_MODEL_ALIASES = {
     # above). Sol/Terra/Luna are durable capability tiers (flagship /
     # balanced mini-like / fast nano-like); no separate "-codex" variant.
     "5.6": "gpt-5.6-sol",
+    # Official Codex guidance also uses the family spelling `gpt-5.6`, but the
+    # ChatGPT-account route on this installation rejects that umbrella ID while
+    # serving the concrete Sol tier. Treat both spellings as the default tier.
+    "gpt-5.6": "gpt-5.6-sol",
     "5.6-sol": "gpt-5.6-sol",
     "sol": "gpt-5.6-sol",
     "5.6-terra": "gpt-5.6-terra",
