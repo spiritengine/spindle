@@ -8301,3 +8301,40 @@ def test_launchd_log_is_named_for_the_service():
     """Two installs must not interleave output in one ~/.spindle/spindle.log."""
     plist = spindle._launchd_plist_text("com.spindle-release.server", "/bin/spindle", 8042, name="spindle-release")
     assert "spindle-release.log" in plist
+
+
+class TestShippedExamplesMatchTheGenerator:
+    """The examples are a manual-install path, so they must not drift from the tool."""
+
+    def _examples(self):
+        root = Path(spindle.__file__).parent.parent / "examples"
+        if not root.exists():
+            pytest.skip("no examples/ (running against an installed wheel)")
+        return root
+
+    def test_example_unit_is_recognized_as_ours(self):
+        """Copied in by hand, it must still be replaceable by install-service --force."""
+        unit = self._examples() / "spindle.service"
+        assert spindle._service_file_is_foreign(unit) is False
+
+    def test_example_plist_is_recognized_as_ours(self):
+        plist = self._examples() / "com.spindle.server.plist"
+        assert spindle._service_file_is_foreign(plist) is False
+
+    def test_example_unit_carries_what_the_generator_emits(self):
+        text = (self._examples() / "spindle.service").read_text()
+        assert spindle.SERVICE_MARKER in text
+        assert "serve --http --port" in text  # not the portless 1.1.0 ExecStart
+        assert "Environment=SPINDLE_PORT=" in text
+        assert "SPINDLE_HOME" in text
+
+    def test_example_plist_carries_what_the_generator_emits(self):
+        text = (self._examples() / "com.spindle.server.plist").read_text()
+        assert spindle.SERVICE_MARKER in text
+        assert "<key>SPINDLE_PORT</key>" in text
+        assert "<key>PATH</key>" in text
+
+    def test_example_plist_is_valid_xml(self):
+        import xml.etree.ElementTree as ET
+
+        ET.parse(self._examples() / "com.spindle.server.plist")

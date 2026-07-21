@@ -1,16 +1,11 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!--
-  Spindle launchd service for macOS
-
-  This file is for reference. Use `spindle install-service` to install
-  automatically with the correct paths for your system.
-
-  Manual installation:
-    cp examples/com.spindle.server.plist ~/Library/LaunchAgents/
-    # Edit the spindle path if not in /usr/local/bin
-    launchctl load ~/Library/LaunchAgents/com.spindle.server.plist
--->
+<!-- managed-by: spindle install-service (spindle 1.2.0). Reference copy of the
+     agent the command generates on macOS. See examples/README.md before
+     installing this by hand. Keep this marker line: install-service refuses to
+     overwrite a service file spindle did not write, and this is how it knows
+     its own. (No double hyphens in this comment: XML forbids them, and a plist
+     that will not parse is a service that will not load.) -->
 <plist version="1.0">
 <dict>
     <key>Label</key>
@@ -20,7 +15,20 @@
         <string>/usr/local/bin/spindle</string>
         <string>serve</string>
         <string>--http</string>
+        <string>--port</string>
+        <string>8002</string>
     </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>SPINDLE_PORT</key>
+        <string>8002</string>
+        <key>PYTHONUNBUFFERED</key>
+        <string>1</string>
+        <key>SPINDLE_HOME</key>
+        <string>/Users/YOURUSERNAME/.spindle</string>
+        <key>PATH</key>
+        <string>/usr/local/bin:/opt/homebrew/bin:/Users/YOURUSERNAME/.local/bin:/usr/bin:/bin</string>
+    </dict>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
