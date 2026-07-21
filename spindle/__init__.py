@@ -105,6 +105,12 @@ async def health_check(request: Request) -> JSONResponse:
             "python": sys.executable,
             "spool_dir": str(SPINDLE_DIR),
             "port": _server_port,
+            # The PATH the service will actually search when it spawns a harness.
+            # A unit's PATH is baked at install time and goes stale (a new node
+            # version moves `codex`), and the failure surfaces much later as a
+            # spool that dies at spawn. Reporting it lets doctor catch the drift
+            # instead of only checking the PATH of the shell asking.
+            "path": os.environ.get("PATH", ""),
         }
     )
 
@@ -6988,13 +6994,19 @@ def _probe_command(command: str, timeout: float = 5.0) -> Tuple[Optional[str], O
         return path, None
 
 
-def _doctor_harness_check() -> dict:
+def _doctor_harness_check(service_path: Optional[str] = None) -> dict:
     """Report which harness CLIs are actually installed, plus lodged profiles.
 
     Presence only. Whether the CLI is *logged in* cannot be read off the binary,
     and an installed-but-unauthenticated harness is the likeliest first-run
     failure on a fresh machine — so this check says what it knows and points at
     --smoke, which is the part that actually proves a spool can run.
+
+    ``service_path`` is the running service's PATH (from /health). When given,
+    every harness this shell can see is re-resolved against it: a service unit
+    carries a PATH baked at install time, and when that goes stale the harness
+    is findable from your shell and unfindable from the service that has to
+    spawn it.
     """
     lines = []
     detected = {}
@@ -7024,6 +7036,21 @@ def _doctor_harness_check() -> dict:
         )
 
     status = "ok" if len(detected) > 1 else "warn"
+
+    # Drift between this shell's PATH and the service's baked one.
+    unreachable = []
+    if service_path:
+        for harness, info in detected.items():
+            if not shutil.which(info["command"], path=service_path):
+                unreachable.append(harness)
+    if unreachable:
+        status = "warn"
+        lines.append(
+            f"the running service cannot find {', '.join(sorted(unreachable))} — its PATH was baked at "
+            "install time and has gone stale; spools it spawns will fail at launch. "
+            "Re-run `spindle install-service --force` from a shell with the right PATH, then `spindle reload`."
+        )
+
     lines.append("found on PATH is not the same as logged in — `spindle doctor --smoke` checks that a spool runs")
     return _doctor_result(
         "harnesses",
@@ -7032,6 +7059,7 @@ def _doctor_harness_check() -> dict:
         lines,
         detected=detected,
         profiles=profiles,
+        unreachable_from_service=unreachable,
     )
 
 
@@ -7159,6 +7187,36 @@ def _doctor_smoke_check(harness: str, timeout: int = 240, model: Optional[str] =
         shutil.rmtree(working_dir, ignore_errors=True)
 
 
+def _reload_warn_on_store_mismatch(host: str, port: int) -> Optional[str]:
+    """Warn when a reload would drain a different store than the service uses.
+
+    `reload` waits for *this* process's spool store to go idle before restarting.
+    Once two installs can each have their own SPINDLE_HOME, that wait can be
+    about the wrong store — reporting an idle queue while the service it is
+    about to restart has agents mid-flight. Returns the warning text (also
+    printed to stderr), or None when the stores agree or nothing answered.
+    """
+    health, err = _fetch_health(host, port, timeout=2.0)
+    if err or not isinstance(health, dict):
+        return None
+    service_store = health.get("spool_dir")
+    if not service_store:
+        return None
+    try:
+        same = Path(service_store).resolve() == Path(SPINDLE_DIR).resolve()
+    except OSError:
+        same = False
+    if same:
+        return None
+    warning = (
+        f"warning: the service on {host}:{port} stores spools in {service_store}, "
+        f"but this command drains {SPINDLE_DIR}. The drain cannot see that service's "
+        f"in-flight spools. Re-run with SPINDLE_HOME={Path(service_store).parent} to drain the right store."
+    )
+    print(warning, file=sys.stderr)
+    return warning
+
+
 def _doctor_run(
     host: str = DEFAULT_HOST,
     port: Optional[int] = None,
@@ -7169,11 +7227,17 @@ def _doctor_run(
 ) -> dict:
     """Run every doctor check and return the full report."""
     port = DEFAULT_PORT if port is None else port
+    service = _doctor_service_check(host, port, service_timeout)
+    # Only trust the reported PATH when the service is this same install; another
+    # install's PATH says nothing about whether ours can spawn a harness.
+    service_path = None
+    if service["status"] == "ok":
+        service_path = (service["data"].get("health") or {}).get("path")
     checks = [
         _doctor_cli_check(),
-        _doctor_service_check(host, port, service_timeout),
+        service,
         _doctor_storage_check(),
-        _doctor_harness_check(),
+        _doctor_harness_check(service_path=service_path),
         _doctor_shard_check(),
     ]
 
@@ -7213,14 +7277,38 @@ def _doctor_run(
 SERVICE_MARKER = "managed-by: spindle install-service"
 
 
+# Fingerprints of the service files spindle wrote BEFORE it started marking them
+# (<= 1.1.0). Without these, upgrading would be a dead end: the old unit has no
+# marker, so `install-service --force` would refuse to replace spindle's own
+# file. Each fingerprint is a line only the generator emits — the 1.1.0 unit's
+# literal `%h` PATH, and the 1.1.0 plist's fixed label plus its portless
+# ExecStart. A hand-written unit for the same service does not carry them (the
+# whole point is to keep refusing those).
+_LEGACY_SERVICE_FINGERPRINTS = (
+    ("Environment=PATH=%h/.local/bin:/usr/bin", "serve --http"),
+    ("<string>com.spindle.server</string>", "<string>--http</string>"),
+)
+
+
 def _service_file_is_foreign(path: Path) -> bool:
-    """True if a service file exists that spindle did not write."""
+    """True if a service file exists that spindle did not write.
+
+    "Did not write" means: no current marker, and no fingerprint of a service
+    file an older spindle generated. Everything else — a hand-rolled unit, one
+    from another tool — is someone else's and is never overwritten.
+    """
     if not path.exists():
         return False
     try:
-        return SERVICE_MARKER not in path.read_text(errors="replace")
+        text = path.read_text(errors="replace")
     except OSError:
         return True
+    if SERVICE_MARKER in text:
+        return False
+    for fingerprint in _LEGACY_SERVICE_FINGERPRINTS:
+        if all(part in text for part in fingerprint):
+            return False
+    return True
 
 
 def _service_path_env(path_env: Optional[str] = None) -> str:
@@ -7293,14 +7381,19 @@ def _launchd_plist_text(
     port: int,
     home: Optional[str] = None,
     path_env: Optional[str] = None,
+    name: str = "spindle",
 ) -> str:
-    """Render a launchd plist for this install (macOS counterpart of the unit)."""
+    """Render a launchd plist for this install (macOS counterpart of the unit).
+
+    The log is named for the service, so two installs do not both write
+    ~/.spindle/spindle.log and interleave their output.
+    """
     env_entries = [("SPINDLE_PORT", str(port)), ("PYTHONUNBUFFERED", "1")]
     if home:
         env_entries.append(("SPINDLE_HOME", home))
     env_entries.append(("PATH", _service_path_env(path_env)))
     env_xml = "\n".join(f"        <key>{k}</key>\n        <string>{v}</string>" for k, v in env_entries)
-    log_path = Path.home() / ".spindle" / f"{label.split('.')[-1] or 'spindle'}.log"
+    log_path = Path.home() / ".spindle" / f"{name or 'spindle'}.log"
     return f"""\
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -7379,6 +7472,8 @@ def main():
         help="Restart immediately instead of draining (may interrupt in-flight spools)",
     )
     _reload_parser.add_argument("--name", default="spindle", help="systemd unit name (default: spindle)")
+    _reload_parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="Port of the service being restarted")
+    _reload_parser.add_argument("--host", default=DEFAULT_HOST, help="Host of the service being restarted")
 
     # status command
     _status_parser = subparsers.add_parser("status", help="Check spindle status")
@@ -7539,6 +7634,10 @@ def main():
         # aren't interrupted. --force skips the wait. New spins are still
         # allowed during the wait, so this restarts at the next idle moment.
         if not args.force:
+            # The drain reads THIS process's store. If the unit being restarted
+            # serves a different one, "no spools running" is a statement about
+            # the wrong store, and the restart would interrupt live agents.
+            _reload_warn_on_store_mismatch(args.host, args.port)
             active = _count_running()
             if active:
                 # flush: this is the last output before a potentially long block,
@@ -7881,7 +7980,7 @@ def main():
 
         elif system == "Darwin":
             label = f"com.{args.name}.server"
-            plist_content = _launchd_plist_text(label, spindle_path, args.port, home=service_home)
+            plist_content = _launchd_plist_text(label, spindle_path, args.port, home=service_home, name=args.name)
             launch_agents = Path.home() / "Library" / "LaunchAgents"
             plist_file = launch_agents / f"{label}.plist"
 

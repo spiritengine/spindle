@@ -7781,7 +7781,9 @@ class TestDoctorRun:
         )
         monkeypatch.setattr(spindle, "_doctor_storage_check", lambda: spindle._doctor_result("storage", "ok", "store"))
         monkeypatch.setattr(
-            spindle, "_doctor_harness_check", lambda: spindle._doctor_result("harnesses", "ok", "harnesses")
+            spindle,
+            "_doctor_harness_check",
+            lambda service_path=None: spindle._doctor_result("harnesses", "ok", "harnesses"),
         )
         monkeypatch.setattr(spindle, "_doctor_shard_check", lambda: spindle._doctor_result("shards", "ok", "shards"))
 
@@ -8124,3 +8126,178 @@ def test_harness_check_says_presence_is_not_authentication(monkeypatch):
     result = spindle._doctor_harness_check()
     assert any("not the same as logged in" in line for line in result["lines"])
     assert any("--smoke" in line for line in result["lines"])
+
+
+# --- 1.1.0 unit that install-service must still recognize as its own ---------
+_LEGACY_UNIT = """\
+[Unit]
+Description=Spindle MCP Server
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/home/u/.local/bin/spindle serve --http
+Restart=on-failure
+RestartSec=5
+Environment=PATH=%h/.local/bin:/usr/bin
+
+[Install]
+WantedBy=default.target
+"""
+
+# A unit a person wrote for the same service. Superficially similar, and must
+# never be overwritten - it carries settings spindle knows nothing about.
+_HAND_WRITTEN_UNIT = """\
+[Unit]
+Description=Spindle MCP Server (HTTP)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/u/projects/spindle
+ExecStart=/home/u/.pyenv/versions/3.12.0/bin/spindle serve --http --port 8002
+Restart=on-failure
+Environment=PATH=/home/u/.nvm/versions/node/v20.20.2/bin:/usr/bin
+EnvironmentFile=-/home/u/.spindle/env
+
+[Install]
+WantedBy=default.target
+"""
+
+_LEGACY_PLIST = """\
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.spindle.server</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/spindle</string>
+        <string>serve</string>
+        <string>--http</string>
+    </array>
+</dict>
+</plist>
+"""
+
+
+class TestUpgradeFromUnmarkedServiceFiles:
+    """Refusing to clobber other people's units must not strand our own upgraders."""
+
+    def test_legacy_unit_is_ours(self, tmp_path):
+        unit = tmp_path / "spindle.service"
+        unit.write_text(_LEGACY_UNIT)
+        assert spindle._service_file_is_foreign(unit) is False
+
+    def test_legacy_plist_is_ours(self, tmp_path):
+        plist = tmp_path / "com.spindle.server.plist"
+        plist.write_text(_LEGACY_PLIST)
+        assert spindle._service_file_is_foreign(plist) is False
+
+    def test_hand_written_unit_is_still_protected(self, tmp_path):
+        """The look-alike case: same service, same ExecStart shape, not ours."""
+        unit = tmp_path / "spindle.service"
+        unit.write_text(_HAND_WRITTEN_UNIT)
+        assert spindle._service_file_is_foreign(unit) is True
+
+    def test_current_unit_round_trips(self, tmp_path):
+        unit = tmp_path / "spindle.service"
+        unit.write_text(spindle._systemd_unit_text("/bin/spindle", 8002))
+        assert spindle._service_file_is_foreign(unit) is False
+
+
+class TestServiceStalePath:
+    """A unit's PATH is baked at install time and rots; the failure lands much later."""
+
+    def _detected(self, monkeypatch):
+        monkeypatch.setattr(
+            spindle,
+            "_probe_command",
+            lambda cmd, timeout=5.0: (f"/new/bin/{cmd}", "1.0") if cmd in ("claude", "codex") else (None, None),
+        )
+        monkeypatch.setattr(spindle, "_discover_profiles", lambda: {})
+
+    def test_harness_unreachable_from_the_service_warns(self, monkeypatch, tmp_path):
+        """Found from this shell, unfindable from the service that has to spawn it."""
+        self._detected(monkeypatch)
+        result = spindle._doctor_harness_check(service_path=str(tmp_path))
+        assert result["status"] == "warn"
+        assert set(result["data"]["unreachable_from_service"]) == {"claude-code", "codex"}
+        assert any("cannot find" in line for line in result["lines"])
+
+    def test_no_warning_when_the_service_can_see_them(self, monkeypatch, tmp_path):
+        self._detected(monkeypatch)
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        for cmd in ("claude", "codex"):
+            exe = bin_dir / cmd
+            exe.write_text("#!/bin/sh\n")
+            exe.chmod(0o755)
+        result = spindle._doctor_harness_check(service_path=str(bin_dir))
+        assert result["data"]["unreachable_from_service"] == []
+        assert result["status"] == "ok"
+
+    def test_no_service_means_no_path_claim(self, monkeypatch):
+        self._detected(monkeypatch)
+        result = spindle._doctor_harness_check(service_path=None)
+        assert result["data"]["unreachable_from_service"] == []
+
+    def test_health_reports_the_path_the_service_will_search(self):
+        payload = json.loads(asyncio.run(spindle.health_check(MagicMock())).body)
+        assert payload["path"] == os.environ.get("PATH", "")
+
+    def test_doctor_only_trusts_the_path_of_a_matching_install(self, monkeypatch):
+        """A foreign service's PATH says nothing about whether ours can spawn."""
+        seen = {}
+
+        def fake_harness_check(service_path=None):
+            seen["service_path"] = service_path
+            return spindle._doctor_result("harnesses", "ok", "harnesses")
+
+        monkeypatch.setattr(spindle, "_doctor_cli_check", lambda: spindle._doctor_result("cli", "ok", "cli"))
+        monkeypatch.setattr(spindle, "_doctor_storage_check", lambda: spindle._doctor_result("storage", "ok", "s"))
+        monkeypatch.setattr(spindle, "_doctor_shard_check", lambda: spindle._doctor_result("shards", "ok", "s"))
+        monkeypatch.setattr(spindle, "_doctor_harness_check", fake_harness_check)
+
+        foreign = spindle._doctor_result("service", "fail", "different install", health={"path": "/foreign/bin"})
+        monkeypatch.setattr(spindle, "_doctor_service_check", lambda host, port, timeout=2.0: foreign)
+        spindle._doctor_run()
+        assert seen["service_path"] is None
+
+        ours = spindle._doctor_result("service", "ok", "same install", health={"path": "/our/bin"})
+        monkeypatch.setattr(spindle, "_doctor_service_check", lambda host, port, timeout=2.0: ours)
+        spindle._doctor_run()
+        assert seen["service_path"] == "/our/bin"
+
+
+class TestReloadStoreMismatch:
+    """`reload` drains this process's store; that can be the wrong one."""
+
+    def test_divergent_store_warns(self, monkeypatch, capsys):
+        monkeypatch.setattr(
+            spindle,
+            "_fetch_health",
+            lambda host, port, timeout=2.0: ({"spool_dir": "/elsewhere/spools"}, None),
+        )
+        warning = spindle._reload_warn_on_store_mismatch("127.0.0.1", 8042)
+        assert warning and "cannot see that service's" in warning
+        assert "/elsewhere/spools" in capsys.readouterr().err
+
+    def test_matching_store_is_silent(self, monkeypatch, capsys):
+        monkeypatch.setattr(
+            spindle,
+            "_fetch_health",
+            lambda host, port, timeout=2.0: ({"spool_dir": str(spindle.SPINDLE_DIR)}, None),
+        )
+        assert spindle._reload_warn_on_store_mismatch("127.0.0.1", 8042) is None
+        assert capsys.readouterr().err == ""
+
+    def test_no_service_is_silent(self, monkeypatch):
+        monkeypatch.setattr(spindle, "_fetch_health", lambda host, port, timeout=2.0: (None, "refused"))
+        assert spindle._reload_warn_on_store_mismatch("127.0.0.1", 8042) is None
+
+
+def test_launchd_log_is_named_for_the_service():
+    """Two installs must not interleave output in one ~/.spindle/spindle.log."""
+    plist = spindle._launchd_plist_text("com.spindle-release.server", "/bin/spindle", 8042, name="spindle-release")
+    assert "spindle-release.log" in plist

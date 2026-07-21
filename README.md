@@ -560,6 +560,12 @@ The generated unit bakes in the current `PATH`, `SPINDLE_PORT`, and
 minimal one and cannot find `claude`/`codex`/`gemini`, which shows up much later
 as a spool that fails at spawn.
 
+Because that `PATH` is a snapshot, it goes stale — installing a harness
+somewhere new, or a node upgrade relocating `codex`, leaves the service unable
+to find what your shell finds fine. `spindle doctor` compares the two and says
+so. The fix is to re-run `install-service --force` from a shell with the right
+`PATH`, then `spindle reload`.
+
 Use `--force` to overwrite a service file spindle wrote earlier. A service file
 spindle did *not* write is never overwritten, `--force` or not — it may be the
 one already serving the machine.
