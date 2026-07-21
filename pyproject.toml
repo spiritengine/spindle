@@ -1,3 +1,10 @@
+# Declared explicitly rather than left to PEP 517's legacy fallback. The `attr:`
+# version directive needs setuptools >= 61, and a public sdist should not depend
+# on whatever setuptools a builder happens to have.
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "spindle-mcp"
 # Read from spindle/_version.py so the wheel metadata, `spindle --version`, the

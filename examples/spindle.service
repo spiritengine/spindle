@@ -10,13 +10,19 @@
 #   cp examples/spindle.service ~/.config/systemd/user/spindle.service
 #   # Edit ExecStart to the output of `which spindle`
 #   # Edit the PATH below - see the note on it
+#   # If you edit anything else, DROP the marker line at the top: it tells
+#   # install-service the file is its own to replace. Without it, install-service
+#   # refuses unless you pass --force, and --force backs the file up first.
 #   systemctl --user daemon-reload
 #   systemctl --user enable spindle
 #   systemctl --user start spindle
 #   spindle doctor        # confirms the service is this install and can see the harnesses
 #
-# Keep the marker line at the top. `install-service` refuses to overwrite a
-# service file spindle did not write, and that line is how it recognizes its own.
+# The marker line at the top is what tells `install-service` this file is its
+# own and may be replaced. Keep it if you want spindle to keep this unit up to
+# date; remove it if you have customized the file and want spindle to leave it
+# alone. Either way nothing is destroyed: replacing an unmarked file requires
+# --force and writes a timestamped backup beside it first.
 
 [Unit]
 Description=Spindle MCP Server (spindle, port 8002)
@@ -35,14 +41,18 @@ Environment=SPINDLE_PORT=8002
 
 # Spool store. Omit to use ~/.spindle. Set it only if this service should have
 # its own store - two services sharing one store fight over spool records.
-#Environment=SPINDLE_HOME=%h/.spindle
+#Environment="SPINDLE_HOME=%h/.spindle"
 
 # PATH matters more than it looks. A systemd user unit starts with a minimal
 # PATH and will not find claude/codex/gemini, which surfaces much later as a
 # spool that dies at spawn. List the directories your harness CLIs actually
 # live in - `spindle doctor` reports any this service cannot reach. Re-check it
 # after anything moves a CLI (a node upgrade relocating codex is the usual one).
-Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+#
+# Quote the value and double any literal % (systemd splits an unquoted
+# Environment= on whitespace and expands % specifiers). A PATH holding
+# "/mnt/c/Program Files/..." unquoted loses everything after the space.
+Environment="PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin"
 
 [Install]
 WantedBy=default.target

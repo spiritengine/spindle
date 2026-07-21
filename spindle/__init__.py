@@ -54,7 +54,11 @@ try:
     from starlette.requests import Request  # noqa: E402
     from starlette.responses import JSONResponse  # noqa: E402
 finally:
-    warnings.showwarning = _real_showwarning
+    # Restore only if ours is still the installed hook. Anything imported above
+    # may legitimately install its own (logging.captureWarnings does), and
+    # blindly reassigning would silently uninstall it.
+    if warnings.showwarning is _showwarning_without_authlib_noise:
+        warnings.showwarning = _real_showwarning
 
 from ._version import __version__  # noqa: E402
 
@@ -6778,7 +6782,12 @@ def _fetch_health(host: str, port: int, timeout: float = 2.0) -> Tuple[Optional[
 
 
 def _script_interpreter(path: str) -> Optional[str]:
-    """Interpreter from a console script's shebang, or None if unreadable."""
+    """Interpreter from a console script's shebang, or None if unreadable.
+
+    `#!/usr/bin/env python3` names the launcher, not the interpreter, so the
+    argument after `env` is the useful part — otherwise every env-shebang script
+    compares as living in /usr/bin.
+    """
     try:
         with open(path, "r", errors="replace") as fh:
             first = fh.readline().strip()
@@ -6786,7 +6795,16 @@ def _script_interpreter(path: str) -> Optional[str]:
         return None
     if not first.startswith("#!"):
         return None
-    return first[2:].strip().split()[0] if first[2:].strip() else None
+    parts = first[2:].strip().split()
+    if not parts:
+        return None
+    if os.path.basename(parts[0]) == "env":
+        # Skip `env` and any VAR=value assignments it was given.
+        for token in parts[1:]:
+            if "=" not in token and not token.startswith("-"):
+                return token
+        return None
+    return parts[0]
 
 
 def _doctor_cli_check(argv0: Optional[str] = None) -> dict:
@@ -6864,11 +6882,24 @@ def _doctor_service_check(host: str, port: int, timeout: float = 2.0) -> dict:
         )
 
     if health.get("status") != "healthy":
+        # Something is listening and speaking JSON, but it is not a healthy
+        # spindle. Only a failing *spindle* is this install's problem — an
+        # unrelated app on the port is a warning, the same tier as nothing
+        # listening at all, or a stdio-only user gets exit 1 from a fine install.
+        looks_like_spindle = "version" in health or "running_spools" in health
         return _doctor_result(
             "service",
-            "fail",
+            "fail" if looks_like_spindle else "warn",
             f"{endpoint} answered but is not a healthy spindle service",
-            [f"payload: {json.dumps(health)[:200]}"],
+            [
+                f"payload: {json.dumps(health)[:200]}",
+                (
+                    "that looks like a spindle in a bad state"
+                    if looks_like_spindle
+                    else "that looks like some other application on this port; "
+                    "point spindle elsewhere with --port or SPINDLE_PORT"
+                ),
+            ],
             endpoint=endpoint,
             running=True,
             health=health,
@@ -6892,7 +6923,7 @@ def _doctor_service_check(host: str, port: int, timeout: float = 2.0) -> dict:
     if svc_spool_dir:
         lines.append(f"service spool dir: {svc_spool_dir}")
 
-    def result(status: str, detail: str, extra: Optional[list] = None) -> dict:
+    def result(status: str, detail: str, extra: Optional[list] = None, same_install: bool = False) -> dict:
         return _doctor_result(
             "service",
             status,
@@ -6904,6 +6935,11 @@ def _doctor_service_check(host: str, port: int, timeout: float = 2.0) -> dict:
             service_package=svc_package,
             cli_version=__version__,
             cli_package=_package_path(),
+            # Identity, reported separately from status. A confirmed-same service
+            # can still be "warn" (e.g. a divergent spool store), and callers that
+            # need to know whether to trust what it reports must key off identity,
+            # not off the status of the whole check.
+            same_install=same_install,
             health=health,
         )
 
@@ -6930,6 +6966,19 @@ def _doctor_service_check(host: str, port: int, timeout: float = 2.0) -> dict:
             ],
         )
 
+    if not svc_package:
+        # Version alone is not identity: any responder can claim a version string,
+        # and a matching one would otherwise be treated as this install and have
+        # the rest of its report (notably its PATH) believed.
+        return result(
+            "warn",
+            f"{endpoint} reports version {svc_version} but not which install it is",
+            [
+                "every spindle from 1.2.0 on reports its package path; something else is answering "
+                "this port, or the response was truncated",
+            ],
+        )
+
     if svc_version != __version__:
         return result(
             "fail",
@@ -6945,7 +6994,9 @@ def _doctor_service_check(host: str, port: int, timeout: float = 2.0) -> dict:
             f"the service stores spools in {svc_spool_dir} but this CLI reads {SPINDLE_DIR} — "
             "spools spun through the service will not be visible to this CLI (SPINDLE_HOME differs)"
         )
-    return result(status, f"spindle {svc_version} on {endpoint} — same install as this CLI", extra)
+    # Identity is settled by version + package; the store warning above does not
+    # unsettle it, so this stays same_install=True and its PATH stays trustworthy.
+    return result(status, f"spindle {svc_version} on {endpoint} — same install as this CLI", extra, same_install=True)
 
 
 def _doctor_storage_check() -> dict:
@@ -6994,7 +7045,7 @@ def _probe_command(command: str, timeout: float = 5.0) -> Tuple[Optional[str], O
         return path, None
 
 
-def _doctor_harness_check(service_path: Optional[str] = None) -> dict:
+def _doctor_harness_check(service_path: Optional[str] = None, service_name: Optional[str] = None) -> dict:
     """Report which harness CLIs are actually installed, plus lodged profiles.
 
     Presence only. Whether the CLI is *logged in* cannot be read off the binary,
@@ -7045,10 +7096,16 @@ def _doctor_harness_check(service_path: Optional[str] = None) -> dict:
                 unreachable.append(harness)
     if unreachable:
         status = "warn"
+        # Name the service in the remedy. A bare `install-service --force` writes
+        # the DEFAULT unit on the DEFAULT port, so an operator whose stale service
+        # is `spindle-b` on 8042 would rewrite (or create) the wrong one and leave
+        # the stale service exactly as it was.
+        suffix = f" --name {service_name}" if service_name and service_name != "spindle" else ""
         lines.append(
             f"the running service cannot find {', '.join(sorted(unreachable))} — its PATH was baked at "
             "install time and has gone stale; spools it spawns will fail at launch. "
-            "Re-run `spindle install-service --force` from a shell with the right PATH, then `spindle reload`."
+            f"Re-run `spindle install-service{suffix} --port <its port> --force` from a shell with the right "
+            f"PATH, then `spindle reload{suffix}`."
         )
 
     lines.append("found on PATH is not the same as logged in — `spindle doctor --smoke` checks that a spool runs")
@@ -7123,19 +7180,38 @@ def _doctor_smoke_check(harness: str, timeout: int = 240, model: Optional[str] =
     agent with the installed CLI's own code, persist the spool, finalize it, and
     read the result back. Runs in a throwaway working dir so no repo is touched.
     """
+    harness = (harness or "").lower()
     name = f"smoke:{harness}"
     if harness not in DOCTOR_SMOKE_HARNESSES:
+        # A harness that exists but has no enforced read-only tier is a legitimate
+        # skip. A name that is not a harness at all is a mistake, and skipping it
+        # would let `doctor --smoke --harness codxe` exit 0 having smoked nothing.
+        if harness in BUILTIN_HARNESSES or harness in _discover_profiles():
+            return _doctor_result(
+                name,
+                "skip",
+                f"no read-only smoke for {harness} "
+                f"(only {', '.join(DOCTOR_SMOKE_HARNESSES)} have an enforced read-only tier)",
+            )
         return _doctor_result(
             name,
-            "skip",
-            f"no read-only smoke for {harness} (only {', '.join(DOCTOR_SMOKE_HARNESSES)} have an enforced read-only tier)",
+            "fail",
+            f"unknown harness {harness!r} — nothing was smoked",
+            [f"smokeable harnesses: {', '.join(DOCTOR_SMOKE_HARNESSES)}"],
+            harness=harness,
         )
 
+    # timeout <= 0 would mean "no timeout" to the spin contract while the poll
+    # loop below exits immediately — spawning a real agent and abandoning it.
+    timeout = max(1, int(timeout))
     working_dir = tempfile.mkdtemp(prefix="spindle-doctor-")
+    keep_working_dir = False
     try:
         spool_id = _doctor_smoke_spin(harness, working_dir, model, timeout)
         if spool_id.startswith("Error:"):
-            return _doctor_result(name, "fail", f"could not spawn: {spool_id}", harness=harness)
+            # A full queue says nothing about whether this install works.
+            status = "skip" if "concurrent" in spool_id.lower() else "fail"
+            return _doctor_result(name, status, f"could not spawn: {spool_id}", harness=harness)
 
         deadline = time.time() + timeout
         spool = None
@@ -7148,11 +7224,21 @@ def _doctor_smoke_check(harness: str, timeout: int = 240, model: Optional[str] =
 
         status = (spool or {}).get("status")
         if status not in _TERMINAL_SPOOL_STATUSES:
+            # _spin_drop_sync sends SIGTERM and marks the spool terminal; it does
+            # not wait or escalate. Say what was actually done rather than claim
+            # the process is gone, and leave the agent's working dir in place —
+            # deleting it out from under a process that may still be alive is how
+            # a hung smoke turns into something worse.
             _spin_drop_sync(spool_id)
+            keep_working_dir = True
             return _doctor_result(
                 name,
                 "fail",
-                f"spool {spool_id} did not finish within {timeout}s (dropped)",
+                f"spool {spool_id} did not finish within {timeout}s (sent it a kill signal)",
+                [
+                    f"confirm it stopped with: spindle unspool {spool_id}",
+                    f"its working dir was left in place: {working_dir}",
+                ],
                 harness=harness,
                 spool_id=spool_id,
             )
@@ -7184,7 +7270,34 @@ def _doctor_smoke_check(harness: str, timeout: int = 240, model: Optional[str] =
             spool_id=spool_id,
         )
     finally:
-        shutil.rmtree(working_dir, ignore_errors=True)
+        if not keep_working_dir:
+            shutil.rmtree(working_dir, ignore_errors=True)
+
+
+def _unit_file_path(name: str) -> Path:
+    """Path of the systemd user unit for a service name."""
+    return Path.home() / ".config" / "systemd" / "user" / f"{name}.service"
+
+
+def _port_from_unit(name: str) -> Optional[int]:
+    """Read SPINDLE_PORT out of a named unit, or None.
+
+    `reload --name X` has to probe the service it is about to restart, and the
+    operator's shell env says nothing about which port that unit bound — the
+    unit's own SPINDLE_PORT is the service's environment, not theirs. Guessing
+    the default instead means probing a *different* service, whose store happens
+    to match, so the wrong-store warning stays silent exactly when it matters.
+    """
+    unit = _unit_file_path(name)
+    try:
+        text = unit.read_text(errors="replace")
+    except OSError:
+        return None
+    match = re.search(r"^Environment=\"?SPINDLE_PORT=(\d+)", text, re.MULTILINE)
+    if match:
+        return int(match.group(1))
+    match = re.search(r"serve\s+--http\s+--port\s+(\d+)", text)
+    return int(match.group(1)) if match else None
 
 
 def _reload_warn_on_store_mismatch(host: str, port: int) -> Optional[str]:
@@ -7224,20 +7337,29 @@ def _doctor_run(
     smoke_harnesses: Optional[list] = None,
     smoke_timeout: int = 240,
     service_timeout: float = 2.0,
+    service_name: Optional[str] = None,
 ) -> dict:
-    """Run every doctor check and return the full report."""
+    """Run every doctor check and return the full report.
+
+    ``service_name`` is the systemd unit this report is about, used only to make
+    the remedies name the right service.
+    """
     port = DEFAULT_PORT if port is None else port
     service = _doctor_service_check(host, port, service_timeout)
-    # Only trust the reported PATH when the service is this same install; another
-    # install's PATH says nothing about whether ours can spawn a harness.
+    # Only trust the reported PATH when the service is confirmed to be this same
+    # install; another install's PATH says nothing about whether ours can spawn a
+    # harness. Keyed off identity, not off the check's status — a confirmed-same
+    # service warns when its spool store differs, and gating on status meant the
+    # stale-PATH check silently switched itself off in exactly the two-install
+    # setup the README documents.
     service_path = None
-    if service["status"] == "ok":
+    if service["data"].get("same_install"):
         service_path = (service["data"].get("health") or {}).get("path")
     checks = [
         _doctor_cli_check(),
         service,
         _doctor_storage_check(),
-        _doctor_harness_check(service_path=service_path),
+        _doctor_harness_check(service_path=service_path, service_name=service_name),
         _doctor_shard_check(),
     ]
 
@@ -7284,31 +7406,56 @@ SERVICE_MARKER = "managed-by: spindle install-service"
 # literal `%h` PATH, and the 1.1.0 plist's fixed label plus its portless
 # ExecStart. A hand-written unit for the same service does not carry them (the
 # whole point is to keep refusing those).
-_LEGACY_SERVICE_FINGERPRINTS = (
-    ("Environment=PATH=%h/.local/bin:/usr/bin", "serve --http"),
-    ("<string>com.spindle.server</string>", "<string>--http</string>"),
-)
 
 
-def _service_file_is_foreign(path: Path) -> bool:
-    """True if a service file exists that spindle did not write.
+def _service_file_is_marked(path: Path) -> bool:
+    """True if this service file carries spindle's marker in its header.
 
-    "Did not write" means: no current marker, and no fingerprint of a service
-    file an older spindle generated. Everything else — a hand-rolled unit, one
-    from another tool — is someone else's and is never overwritten.
+    Anchored deliberately. Matching the marker anywhere in the file lets a unit
+    whose comment reads "NOT managed-by: spindle install-service, hand-written"
+    be claimed as ours, and lets any file that merely quotes the docs be claimed
+    too. The generators put the marker in the first line (unit) or third (plist),
+    so only a leading comment line counts, and it must *start* with the marker
+    once its comment punctuation is stripped.
     """
-    if not path.exists():
-        return False
     try:
-        text = path.read_text(errors="replace")
+        with open(path, "r", errors="replace") as fh:
+            head = [next(fh, "") for _ in range(10)]
     except OSError:
-        return True
-    if SERVICE_MARKER in text:
         return False
-    for fingerprint in _LEGACY_SERVICE_FINGERPRINTS:
-        if all(part in text for part in fingerprint):
-            return False
-    return True
+    for line in head:
+        stripped = line.strip().lstrip("#").lstrip("<!-").strip()
+        if stripped.startswith(SERVICE_MARKER):
+            return True
+    return False
+
+
+def _backup_service_file(path: Path) -> Optional[Path]:
+    """Copy a service file aside before replacing it. Returns the backup path.
+
+    Ownership of a service file cannot be inferred reliably: the shape spindle
+    generated is also the shape users copy from `examples/` and then edit, so any
+    fingerprint that recognizes an upgrader's old unit also claims a unit they
+    customized. Rather than guess, spindle keeps a copy of anything it did not
+    demonstrably write, so replacing it is never destructive.
+    """
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup = path.with_name(f"{path.name}.bak-{stamp}")
+    n = 1
+    while backup.exists():
+        backup = path.with_name(f"{path.name}.bak-{stamp}-{n}")
+        n += 1
+    try:
+        shutil.copy2(path, backup)
+    except OSError as exc:
+        logger.warning("spindle: could not back up %s: %s", path, exc)
+        return None
+    return backup
+
+
+def _valid_service_name(name: str) -> bool:
+    """Service names become filenames; keep them from escaping the unit dir."""
+    return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", name or ""))
 
 
 def _service_path_env(path_env: Optional[str] = None) -> str:
@@ -7319,6 +7466,12 @@ def _service_path_env(path_env: Optional[str] = None) -> str:
     user unit's minimal PATH would not), but it routinely carries duplicates and
     per-process temp dirs that will not exist when the service starts. Those are
     dropped so the unit stays readable and honest about what it points at.
+
+    Relative entries are dropped too. A service has no meaningful working
+    directory, so `./node_modules/.bin` resolves to something else (or nothing)
+    once systemd starts it — while still resolving for whoever runs doctor from
+    the directory it was captured in, which would make doctor certify a PATH the
+    service cannot actually use.
     """
     raw = path_env if path_env is not None else os.environ.get("PATH", "")
     kept = []
@@ -7327,6 +7480,8 @@ def _service_path_env(path_env: Optional[str] = None) -> str:
         if not entry or entry in seen:
             continue
         seen.add(entry)
+        if not os.path.isabs(entry):
+            continue
         try:
             if not Path(entry).is_dir():
                 continue
@@ -7350,11 +7505,23 @@ def _systemd_unit_text(
     which fails at spawn time with a confusing "not found". SPINDLE_PORT and
     SPINDLE_HOME are set so `spindle status`/`doctor` in the same environment
     resolve the same port and store the service uses.
+
+    Every interpolated value is quoted and `%`-escaped. systemd splits an
+    unquoted `Environment=` on whitespace and runs specifier expansion on `%`,
+    so a PATH holding `/mnt/c/Program Files/...` (the WSL default) silently
+    truncates at the space, and a `%` anywhere makes systemd drop the whole
+    assignment and fall back to its minimal PATH. Both failures start cleanly
+    and answer /health; only the spawned agents die.
     """
+
+    def q(value: str) -> str:
+        # systemd: %% is a literal %, and quoting keeps whitespace in one value.
+        return '"' + str(value).replace("%", "%%").replace('"', '\\"') + '"'
+
     env_lines = [f"Environment=SPINDLE_PORT={port}"]
     if home:
-        env_lines.append(f"Environment=SPINDLE_HOME={home}")
-    env_lines.append(f"Environment=PATH={_service_path_env(path_env)}")
+        env_lines.append(f"Environment={q('SPINDLE_HOME=' + str(home))}")
+    env_lines.append(f"Environment={q('PATH=' + _service_path_env(path_env))}")
     env_block = "\n".join(env_lines)
     return f"""\
 # {SERVICE_MARKER} (spindle {__version__})
@@ -7364,7 +7531,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart={spindle_path} serve --http --port {port}
+ExecStart={q(spindle_path)} serve --http --port {port}
 Restart=on-failure
 RestartSec=5
 Environment=PYTHONUNBUFFERED=1
@@ -7387,12 +7554,19 @@ def _launchd_plist_text(
 
     The log is named for the service, so two installs do not both write
     ~/.spindle/spindle.log and interleave their output.
+
+    Every interpolated value is XML-escaped. These are filesystem paths and a
+    whole PATH: one `&` in any directory name (legal on macOS, and PATH
+    aggregates directories the user never chose) produces a plist that will not
+    parse, which launchd reports only by never starting the service.
     """
+    from xml.sax.saxutils import escape
+
     env_entries = [("SPINDLE_PORT", str(port)), ("PYTHONUNBUFFERED", "1")]
     if home:
-        env_entries.append(("SPINDLE_HOME", home))
+        env_entries.append(("SPINDLE_HOME", str(home)))
     env_entries.append(("PATH", _service_path_env(path_env)))
-    env_xml = "\n".join(f"        <key>{k}</key>\n        <string>{v}</string>" for k, v in env_entries)
+    env_xml = "\n".join(f"        <key>{escape(k)}</key>\n        <string>{escape(v)}</string>" for k, v in env_entries)
     log_path = Path.home() / ".spindle" / f"{name or 'spindle'}.log"
     return f"""\
 <?xml version="1.0" encoding="UTF-8"?>
@@ -7401,10 +7575,10 @@ def _launchd_plist_text(
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>{label}</string>
+    <string>{escape(label)}</string>
     <key>ProgramArguments</key>
     <array>
-        <string>{spindle_path}</string>
+        <string>{escape(spindle_path)}</string>
         <string>serve</string>
         <string>--http</string>
         <string>--port</string>
@@ -7419,9 +7593,9 @@ def _launchd_plist_text(
     <key>KeepAlive</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>{log_path}</string>
+    <string>{escape(str(log_path))}</string>
     <key>StandardErrorPath</key>
-    <string>{log_path}</string>
+    <string>{escape(str(log_path))}</string>
 </dict>
 </plist>
 """
@@ -7496,6 +7670,11 @@ def main():
         help=f"Comma-separated harnesses to smoke (default: {','.join(DOCTOR_SMOKE_HARNESSES)})",
     )
     doctor_parser.add_argument("--smoke-timeout", type=int, default=240, help="Seconds to wait per smoke spool")
+    doctor_parser.add_argument(
+        "--name",
+        default="spindle",
+        help="systemd unit this report is about, so remedies name the right service (default: spindle)",
+    )
     doctor_parser.add_argument("--json", action="store_true", help="Machine-readable report instead of plain text")
 
     # install-service command
@@ -7614,8 +7793,17 @@ def main():
             # Start in background. Launch the package by module name, not by
             # __file__: an installed wheel's __init__.py run as a script has no
             # package context, so `python -m spindle` is the portable form.
+            #
+            # cwd matters here. `-m` puts the working directory at the front of
+            # sys.path, so running this from a spindle checkout (or any repo with
+            # a spindle/ directory) would start the service from THAT code while
+            # the console script is the installed one — precisely the "which
+            # install is answering the port?" confusion this release removes.
+            # -P / PYTHONSAFEPATH would be cleaner but are 3.11+, and the floor
+            # here is 3.10.
             subprocess.Popen(
                 [sys.executable, "-m", "spindle", "serve", "--http", "--port", str(args.port)],
+                cwd=str(Path.home()),
                 start_new_session=True,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -7636,8 +7824,10 @@ def main():
         if not args.force:
             # The drain reads THIS process's store. If the unit being restarted
             # serves a different one, "no spools running" is a statement about
-            # the wrong store, and the restart would interrupt live agents.
-            _reload_warn_on_store_mismatch(args.host, args.port)
+            # the wrong store, and the restart would interrupt live agents. Ask
+            # the unit which port it bound rather than the shell that ran us.
+            probe_port = _port_from_unit(args.name) or args.port
+            _reload_warn_on_store_mismatch(args.host, probe_port)
             active = _count_running()
             if active:
                 # flush: this is the last output before a potentially long block,
@@ -7689,6 +7879,7 @@ def main():
             port=args.port,
             smoke=args.smoke,
             smoke_harnesses=smoke_harnesses,
+            service_name=args.name,
             smoke_timeout=args.smoke_timeout,
         )
         print(json.dumps(report, indent=2) if args.json else _doctor_render(report))
@@ -7922,6 +8113,16 @@ def main():
 
         service_home = args.home or os.environ.get("SPINDLE_HOME")
 
+        # The name becomes a filename in the unit/agent directory; `../../x` would
+        # write outside it.
+        if not _valid_service_name(args.name):
+            print(
+                f"Invalid service name {args.name!r}: use letters, digits, dot, dash, underscore "
+                "(it becomes a filename).",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
         if system == "Linux":
             # Check if systemd is actually running (important for WSL)
             systemd_check = subprocess.run(["systemctl", "--user", "status"], capture_output=True, text=True)
@@ -7951,18 +8152,24 @@ def main():
             service_dir = Path.home() / ".config" / "systemd" / "user"
             service_file = service_dir / f"{args.name}.service"
 
-            if _service_file_is_foreign(service_file):
-                print(f"Refusing to touch {service_file}: spindle did not write it.")
-                print("It may be the unit already serving this machine. Either:")
-                print(f"  install alongside it: spindle install-service --name {args.name}-2 --port <other-port>")
-                print("  or remove/rename it yourself first.")
-                sys.exit(1)
+            unmanaged = service_file.exists() and not _service_file_is_marked(service_file)
             if service_file.exists() and not args.force:
                 print(f"Service file already exists: {service_file}")
-                print("Use --force to overwrite")
+                if unmanaged:
+                    print("It does not carry spindle's marker, so spindle did not write it (or you edited it).")
+                    print("--force will replace it, keeping a timestamped backup beside it first.")
+                    print(f"To leave it alone: spindle install-service --name {args.name}-2 --port <other-port>")
+                else:
+                    print("Use --force to overwrite")
                 sys.exit(1)
 
             service_dir.mkdir(parents=True, exist_ok=True)
+            if unmanaged:
+                backup = _backup_service_file(service_file)
+                if backup is None:
+                    print(f"Refusing to replace {service_file}: it is not spindle's and could not be backed up.")
+                    sys.exit(1)
+                print(f"{service_file} was not written by spindle; backed it up to {backup}")
             service_file.write_text(service_content)
             print(f"Wrote {service_file} (port {args.port}, spindle {__version__})")
             if service_home:
@@ -7984,30 +8191,43 @@ def main():
             launch_agents = Path.home() / "Library" / "LaunchAgents"
             plist_file = launch_agents / f"{label}.plist"
 
-            if _service_file_is_foreign(plist_file):
-                print(f"Refusing to touch {plist_file}: spindle did not write it.")
-                print("It may be the agent already serving this machine. Either:")
-                print(f"  install alongside it: spindle install-service --name {args.name}-2 --port <other-port>")
-                print("  or remove/rename it yourself first.")
-                sys.exit(1)
+            unmanaged = plist_file.exists() and not _service_file_is_marked(plist_file)
             if plist_file.exists() and not args.force:
                 print(f"Plist already exists: {plist_file}")
-                print("Use --force to overwrite")
+                if unmanaged:
+                    print("It does not carry spindle's marker, so spindle did not write it (or you edited it).")
+                    print("--force will replace it, keeping a timestamped backup beside it first.")
+                    print(f"To leave it alone: spindle install-service --name {args.name}-2 --port <other-port>")
+                else:
+                    print("Use --force to overwrite")
                 sys.exit(1)
+
+            launch_agents.mkdir(parents=True, exist_ok=True)
+            if unmanaged:
+                backup = _backup_service_file(plist_file)
+                if backup is None:
+                    print(f"Refusing to replace {plist_file}: it is not spindle's and could not be backed up.")
+                    sys.exit(1)
+                print(f"{plist_file} was not written by spindle; backed it up to {backup}")
 
             # Unload if already loaded
             if plist_file.exists():
                 subprocess.run(["launchctl", "unload", str(plist_file)], capture_output=True)
 
-            launch_agents.mkdir(parents=True, exist_ok=True)
             plist_file.write_text(plist_content)
             print(f"Wrote {plist_file} (port {args.port}, spindle {__version__})")
 
             # Ensure log directory exists
             (Path.home() / ".spindle").mkdir(parents=True, exist_ok=True)
 
-            # Load the service
-            subprocess.run(["launchctl", "load", str(plist_file)])
+            # Load the service. launchctl's exit code is the only signal that the
+            # plist was accepted; announcing success without it means a plist that
+            # never loads reads as a successful install.
+            loaded = subprocess.run(["launchctl", "load", str(plist_file)], capture_output=True, text=True)
+            if loaded.returncode != 0:
+                print(f"launchctl load failed (exit {loaded.returncode}): {(loaded.stderr or '').strip()}")
+                print(f"Check the plist with: plutil -lint {plist_file}")
+                sys.exit(1)
             print("Loaded launchd service")
 
             print("\nService is now running.")

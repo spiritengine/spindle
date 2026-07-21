@@ -563,12 +563,15 @@ as a spool that fails at spawn.
 Because that `PATH` is a snapshot, it goes stale — installing a harness
 somewhere new, or a node upgrade relocating `codex`, leaves the service unable
 to find what your shell finds fine. `spindle doctor` compares the two and says
-so. The fix is to re-run `install-service --force` from a shell with the right
-`PATH`, then `spindle reload`.
+so, naming the service. The fix is to re-run `install-service --name <name>
+--port <port> --force` from a shell with the right `PATH`, then
+`spindle reload --name <name>`.
 
-Use `--force` to overwrite a service file spindle wrote earlier. A service file
-spindle did *not* write is never overwritten, `--force` or not — it may be the
-one already serving the machine.
+`--force` overwrites a service file spindle wrote earlier. If the file does not
+carry spindle's marker — because you wrote it, or because you copied an example
+and edited it — `--force` first copies it aside as `<name>.service.bak-<date>`
+and says where. Ownership of a service file cannot be inferred reliably, so
+spindle keeps a copy rather than guess.
 
 Then `spindle reload` restarts the service to pick up code changes.
 
