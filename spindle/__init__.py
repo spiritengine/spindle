@@ -881,6 +881,36 @@ def _cleanup_shard(
         return False
 
 
+def _shard_has_other_active_spool(spool_id: str, shard_info: dict) -> bool:
+    """Whether cleanup must defer because another spool may use the worktree.
+
+    Any other pending spool is conservatively blocking: it has reserved a slot
+    but may not have persisted its final working directory yet. A running spool
+    blocks only when its working directory is the shard root or a descendant.
+    Call this while holding ``_concurrency_lock`` so a new pending spool cannot
+    appear between the check and worktree removal.
+    """
+    worktree_path = shard_info.get("worktree_path")
+    if not worktree_path:
+        return True
+    worktree = Path(worktree_path).resolve()
+    for other in _list_spools():
+        if other.get("id") == spool_id:
+            continue
+        status = other.get("status")
+        if status == "pending":
+            return True
+        if status != "running":
+            continue
+        other_working_dir = other.get("working_dir")
+        if not other_working_dir:
+            continue
+        other_path = Path(other_working_dir).resolve()
+        if other_path == worktree or worktree in other_path.parents:
+            return True
+    return False
+
+
 def _get_spool_path(spool_id: str) -> Path:
     """Get path to spool JSON file."""
     return SPINDLE_DIR / f"{spool_id}.json"
@@ -987,6 +1017,24 @@ def _list_spools() -> list[dict]:
         except Exception:
             pass
     return spools
+
+
+@contextmanager
+def _concurrency_lock() -> Generator[None, None, None]:
+    """Serialize slot reservation with automatic shard cleanup.
+
+    Cleanup must not race a new pending spool that is about to detect/reuse the
+    same worktree. Holding this lock while checking active spools and removing a
+    clean failed shard makes the decision atomic with slot reservation.
+    """
+    SPINDLE_DIR.mkdir(parents=True, exist_ok=True)
+    lock_file = SPINDLE_DIR / ".concurrency.lock"
+    with open(lock_file, "a") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
 def _find_spool_by_session(session_id: str) -> Optional[dict]:
@@ -1391,34 +1439,22 @@ def _try_reserve_slot_and_create(spool_id: str, initial_status: str = "pending")
     Uses file locking to prevent TOCTOU race between check and spawn.
     The lock is held during both the check and the initial spool creation.
     """
-    lock_file = SPINDLE_DIR / ".concurrency.lock"
-    SPINDLE_DIR.mkdir(parents=True, exist_ok=True)
+    with _concurrency_lock():
+        # Now we have exclusive access - check the limit
+        running_count = _count_running()
+        if running_count >= MAX_CONCURRENT:
+            return False, f"Error: Max {MAX_CONCURRENT} concurrent spools. Wait for some to complete."
 
-    # Open lock file (creates if needed)
-    with open(lock_file, "a") as f:
-        # Acquire exclusive lock - blocks if another thread holds it
-        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        # Slot available - create the spool immediately while holding the lock
+        # This ensures the slot is claimed atomically
+        spool = {
+            "id": spool_id,
+            "status": initial_status,
+            "created_at": datetime.now().isoformat(),
+        }
+        _write_spool(spool_id, spool)
 
-        try:
-            # Now we have exclusive access - check the limit
-            running_count = _count_running()
-            if running_count >= MAX_CONCURRENT:
-                return False, f"Error: Max {MAX_CONCURRENT} concurrent spools. Wait for some to complete."
-
-            # Slot available - create the spool immediately while holding the lock
-            # This ensures the slot is claimed atomically
-            spool = {
-                "id": spool_id,
-                "status": initial_status,
-                "created_at": datetime.now().isoformat(),
-            }
-            _write_spool(spool_id, spool)
-
-            return True, None
-        finally:
-            # Release lock - happens automatically when context exits
-            # but explicit unlock is clearer
-            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        return True, None
 
 
 def _extract_last_json_object(text: str) -> Optional[dict]:
@@ -1598,7 +1634,7 @@ def _extract_codex_result(stdout: str) -> Optional[str]:
 
 
 def _codex_failure_message(stdout: str) -> Optional[str]:
-    """Return the last structured Codex turn failure, if the stream has one.
+    """Return the final terminal Codex turn failure, if the stream has one.
 
     Codex sometimes exits successfully at the process level after emitting a
     ``turn.failed`` JSONL event (for example, an account/model HTTP 400). The
@@ -1606,19 +1642,36 @@ def _codex_failure_message(stdout: str) -> Optional[str]:
     is therefore authoritative. Its message may itself be a serialized API
     error object; unwrap that so callers get the actionable provider message.
     """
+    terminal_type = None
     failure = None
     for line in stdout.splitlines():
         try:
             event = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if not isinstance(event, dict) or event.get("type") != "turn.failed":
+        if not isinstance(event, dict):
             continue
-        error = event.get("error")
-        failure = error.get("message") if isinstance(error, dict) else error
+        event_type = event.get("type")
+        if event_type == "turn.completed":
+            terminal_type = event_type
+            failure = None
+        elif event_type in {"turn.failed", "error"}:
+            terminal_type = event_type
+            error = event.get("error")
+            if error is None:
+                error = event.get("message")
+            if isinstance(error, dict):
+                failure = error.get("message")
+                details = {key: value for key, value in error.items() if key != "message" and value is not None}
+                if not failure and details:
+                    failure = json.dumps(details, sort_keys=True)
+            else:
+                failure = error
 
-    if not failure:
+    if terminal_type not in {"turn.failed", "error"}:
         return None
+    if not failure:
+        return "Codex failed without an error message"
     if not isinstance(failure, str):
         return str(failure)
 
@@ -1870,7 +1923,11 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
                                 event = json.loads(line)
                             except json.JSONDecodeError:
                                 continue
-                            if isinstance(event, dict) and event.get("type") == "turn.completed":
+                            if isinstance(event, dict) and event.get("type") in {
+                                "turn.completed",
+                                "turn.failed",
+                                "error",
+                            }:
                                 output_complete = True
                                 break
                     else:
@@ -1917,12 +1974,26 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
             except IOError:
                 pass
 
+        codex_failure_message = _codex_failure_message(stdout) if spool.get("harness") == "codex" else None
+
         # Capture (and reap) the child's exit code if we still hold its handle.
         # poll() returns None if the process hasn't actually exited yet (e.g.
         # output is complete but the CLI lingers); that's fine - exit_code stays
         # unknown for that case. None when there's no handle (orphan recovery).
         proc = _PROC_HANDLES.pop(spool_id, None)
         exit_code = proc.poll() if proc is not None else None
+        if codex_failure_message and proc is not None and exit_code is None:
+            # turn.failed is terminal. Stop a known lingering child before any
+            # clean-shard reclamation; never signal a PID when this process no
+            # longer owns its Popen handle (for example after server restart).
+            try:
+                proc.terminate()
+                exit_code = proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                exit_code = proc.wait(timeout=5)
+            except OSError:
+                exit_code = proc.poll()
         if exit_code is not None:
             spool["exit_code"] = exit_code
         # Suffix for the "no output" fallbacks so a silent failure reports the
@@ -1943,7 +2014,6 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
                     extracted = _extract_codex_result(stdout)
                     spool["result"] = extracted if extracted is not None else stdout
 
-                    failure_message = _codex_failure_message(stdout)
                     for line in stdout.strip().split("\n"):
                         try:
                             event = json.loads(line)
@@ -1958,9 +2028,9 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
                             if usage:
                                 spool["cost"] = usage
 
-                    if failure_message:
+                    if codex_failure_message:
                         spool["status"] = "error"
-                        spool["error"] = failure_message
+                        spool["error"] = codex_failure_message
                     else:
                         spool["status"] = "complete"
                 elif stderr.strip():
@@ -2098,17 +2168,24 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
         # Reclaim only a shard created for this exact spool, and only when Git
         # proves no work exists. Reused shards and failed shards containing
         # edits/commits are preserved so an API failure can never discard work.
-        if (
-            spool.get("status") == "error"
-            and spool.get("shard_created_by_spool")
-            and _get_shard_commit_status(spool) == "no_changes"
-        ):
+        if spool.get("status") == "error" and spool.get("shard_created_by_spool") and not _is_pid_alive(pid):
             shard_info = spool.get("shard") or {}
             cleanup_dir = spool.get("shard_source_dir")
-            if cleanup_dir and _cleanup_shard(shard_info, cleanup_dir, spool_id=spool_id):
-                shard_info["startup_failure_cleaned"] = True
-                spool["shard"] = shard_info
-                _write_spool(spool_id, spool)
+            if cleanup_dir:
+                # Serialize with new slot reservation. Any other pending spool
+                # could be about to resolve this worktree, while a running one
+                # may already be using it. Git inspection also fails closed:
+                # only an authoritative no_changes result permits deletion.
+                with _concurrency_lock():
+                    safe_to_clean = not _shard_has_other_active_spool(spool_id, shard_info)
+                    safe_to_clean = safe_to_clean and _shard_is_pristine_for_cleanup(spool)
+                    if safe_to_clean and _cleanup_shard(shard_info, cleanup_dir, spool_id=spool_id):
+                        shard_info["startup_failure_cleaned"] = True
+                        spool["shard"] = shard_info
+                        # spool_retry must launch from the surviving source repo,
+                        # not the worktree path that cleanup just removed.
+                        spool["working_dir"] = cleanup_dir
+                        _write_spool(spool_id, spool)
 
         # Clean up output files
         if stdout_path.exists():
@@ -4226,7 +4303,9 @@ def _get_shard_commit_status(spool: dict) -> Optional[str]:
         result = subprocess.run(
             ["git", "status", "--porcelain"], capture_output=True, text=True, cwd=worktree_path, timeout=10
         )
-        has_uncommitted = bool(result.stdout.strip()) if result.returncode == 0 else False
+        if result.returncode != 0:
+            return "unknown"
+        has_uncommitted = bool(result.stdout.strip())
 
         # Check for commits ahead of base branch
         result = subprocess.run(
@@ -4236,7 +4315,9 @@ def _get_shard_commit_status(spool: dict) -> Optional[str]:
             cwd=worktree_path,
             timeout=10,
         )
-        commits_ahead = int(result.stdout.strip()) if result.returncode == 0 else 0
+        if result.returncode != 0:
+            return "unknown"
+        commits_ahead = int(result.stdout.strip())
 
         if has_uncommitted:
             return "uncommitted"
@@ -4274,6 +4355,43 @@ def _get_shard_commit_status(spool: dict) -> Optional[str]:
 
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError, ValueError):
         return "unknown"
+
+
+def _shard_is_pristine_for_cleanup(spool: dict) -> bool:
+    """Prove a failed spool's shard contains no user or generated work.
+
+    This predicate authorizes destructive cleanup, so every uncertainty fails
+    closed. Unlike the display-oriented commit-status helper, ignored files are
+    work too: reports, build output, or other artifacts must never be discarded
+    merely because ``.gitignore`` hides them.
+    """
+    shard_info = spool.get("shard") or {}
+    worktree_path = shard_info.get("worktree_path")
+    if not worktree_path or not Path(worktree_path).exists():
+        return False
+    base_branch = _shard_base_branch(spool)
+    try:
+        status = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=all", "--ignored"],
+            capture_output=True,
+            text=True,
+            cwd=worktree_path,
+            timeout=10,
+        )
+        if status.returncode != 0 or status.stdout.strip():
+            return False
+        commits = subprocess.run(
+            ["git", "rev-list", "--count", f"{base_branch}..HEAD"],
+            capture_output=True,
+            text=True,
+            cwd=worktree_path,
+            timeout=10,
+        )
+        if commits.returncode != 0:
+            return False
+        return int(commits.stdout.strip()) == 0
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError, ValueError):
+        return False
 
 
 def _get_shard_change_stats(spool: dict) -> Optional[dict]:

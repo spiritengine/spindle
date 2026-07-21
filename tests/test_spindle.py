@@ -6,6 +6,7 @@ import inspect
 import json
 import multiprocessing
 import os
+import signal
 import subprocess
 import threading
 from contextlib import contextmanager
@@ -1181,6 +1182,32 @@ class TestSingleSpoolGrep:
 class TestCodexResultExtraction:
     """Codex results should store the agent's prose, not the raw event stream."""
 
+    def _git_shard(self, tmp_path):
+        repo = tmp_path / "repo"
+        worktree = tmp_path / "worktree"
+        subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+        (repo / ".gitignore").write_text("ignored/\n*.log\n")
+        (repo / "README.md").write_text("base\n")
+        subprocess.run(["git", "-C", str(repo), "add", ".gitignore", "README.md"], check=True)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo),
+                "-c",
+                "user.name=Spindle Test",
+                "-c",
+                "user.email=spindle@example.test",
+                "commit",
+                "-q",
+                "-m",
+                "base",
+            ],
+            check=True,
+        )
+        subprocess.run(["git", "-C", str(repo), "worktree", "add", "-q", "-b", "shard-test", str(worktree)], check=True)
+        return repo, worktree
+
     def _stream(self):
         # A realistic codex stream: messages plus a huge command-output item.
         big_output = "LOG LINE\n" * 5000
@@ -1269,6 +1296,69 @@ class TestCodexResultExtraction:
             "The 'gpt-5.6' model is not supported when using Codex with a ChatGPT account."
         )
 
+    @pytest.mark.parametrize(
+        "failed_event",
+        [
+            {"type": "turn.failed"},
+            {"type": "turn.failed", "error": {}},
+            {"type": "turn.failed", "error": {"message": ""}},
+        ],
+    )
+    def test_failure_message_is_generic_when_provider_omits_message(self, failed_event):
+        assert spindle._codex_failure_message(json.dumps(failed_event)) == "Codex failed without an error message"
+
+    def test_top_level_codex_error_is_terminal(self):
+        stream = json.dumps({"type": "error", "message": "unrecoverable stream failure"})
+        assert spindle._codex_failure_message(stream) == "unrecoverable stream failure"
+
+    def test_failure_message_uses_last_terminal_event(self):
+        recovered = "\n".join(
+            [
+                json.dumps({"type": "turn.failed", "error": {"message": "stream interrupted"}}),
+                json.dumps({"type": "turn.started"}),
+                json.dumps({"type": "turn.completed", "usage": {}}),
+            ]
+        )
+        later_failure = "\n".join(
+            [
+                json.dumps({"type": "turn.completed", "usage": {}}),
+                json.dumps({"type": "turn.failed", "error": {"code": "rate_limit"}}),
+            ]
+        )
+
+        assert spindle._codex_failure_message(recovered) is None
+        assert spindle._codex_failure_message(later_failure) == '{"code": "rate_limit"}'
+
+    def test_finalize_reports_recovered_later_turn_as_complete(self, tmp_path):
+        stream = "\n".join(
+            [
+                json.dumps({"type": "turn.failed", "error": {"message": "stream interrupted"}}),
+                json.dumps({"type": "turn.started"}),
+                json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "Recovered."}}),
+                json.dumps({"type": "turn.completed", "usage": {"output_tokens": 3}}),
+            ]
+        )
+        spool_id = "codex-recovered-turn"
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool(
+                spool_id,
+                {
+                    "id": spool_id,
+                    "status": "running",
+                    "harness": "codex",
+                    "prompt": "work",
+                    "pid": 999999999,
+                    "created_at": datetime.now().isoformat(),
+                },
+            )
+            _get_output_path(spool_id).write_text(stream)
+            assert _check_and_finalize_spool(spool_id) is True
+            spool = _read_spool(spool_id)
+
+        assert spool["status"] == "complete"
+        assert spool["result"] == "Recovered."
+        assert spool["cost"]["output_tokens"] == 3
+
     def test_finalize_marks_turn_failed_error_and_cleans_unchanged_new_shard(self, tmp_path):
         provider_error = json.dumps(
             {"status": 400, "error": {"message": "The requested model is not supported for this account."}}
@@ -1300,7 +1390,7 @@ class TestCodexResultExtraction:
                 },
             )
             _get_output_path(spool_id).write_text(stream)
-            with patch("spindle._get_shard_commit_status", return_value="no_changes"):
+            with patch("spindle._shard_is_pristine_for_cleanup", return_value=True):
                 with patch("spindle._cleanup_shard", return_value=True) as cleanup:
                     assert _check_and_finalize_spool(spool_id) is True
 
@@ -1310,6 +1400,7 @@ class TestCodexResultExtraction:
             assert spool["result"] == stream
             assert spool["session_id"] == "thread-failed"
             assert spool["shard"]["startup_failure_cleaned"] is True
+            assert spool["working_dir"] == str(tmp_path / "repo")
             cleanup.assert_called_once()
             cleanup_args, cleanup_kwargs = cleanup.call_args
             assert cleanup_args[0]["worktree_path"] == shard["worktree_path"]
@@ -1317,12 +1408,79 @@ class TestCodexResultExtraction:
             assert cleanup_kwargs == {"spool_id": spool_id}
             assert _get_transcript_path(spool_id).read_text() == stream
 
+    def test_finalize_treats_turn_failed_as_terminal_and_stops_known_lingering_child(self, tmp_path):
+        spool_id = "codex-terminal-failure"
+        stream = json.dumps({"type": "turn.failed", "error": {"message": "provider failed"}})
+        proc = MagicMock()
+        proc.poll.return_value = None
+        proc.wait.return_value = -signal.SIGTERM
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool(
+                spool_id,
+                {
+                    "id": spool_id,
+                    "status": "running",
+                    "harness": "codex",
+                    "prompt": "work",
+                    "pid": os.getpid(),
+                    "created_at": datetime.now().isoformat(),
+                },
+            )
+            _get_output_path(spool_id).write_text(stream)
+            spindle._PROC_HANDLES[spool_id] = proc
+            try:
+                assert _check_and_finalize_spool(spool_id) is True
+            finally:
+                spindle._PROC_HANDLES.pop(spool_id, None)
+
+            spool = _read_spool(spool_id)
+            assert spool["status"] == "error"
+            assert spool["error"] == "provider failed"
+            assert spool["exit_code"] == -signal.SIGTERM
+            proc.terminate.assert_called_once_with()
+            proc.wait.assert_called_once_with(timeout=5)
+
     @pytest.mark.parametrize(
-        "created_by_spool,commit_status",
-        [(False, "no_changes"), (True, "uncommitted"), (True, "has_commit"), (True, "unknown")],
+        "other_spool",
+        [
+            {"id": "other-pending", "status": "pending"},
+            {"id": "other-running", "status": "running", "working_dir": "WORKTREE/subdir"},
+        ],
     )
-    def test_finalize_preserves_reused_or_changed_failed_shard(self, tmp_path, created_by_spool, commit_status):
-        spool_id = f"codex-preserve-{created_by_spool}-{commit_status}"
+    def test_finalize_preserves_failed_shard_while_another_spool_may_use_it(self, tmp_path, other_spool):
+        spool_id = "codex-owner-failed"
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        other_spool = dict(other_spool)
+        if other_spool.get("working_dir"):
+            other_spool["working_dir"] = other_spool["working_dir"].replace("WORKTREE", str(worktree))
+        stream = json.dumps({"type": "turn.failed", "error": {"message": "provider failed"}})
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool(other_spool["id"], other_spool)
+            _write_spool(
+                spool_id,
+                {
+                    "id": spool_id,
+                    "status": "running",
+                    "harness": "codex",
+                    "prompt": "work",
+                    "pid": 999999999,
+                    "created_at": datetime.now().isoformat(),
+                    "shard": {"worktree_path": str(worktree)},
+                    "shard_created_by_spool": True,
+                    "shard_source_dir": str(tmp_path / "repo"),
+                },
+            )
+            _get_output_path(spool_id).write_text(stream)
+            with patch("spindle._shard_is_pristine_for_cleanup", return_value=True):
+                with patch("spindle._cleanup_shard") as cleanup:
+                    assert _check_and_finalize_spool(spool_id) is True
+            cleanup.assert_not_called()
+            assert _read_spool(spool_id)["status"] == "error"
+
+    @pytest.mark.parametrize("created_by_spool,pristine", [(False, True), (True, False)])
+    def test_finalize_preserves_reused_or_changed_failed_shard(self, tmp_path, created_by_spool, pristine):
+        spool_id = f"codex-preserve-{created_by_spool}-{pristine}"
         stream = json.dumps({"type": "turn.failed", "error": {"message": "provider failed"}})
         with patch("spindle.SPINDLE_DIR", tmp_path):
             _write_spool(
@@ -1340,11 +1498,115 @@ class TestCodexResultExtraction:
                 },
             )
             _get_output_path(spool_id).write_text(stream)
-            with patch("spindle._get_shard_commit_status", return_value=commit_status):
+            with patch("spindle._shard_is_pristine_for_cleanup", return_value=pristine):
                 with patch("spindle._cleanup_shard") as cleanup:
                     assert _check_and_finalize_spool(spool_id) is True
             cleanup.assert_not_called()
             assert _read_spool(spool_id)["status"] == "error"
+
+    @pytest.mark.parametrize("failure_point", ["status", "rev-list"])
+    def test_shard_commit_status_fails_closed_on_git_error(self, tmp_path, failure_point):
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        spool = {
+            "base_branch": "main",
+            "shard": {"worktree_path": str(worktree), "branch_name": "shard-test"},
+        }
+        ok = MagicMock(returncode=0, stdout="")
+        failed = MagicMock(returncode=128, stdout="", stderr="bad revision")
+        responses = [failed] if failure_point == "status" else [ok, failed]
+        with patch("spindle.subprocess.run", side_effect=responses):
+            assert spindle._get_shard_commit_status(spool) == "unknown"
+
+    @pytest.mark.parametrize("failure_point", ["status", "rev-list"])
+    def test_cleanup_pristine_check_fails_closed_on_git_error(self, tmp_path, failure_point):
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        spool = {
+            "base_branch": "main",
+            "shard": {"worktree_path": str(worktree), "branch_name": "shard-test"},
+        }
+        ok = MagicMock(returncode=0, stdout="")
+        failed = MagicMock(returncode=128, stdout="", stderr="bad revision")
+        responses = [failed] if failure_point == "status" else [ok, failed]
+        with patch("spindle.subprocess.run", side_effect=responses):
+            assert spindle._shard_is_pristine_for_cleanup(spool) is False
+
+    def test_finalize_preserves_failed_shard_with_ignored_output(self, tmp_path):
+        repo, worktree = self._git_shard(tmp_path)
+        (worktree / "ignored").mkdir()
+        (worktree / "ignored" / "report.md").write_text("valuable report\n")
+        (worktree / "run.log").write_text("valuable log\n")
+        spool_id = "codex-ignored-output"
+        stream = json.dumps({"type": "turn.failed", "error": {"message": "provider failed"}})
+        with patch("spindle.SPINDLE_DIR", tmp_path / "spools"):
+            _write_spool(
+                spool_id,
+                {
+                    "id": spool_id,
+                    "status": "running",
+                    "harness": "codex",
+                    "prompt": "work",
+                    "pid": 999999999,
+                    "created_at": datetime.now().isoformat(),
+                    "working_dir": str(worktree),
+                    "base_branch": "main",
+                    "shard": {"worktree_path": str(worktree), "branch_name": "shard-test"},
+                    "shard_created_by_spool": True,
+                    "shard_source_dir": str(repo),
+                },
+            )
+            _get_output_path(spool_id).write_text(stream)
+            assert _check_and_finalize_spool(spool_id) is True
+
+        assert worktree.exists()
+        assert (worktree / "ignored" / "report.md").read_text() == "valuable report\n"
+        assert (worktree / "run.log").read_text() == "valuable log\n"
+
+    def test_finalize_really_removes_pristine_failed_shard_and_retry_uses_source_repo(self, tmp_path):
+        repo, worktree = self._git_shard(tmp_path)
+        spool_id = "codex-pristine-failure"
+        stream = json.dumps({"type": "turn.failed", "error": {"message": "provider failed"}})
+        shard = {"worktree_path": str(worktree), "branch_name": "shard-test"}
+        with patch("spindle.SPINDLE_DIR", tmp_path / "spools"):
+            _write_spool(
+                spool_id,
+                {
+                    "id": spool_id,
+                    "status": "running",
+                    "harness": "codex",
+                    "prompt": "work",
+                    "pid": 999999999,
+                    "created_at": datetime.now().isoformat(),
+                    "working_dir": str(worktree),
+                    "model": "gpt-5.6-sol",
+                    "sandbox": "workspace-write",
+                    "permission": "careful+shard",
+                    "base_branch": "main",
+                    "shard": shard,
+                    "shard_created_by_spool": True,
+                    "shard_source_dir": str(repo),
+                },
+            )
+            _get_output_path(spool_id).write_text(stream)
+            assert _check_and_finalize_spool(spool_id) is True
+
+            spool = _read_spool(spool_id)
+            assert spool["working_dir"] == str(repo)
+            assert spool["shard"]["startup_failure_cleaned"] is True
+            assert not worktree.exists()
+            assert (
+                subprocess.run(
+                    ["git", "-C", str(repo), "show-ref", "--verify", "--quiet", "refs/heads/shard-test"]
+                ).returncode
+                != 0
+            )
+
+            retry_tool = spool_retry.fn if hasattr(spool_retry, "fn") else spool_retry
+            with patch("spindle._codex_spin_sync", return_value="retry-spool") as retry:
+                assert asyncio.run(retry_tool(spool_id)) == "retry-spool"
+            assert retry.call_args.args[1] == str(repo)
+            assert retry.call_args.kwargs["shard"] is True
 
     def test_finalize_falls_back_to_raw_stream_when_no_messages(self, tmp_path):
         # No agent_message items, but valid session/cost events and a non-dict
