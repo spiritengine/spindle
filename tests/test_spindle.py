@@ -10238,3 +10238,50 @@ class TestNumericEscapeDigitsAreDigits:
         assert "sk-SECRET" not in shown
         assert "SPINDLE_PORT=7" in shown
         assert "malformed" in shown
+
+
+class TestResolverHasNoUnreachableFallback:
+    """After the refusal, only three states remain — nothing else needs a branch.
+
+    Two review rounds were spent adding fallbacks for a fourth state that the
+    record redesign had already made impossible. A mutation study proved the
+    suite could not tell they were gone, which is the only reason they survived.
+    """
+
+    @pytest.fixture
+    def config(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
+        monkeypatch.delenv("SPINDLE_HOME", raising=False)
+        monkeypatch.delenv("SPINDLE_PORT", raising=False)
+        return tmp_path
+
+    def test_an_existing_file_without_a_record_always_refuses(self, config, tmp_path):
+        """This is what makes the fourth state impossible; pin it directly."""
+        unit = tmp_path / "svc.service"
+        unit.write_text(spindle._systemd_unit_text("/bin/spindle", 8115, name="svc"))
+        for arg_port, arg_home in [(None, None), (None, "/srv/x"), (9001, None)]:
+            _, _, _, blocker = spindle._resolve_service_settings(unit, arg_port, arg_home, name="svc")
+            assert blocker is not None, (arg_port, arg_home)
+
+    def test_both_arguments_together_are_the_only_way_past_it(self, config, tmp_path):
+        unit = tmp_path / "svc.service"
+        unit.write_text(spindle._systemd_unit_text("/bin/spindle", 8115, name="svc"))
+        port, home, _, blocker = spindle._resolve_service_settings(unit, 9001, "/srv/x", name="svc")
+        assert (port, home, blocker) == (9001, "/srv/x", None)
+
+    def test_every_reachable_state_is_covered(self, config, tmp_path):
+        """Explicit argument, usable record, or no file — exhaustively."""
+        unit = tmp_path / "svc.service"
+        body = spindle._systemd_unit_text("/bin/spindle", 8115, home="/srv/rec", name="svc")
+
+        # no file at all
+        assert spindle._resolve_service_settings(unit, None, None, name="svc")[0] == spindle.DEFAULT_PORT
+
+        # usable record
+        unit.write_text(body)
+        spindle._write_service_record("svc", 8115, "/srv/rec", unit, body)
+        port, home, _, blocker = spindle._resolve_service_settings(unit, None, None, name="svc")
+        assert (port, home, blocker) == (8115, "/srv/rec", None)
+
+        # explicit arguments win over it
+        assert spindle._resolve_service_settings(unit, 9001, "/srv/x", name="svc")[:2] == (9001, "/srv/x")

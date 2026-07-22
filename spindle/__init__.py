@@ -8035,24 +8035,26 @@ def _resolve_service_settings(
             blocker += f"\n{excerpt_note}"
         return None, None, notes, blocker
 
+    # Past the refusal above, only three states remain: an explicit argument, a
+    # usable record, or a service that does not exist yet. An existing file with
+    # no usable record has already returned a blocker, so there is no fourth
+    # case — two earlier rounds added `elif exists:` fallbacks for one, and they
+    # were unreachable from the moment the record replaced reading the file. A
+    # mutation study found the suite could not tell they were gone.
     if arg_port is not None:
         port = arg_port
-    elif record is not None and isinstance(record.get("port"), int):
+    elif record is not None:
         port = record["port"]
         notes.append(f"Keeping the port spindle installed {name} with: {port} (pass --port to change it)")
-    elif exists:
-        port = _BASE_DEFAULT_PORT
     else:
         port = DEFAULT_PORT
 
     if arg_home is not None:
         home = arg_home or None
-    elif record is not None and "home" in record:
-        home = record["home"] if isinstance(record["home"], str) else None
+    elif record is not None:
+        home = record["home"]
         shown = home if home else "the default"
         notes.append(f"Keeping the spool store spindle installed {name} with: {shown} (pass --home to change it)")
-    elif exists:
-        home = None
     else:
         home = os.environ.get("SPINDLE_HOME")
 
