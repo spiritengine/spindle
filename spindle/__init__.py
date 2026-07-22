@@ -884,14 +884,14 @@ def _cleanup_shard(
 
 
 def _preserve_failed_spool_shard(spool: dict) -> bool:
-    """Mark a failed spool's newly-created shard for explicit recovery.
+    """Mark a failed or timed-out spool's new shard for explicit recovery.
 
     Automatic cleanup cannot atomically prove that ignored output was not
     created between its final Git status check and worktree removal. Preserve
     every shard whose agent failed instead; retry can safely reuse it, and a
     human or SKEIN can inspect and explicitly clean it later.
     """
-    if spool.get("status") != "error" or not spool.get("shard_created_by_spool"):
+    if spool.get("status") not in {"error", "timeout"} or not spool.get("shard_created_by_spool"):
         return False
     shard_info = spool.get("shard") or {}
     shard_info["startup_failure_preserved"] = True
@@ -1757,10 +1757,14 @@ def _is_pid_alive(pid: int) -> bool:
     except (OSError, ProcessLookupError):
         return False
 
-    # os.kill(pid, 0) succeeds for zombie processes too. Inspect /proc without
-    # waitpid: reaping here can steal the real return code from a Popen handle.
+    # os.kill(pid, 0) succeeds for zombie processes too. On Linux, inspect
+    # /proc without waitpid: reaping here can steal the real return code from a
+    # Popen handle. Without /proc, the successful kill probe is authoritative.
+    proc_root = Path("/proc")
+    if not proc_root.is_dir():
+        return True
     try:
-        stat = Path(f"/proc/{pid}/stat").read_text()
+        stat = (proc_root / str(pid) / "stat").read_text()
     except FileNotFoundError:
         return False
     except OSError:
@@ -1937,6 +1941,13 @@ def _cleanup_old_spools() -> None:
             # handle until an explicit merge/abandon operation resolves it.
             if data.get("shard_cleanup_preserved"):
                 continue
+            # A terminal spool may still have an unsignalable process holding
+            # its capture descriptors. Keep the record and captures until the
+            # warned-about process group is verifiably gone.
+            if data.get("process_group_cleanup_warning"):
+                pid = data.get("pid")
+                if not pid or _is_pid_alive(pid) or _is_process_group_alive(pid):
+                    continue
             created = datetime.fromisoformat(data.get("created_at", ""))
             if created < cutoff:
                 # Use lock to prevent race with finalization
@@ -2491,6 +2502,17 @@ def _monitor_spool(spool_id: str) -> None:
                     elapsed = (now - created).total_seconds()
                     if elapsed <= spool["timeout"]:
                         continue
+                    # Output can become terminal between the optimistic
+                    # precheck and this lock. Recheck while serialized so a
+                    # boundary result cannot be overwritten by timeout.
+                    if _spool_has_complete_output(
+                        spool,
+                        _get_output_path(spool_id),
+                        _get_stderr_path(spool_id),
+                    ):
+                        spool["output_complete_detected_at"] = datetime.now().isoformat()
+                        _write_spool(spool_id, spool)
+                        continue
                     pid = spool.get("pid")
                     group_alive = bool(pid) and (_is_pid_alive(pid) or _is_process_group_alive(pid))
                     if group_alive and not _terminate_process_group(pid, 0.5):
@@ -2500,6 +2522,7 @@ def _monitor_spool(spool_id: str) -> None:
                     spool["status"] = "timeout"
                     spool["error"] = f"Timeout after {spool['timeout']}s"
                     spool["completed_at"] = datetime.now().isoformat()
+                    _preserve_failed_spool_shard(spool)
                     _write_spool(spool_id, spool)
                     proc = _PROC_HANDLES.pop(spool_id, None)
                     if proc is not None and proc.poll() is None:

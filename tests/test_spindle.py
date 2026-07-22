@@ -2931,6 +2931,38 @@ class TestOrphanedLockSweep:
             assert _read_spool("preserved") is not None
             assert _read_spool("ordinary") is None
 
+    def test_live_warned_process_keeps_old_spool_record_and_captures(self, tmp_path):
+        old_created = (datetime.now() - timedelta(hours=25)).isoformat()
+        spool_id = "warned-live-group"
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool(
+                spool_id,
+                {
+                    "id": spool_id,
+                    "status": "complete",
+                    "created_at": old_created,
+                    "pid": 595959,
+                    "process_group_cleanup_warning": "group survived",
+                },
+            )
+            _get_output_path(spool_id).write_text("still open")
+            _get_stderr_path(spool_id).write_text("diagnostic")
+            with patch("spindle._is_pid_alive", return_value=False):
+                with patch("spindle._is_process_group_alive", return_value=True):
+                    spindle._cleanup_old_spools()
+
+            assert _read_spool(spool_id) is not None
+            assert _get_output_path(spool_id).read_text() == "still open"
+            assert _get_stderr_path(spool_id).read_text() == "diagnostic"
+
+            with patch("spindle._is_pid_alive", return_value=False):
+                with patch("spindle._is_process_group_alive", return_value=False):
+                    spindle._cleanup_old_spools()
+
+            assert _read_spool(spool_id) is None
+            assert not _get_output_path(spool_id).exists()
+            assert not _get_stderr_path(spool_id).exists()
+
     def test_explicit_shard_abandon_clears_preservation_marker(self, tmp_path):
         spool_id = "preserved-abandon"
         worktree = tmp_path / "worktrees" / "preserved-abandon"
@@ -2979,6 +3011,11 @@ class TestProcessUtils:
     def test_is_pid_alive_never_reaps_popen_exit_status(self):
         with patch("spindle.os.waitpid", side_effect=AssertionError("must not reap")):
             assert _is_pid_alive(os.getpid()) is True
+
+    def test_is_pid_alive_uses_successful_signal_probe_without_proc(self):
+        with patch("spindle.os.kill", return_value=None):
+            with patch("spindle.Path.is_dir", return_value=False):
+                assert _is_pid_alive(12345) is True
 
 
 class TestSpoolDataStructure:
@@ -7244,6 +7281,8 @@ class TestReviewTagTimeout:
             "timeout": 1,
             "created_at": (datetime.now() - timedelta(seconds=5)).isoformat(),
             "prompt": "test",
+            "shard": {"worktree_path": str(tmp_path / "worktree")},
+            "shard_created_by_spool": True,
         }
 
         with patch("spindle.SPINDLE_DIR", tmp_path):
@@ -7257,6 +7296,33 @@ class TestReviewTagTimeout:
         assert result["status"] == "timeout"
         assert result["error"] == "Timeout after 1s"
         assert result["process_group_cleanup_warning"] == ("Process group survived TERM and KILL after spool timeout")
+        assert result["shard_cleanup_preserved"] is True
+        assert result["shard"]["startup_failure_preserved"] is True
+
+    def test_timeout_rechecks_completed_output_after_taking_terminal_lock(self, tmp_path):
+        spool_id = "test-timeout-result-lock-race"
+        spool = {
+            "id": spool_id,
+            "status": "running",
+            "harness": "claude-code",
+            "pid": 606060,
+            "timeout": 1,
+            "created_at": (datetime.now() - timedelta(seconds=5)).isoformat(),
+            "prompt": "test",
+        }
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool(spool_id, spool)
+            with patch("spindle._spool_has_complete_output", side_effect=[False, True]):
+                with patch("spindle._check_and_finalize_spool", return_value=True):
+                    with patch("spindle._terminate_process_group") as terminate:
+                        _monitor_spool(spool_id)
+            result = _read_spool(spool_id)
+
+        terminate.assert_not_called()
+        assert result["status"] == "running"
+        assert result["output_complete_detected_at"]
+        assert "error" not in result
 
     def test_completed_output_at_timeout_is_not_discarded_during_cli_shutdown(self, tmp_path):
         spool_id = "test-timeout-completed-output"
