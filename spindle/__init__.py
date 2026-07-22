@@ -7350,18 +7350,123 @@ def _unit_file_path(name: str) -> Path:
     return _systemd_user_dir() / f"{name}.service"
 
 
-def _env_from_unit(name: str, var: str) -> Optional[str]:
-    """Read one Environment= value out of a named unit, quoted or not."""
-    try:
-        text = _unit_file_path(name).read_text(errors="replace")
-    except OSError:
-        return None
+def _env_from_unit_text(text: str, var: str) -> Optional[str]:
+    """Read one Environment= value out of unit text, quoted or not."""
     match = re.search(rf'^Environment=(?:"{var}=(.*?)"|{var}=(\S*))\s*$', text, re.MULTILINE)
     if not match:
         return None
     value = match.group(1) if match.group(1) is not None else match.group(2)
     # Undo the escaping _systemd_quote applied.
     return value.replace("%%", "%").replace('\\"', '"').replace("\\\\", "\\")
+
+
+def _env_from_unit(name: str, var: str) -> Optional[str]:
+    """Read one Environment= value out of a named unit, quoted or not."""
+    try:
+        text = _unit_file_path(name).read_text(errors="replace")
+    except OSError:
+        return None
+    return _env_from_unit_text(text, var)
+
+
+def _service_settings_from_file(path: Path) -> dict:
+    """Read the port and spool store out of an existing service file.
+
+    ONE rule governs regeneration, and this is the half that reads:
+
+        an explicit argument  >  what the service is already configured with
+                              >  the default
+
+    Without the middle term, `install-service --name X --force` — the command
+    doctor's own remedies tell you to run — rebuilds the service purely from
+    argv, so every setting the operator is not repeating on the command line is
+    silently discarded. Omitting `--port` moved a service off its port onto 8002
+    (colliding with the default install); omitting `--home` moved it off its
+    spool store onto ~/.spindle, stranding every spool in the old one.
+
+    Handles both formats so the rule cannot hold on one platform and not the
+    other. Returns {"port": int|None, "home": str|None}; unreadable or
+    unrecognized files yield Nones, which fall through to the defaults.
+    """
+    settings = {"port": None, "home": None}
+    try:
+        text = path.read_text(errors="replace")
+    except OSError:
+        return settings
+
+    if path.suffix == ".plist" or text.lstrip().startswith("<?xml"):
+        try:
+            import xml.etree.ElementTree as ET
+
+            root = ET.fromstring(text)
+        except Exception:
+            return settings
+        # <dict> is a flat key/value sequence: <key>NAME</key><value-element>.
+        for parent in root.iter("dict"):
+            children = list(parent)
+            for i, child in enumerate(children):
+                if child.tag != "key" or i + 1 >= len(children):
+                    continue
+                value_node = children[i + 1]
+                if child.text == "SPINDLE_HOME" and value_node.text:
+                    settings["home"] = value_node.text
+                elif child.text == "SPINDLE_PORT" and value_node.text:
+                    try:
+                        settings["port"] = int(value_node.text)
+                    except ValueError:
+                        pass
+        # ProgramArguments is what launchd actually runs, so it wins on port.
+        for array in root.iter("array"):
+            args = [node.text or "" for node in array if node.tag == "string"]
+            if "--port" in args:
+                idx = args.index("--port")
+                if idx + 1 < len(args):
+                    try:
+                        settings["port"] = int(args[idx + 1])
+                    except ValueError:
+                        pass
+        return settings
+
+    # systemd unit. ExecStart wins on port: it is what the service binds.
+    settings["home"] = _env_from_unit_text(text, "SPINDLE_HOME")
+    env_port = _env_from_unit_text(text, "SPINDLE_PORT")
+    if env_port:
+        try:
+            settings["port"] = int(env_port)
+        except ValueError:
+            pass
+    match = re.search(r"serve\s+--http\s+--port\s+(\d+)", text)
+    if match:
+        settings["port"] = int(match.group(1))
+    return settings
+
+
+def _resolve_service_settings(
+    existing: Path,
+    arg_port: Optional[int],
+    arg_home: Optional[str],
+) -> Tuple[int, Optional[str], list]:
+    """Apply the precedence rule. Returns (port, home, notes to print)."""
+    persisted = _service_settings_from_file(existing)
+    notes = []
+
+    if arg_port is not None:
+        port = arg_port
+    elif persisted["port"] is not None:
+        port = persisted["port"]
+        notes.append(f"Keeping the port {existing.name} already binds: {port} (pass --port to change it)")
+    else:
+        port = DEFAULT_PORT
+
+    if arg_home:
+        home = arg_home
+    elif persisted["home"]:
+        home = persisted["home"]
+        notes.append(f"Keeping the spool store {existing.name} already uses: {home} (pass --home to change it)")
+    else:
+        home = os.environ.get("SPINDLE_HOME")
+
+    return port, home, notes
 
 
 def _port_from_unit(name: str) -> Optional[int]:
@@ -7807,7 +7912,10 @@ def main():
         help="Service name (default: spindle). Use a distinct name to run a second install alongside the first.",
     )
     install_service_parser.add_argument(
-        "--port", type=int, default=DEFAULT_PORT, help=f"Port the service binds (default: {DEFAULT_PORT})"
+        "--port",
+        type=int,
+        default=None,
+        help=f"Port the service binds (default: keep the existing service's port, else {DEFAULT_PORT})",
     )
     install_service_parser.add_argument(
         "--home",
@@ -8247,17 +8355,6 @@ def main():
             else:
                 spindle_path = str(Path.home() / ".local" / "bin" / "spindle")
 
-        # Carry the existing unit's spool store forward when this run does not
-        # name one. Regeneration is built from argv and the ambient environment,
-        # so re-running install-service from a shell without SPINDLE_HOME set —
-        # which is exactly what doctor's own stale-PATH remedy tells you to do —
-        # used to drop the store the service was installed with, silently moving
-        # it onto ~/.spindle and stranding every spool in the old store.
-        inherited_home = _env_from_unit(args.name, "SPINDLE_HOME")
-        service_home = args.home or os.environ.get("SPINDLE_HOME") or inherited_home
-        if service_home and service_home == inherited_home and not (args.home or os.environ.get("SPINDLE_HOME")):
-            print(f"Keeping the spool store already in {args.name}.service: {service_home}")
-
         # The name becomes a filename in the unit/agent directory; `../../x` would
         # write outside it.
         if not _valid_service_name(args.name):
@@ -8293,9 +8390,15 @@ def main():
                     print("Run spindle manually: spindle serve --http")
                 sys.exit(1)
 
-            service_content = _systemd_unit_text(spindle_path, args.port, home=service_home, name=args.name)
             service_dir = _systemd_user_dir()
             service_file = service_dir / f"{args.name}.service"
+
+            # Explicit argument > what this service is already configured with >
+            # default. Read before anything is written.
+            service_port, service_home, notes = _resolve_service_settings(service_file, args.port, args.home)
+            for note in notes:
+                print(note)
+            service_content = _systemd_unit_text(spindle_path, service_port, home=service_home, name=args.name)
 
             unmanaged = service_file.exists() and not _service_file_is_marked(service_file)
             if service_file.exists() and not args.force:
@@ -8320,7 +8423,7 @@ def main():
                 origin = "was not written by spindle" if unmanaged else "is being regenerated"
                 print(f"{service_file} {origin}; backed it up to {backup}")
             service_file.write_text(service_content)
-            print(f"Wrote {service_file} (port {args.port}, spindle {__version__})")
+            print(f"Wrote {service_file} (port {service_port}, spindle {__version__})")
             if service_home:
                 print(f"Spool store baked into the unit: {service_home}")
 
@@ -8340,40 +8443,49 @@ def main():
             print(f"Enabled {args.name} service")
 
             print(f"\nTo start now: spindle start --name {args.name}")
-            print(f"To check status: spindle status --port {args.port}")
-            print(f"To verify the install: spindle doctor --port {args.port}")
+            print(f"To check status: spindle status --port {service_port}")
+            print(f"To verify the install: spindle doctor --name {args.name} --port {service_port}")
 
         elif system == "Darwin":
             label = f"com.{args.name}.server"
-            plist_content = _launchd_plist_text(label, spindle_path, args.port, home=service_home, name=args.name)
             launch_agents = Path.home() / "Library" / "LaunchAgents"
             plist_file = launch_agents / f"{label}.plist"
+
+            # Same precedence rule as the systemd branch, from the same reader.
+            # This branch previously rebuilt the agent from argv alone, so a
+            # reinstall without --port/--home moved it off both.
+            service_port, service_home, notes = _resolve_service_settings(plist_file, args.port, args.home)
+            for note in notes:
+                print(note)
+            plist_content = _launchd_plist_text(label, spindle_path, service_port, home=service_home, name=args.name)
 
             unmanaged = plist_file.exists() and not _service_file_is_marked(plist_file)
             if plist_file.exists() and not args.force:
                 print(f"Plist already exists: {plist_file}")
                 if unmanaged:
                     print("It does not carry spindle's marker, so spindle did not write it (or you edited it).")
-                    print("--force will replace it, keeping a timestamped backup beside it first.")
                     print(f"To leave it alone: spindle install-service --name {args.name}-2 --port <other-port>")
-                else:
-                    print("Use --force to overwrite")
+                print("--force replaces it, keeping a timestamped backup beside it first.")
                 sys.exit(1)
 
             launch_agents.mkdir(parents=True, exist_ok=True)
-            if unmanaged:
+            # Back up EVERY replacement, marked or not, and before the unload —
+            # so a failed load below has something to put back.
+            backup = None
+            if plist_file.exists():
                 backup = _backup_service_file(plist_file)
                 if backup is None:
-                    print(f"Refusing to replace {plist_file}: it is not spindle's and could not be backed up.")
+                    print(f"Refusing to replace {plist_file}: it could not be backed up first.")
                     sys.exit(1)
-                print(f"{plist_file} was not written by spindle; backed it up to {backup}")
+                origin = "was not written by spindle" if unmanaged else "is being regenerated"
+                print(f"{plist_file} {origin}; backed it up to {backup}")
 
             # Unload if already loaded
             if plist_file.exists():
                 subprocess.run(["launchctl", "unload", str(plist_file)], capture_output=True)
 
             plist_file.write_text(plist_content)
-            print(f"Wrote {plist_file} (port {args.port}, spindle {__version__})")
+            print(f"Wrote {plist_file} (port {service_port}, spindle {__version__})")
 
             # Ensure log directory exists
             (Path.home() / ".spindle").mkdir(parents=True, exist_ok=True)
@@ -8385,12 +8497,22 @@ def main():
             if loaded.returncode != 0:
                 print(f"launchctl load failed (exit {loaded.returncode}): {(loaded.stderr or '').strip()}")
                 print(f"Check the plist with: plutil -lint {plist_file}")
+                # The old agent was unloaded and its file overwritten. Put it back
+                # and reload it, so a rejected new plist does not leave the machine
+                # with no service at all.
+                if backup is not None:
+                    try:
+                        shutil.copy2(backup, plist_file)
+                        subprocess.run(["launchctl", "load", str(plist_file)], capture_output=True)
+                        print(f"Restored the previous plist from {backup} and reloaded it.")
+                    except OSError as exc:
+                        print(f"Could not restore the previous plist from {backup}: {exc}")
                 sys.exit(1)
             print("Loaded launchd service")
 
             print("\nService is now running.")
-            print(f"To check status: spindle status --port {args.port}")
-            print(f"To verify the install: spindle doctor --port {args.port}")
+            print(f"To check status: spindle status --port {service_port}")
+            print(f"To verify the install: spindle doctor --name {args.name} --port {service_port}")
             print(f"To stop: launchctl unload {plist_file}")
 
         else:

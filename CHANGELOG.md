@@ -39,10 +39,16 @@ and run alongside another install without confusing the two.
   the command line, so hand-added directives are dropped by `--force` whether or
   not spindle wrote the file; and ownership cannot be inferred anyway, since the
   shape spindle generates is the shape users copy out of `examples/` and edit.
-  It also carries the existing unit's `SPINDLE_HOME` forward when the new
-  invocation does not name one — otherwise re-running it from a shell without
-  `SPINDLE_HOME` (which is what doctor's own stale-PATH remedy tells you to do)
-  moved the service onto `~/.spindle` and stranded every spool in its old store.
+  Regeneration follows one rule on both platforms: an explicit argument beats
+  what the service is already configured with, which beats the default. Without
+  the middle term, re-running `install-service --name X --force` — which is what
+  doctor's own remedies tell you to do — rebuilt the service from the command
+  line alone, moving it off its port onto 8002 (colliding with the default
+  install) and off its spool store onto `~/.spindle`, stranding every spool
+  there. On macOS it also took no backup at all.
+- A launchd agent whose new plist fails to load is restored from its backup and
+  reloaded, rather than leaving the machine with the old agent unloaded and a
+  rejected plist in place.
 - Generated units record `SPINDLE_SERVICE_NAME`, so the `spindle_reload` MCP
   tool restarts the unit its own service was installed as. It hardcoded
   `spindle.service`, so an agent calling it from a second install restarted the

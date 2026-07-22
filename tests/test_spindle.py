@@ -8783,3 +8783,105 @@ class TestSmokeTimeoutIsRejectedNotClamped:
 
     def test_positive_passes(self):
         assert spindle._positive_seconds("240") == 240
+
+
+class TestReinstallPreservesServiceState:
+    """The rule: explicit argument > what the service already is > default.
+
+    The whole-command sequence, on both service formats, because that is what
+    was broken: every prior fix was field-specific (SPINDLE_HOME but not the
+    port) or platform-specific (systemd but not launchd), and each survived
+    review because the tests exercised renderers and readers in isolation
+    rather than "install, then reinstall with the arguments omitted".
+    """
+
+    def _unit(self, tmp_path, port, home=None):
+        path = tmp_path / "svc.service"
+        path.write_text(spindle._systemd_unit_text("/bin/spindle", port, home=home, name="svc"))
+        return path
+
+    def _plist(self, tmp_path, port, home=None):
+        path = tmp_path / "com.svc.server.plist"
+        path.write_text(spindle._launchd_plist_text("com.svc.server", "/bin/spindle", port, home=home, name="svc"))
+        return path
+
+    # --- reading state back out of each format --------------------------------
+
+    def test_reads_a_units_port_and_store(self, tmp_path):
+        settings = spindle._service_settings_from_file(self._unit(tmp_path, 8075, "/srv/store"))
+        assert settings == {"port": 8075, "home": "/srv/store"}
+
+    def test_reads_a_plists_port_and_store(self, tmp_path):
+        settings = spindle._service_settings_from_file(self._plist(tmp_path, 8075, "/srv/store"))
+        assert settings == {"port": 8075, "home": "/srv/store"}
+
+    def test_plist_program_arguments_win_on_port(self, tmp_path):
+        """What launchd actually runs beats a stale environment entry."""
+        path = self._plist(tmp_path, 8075, "/srv/store")
+        path.write_text(
+            path.read_text().replace(
+                "<string>8075</string>\n        <string>PYTHON", "<string>9000</string>\n        <string>PYTHON"
+            )
+        )
+        text = path.read_text().replace(
+            "<string>--port</string>\n        <string>8075</string>",
+            "<string>--port</string>\n        <string>9000</string>",
+        )
+        path.write_text(text)
+        assert spindle._service_settings_from_file(path)["port"] == 9000
+
+    def test_missing_file_yields_no_settings(self, tmp_path):
+        assert spindle._service_settings_from_file(tmp_path / "nope.service") == {"port": None, "home": None}
+
+    def test_unparseable_file_yields_no_settings(self, tmp_path):
+        junk = tmp_path / "junk.plist"
+        junk.write_text("<?xml version='1.0'?><not-closed")
+        assert spindle._service_settings_from_file(junk) == {"port": None, "home": None}
+
+    # --- the precedence rule itself ------------------------------------------
+
+    def test_omitted_arguments_keep_the_existing_port_and_store(self, tmp_path):
+        """`install-service --name X --force` with nothing else must not move it."""
+        for path in (self._unit(tmp_path, 8075, "/srv/store"), self._plist(tmp_path, 8075, "/srv/store")):
+            port, home, notes = spindle._resolve_service_settings(path, None, None)
+            assert (port, home) == (8075, "/srv/store"), path.name
+            assert any("Keeping the port" in n for n in notes)
+            assert any("Keeping the spool store" in n for n in notes)
+
+    def test_explicit_arguments_win(self, tmp_path):
+        for path in (self._unit(tmp_path, 8075, "/srv/store"), self._plist(tmp_path, 8075, "/srv/store")):
+            port, home, _ = spindle._resolve_service_settings(path, 9001, "/other/store")
+            assert (port, home) == (9001, "/other/store"), path.name
+
+    def test_explicit_port_alone_keeps_the_store(self, tmp_path):
+        port, home, _ = spindle._resolve_service_settings(self._unit(tmp_path, 8075, "/srv/store"), 9001, None)
+        assert (port, home) == (9001, "/srv/store")
+
+    def test_first_install_falls_back_to_defaults(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("SPINDLE_HOME", raising=False)
+        port, home, notes = spindle._resolve_service_settings(tmp_path / "new.service", None, None)
+        assert port == spindle.DEFAULT_PORT
+        assert home is None
+        assert notes == []
+
+    def test_environment_supplies_the_store_only_on_a_first_install(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("SPINDLE_HOME", "/from/env")
+        _, fresh_home, _ = spindle._resolve_service_settings(tmp_path / "new.service", None, None)
+        assert fresh_home == "/from/env"
+        # An existing service keeps its own store rather than adopting the shell's.
+        _, kept_home, _ = spindle._resolve_service_settings(self._unit(tmp_path, 8075, "/srv/store"), None, None)
+        assert kept_home == "/srv/store"
+
+    def test_a_round_trip_through_both_renderers_is_stable(self, tmp_path):
+        """Reinstalling repeatedly must not drift the service off its settings."""
+        for maker in (self._unit, self._plist):
+            path = maker(tmp_path, 8075, "/srv/store")
+            for _ in range(3):
+                port, home, _ = spindle._resolve_service_settings(path, None, None)
+                if path.suffix == ".plist":
+                    path.write_text(
+                        spindle._launchd_plist_text("com.svc.server", "/bin/spindle", port, home=home, name="svc")
+                    )
+                else:
+                    path.write_text(spindle._systemd_unit_text("/bin/spindle", port, home=home, name="svc"))
+            assert spindle._service_settings_from_file(path) == {"port": 8075, "home": "/srv/store"}
