@@ -848,6 +848,65 @@ class TestClaudePermissionCommandShape:
         assert cmd[cmd.index("--permission-mode") + 1] == "auto"
         assert "--allowedTools" not in cmd
 
+    def test_expired_shard_fallback_keeps_wrapper_and_replaces_birth_token(self, tmp_path):
+        session_id = "expired-shard-session"
+        original_id = "expired-shard-original"
+        failing_id = "expired-shard-failing"
+        worktree = tmp_path / "worktrees" / "expired-shard"
+        worktree.mkdir(parents=True)
+        shard = {"worktree_path": str(worktree), "branch_name": "shard-expired-shard"}
+        original = {
+            "id": original_id,
+            "status": "complete",
+            "session_id": session_id,
+            "harness": "claude-code",
+            "permission": "careful+shard",
+            "allowed_tools": None,
+            "working_dir": str(worktree),
+            "shard": shard,
+        }
+        failing = {
+            "id": failing_id,
+            "status": "running",
+            "session_id": session_id,
+            "prompt": f"Continue {session_id}: keep going",
+            "working_dir": str(worktree),
+            "shard": shard,
+            "pid": 797979,
+            "process_start_time": "old-birth-token",
+        }
+        wrapped = []
+        spawned = []
+
+        def wrap(cmd, shard_info, cwd, **kwargs):
+            wrapped.append((list(cmd), shard_info, cwd))
+            return ["wrapped-fallback"]
+
+        def spawn(spawn_id, cmd, cwd, env=None):
+            spawned.append((spawn_id, list(cmd), cwd))
+            return 808080
+
+        with patch("spindle.SPINDLE_DIR", tmp_path / "spools"):
+            _write_spool(original_id, original)
+            _write_spool(failing_id, failing)
+            transcript = _get_transcript_path(original_id)
+            transcript.parent.mkdir(parents=True, exist_ok=True)
+            transcript.write_text("prior transcript")
+            with patch("spindle._find_spool_by_session", return_value=original):
+                with patch("spindle._is_pid_alive", return_value=False):
+                    with patch("spindle._is_process_group_alive", return_value=False):
+                        with patch("spindle._codex_bwrap_wrap", side_effect=wrap):
+                            with patch("spindle._spawn_detached", side_effect=spawn):
+                                with patch("spindle._process_start_time", return_value="new-birth-token"):
+                                    assert _handle_expired_session(failing_id, failing) is True
+            saved = _read_spool(failing_id)
+
+        assert wrapped[0][1:] == (shard, str(worktree))
+        assert "--permission-mode" in wrapped[0][0]
+        assert spawned == [(failing_id, ["wrapped-fallback"], str(worktree))]
+        assert saved["pid"] == 808080
+        assert saved["process_start_time"] == "new-birth-token"
+
     def test_expired_session_fallback_refuses_stored_manual_shard(self, tmp_path):
         """Finding C: a stored readonly/manual + shard spool reaching the transcript
         fallback is refused before spawning — it must not launch with bypassPermissions
@@ -6035,6 +6094,45 @@ class TestShardMergeCleanupFailure:
 
         assert active_id in merge_result
         assert active_id in abandon_result
+        cleanup.assert_not_called()
+
+    def test_shared_terminal_warned_group_blocks_merge_and_abandon(self, tmp_path):
+        state_dir = tmp_path / "spools"
+        worktree = tmp_path / "worktrees" / "shared-warned"
+        worktree.mkdir(parents=True)
+        target_id = "shared-warned-target"
+        warned_id = "shared-warned-other"
+        shard = {"worktree_path": str(worktree), "branch_name": "shard-shared-warned"}
+        with patch("spindle.SPINDLE_DIR", state_dir):
+            _write_spool(
+                target_id,
+                {
+                    "id": target_id,
+                    "status": "complete",
+                    "base_branch": "main",
+                    "created_at": datetime.now().isoformat(),
+                    "shard": shard,
+                },
+            )
+            _write_spool(
+                warned_id,
+                {
+                    "id": warned_id,
+                    "status": "complete",
+                    "working_dir": str(tmp_path / "outside"),
+                    "process_group_cleanup_warning": "group survived",
+                    "created_at": datetime.now().isoformat(),
+                    "shard": shard,
+                },
+            )
+            merge = shard_merge.fn if hasattr(shard_merge, "fn") else shard_merge
+            abandon = shard_abandon.fn if hasattr(shard_abandon, "fn") else shard_abandon
+            with patch("spindle._cleanup_shard") as cleanup:
+                merge_result = asyncio.run(merge(target_id, caller_cwd=str(tmp_path / "outside")))
+                abandon_result = asyncio.run(abandon(target_id, caller_cwd=str(tmp_path / "outside")))
+
+        assert warned_id in merge_result
+        assert warned_id in abandon_result
         cleanup.assert_not_called()
 
     def test_merge_blocks_new_process_publication_in_same_worktree(self, tmp_path):

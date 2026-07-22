@@ -2636,11 +2636,28 @@ Continue from above. New message: {spool["prompt"].split(": ", 1)[-1]}"""
         if profile_extra_args:
             cmd.extend(profile_extra_args)
 
+    shard_info = spool.get("shard") or original_spool.get("shard")
+    fallback_cwd = spool.get("working_dir") or (shard_info or {}).get("worktree_path")
+    if shard_info:
+        cmd = _codex_bwrap_wrap(
+            cmd,
+            shard_info,
+            fallback_cwd,
+            process_env=_process_env(spawn_env),
+        )
+
     try:
-        new_pid = _spawn_detached(spool_id, cmd, spool["working_dir"], spawn_env)
+        new_pid = _spawn_detached(spool_id, cmd, fallback_cwd, spawn_env)
 
         # Update spool with new PID and mark as using transcript fallback
         spool["pid"] = new_pid
+        process_start_time = _process_start_time(new_pid)
+        if process_start_time is not None:
+            spool["process_start_time"] = process_start_time
+        else:
+            spool.pop("process_start_time", None)
+        if shard_info:
+            spool["shard"] = shard_info
         spool["used_transcript_fallback"] = True
         spool["transcript_injected_at"] = datetime.now().isoformat()
         _write_spool(spool_id, spool)
@@ -5273,7 +5290,8 @@ def _shard_merge_locked(spool_id: str, keep_branch: bool, caller_cwd: str | None
     # Check if any active spool has working_dir inside this worktree.
     wt_path = Path(worktree_path).resolve()
     for other in _list_spools():
-        if other.get("status") in {"pending", "running"} and other.get("id") != spool_id:
+        other_active = other.get("status") in {"pending", "running"} or bool(other.get("process_group_cleanup_warning"))
+        if other_active and other.get("id") != spool_id:
             if _spool_worktree_path(other) == str(wt_path):
                 return f"Error: Spool {other['id']} is still running in this worktree. Wait for it to complete or use spin_drop() first."
             other_wd = other.get("working_dir", "")
@@ -5429,7 +5447,8 @@ def _shard_abandon_locked(spool_id: str, keep_branch: bool, caller_cwd: str | No
     # Check if any OTHER active spool has working_dir inside this worktree.
     wt_path = Path(worktree_path).resolve()
     for other in _list_spools():
-        if other.get("status") in {"pending", "running"} and other.get("id") != spool_id:
+        other_active = other.get("status") in {"pending", "running"} or bool(other.get("process_group_cleanup_warning"))
+        if other_active and other.get("id") != spool_id:
             if _spool_worktree_path(other) == str(wt_path):
                 return f"Error: Spool {other['id']} is still running in this worktree. Wait for it to complete or use spin_drop() first."
             other_wd = other.get("working_dir", "")
