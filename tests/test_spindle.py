@@ -2931,6 +2931,37 @@ class TestOrphanedLockSweep:
             assert _read_spool("preserved") is not None
             assert _read_spool("ordinary") is None
 
+    def test_explicit_shard_abandon_clears_preservation_marker(self, tmp_path):
+        spool_id = "preserved-abandon"
+        worktree = tmp_path / "worktrees" / "preserved-abandon"
+        worktree.mkdir(parents=True)
+        with patch("spindle.SPINDLE_DIR", tmp_path / "spools"):
+            _write_spool(
+                spool_id,
+                {
+                    "id": spool_id,
+                    "status": "error",
+                    "created_at": datetime.now().isoformat(),
+                    "shard_cleanup_preserved": True,
+                    "shard_cleanup_preserved_reason": "automatic cleanup disabled after agent failure",
+                    "shard": {
+                        "worktree_path": str(worktree),
+                        "branch_name": "shard-preserved-abandon",
+                        "startup_failure_preserved": True,
+                    },
+                },
+            )
+            abandon = shard_abandon.fn if hasattr(shard_abandon, "fn") else shard_abandon
+            with patch("spindle._cleanup_shard", return_value=True):
+                result = asyncio.run(abandon(spool_id, caller_cwd=str(tmp_path / "outside")))
+            saved = _read_spool(spool_id)
+
+        assert result == f"Abandoned shard {spool_id}"
+        assert saved["shard"]["abandoned"] is True
+        assert "startup_failure_preserved" not in saved["shard"]
+        assert "shard_cleanup_preserved" not in saved
+        assert "shard_cleanup_preserved_reason" not in saved
+
 
 class TestProcessUtils:
     """Test process utility functions."""

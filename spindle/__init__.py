@@ -903,6 +903,14 @@ def _preserve_failed_spool_shard(spool: dict) -> bool:
     return True
 
 
+def _clear_preserved_spool_shard(spool: dict) -> None:
+    """Clear recovery markers after an explicit merge or abandon resolves a shard."""
+    spool.pop("shard_cleanup_preserved", None)
+    spool.pop("shard_cleanup_preserved_reason", None)
+    shard_info = spool.get("shard") or {}
+    shard_info.pop("startup_failure_preserved", None)
+
+
 def _get_spool_path(spool_id: str) -> Path:
     """Get path to spool JSON file."""
     return SPINDLE_DIR / f"{spool_id}.json"
@@ -5082,6 +5090,7 @@ async def shard_merge(spool_id: str, keep_branch: bool = False, caller_cwd: str 
         # Update spool record
         spool["shard"]["merged"] = True
         spool["shard"]["merged_at"] = datetime.now().isoformat()
+        _clear_preserved_spool_shard(spool)
         _write_spool(spool_id, spool)
 
         # Auto-close any tender folios for this worktree
@@ -5174,6 +5183,7 @@ async def shard_abandon(spool_id: str, keep_branch: bool = False, caller_cwd: st
     if success:
         spool["shard"]["abandoned"] = True
         spool["shard"]["abandoned_at"] = datetime.now().isoformat()
+        _clear_preserved_spool_shard(spool)
         _write_spool(spool_id, spool)
         return f"Abandoned shard {spool_id}" + (" (branch kept)" if keep_branch else "")
     else:
