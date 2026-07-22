@@ -7518,7 +7518,7 @@ def _service_settings_from_file(path: Path) -> dict:
     from "nothing here could be parsed" — the caller must not claim to be
     keeping a value it never actually read.
     """
-    settings = {"port": None, "home": None, "readable": False, "home_specifier": False}
+    settings = {"port": None, "home": None, "readable": False, "home_specifier": False, "env_file": False}
 
     # launchd: plistlib is the canonical reader. Hand-walking the XML meant not
     # handling launchd's own binary format (plutil -convert binary1 is routine),
@@ -7571,6 +7571,7 @@ def _service_settings_from_file(path: Path) -> dict:
     # systemd unit. ExecStart wins on port: it is what the service binds.
     # Anchored to the ExecStart line, so an ExecStartPre that happens to mention
     # `serve --http --port` cannot supply the port the unit is rewritten with.
+    settings["env_file"] = bool(re.search(r"^\s*EnvironmentFile\s*=", text, re.MULTILINE))
     settings["home"] = _env_from_unit_text(text, "SPINDLE_HOME")
     # A literal percent is written `%%` and a specifier is a bare `%`, but both
     # come back as `%` once unescaped — so the raw text is the only place the
@@ -7726,6 +7727,8 @@ def _resolve_service_settings(
     # edited since — a hand-tuned port, a replaced unit — the record is stale,
     # and regenerating from it would rewrite the service back to settings it is
     # no longer running with, announcing that it "kept" them.
+    if record is not None and not exists:
+        notes.append(f"{existing.name} is gone; recreating it from spindle's record of what it installed.")
     if record is not None and exists:
         if _service_file_digest(existing) != record["service_sha256"]:
             notes.append(f"{existing.name} has been edited since spindle installed it; its record is stale.")
@@ -7735,7 +7738,6 @@ def _resolve_service_settings(
         import shlex
 
         guess = _service_settings_from_file(existing)
-        hint_port = guess["port"] if guess["port"] is not None else _BASE_DEFAULT_PORT
         hint_home = guess["home"]
         # Both flags always appear, because the refusal requires both; a remedy
         # that omits one refuses again when pasted. --home '' asks for the
@@ -7750,7 +7752,15 @@ def _resolve_service_settings(
             home_hint = "<store>"
             caveat = f"\n{existing.name} could not be read at all, so neither value below is a reading of it."
         else:
-            port_hint = str(hint_port)
+            # Per field, not per file. A unit can be perfectly readable and still
+            # hold its port somewhere this reader does not look — `--port=8115`,
+            # a `--host` argument before the port, a value from an
+            # EnvironmentFile. Printing 8002 there is not a reading of the file,
+            # it is the default install's port wearing the file's name, and it
+            # pastes as a command that moves the service onto it.
+            port_hint = str(guess["port"]) if guess["port"] is not None else "<port>"
+            if guess["port"] is None:
+                caveat += f"\n{existing.name} does not state a port anywhere spindle can read; supply the real one."
             if guess.get("home_specifier"):
                 # A systemd specifier resolves against the service's runtime
                 # context, so it cannot be repeated back as a literal path.
@@ -7764,6 +7774,14 @@ def _resolve_service_settings(
                 )
             elif hint_home:
                 home_hint = shlex.quote(hint_home)
+            elif guess.get("env_file"):
+                # SPINDLE_HOME may be coming from that file, so "no store here"
+                # cannot be read as "the default store".
+                home_hint = "<store>"
+                caveat += (
+                    f"\n{existing.name} pulls environment from an EnvironmentFile, which may set the store; "
+                    f"spindle cannot see it. Supply the real one, or '' for the default."
+                )
             else:
                 home_hint = "''"
         hint = f"--port {port_hint} --home {home_hint}"
@@ -8753,7 +8771,7 @@ def main():
                     sys.exit(1)
                 origin = "was not written by spindle" if unmanaged else "is being regenerated"
                 print(f"{service_file} {origin}; backed it up to {backup}")
-            service_file.write_text(service_content)
+            service_file.write_text(service_content, encoding="utf-8")
             print(f"Wrote {service_file} (port {service_port}, spindle {__version__})")
             if service_home:
                 print(f"Spool store baked into the unit: {service_home}")
@@ -8869,7 +8887,7 @@ def main():
             # that fails on a full disk used to leave the machine with no agent,
             # a truncated plist, and a backup nothing would ever mention again.
             try:
-                plist_file.write_text(plist_content)
+                plist_file.write_text(plist_content, encoding="utf-8")
             except OSError as exc:
                 _restore_previous(f"Could not write {plist_file}: {exc}")
                 sys.exit(1)

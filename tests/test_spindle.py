@@ -9303,13 +9303,14 @@ class TestRegenerationUsesTheRecord:
         port, home, _, blocker = spindle._resolve_service_settings(unit, 9001, "/srv/new", name="svc")
         assert (port, home, blocker) == (9001, "/srv/new", None)
 
-    def test_the_hint_does_not_have_to_be_right_to_be_safe(self, config, tmp_path):
-        """A file whose settings the reader cannot make out still blocks, with a plain hint."""
+    def test_a_file_stating_no_port_gets_a_placeholder_not_the_default(self, config, tmp_path):
+        """8002 is not a reading of the file; it is the default install's port."""
         unit = tmp_path / "svc.service"
-        unit.write_text("[Unit]\nDescription=hand written, nothing readable\n")
+        unit.write_text("[Unit]\nDescription=hand written, no port anywhere\n")
         _, _, _, blocker = spindle._resolve_service_settings(unit, None, None, name="svc")
         assert blocker is not None
-        assert f"--port {spindle._BASE_DEFAULT_PORT}" in blocker
+        assert "--port <port>" in blocker
+        assert str(spindle._BASE_DEFAULT_PORT) not in blocker
 
 
 class TestInstallServiceRefusesToGuess:
@@ -9658,3 +9659,87 @@ class TestTheHintIsNeverPasteableWhenItIsNotAReading:
         home = argv[argv.index("--home") + 1]
         p2, h2, _, blocker2 = spindle._resolve_service_settings(unit, port, home, name="svc")
         assert (p2, h2, blocker2) == (8115, "/srv/my store", None)
+
+
+class TestHintNeverInventsAValueItDidNotRead:
+    """A readable file can still hold its settings where this reader cannot see."""
+
+    @pytest.fixture
+    def config(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
+        return tmp_path
+
+    def _blocker(self, unit):
+        return spindle._resolve_service_settings(unit, None, None, name="svc")[3]
+
+    def _command(self, blocker):
+        return [line for line in blocker.splitlines() if "install-service" in line][0]
+
+    def test_a_port_behind_another_flag_is_not_reported_as_8002(self, config, tmp_path):
+        """`--host` between `--http` and `--port` defeats the reader; 8002 is not the answer."""
+        unit = tmp_path / "svc.service"
+        unit.write_text(
+            '[Service]\nEnvironment="SPINDLE_HOME=/srv/store"\n'
+            "ExecStart=/usr/bin/spindle serve --http --host 127.0.0.1 --port 8115\n"
+        )
+        command = self._command(self._blocker(unit))
+        assert "--port <port>" in command
+        assert "8002" not in command
+        assert "/srv/store" in command  # the store WAS read, so it is still offered
+
+    def test_the_equals_form_of_port_likewise(self, config, tmp_path):
+        unit = tmp_path / "svc.service"
+        unit.write_text("[Service]\nExecStart=/usr/bin/spindle serve --http --port=8115\n")
+        assert "--port <port>" in self._command(self._blocker(unit))
+
+    def test_a_plist_without_a_port_argument_likewise(self, config, tmp_path):
+        import plistlib
+
+        path = tmp_path / "com.svc.server.plist"
+        with open(path, "wb") as fh:
+            plistlib.dump({"ProgramArguments": ["/bin/spindle", "serve"]}, fh)
+        assert "--port <port>" in self._command(self._blocker(path))
+
+    def test_an_environmentfile_makes_the_store_unknowable(self, config, tmp_path):
+        """Absent SPINDLE_HOME usually means the default — but not when a file supplies it."""
+        unit = tmp_path / "svc.service"
+        unit.write_text(
+            "[Service]\nEnvironmentFile=/etc/spindle.env\nExecStart=/usr/bin/spindle serve --http --port 8115\n"
+        )
+        blocker = self._blocker(unit)
+        assert "--home <store>" in self._command(blocker)
+        assert "EnvironmentFile" in blocker
+
+    def test_without_an_environmentfile_the_default_store_is_still_offered(self, config, tmp_path):
+        unit = tmp_path / "svc.service"
+        unit.write_text("[Service]\nExecStart=/usr/bin/spindle serve --http --port 8115\n")
+        assert "--home ''" in self._command(self._blocker(unit))
+
+    def test_a_fully_readable_file_still_pastes_back_exactly(self, config, tmp_path):
+        import shlex
+
+        unit = tmp_path / "svc.service"
+        unit.write_text(
+            '[Service]\nEnvironment="SPINDLE_HOME=/srv/store"\nExecStart=/usr/bin/spindle serve --http --port 8115\n'
+        )
+        argv = shlex.split(self._command(self._blocker(unit)))
+        port = int(argv[argv.index("--port") + 1])
+        home = argv[argv.index("--home") + 1]
+        assert spindle._resolve_service_settings(unit, port, home, name="svc")[:2] == (8115, "/srv/store")
+
+
+class TestOrphanedRecordIsAnnounced:
+    @pytest.fixture
+    def config(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
+        monkeypatch.delenv("SPINDLE_HOME", raising=False)
+        return tmp_path
+
+    def test_recreating_a_deleted_service_says_where_the_values_came_from(self, config, tmp_path):
+        unit = tmp_path / "svc.service"
+        unit.write_text("body")
+        spindle._write_service_record("svc", 8115, "/srv/store", unit, "body")
+        unit.unlink()
+        port, home, notes, blocker = spindle._resolve_service_settings(unit, None, None, name="svc")
+        assert (port, home, blocker) == (8115, "/srv/store", None)
+        assert any("recreating it from spindle's record" in n for n in notes)
