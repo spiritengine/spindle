@@ -811,6 +811,7 @@ def _cleanup_shard(
     keep_branch: bool = False,
     spool_id: Optional[str] = None,
     force: bool = True,
+    expected_head: Optional[str] = None,
 ) -> bool:
     """
     Clean up a SHARD worktree.
@@ -822,6 +823,8 @@ def _cleanup_shard(
         spool_id: Optional spool ID for better error logging
         force: Whether Git may remove a dirty worktree. Automatic cleanup must
             pass False so Git performs a final race-resistant dirty check.
+        expected_head: For automatic cleanup, the only branch OID Git may
+            delete. A racing commit makes atomic branch deletion fail closed.
 
     Returns:
         True if successful
@@ -834,6 +837,16 @@ def _cleanup_shard(
 
     worktree_removed = False
     try:
+        if not force:
+            final_status = subprocess.run(
+                ["git", "status", "--porcelain", "--untracked-files=all", "--ignored"],
+                capture_output=True,
+                text=True,
+                cwd=worktree_path,
+                timeout=10,
+            )
+            if final_status.returncode != 0 or final_status.stdout.strip():
+                return False
         # Remove worktree
         remove_cmd = ["git", "worktree", "remove"]
         if force:
@@ -857,9 +870,22 @@ def _cleanup_shard(
 
         # Optionally delete branch
         if not keep_branch and branch_name:
-            result = subprocess.run(
-                ["git", "branch", "-D", branch_name], capture_output=True, text=True, cwd=working_dir, timeout=10
-            )
+            if expected_head:
+                result = subprocess.run(
+                    ["git", "update-ref", "-d", f"refs/heads/{branch_name}", expected_head],
+                    capture_output=True,
+                    text=True,
+                    cwd=working_dir,
+                    timeout=10,
+                )
+            else:
+                result = subprocess.run(
+                    ["git", "branch", "-D", branch_name],
+                    capture_output=True,
+                    text=True,
+                    cwd=working_dir,
+                    timeout=10,
+                )
             if result.returncode != 0:
                 logger.warning(
                     f"Failed to delete branch {branch_name}"
@@ -957,6 +983,31 @@ def _shard_has_other_active_spool(spool_id: str, shard_info: dict) -> bool:
     return False
 
 
+def _shard_cleanup_expected_head(spool: dict) -> Optional[str]:
+    """Return the only branch OID automatic cleanup may delete.
+
+    A pristine shard points at its base branch's current commit. Snapshotting
+    that base OID, rather than the shard branch itself, ensures a commit racing
+    after the pristine check cannot become the deletion target.
+    """
+    worktree_path = (spool.get("shard") or {}).get("worktree_path")
+    if not worktree_path:
+        return None
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", _shard_base_branch(spool)],
+            capture_output=True,
+            text=True,
+            cwd=worktree_path,
+            timeout=10,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return None
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    return result.stdout.strip()
+
+
 def _cleanup_failed_spool_shard(spool: dict) -> bool:
     """Safely reclaim a pristine shard created for a failed spool.
 
@@ -1007,6 +1058,9 @@ def _cleanup_failed_spool_shard(spool: dict) -> bool:
             return False
         if cleanup_state != "pristine":
             return defer("Git cleanup state is uncertain")
+        expected_head = _shard_cleanup_expected_head(spool)
+        if not expected_head:
+            return defer("base branch identity is uncertain")
         # Persist intent before the destructive call. If Spindle dies after Git
         # removes the worktree but before the caller writes the repaired record,
         # startup recovery sees this flag, notices the missing path, and repairs
@@ -1020,6 +1074,7 @@ def _cleanup_failed_spool_shard(spool: dict) -> bool:
             cleanup_dir,
             spool_id=spool.get("id"),
             force=False,
+            expected_head=expected_head,
         ):
             if worktree_path and not Path(worktree_path).exists():
                 return cleaned()
@@ -2450,8 +2505,10 @@ def _handle_expired_session(spool_id: str, spool: dict) -> bool:
 
     # Kill the failing process
     pid = spool.get("pid")
-    if pid and _is_pid_alive(pid):
-        _terminate_process_group(pid, 0.2)
+    if pid and (_is_pid_alive(pid) or _is_process_group_alive(pid)):
+        if not _terminate_process_group(pid, 0.2):
+            logger.error("spindle: cannot retry %s while its old process group remains alive", spool_id)
+            return False
 
     # Read transcript
     try:
@@ -2555,10 +2612,13 @@ def _monitor_spool(spool_id: str) -> None:
             now = datetime.now(timezone.utc) if created.tzinfo else datetime.now()
             elapsed = (now - created).total_seconds()
             if elapsed > spool["timeout"]:
-                # Kill the process
                 pid = spool.get("pid")
-                if pid and _is_pid_alive(pid):
-                    _terminate_process_group(pid, 0.5)
+                group_alive = bool(pid) and (_is_pid_alive(pid) or _is_process_group_alive(pid))
+                if group_alive and not _terminate_process_group(pid, 0.5):
+                    spool["error"] = "Timeout reached; process-group termination still pending"
+                    _write_spool(spool_id, spool)
+                    time.sleep(MONITOR_POLL_INTERVAL)
+                    continue
                 # Mark as timeout
                 spool["status"] = "timeout"
                 spool["error"] = f"Timeout after {spool['timeout']}s"
@@ -5727,7 +5787,8 @@ def _codex_bwrap_wrap(
     Returns the (possibly bwrap-wrapped) command. If bwrap is not available,
     logs a warning and returns codex_cmd unchanged.
     """
-    bwrap_bin = shutil.which("bwrap")
+    effective_env = process_env or os.environ
+    bwrap_bin = shutil.which("bwrap", path=effective_env.get("PATH"))
     if not bwrap_bin:
         print(
             "[Spindle] WARNING: bwrap not available — codex shard isolation is "
@@ -5735,7 +5796,6 @@ def _codex_bwrap_wrap(
         )
         return codex_cmd
 
-    effective_env = process_env or os.environ
     home = effective_env.get("HOME", str(Path.home()))
     worktree_root = shard_info["worktree_path"]
     cmd = [

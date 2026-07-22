@@ -1396,8 +1396,9 @@ class TestCodexResultExtraction:
             )
             _get_output_path(spool_id).write_text(stream)
             with patch("spindle._shard_cleanup_state", return_value="pristine"):
-                with patch("spindle._cleanup_shard", return_value=True) as cleanup:
-                    assert _check_and_finalize_spool(spool_id) is True
+                with patch("spindle._shard_cleanup_expected_head", return_value="base-oid"):
+                    with patch("spindle._cleanup_shard", return_value=True) as cleanup:
+                        assert _check_and_finalize_spool(spool_id) is True
 
             spool = _read_spool(spool_id)
             assert spool["status"] == "error"
@@ -1410,7 +1411,11 @@ class TestCodexResultExtraction:
             cleanup_args, cleanup_kwargs = cleanup.call_args
             assert cleanup_args[0]["worktree_path"] == shard["worktree_path"]
             assert cleanup_args[1] == str(tmp_path / "repo")
-            assert cleanup_kwargs == {"spool_id": spool_id, "force": False}
+            assert cleanup_kwargs == {
+                "spool_id": spool_id,
+                "force": False,
+                "expected_head": "base-oid",
+            }
             assert _get_transcript_path(spool_id).read_text() == stream
 
     def test_finalize_waits_for_process_exit_after_failure_event(self, tmp_path):
@@ -1741,8 +1746,9 @@ class TestCodexResultExtraction:
             with patch("spindle.time.sleep"):
                 with patch("spindle._shard_has_other_active_spool", return_value=False):
                     with patch("spindle._shard_cleanup_state", return_value="pristine"):
-                        with patch("spindle._cleanup_shard", return_value=True) as cleanup:
-                            spindle._monitor_deferred_shard_cleanup(spool_id)
+                        with patch("spindle._shard_cleanup_expected_head", return_value="base-oid"):
+                            with patch("spindle._cleanup_shard", return_value=True) as cleanup:
+                                spindle._monitor_deferred_shard_cleanup(spool_id)
 
             repaired = _read_spool(spool_id)
         cleanup.assert_called_once()
@@ -1802,6 +1808,86 @@ class TestCodexResultExtraction:
         assert late_output.read_text() == "valuable late output\n"
         assert spool["shard_cleanup_pending"] is True
 
+    def test_automatic_cleanup_preserves_ignored_output_created_after_pristine_check(self, tmp_path):
+        repo, worktree = self._git_shard(tmp_path)
+        ignored_output = worktree / "ignored" / "report.md"
+        spool = {
+            "id": "codex-late-ignored-output",
+            "status": "error",
+            "pid": None,
+            "working_dir": str(worktree),
+            "base_branch": "main",
+            "shard": {"worktree_path": str(worktree), "branch_name": "shard-test"},
+            "shard_created_by_spool": True,
+            "shard_source_dir": str(repo),
+        }
+
+        def pristine_then_write(_spool):
+            ignored_output.parent.mkdir()
+            ignored_output.write_text("valuable ignored output\n")
+            return "pristine"
+
+        with patch("spindle.SPINDLE_DIR", tmp_path / "spools"):
+            with patch("spindle._shard_cleanup_state", side_effect=pristine_then_write):
+                assert spindle._cleanup_failed_spool_shard(spool) is False
+
+        assert worktree.exists()
+        assert ignored_output.read_text() == "valuable ignored output\n"
+        assert spool["shard_cleanup_pending"] is True
+
+    def test_automatic_cleanup_preserves_commit_created_after_pristine_check(self, tmp_path):
+        repo, worktree = self._git_shard(tmp_path)
+        spool = {
+            "id": "codex-late-commit",
+            "status": "error",
+            "pid": None,
+            "working_dir": str(worktree),
+            "base_branch": "main",
+            "shard": {"worktree_path": str(worktree), "branch_name": "shard-test"},
+            "shard_created_by_spool": True,
+            "shard_source_dir": str(repo),
+        }
+
+        def pristine_then_commit(_spool):
+            (worktree / "late-commit.txt").write_text("valuable committed work\n")
+            subprocess.run(["git", "-C", str(worktree), "add", "late-commit.txt"], check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(worktree),
+                    "-c",
+                    "user.name=Spindle Test",
+                    "-c",
+                    "user.email=spindle@example.test",
+                    "commit",
+                    "-q",
+                    "-m",
+                    "late work",
+                ],
+                check=True,
+            )
+            return "pristine"
+
+        with patch("spindle.SPINDLE_DIR", tmp_path / "spools"):
+            with patch("spindle._shard_cleanup_state", side_effect=pristine_then_commit):
+                assert spindle._cleanup_failed_spool_shard(spool) is True
+
+        assert not worktree.exists()
+        late_commit = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "shard-test"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        saved = subprocess.run(
+            ["git", "-C", str(repo), "show", f"{late_commit}:late-commit.txt"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        assert saved == "valuable committed work\n"
+
     def test_cleanup_intent_is_persisted_before_removal_and_repairs_after_restart(self, tmp_path):
         worktree = tmp_path / "worktree"
         worktree.mkdir()
@@ -1823,9 +1909,10 @@ class TestCodexResultExtraction:
         with patch("spindle.SPINDLE_DIR", tmp_path / "spools"):
             _write_spool(spool_id, spool)
             with patch("spindle._shard_cleanup_state", return_value="pristine"):
-                with patch("spindle._cleanup_shard", side_effect=remove_then_crash):
-                    with pytest.raises(RuntimeError, match="simulated server crash"):
-                        spindle._cleanup_failed_spool_shard(spool)
+                with patch("spindle._shard_cleanup_expected_head", return_value="base-oid"):
+                    with patch("spindle._cleanup_shard", side_effect=remove_then_crash):
+                        with pytest.raises(RuntimeError, match="simulated server crash"):
+                            spindle._cleanup_failed_spool_shard(spool)
 
             persisted = _read_spool(spool_id)
             assert persisted["shard_cleanup_pending"] is True
@@ -3697,7 +3784,7 @@ class TestGeminiHarness:
             path.mkdir(parents=True)
         shard_info = {"worktree_path": str(worktree), "branch_name": "shard-env"}
 
-        with patch("shutil.which", return_value="/usr/bin/bwrap"):
+        with patch("shutil.which", return_value="/caller/bin/bwrap") as which:
             cmd = _codex_bwrap_wrap(
                 ["/caller/bin/codex", "exec"],
                 shard_info,
@@ -3710,7 +3797,8 @@ class TestGeminiHarness:
             )
 
         binds = {(cmd[index + 1], cmd[index + 2]) for index, item in enumerate(cmd[:-2]) if item == "--bind"}
-        assert cmd[0] == "/usr/bin/bwrap"
+        which.assert_called_once_with("bwrap", path="/caller/bin")
+        assert cmd[0] == "/caller/bin/bwrap"
         assert (str(caller_home / ".config"), str(caller_home / ".config")) in binds
         assert (str(codex_home), str(codex_home)) in binds
         assert (str(host_home / ".codex"), str(host_home / ".codex")) not in binds
@@ -6982,6 +7070,52 @@ class TestReviewTagTimeout:
         assert not pid_alive_after, "process should have been killed by _monitor_spool"
         assert result["status"] == "timeout"
         assert "Timeout" in result["error"]
+
+    def test_monitor_spool_terminates_live_group_after_leader_exits(self, tmp_path):
+        spool_id = "test-timeout-orphan-group"
+        spool = {
+            "id": spool_id,
+            "status": "running",
+            "pid": 424242,
+            "timeout": 1,
+            "created_at": (datetime.now() - timedelta(seconds=5)).isoformat(),
+            "prompt": "test",
+        }
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool(spool_id, spool)
+            with patch("spindle._is_pid_alive", return_value=False):
+                with patch("spindle._is_process_group_alive", return_value=True):
+                    with patch("spindle._terminate_process_group", return_value=True) as terminate:
+                        _monitor_spool(spool_id)
+            result = _read_spool(spool_id)
+
+        terminate.assert_called_once_with(424242, 0.5)
+        assert result["status"] == "timeout"
+
+    def test_monitor_spool_stays_running_while_timeout_group_survives(self, tmp_path):
+        spool_id = "test-timeout-stubborn-group"
+        spool = {
+            "id": spool_id,
+            "status": "running",
+            "pid": 434343,
+            "timeout": 1,
+            "created_at": (datetime.now() - timedelta(seconds=5)).isoformat(),
+            "prompt": "test",
+        }
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool(spool_id, spool)
+            with patch("spindle._is_pid_alive", return_value=False):
+                with patch("spindle._is_process_group_alive", return_value=True):
+                    with patch("spindle._terminate_process_group", return_value=False):
+                        with patch("spindle.time.sleep", side_effect=RuntimeError("stop monitor")):
+                            with pytest.raises(RuntimeError, match="stop monitor"):
+                                _monitor_spool(spool_id)
+            result = _read_spool(spool_id)
+
+        assert result["status"] == "running"
+        assert result["error"] == "Timeout reached; process-group termination still pending"
 
 
 class TestCCBgTasks:
