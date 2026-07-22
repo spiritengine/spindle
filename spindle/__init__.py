@@ -912,6 +912,10 @@ def _clear_preserved_spool_shard(spool: dict) -> None:
     spool.pop("shard_cleanup_pending_reason", None)
     shard_info = spool.get("shard") or {}
     shard_info.pop("startup_failure_preserved", None)
+    shard_info.pop("merge_in_progress", None)
+    shard_info.pop("merge_in_progress_at", None)
+    shard_info.pop("abandon_in_progress", None)
+    shard_info.pop("abandon_in_progress_at", None)
 
 
 def _get_spool_path(spool_id: str) -> Path:
@@ -1540,6 +1544,21 @@ def _prepare_pending_spool_for_spawn(spool: dict) -> bool:
         return False
 
 
+def _record_pre_spawn_failure(spool_id: str, error: str) -> None:
+    """Finalize an unlaunched reservation without deleting a recovery winner."""
+    with _spool_lock(spool_id) as acquired:
+        if not acquired:
+            return
+        current = _read_spool(spool_id)
+        if not current or current.get("status") != "pending":
+            return
+        current["status"] = "error"
+        current["error"] = error
+        current["completed_at"] = datetime.now().isoformat()
+        _preserve_failed_spool_shard(current)
+        _write_spool(spool_id, current)
+
+
 def _publish_spawned_process(spool_id: str, pid: int) -> bool:
     """Atomically move a reserved spool to running or retire its late process."""
     with _spool_lock(spool_id) as acquired:
@@ -1904,6 +1923,28 @@ def _spool_process_identity_matches(spool: dict) -> bool:
     return proc is not None and getattr(proc, "pid", None) == pid
 
 
+def _spool_process_group_is_alive(spool: dict) -> bool:
+    """Whether a spool's recorded leader or any member of its group is alive."""
+    pid = spool.get("pid")
+    return bool(pid) and (_is_pid_alive(pid) or _is_process_group_alive(pid))
+
+
+def _resolve_spool_process_group(spool: dict, grace_seconds: float) -> str:
+    """Safely drain a spool group without ever signaling a reused PID.
+
+    Returns ``gone``, ``terminated``, ``unverifiable``, or ``survived``.
+    Liveness is checked before identity so a warning can be retired after the
+    original group exits. Identity is mandatory immediately before signaling.
+    """
+    if not _spool_process_group_is_alive(spool):
+        return "gone"
+    if not _spool_process_identity_matches(spool):
+        return "unverifiable"
+    if _terminate_process_group(spool["pid"], grace_seconds):
+        return "terminated"
+    return "survived"
+
+
 def _is_pid_alive(pid: int) -> bool:
     """Check if a process is still running (not a zombie)."""
     try:
@@ -2254,9 +2295,17 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
         # usable result and pin a concurrency slot forever.
         group_cleanup_succeeded = True
         if _is_process_group_alive(pid):
-            if not _terminate_process_group(pid, 0.5):
+            group_resolution = _resolve_spool_process_group(spool, 0.5)
+            if group_resolution not in {"gone", "terminated"}:
                 group_cleanup_succeeded = False
-                spool["process_group_cleanup_warning"] = "Process group survived TERM and KILL after agent completion"
+                if group_resolution == "unverifiable":
+                    spool["process_group_cleanup_warning"] = (
+                        "Process group identity could not be verified after agent completion"
+                    )
+                else:
+                    spool["process_group_cleanup_warning"] = (
+                        "Process group survived TERM and KILL after agent completion"
+                    )
             if proc is not None:
                 observed_exit_code = proc.poll()
             process_alive = False
@@ -2586,11 +2635,14 @@ def _handle_expired_session_locked(spool_id: str, spool: dict) -> bool:
         return False
 
     # Kill the failing process
-    pid = spool.get("pid")
-    if pid and (_is_pid_alive(pid) or _is_process_group_alive(pid)):
-        if not _terminate_process_group(pid, 0.2):
-            logger.error("spindle: cannot retry %s while its old process group remains alive", spool_id)
-            return False
+    group_resolution = _resolve_spool_process_group(spool, 0.2)
+    if group_resolution not in {"gone", "terminated"}:
+        logger.error(
+            "spindle: cannot retry %s while its old process group is %s",
+            spool_id,
+            group_resolution,
+        )
+        return False
     _pop_and_reap_process_handle(spool_id)
 
     # Read transcript
@@ -2720,12 +2772,16 @@ def _monitor_spool(spool_id: str) -> None:
                         spool["output_complete_detected_at"] = datetime.now().isoformat()
                         _write_spool(spool_id, spool)
                         continue
-                    pid = spool.get("pid")
-                    group_alive = bool(pid) and (_is_pid_alive(pid) or _is_process_group_alive(pid))
-                    if group_alive and not _terminate_process_group(pid, 0.5):
-                        spool["process_group_cleanup_warning"] = (
-                            "Process group survived TERM and KILL after spool timeout"
-                        )
+                    group_resolution = _resolve_spool_process_group(spool, 0.5)
+                    if group_resolution not in {"gone", "terminated"}:
+                        if group_resolution == "unverifiable":
+                            spool["process_group_cleanup_warning"] = (
+                                "Process group identity could not be verified after spool timeout"
+                            )
+                        else:
+                            spool["process_group_cleanup_warning"] = (
+                                "Process group survived TERM and KILL after spool timeout"
+                            )
                     spool["status"] = "timeout"
                     spool["error"] = f"Timeout after {spool['timeout']}s"
                     spool["completed_at"] = datetime.now().isoformat()
@@ -2919,9 +2975,13 @@ def _spin_sync(
             if shard_info:
                 cwd = shard_info["worktree_path"]
         if shard_info is None:
-            if shard_error:
-                return f"Error: Failed to create SHARD worktree — {shard_error}"
-            return "Error: Failed to create SHARD worktree. Check git repo status."
+            error = (
+                f"Failed to create SHARD worktree — {shard_error}"
+                if shard_error
+                else "Failed to create SHARD worktree. Check git repo status."
+            )
+            _record_pre_spawn_failure(spool_id, error)
+            return f"Error: {error}"
 
     # Inject research guidance and SKEIN context for shard agents (unless skeinless=True)
     effective_prompt = prompt
@@ -3539,12 +3599,16 @@ def _spin_drop_locked(spool_id: str) -> str:
     if not pid:
         return f"Spool {spool_id} has no PID recorded yet"
 
-    group_cleanup_succeeded = _terminate_process_group(pid, 0.5)
+    group_resolution = _resolve_spool_process_group(spool, 0.5)
+    group_cleanup_succeeded = group_resolution in {"gone", "terminated"}
 
     spool["status"] = "error"
     spool["error"] = "Cancelled by user"
     if not group_cleanup_succeeded:
-        spool["process_group_cleanup_warning"] = "Process group survived TERM and KILL after cancellation"
+        if group_resolution == "unverifiable":
+            spool["process_group_cleanup_warning"] = "Process group identity could not be verified after cancellation"
+        else:
+            spool["process_group_cleanup_warning"] = "Process group survived TERM and KILL after cancellation"
     spool["completed_at"] = datetime.now().isoformat()
     _preserve_failed_spool_shard(spool)
     _write_spool(spool_id, spool)
@@ -5295,7 +5359,9 @@ def _shard_merge_locked(spool_id: str, keep_branch: bool, caller_cwd: str | None
     # Check if any active spool has working_dir inside this worktree.
     wt_path = Path(worktree_path).resolve()
     for other in _list_spools():
-        other_active = other.get("status") in {"pending", "running"} or bool(other.get("process_group_cleanup_warning"))
+        other_active = other.get("status") in {"pending", "running"} or (
+            bool(other.get("process_group_cleanup_warning")) and _spool_process_group_is_alive(other)
+        )
         if other_active and other.get("id") != spool_id:
             if _spool_worktree_path(other) == str(wt_path):
                 return f"Error: Spool {other['id']} is still running in this worktree. Wait for it to complete or use spin_drop() first."
@@ -5313,13 +5379,11 @@ def _shard_merge_locked(spool_id: str, keep_branch: bool, caller_cwd: str | None
     # A terminal result can outlive a process group that is still writing into
     # the shard. Resolve that explicit warning before any Git or cleanup work.
     if spool.get("process_group_cleanup_warning"):
-        pid = spool.get("pid")
-        process_alive = bool(pid) and (_is_pid_alive(pid) or _is_process_group_alive(pid))
-        if process_alive:
-            if not _spool_process_identity_matches(spool):
-                return f"Error: Spool {spool_id} has an unverifiable process-group warning; shard preserved"
-            if not _terminate_process_group(pid, 0.5):
-                return f"Error: Could not terminate process group for spool {spool_id}; shard preserved"
+        group_resolution = _resolve_spool_process_group(spool, 0.5)
+        if group_resolution == "unverifiable":
+            return f"Error: Spool {spool_id} has an unverifiable process-group warning; shard preserved"
+        if group_resolution == "survived":
+            return f"Error: Could not terminate process group for spool {spool_id}; shard preserved"
         _pop_and_reap_process_handle(spool_id)
         spool.pop("process_group_cleanup_warning", None)
         _write_spool(spool_id, spool)
@@ -5332,6 +5396,12 @@ def _shard_merge_locked(spool_id: str, keep_branch: bool, caller_cwd: str | None
         if result.stdout.strip():
             return "Error: Shard has uncommitted changes. Commit or discard them first."
 
+        # Persist intent before Git can change the main checkout. A crash during
+        # or immediately after merge must leave a durable recovery clue.
+        spool["shard"]["merge_in_progress"] = True
+        spool["shard"]["merge_in_progress_at"] = datetime.now().isoformat()
+        _write_spool(spool_id, spool)
+
         # Merge branch into the main repo's current HEAD
         result = subprocess.run(
             ["git", "merge", branch_name, "--no-ff", "-m", f"Merge shard {spool_id}: {spool.get('prompt', '')[:50]}"],
@@ -5341,12 +5411,23 @@ def _shard_merge_locked(spool_id: str, keep_branch: bool, caller_cwd: str | None
             timeout=30,
         )
         if result.returncode != 0:
+            spool["shard"].pop("merge_in_progress", None)
+            spool["shard"].pop("merge_in_progress_at", None)
+            _write_spool(spool_id, spool)
             return f"Error: Merge failed: {result.stderr}"
 
-        # Record the successful merge before attempting recoverable worktree
-        # cleanup. A cleanup failure must retain a durable spool handle.
+        # Record the successful merge before attempting destructive worktree
+        # cleanup. A crash or cleanup failure must retain a durable handle.
         spool["shard"]["merged"] = True
         spool["shard"]["merged_at"] = datetime.now().isoformat()
+        spool["shard"].pop("merge_in_progress", None)
+        spool["shard"].pop("merge_in_progress_at", None)
+        cleanup_reason = "merge succeeded; shard worktree cleanup pending"
+        spool["shard_cleanup_pending"] = True
+        spool["shard_cleanup_pending_reason"] = cleanup_reason
+        spool["shard_cleanup_preserved"] = True
+        spool["shard_cleanup_preserved_reason"] = cleanup_reason
+        _write_spool(spool_id, spool)
         cleanup_succeeded = _cleanup_shard(
             shard_info,
             str(main_repo),
@@ -5453,7 +5534,9 @@ def _shard_abandon_locked(spool_id: str, keep_branch: bool, caller_cwd: str | No
     # Check if any OTHER active spool has working_dir inside this worktree.
     wt_path = Path(worktree_path).resolve()
     for other in _list_spools():
-        other_active = other.get("status") in {"pending", "running"} or bool(other.get("process_group_cleanup_warning"))
+        other_active = other.get("status") in {"pending", "running"} or (
+            bool(other.get("process_group_cleanup_warning")) and _spool_process_group_is_alive(other)
+        )
         if other_active and other.get("id") != spool_id:
             if _spool_worktree_path(other) == str(wt_path):
                 return f"Error: Spool {other['id']} is still running in this worktree. Wait for it to complete or use spin_drop() first."
@@ -5472,20 +5555,18 @@ def _shard_abandon_locked(spool_id: str, keep_branch: bool, caller_cwd: str | No
     # unrelated process that later reused that number.
     is_running = spool.get("status") == "running"
     has_cleanup_warning = bool(spool.get("process_group_cleanup_warning"))
-    pid = spool.get("pid")
     if is_running:
-        if not _spool_process_identity_matches(spool):
+        group_resolution = _resolve_spool_process_group(spool, 0.5)
+        if group_resolution == "unverifiable":
             return f"Error: Could not verify process identity for spool {spool_id}; shard preserved"
-        if _is_pid_alive(pid) or _is_process_group_alive(pid):
-            if not _terminate_process_group(pid, 0.5):
-                return f"Error: Could not terminate process group for spool {spool_id}; shard preserved"
+        if group_resolution == "survived":
+            return f"Error: Could not terminate process group for spool {spool_id}; shard preserved"
     elif has_cleanup_warning:
-        process_alive = bool(pid) and (_is_pid_alive(pid) or _is_process_group_alive(pid))
-        if process_alive:
-            if not _spool_process_identity_matches(spool):
-                return f"Error: Could not verify process identity for spool {spool_id}; shard preserved"
-            if not _terminate_process_group(pid, 0.5):
-                return f"Error: Could not terminate process group for spool {spool_id}; shard preserved"
+        group_resolution = _resolve_spool_process_group(spool, 0.5)
+        if group_resolution == "unverifiable":
+            return f"Error: Could not verify process identity for spool {spool_id}; shard preserved"
+        if group_resolution == "survived":
+            return f"Error: Could not terminate process group for spool {spool_id}; shard preserved"
     _pop_and_reap_process_handle(spool_id)
     spool.pop("process_group_cleanup_warning", None)
 
@@ -5493,6 +5574,17 @@ def _shard_abandon_locked(spool_id: str, keep_branch: bool, caller_cwd: str | No
         spool["status"] = "error"
         spool["error"] = "Shard abandoned"
         spool["completed_at"] = datetime.now().isoformat()
+
+    # Persist intent before removing the worktree or branch. If this process
+    # exits inside cleanup, the spool still explains the missing/partial shard.
+    cleanup_reason = "shard abandonment cleanup pending"
+    spool["shard"]["abandon_in_progress"] = True
+    spool["shard"]["abandon_in_progress_at"] = datetime.now().isoformat()
+    spool["shard_cleanup_pending"] = True
+    spool["shard_cleanup_pending_reason"] = cleanup_reason
+    spool["shard_cleanup_preserved"] = True
+    spool["shard_cleanup_preserved_reason"] = cleanup_reason
+    _write_spool(spool_id, spool)
 
     # Cleanup shard
     success = _cleanup_shard(shard_info, str(main_repo), keep_branch=keep_branch, spool_id=spool_id)
@@ -5507,7 +5599,13 @@ def _shard_abandon_locked(spool_id: str, keep_branch: bool, caller_cwd: str | No
         spool["status"] = "error"
         spool["error"] = "Shard abandonment failed during worktree cleanup"
         spool["completed_at"] = datetime.now().isoformat()
-        _preserve_failed_spool_shard(spool)
+        spool["shard"].pop("abandon_in_progress", None)
+        spool["shard"].pop("abandon_in_progress_at", None)
+        reason = "shard abandonment failed during worktree cleanup"
+        spool["shard_cleanup_pending"] = True
+        spool["shard_cleanup_pending_reason"] = reason
+        spool["shard_cleanup_preserved"] = True
+        spool["shard_cleanup_preserved_reason"] = reason
         _write_spool(spool_id, spool)
         return f"Warning: Shard cleanup may have been incomplete for {spool_id}"
 
@@ -6134,12 +6232,13 @@ def _codex_spin_sync(
             if shard_info:
                 cwd = shard_info["worktree_path"]
         if shard_info is None:
-            # Clean up reserved slot
-            spool_path = SPINDLE_DIR / f"{spool_id}.json"
-            spool_path.unlink(missing_ok=True)
-            if shard_error:
-                return f"Error: Failed to create SHARD worktree — {shard_error}"
-            return "Error: Failed to create SHARD worktree. Check git repo status."
+            error = (
+                f"Failed to create SHARD worktree — {shard_error}"
+                if shard_error
+                else "Failed to create SHARD worktree. Check git repo status."
+            )
+            _record_pre_spawn_failure(spool_id, error)
+            return f"Error: {error}"
 
     # Inject shard instructions into prompt
     effective_prompt = prompt
@@ -6708,11 +6807,13 @@ def _gemini_spin_sync(
             if shard_info:
                 cwd = shard_info["worktree_path"]
         if shard_info is None:
-            spool_path = SPINDLE_DIR / f"{spool_id}.json"
-            spool_path.unlink(missing_ok=True)
-            if shard_error:
-                return f"Error: Failed to create SHARD worktree — {shard_error}"
-            return "Error: Failed to create SHARD worktree. Check git repo status."
+            error = (
+                f"Failed to create SHARD worktree — {shard_error}"
+                if shard_error
+                else "Failed to create SHARD worktree. Check git repo status."
+            )
+            _record_pre_spawn_failure(spool_id, error)
+            return f"Error: {error}"
 
     # Resolve model aliases (default to pro if no model specified)
     resolved_model = GEMINI_MODEL_ALIASES.get(model, model) if model else "gemini-2.5-pro"
@@ -6967,11 +7068,13 @@ def _kimi_spin_sync(
             if shard_info:
                 cwd = shard_info["worktree_path"]
         if shard_info is None:
-            spool_path = SPINDLE_DIR / f"{spool_id}.json"
-            spool_path.unlink(missing_ok=True)
-            if shard_error:
-                return f"Error: Failed to create SHARD worktree — {shard_error}"
-            return "Error: Failed to create SHARD worktree. Check git repo status."
+            error = (
+                f"Failed to create SHARD worktree — {shard_error}"
+                if shard_error
+                else "Failed to create SHARD worktree. Check git repo status."
+            )
+            _record_pre_spawn_failure(spool_id, error)
+            return f"Error: {error}"
 
     effective_prompt = prompt
     if research_target_info:
