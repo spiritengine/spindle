@@ -3753,6 +3753,15 @@ async def spin_wait(
                             "remaining": remaining_ids,
                         }
                     )
+                elif spool.get("status") == "timeout":
+                    remaining_ids = [s for s in ids if s != spool_id]
+                    return json.dumps(
+                        {
+                            "spool_id": spool_id,
+                            "error": spool.get("error", "Spool timed out"),
+                            "remaining": remaining_ids,
+                        }
+                    )
 
             if timeout:
                 elapsed = (datetime.now() - start_time).total_seconds()
@@ -3786,6 +3795,9 @@ async def spin_wait(
                     pending.remove(spool_id)
                 elif spool.get("status") == "error":
                     results[spool_id] = f"Error: {spool.get('error')}"
+                    pending.remove(spool_id)
+                elif spool.get("status") == "timeout":
+                    results[spool_id] = f"Error: {spool.get('error', 'Spool timed out')}"
                     pending.remove(spool_id)
 
             if not pending:

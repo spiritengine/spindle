@@ -7117,6 +7117,31 @@ class TestReviewTagTimeout:
         else:
             assert result == {spool_id: "Error: Timeout after 10s"}
 
+    @pytest.mark.parametrize("mode", ["yield", "gather"])
+    def test_public_spin_wait_treats_spool_timeout_status_as_terminal(self, tmp_path, mode):
+        spool_id = f"test-public-spin-wait-timeout-{mode}"
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool(
+                spool_id,
+                {
+                    "id": spool_id,
+                    "status": "timeout",
+                    "error": "Timeout after 10s",
+                    "created_at": datetime.now().isoformat(),
+                },
+            )
+            public_spin_wait = getattr(spindle.spin_wait, "fn", spindle.spin_wait)
+            result = json.loads(asyncio.run(public_spin_wait(spool_id, mode=mode)))
+
+        if mode == "yield":
+            assert result == {
+                "spool_id": spool_id,
+                "error": "Timeout after 10s",
+                "remaining": [],
+            }
+        else:
+            assert result == {spool_id: "Error: Timeout after 10s"}
+
 
 class TestCCBgTasks:
     """Tests for _get_cc_bg_tasks and bg-task surfacing in spool_info/spool_peek."""
