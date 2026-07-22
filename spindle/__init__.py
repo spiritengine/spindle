@@ -907,6 +907,8 @@ def _clear_preserved_spool_shard(spool: dict) -> None:
     """Clear recovery markers after an explicit merge or abandon resolves a shard."""
     spool.pop("shard_cleanup_preserved", None)
     spool.pop("shard_cleanup_preserved_reason", None)
+    spool.pop("shard_cleanup_pending", None)
+    spool.pop("shard_cleanup_pending_reason", None)
     shard_info = spool.get("shard") or {}
     shard_info.pop("startup_failure_preserved", None)
 
@@ -1463,6 +1465,59 @@ def _try_reserve_slot_and_create(spool_id: str, initial_status: str = "pending")
         _write_spool(spool_id, spool)
 
         return True, None
+
+
+def _prepare_pending_spool_for_spawn(spool: dict) -> bool:
+    """Publish launch metadata unless recovery already finalized the reservation."""
+    spool_id = spool["id"]
+    with _spool_lock(spool_id) as acquired:
+        if not acquired:
+            return False
+        current = _read_spool(spool_id)
+        if current and current.get("status") == "pending":
+            _write_spool(spool_id, spool)
+            return True
+
+        # Setup may have created a shard before stale-reservation recovery won.
+        # Attach that recovery information to the terminal record instead of
+        # losing the only durable handle to the worktree.
+        if current and spool.get("shard_created_by_spool"):
+            for key in (
+                "working_dir",
+                "shard",
+                "shard_created_by_spool",
+                "shard_source_dir",
+                "base_branch",
+                "harness",
+            ):
+                if key in spool:
+                    current[key] = spool[key]
+            _preserve_failed_spool_shard(current)
+            _write_spool(spool_id, current)
+        return False
+
+
+def _publish_spawned_process(spool_id: str, pid: int) -> bool:
+    """Atomically move a reserved spool to running or retire its late process."""
+    with _spool_lock(spool_id) as acquired:
+        current = _read_spool(spool_id) if acquired else None
+        if current and current.get("status") == "pending":
+            current["pid"] = pid
+            current["status"] = "running"
+            _write_spool(spool_id, current)
+            return True
+
+        # Recovery or cancellation finalized the reservation while Popen was
+        # starting. Never leave that untracked process running in its shard.
+        cleanup_succeeded = _terminate_process_group(pid, 0.2)
+        _pop_and_reap_process_handle(spool_id)
+        if current is not None and not cleanup_succeeded:
+            current["pid"] = pid
+            current["process_group_cleanup_warning"] = (
+                "Process group survived cleanup after spool startup lost its terminal race"
+            )
+            _write_spool(spool_id, current)
+        return False
 
 
 def _extract_last_json_object(text: str) -> Optional[dict]:
@@ -2928,7 +2983,8 @@ Your task:
         "harness": "claude-code",
     }
 
-    _write_spool(spool_id, spool)
+    if not _prepare_pending_spool_for_spawn(spool):
+        return f"Error: Spool {spool_id} was finalized before process startup completed"
 
     # Spawn detached process (spawn_env carries any profile secrets; never persisted)
     try:
@@ -2942,10 +2998,8 @@ Your task:
         _write_spool(spool_id, spool)
         return f"Error: Failed to spawn process: {e}"
 
-    # Update spool with PID and status
-    spool["pid"] = pid
-    spool["status"] = "running"
-    _write_spool(spool_id, spool)
+    if not _publish_spawned_process(spool_id, pid):
+        return f"Error: Spool {spool_id} was finalized before process startup completed"
 
     # Start background monitor thread (daemon so it won't block shutdown)
     _start_spool_monitor(spool_id)
@@ -3716,14 +3770,14 @@ def _respin_sync(handle: str, prompt: str) -> str:
             "harness": "claude-code",
         }
 
-        _write_spool(spool_id, spool)
+        if not _prepare_pending_spool_for_spawn(spool):
+            return f"Error: Spool {spool_id} was finalized before process startup completed"
 
         # Spawn detached process (spawn_env carries any profile secrets; never persisted)
         pid = _spawn_detached(spool_id, cmd, cwd, spawn_env)
 
-        spool["pid"] = pid
-        spool["status"] = "running"
-        _write_spool(spool_id, spool)
+        if not _publish_spawned_process(spool_id, pid):
+            return f"Error: Spool {spool_id} was finalized before process startup completed"
 
         # Start background monitor
         _start_spool_monitor(spool_id)
@@ -5136,12 +5190,25 @@ async def shard_merge(spool_id: str, keep_branch: bool = False, caller_cwd: str 
         if result.returncode != 0:
             return f"Error: Merge failed: {result.stderr}"
 
-        # Cleanup shard
-        _cleanup_shard(shard_info, str(main_repo), keep_branch=keep_branch, spool_id=spool_id)
-
-        # Update spool record
+        # Record the successful merge before attempting recoverable worktree
+        # cleanup. A cleanup failure must retain a durable spool handle.
         spool["shard"]["merged"] = True
         spool["shard"]["merged_at"] = datetime.now().isoformat()
+        cleanup_succeeded = _cleanup_shard(
+            shard_info,
+            str(main_repo),
+            keep_branch=keep_branch,
+            spool_id=spool_id,
+        )
+        if not cleanup_succeeded:
+            reason = "merge succeeded but shard worktree cleanup failed"
+            spool["shard_cleanup_pending"] = True
+            spool["shard_cleanup_pending_reason"] = reason
+            spool["shard_cleanup_preserved"] = True
+            spool["shard_cleanup_preserved_reason"] = reason
+            _write_spool(spool_id, spool)
+            return f"Warning: Merge succeeded to {base_branch}, but shard cleanup failed for {spool_id}"
+
         _clear_preserved_spool_shard(spool)
         _write_spool(spool_id, spool)
 
@@ -5701,7 +5768,11 @@ def _persist_codex_sandbox_refusal(
         "created_at": now,
         "completed_at": now,
     }
-    _write_spool(spool_id, spool)
+    with _spool_lock(spool_id) as acquired:
+        current = _read_spool(spool_id) if acquired else None
+        if not acquired or (current is not None and current.get("status") != "pending"):
+            return f"Error: Spool {spool_id} was finalized before sandbox refusal was recorded"
+        _write_spool(spool_id, spool)
     return f"Error: {message} (spool {spool_id})"
 
 
@@ -6035,7 +6106,8 @@ Your task:
         "harness": "codex",  # Mark as codex harness
     }
 
-    _write_spool(spool_id, spool)
+    if not _prepare_pending_spool_for_spawn(spool):
+        return f"Error: Spool {spool_id} was finalized before process startup completed"
 
     # Spawn detached process
     try:
@@ -6050,10 +6122,8 @@ Your task:
         _write_spool(spool_id, spool)
         return f"Error: Failed to spawn process: {e}"
 
-    # Update spool with PID and status
-    spool["pid"] = pid
-    spool["status"] = "running"
-    _write_spool(spool_id, spool)
+    if not _publish_spawned_process(spool_id, pid):
+        return f"Error: Spool {spool_id} was finalized before process startup completed"
 
     # Start background monitor thread
     _start_spool_monitor(spool_id)
@@ -6212,7 +6282,8 @@ def _codex_respin_sync(session_id: str, prompt: str) -> str:
         "harness": "codex",
     }
 
-    _write_spool(spool_id, spool)
+    if not _prepare_pending_spool_for_spawn(spool):
+        return f"Error: Spool {spool_id} was finalized before process startup completed"
 
     # Spawn detached process
     try:
@@ -6224,10 +6295,8 @@ def _codex_respin_sync(session_id: str, prompt: str) -> str:
         _write_spool(spool_id, spool)
         return f"Error: Failed to spawn process: {e}"
 
-    # Update spool with PID and status
-    spool["pid"] = pid
-    spool["status"] = "running"
-    _write_spool(spool_id, spool)
+    if not _publish_spawned_process(spool_id, pid):
+        return f"Error: Spool {spool_id} was finalized before process startup completed"
 
     # Start background monitor
     _start_spool_monitor(spool_id)
@@ -6601,7 +6670,8 @@ Your task:
         "harness": "gemini",
     }
 
-    _write_spool(spool_id, spool)
+    if not _prepare_pending_spool_for_spawn(spool):
+        return f"Error: Spool {spool_id} was finalized before process startup completed"
 
     # Spawn detached process
     try:
@@ -6615,10 +6685,8 @@ Your task:
         _write_spool(spool_id, spool)
         return f"Error: Failed to spawn process: {e}"
 
-    # Update spool with PID and status
-    spool["pid"] = pid
-    spool["status"] = "running"
-    _write_spool(spool_id, spool)
+    if not _publish_spawned_process(spool_id, pid):
+        return f"Error: Spool {spool_id} was finalized before process startup completed"
 
     # Start background monitor thread (reuse the standard monitor)
     _start_spool_monitor(spool_id)
@@ -6662,13 +6730,13 @@ def _gemini_respin_sync(session_id: str, prompt: str, original_spool: dict) -> s
         "harness": "gemini",
     }
 
-    _write_spool(spool_id, spool)
+    if not _prepare_pending_spool_for_spawn(spool):
+        return f"Error: Spool {spool_id} was finalized before process startup completed"
 
     pid = _spawn_detached(spool_id, gemini_cmd, working_dir, env)
 
-    spool["pid"] = pid
-    spool["status"] = "running"
-    _write_spool(spool_id, spool)
+    if not _publish_spawned_process(spool_id, pid):
+        return f"Error: Spool {spool_id} was finalized before process startup completed"
 
     _start_spool_monitor(spool_id)
 
@@ -6877,7 +6945,8 @@ Your task:
     }
 
     # Write spool to disk
-    _write_spool(spool_id, spool)
+    if not _prepare_pending_spool_for_spawn(spool):
+        return f"Error: Spool {spool_id} was finalized before process startup completed"
 
     # Spawn the process detached
     try:
@@ -6891,10 +6960,8 @@ Your task:
         _write_spool(spool_id, spool)
         return f"Error: Failed to spawn process: {e}"
 
-    # Update spool with PID and status
-    spool["pid"] = pid
-    spool["status"] = "running"
-    _write_spool(spool_id, spool)
+    if not _publish_spawned_process(spool_id, pid):
+        return f"Error: Spool {spool_id} was finalized before process startup completed"
 
     # Start background monitor thread
     _start_spool_monitor(spool_id)
@@ -6980,15 +7047,14 @@ def _kimi_respin_sync(
     }
 
     # Write spool to disk
-    _write_spool(spool_id, spool)
+    if not _prepare_pending_spool_for_spawn(spool):
+        return f"Error: Spool {spool_id} was finalized before process startup completed"
 
     # Spawn the process detached
     pid = _spawn_detached(spool_id, kimi_cmd, working_dir, original_spool.get("env"))
 
-    # Update spool with PID and status
-    spool["pid"] = pid
-    spool["status"] = "running"
-    _write_spool(spool_id, spool)
+    if not _publish_spawned_process(spool_id, pid):
+        return f"Error: Spool {spool_id} was finalized before process startup completed"
 
     # Start background monitor thread
     _start_spool_monitor(spool_id)

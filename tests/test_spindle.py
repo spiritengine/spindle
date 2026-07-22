@@ -5103,6 +5103,63 @@ class TestRecoverOrphansPending:
             assert lock_attempts == [False]
             assert _read_spool("locked-stale")["shard_cleanup_preserved"] is True
 
+    def test_late_spawn_is_terminated_when_recovery_wins(self, tmp_path):
+        spool_id = "recovered-before-pid"
+        proc = MagicMock()
+        proc.poll.return_value = -15
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool(
+                spool_id,
+                {
+                    "id": spool_id,
+                    "status": "error",
+                    "error": "spawn timeout - never started",
+                    "created_at": datetime.now().isoformat(),
+                },
+            )
+            spindle._PROC_HANDLES[spool_id] = proc
+            with patch("spindle._terminate_process_group", return_value=True) as terminate:
+                assert spindle._publish_spawned_process(spool_id, 737373) is False
+            saved = _read_spool(spool_id)
+
+        terminate.assert_called_once_with(737373, 0.2)
+        proc.poll.assert_called_once_with()
+        assert spool_id not in spindle._PROC_HANDLES
+        assert saved["status"] == "error"
+        assert "pid" not in saved
+
+    def test_setup_does_not_overwrite_recovered_shard_reservation(self, tmp_path):
+        spool_id = "recovered-during-setup"
+        worktree = tmp_path / "worktree"
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool(
+                spool_id,
+                {
+                    "id": spool_id,
+                    "status": "error",
+                    "error": "spawn timeout - never started",
+                    "created_at": datetime.now().isoformat(),
+                },
+            )
+            prepared = spindle._prepare_pending_spool_for_spawn(
+                {
+                    "id": spool_id,
+                    "status": "pending",
+                    "working_dir": str(worktree),
+                    "shard": {"worktree_path": str(worktree)},
+                    "shard_created_by_spool": True,
+                    "shard_source_dir": str(tmp_path),
+                    "harness": "codex",
+                    "created_at": datetime.now().isoformat(),
+                }
+            )
+            saved = _read_spool(spool_id)
+
+        assert prepared is False
+        assert saved["status"] == "error"
+        assert saved["shard_cleanup_preserved"] is True
+        assert saved["shard"]["startup_failure_preserved"] is True
+
     def test_fresh_pending_spool_not_touched(self, tmp_path):
         """Pending spool within timeout should remain pending."""
         with patch("spindle.SPINDLE_DIR", tmp_path):
@@ -5831,6 +5888,47 @@ class TestShardOpsBlockedBySubdirectorySpool:
             f"shard_abandon should refuse when another spool has a subdirectory "
             f"working_dir inside the worktree; got: {result!r}"
         )
+
+
+class TestShardMergeCleanupFailure:
+    def test_successful_merge_preserves_handle_when_worktree_cleanup_fails(self, tmp_path):
+        spool_id = "merge-cleanup-failure"
+        state_dir = tmp_path / "spools"
+        worktree = tmp_path / "worktrees" / "merge-cleanup-failure"
+        worktree.mkdir(parents=True)
+        spool = {
+            "id": spool_id,
+            "status": "complete",
+            "prompt": "merge me",
+            "base_branch": "main",
+            "created_at": (datetime.now() - timedelta(hours=25)).isoformat(),
+            "shard": {
+                "worktree_path": str(worktree),
+                "branch_name": "shard-merge-cleanup-failure",
+                "shard_id": "merge-cleanup-failure",
+            },
+        }
+        clean_status = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+        merged = subprocess.CompletedProcess(args=[], returncode=0, stdout="merged", stderr="")
+        merge = shard_merge.fn if hasattr(shard_merge, "fn") else shard_merge
+
+        with patch("spindle.SPINDLE_DIR", state_dir):
+            _write_spool(spool_id, spool)
+            with patch("spindle.subprocess.run", side_effect=[clean_status, merged]):
+                with patch("spindle._cleanup_shard", return_value=False):
+                    with patch("spindle._close_tender_folios") as close_tenders:
+                        result = asyncio.run(merge(spool_id, caller_cwd=str(tmp_path / "outside")))
+            saved = _read_spool(spool_id)
+
+            spindle._cleanup_old_spools()
+            retained = _read_spool(spool_id)
+
+        assert result == f"Warning: Merge succeeded to main, but shard cleanup failed for {spool_id}"
+        assert saved["shard"]["merged"] is True
+        assert saved["shard_cleanup_pending"] is True
+        assert saved["shard_cleanup_preserved"] is True
+        assert retained is not None
+        close_tenders.assert_not_called()
 
 
 class TestCodexRespinPreservesGitAccess:
