@@ -7401,33 +7401,51 @@ def _service_settings_from_file(path: Path) -> dict:
             root = ET.fromstring(text)
         except Exception:
             return settings
-        # <dict> is a flat key/value sequence: <key>NAME</key><value-element>.
-        for parent in root.iter("dict"):
-            children = list(parent)
+
+        # Read only the top-level dict's own keys. Walking every <dict>/<array>
+        # in the document let a nested dict or an unrelated array override the
+        # real ProgramArguments/EnvironmentVariables on a hand-edited plist, and
+        # a wrong value here gets written back into the regenerated agent —
+        # whereas no value at all safely falls through to the default.
+        top = root.find("dict")
+        if top is None:
+            return settings
+
+        def _value_for(container, key_name):
+            children = list(container)
             for i, child in enumerate(children):
-                if child.tag != "key" or i + 1 >= len(children):
-                    continue
-                value_node = children[i + 1]
-                if child.text == "SPINDLE_HOME" and value_node.text:
-                    settings["home"] = value_node.text
-                elif child.text == "SPINDLE_PORT" and value_node.text:
-                    try:
-                        settings["port"] = int(value_node.text)
-                    except ValueError:
-                        pass
+                if child.tag == "key" and child.text == key_name and i + 1 < len(children):
+                    return children[i + 1]
+            return None
+
+        env = _value_for(top, "EnvironmentVariables")
+        if env is not None and env.tag == "dict":
+            home_node = _value_for(env, "SPINDLE_HOME")
+            if home_node is not None and home_node.text:
+                settings["home"] = home_node.text
+            port_node = _value_for(env, "SPINDLE_PORT")
+            if port_node is not None and port_node.text:
+                try:
+                    settings["port"] = int(port_node.text)
+                except ValueError:
+                    pass
+
         # ProgramArguments is what launchd actually runs, so it wins on port.
-        for array in root.iter("array"):
-            args = [node.text or "" for node in array if node.tag == "string"]
-            if "--port" in args:
-                idx = args.index("--port")
-                if idx + 1 < len(args):
+        program = _value_for(top, "ProgramArguments")
+        if program is not None and program.tag == "array":
+            argv = [node.text or "" for node in program if node.tag == "string"]
+            if "--port" in argv:
+                idx = argv.index("--port")
+                if idx + 1 < len(argv):
                     try:
-                        settings["port"] = int(args[idx + 1])
+                        settings["port"] = int(argv[idx + 1])
                     except ValueError:
                         pass
         return settings
 
     # systemd unit. ExecStart wins on port: it is what the service binds.
+    # Anchored to the ExecStart line, so an ExecStartPre that happens to mention
+    # `serve --http --port` cannot supply the port the unit is rewritten with.
     settings["home"] = _env_from_unit_text(text, "SPINDLE_HOME")
     env_port = _env_from_unit_text(text, "SPINDLE_PORT")
     if env_port:
@@ -7435,7 +7453,7 @@ def _service_settings_from_file(path: Path) -> dict:
             settings["port"] = int(env_port)
         except ValueError:
             pass
-    match = re.search(r"serve\s+--http\s+--port\s+(\d+)", text)
+    match = re.search(r"^ExecStart=.*?serve\s+--http\s+--port\s+(\d+)", text, re.MULTILINE)
     if match:
         settings["port"] = int(match.group(1))
     return settings
@@ -7463,6 +7481,19 @@ def _resolve_service_settings(
     elif persisted["home"]:
         home = persisted["home"]
         notes.append(f"Keeping the spool store {existing.name} already uses: {home} (pass --home to change it)")
+    elif existing.exists():
+        # A service installed without --home has no SPINDLE_HOME line and runs on
+        # the default store. That IS what it is configured with, so reading the
+        # ambient SPINDLE_HOME here would move it — the reported failure, in the
+        # one corner where the setting is expressed by its absence. Whether the
+        # file exists is the signal that separates "already configured" from
+        # "being configured for the first time".
+        home = None
+        if os.environ.get("SPINDLE_HOME"):
+            notes.append(
+                f"Keeping the default spool store {existing.name} already uses "
+                f"(ignoring SPINDLE_HOME in this shell; pass --home to change it)"
+            )
     else:
         home = os.environ.get("SPINDLE_HOME")
 
@@ -8503,10 +8534,23 @@ def main():
                 if backup is not None:
                     try:
                         shutil.copy2(backup, plist_file)
-                        subprocess.run(["launchctl", "load", str(plist_file)], capture_output=True)
-                        print(f"Restored the previous plist from {backup} and reloaded it.")
                     except OSError as exc:
                         print(f"Could not restore the previous plist from {backup}: {exc}")
+                    else:
+                        # Check this reload too. Claiming the old agent is back
+                        # when it is not leaves the machine with no service and
+                        # the operator with no reason to look.
+                        reloaded = subprocess.run(
+                            ["launchctl", "load", str(plist_file)], capture_output=True, text=True
+                        )
+                        if reloaded.returncode == 0:
+                            print(f"Restored the previous plist from {backup} and reloaded it.")
+                        else:
+                            print(
+                                f"Restored the previous plist from {backup}, but reloading it also failed "
+                                f"(exit {reloaded.returncode}): {(reloaded.stderr or '').strip()}. "
+                                f"No agent is loaded; run: launchctl load {plist_file}"
+                            )
                 sys.exit(1)
             print("Loaded launchd service")
 

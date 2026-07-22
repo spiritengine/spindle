@@ -8885,3 +8885,144 @@ class TestReinstallPreservesServiceState:
                 else:
                     path.write_text(spindle._systemd_unit_text("/bin/spindle", port, home=home, name="svc"))
             assert spindle._service_settings_from_file(path) == {"port": 8075, "home": "/srv/store"}
+
+
+class TestInstallServiceEndToEnd:
+    """Drive `install-service` through main(), on both platforms.
+
+    The resolver could be perfectly correct and simply not wired into a branch —
+    which is exactly the defect this replaced, and it passed every test because
+    the tests called the resolver directly. These call the command.
+    """
+
+    @pytest.fixture
+    def home(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(spindle.Path, "home", staticmethod(lambda: tmp_path))
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
+        monkeypatch.delenv("SPINDLE_HOME", raising=False)
+        (tmp_path / "bin").mkdir()
+        (tmp_path / "bin" / "spindle").write_text("#!/bin/sh\n")
+        return tmp_path
+
+    def _run(self, argv, monkeypatch, system="Linux", env=None):
+        """Run install-service with the OS and every subprocess call stubbed."""
+        import platform as platform_mod
+
+        monkeypatch.setattr(platform_mod, "system", lambda: system)
+        monkeypatch.setattr(spindle.subprocess, "run", lambda *a, **k: MagicMock(returncode=0, stdout="", stderr=""))
+        for key, value in (env or {}).items():
+            monkeypatch.setenv(key, value)
+        with patch.object(spindle.sys, "argv", ["spindle", "install-service", *argv]):
+            with pytest.raises(SystemExit) as exc:
+                spindle.main()
+        return exc.value.code
+
+    def _unit(self, home):
+        return home / ".config" / "systemd" / "user" / "svc.service"
+
+    def _plist(self, home):
+        return home / "Library" / "LaunchAgents" / "com.svc.server.plist"
+
+    # --- systemd -------------------------------------------------------------
+
+    def test_reinstall_without_arguments_keeps_port_and_store(self, home, monkeypatch, capsys):
+        assert self._run(["--name", "svc", "--port", "8075", "--home", "/srv/store"], monkeypatch) == 0
+        capsys.readouterr()
+        assert self._run(["--name", "svc", "--force"], monkeypatch) == 0
+        assert spindle._service_settings_from_file(self._unit(home)) == {"port": 8075, "home": "/srv/store"}
+        assert "Keeping the port" in capsys.readouterr().out
+
+    def test_ambient_spindle_home_does_not_move_an_existing_service(self, home, monkeypatch, capsys):
+        """The default-store corner: absence of a home line IS its configuration."""
+        assert self._run(["--name", "svc", "--port", "8075"], monkeypatch) == 0
+        capsys.readouterr()
+        assert self._run(["--name", "svc", "--force"], monkeypatch, env={"SPINDLE_HOME": "/srv/other"}) == 0
+        assert spindle._service_settings_from_file(self._unit(home))["home"] is None
+        assert "SPINDLE_HOME" not in self._unit(home).read_text()
+        assert "ignoring SPINDLE_HOME" in capsys.readouterr().out
+
+    def test_ambient_spindle_home_still_applies_on_a_first_install(self, home, monkeypatch):
+        assert self._run(["--name", "svc", "--port", "8075"], monkeypatch, env={"SPINDLE_HOME": "/srv/env"}) == 0
+        assert spindle._service_settings_from_file(self._unit(home))["home"] == "/srv/env"
+
+    def test_explicit_arguments_still_win_on_reinstall(self, home, monkeypatch):
+        assert self._run(["--name", "svc", "--port", "8075", "--home", "/srv/store"], monkeypatch) == 0
+        assert self._run(["--name", "svc", "--port", "9001", "--home", "/srv/new", "--force"], monkeypatch) == 0
+        assert spindle._service_settings_from_file(self._unit(home)) == {"port": 9001, "home": "/srv/new"}
+
+    def test_reinstall_backs_the_previous_unit_up(self, home, monkeypatch):
+        assert self._run(["--name", "svc", "--port", "8075"], monkeypatch) == 0
+        assert self._run(["--name", "svc", "--force"], monkeypatch) == 0
+        backups = list(self._unit(home).parent.glob("svc.service.bak-*"))
+        assert len(backups) == 1
+        assert "8075" in backups[0].read_text()
+
+    def test_existing_unit_without_force_is_refused(self, home, monkeypatch):
+        assert self._run(["--name", "svc", "--port", "8075"], monkeypatch) == 0
+        assert self._run(["--name", "svc"], monkeypatch) == 1
+
+    # --- launchd -------------------------------------------------------------
+
+    def test_darwin_reinstall_without_arguments_keeps_port_and_store(self, home, monkeypatch, capsys):
+        assert self._run(["--name", "svc", "--port", "8075", "--home", "/srv/store"], monkeypatch, "Darwin") == 0
+        capsys.readouterr()
+        assert self._run(["--name", "svc", "--force"], monkeypatch, "Darwin") == 0
+        assert spindle._service_settings_from_file(self._plist(home)) == {"port": 8075, "home": "/srv/store"}
+        assert "Keeping the port" in capsys.readouterr().out
+
+    def test_darwin_reinstall_backs_up_a_marked_plist(self, home, monkeypatch):
+        """macOS backed up only unmarked files, so its own agents were replaced blind."""
+        assert self._run(["--name", "svc", "--port", "8075"], monkeypatch, "Darwin") == 0
+        assert self._run(["--name", "svc", "--force"], monkeypatch, "Darwin") == 0
+        backups = list(self._plist(home).parent.glob("com.svc.server.plist.bak-*"))
+        assert len(backups) == 1
+        assert "8075" in backups[0].read_text()
+
+    def test_darwin_ambient_home_does_not_move_an_existing_agent(self, home, monkeypatch):
+        assert self._run(["--name", "svc", "--port", "8075"], monkeypatch, "Darwin") == 0
+        assert self._run(["--name", "svc", "--force"], monkeypatch, "Darwin", env={"SPINDLE_HOME": "/srv/other"}) == 0
+        assert spindle._service_settings_from_file(self._plist(home))["home"] is None
+
+    def test_darwin_plist_stays_valid_xml_through_a_reinstall(self, home, monkeypatch):
+        import xml.etree.ElementTree as ET
+
+        assert self._run(["--name", "svc", "--port", "8075", "--home", "/srv/A&B"], monkeypatch, "Darwin") == 0
+        assert self._run(["--name", "svc", "--force"], monkeypatch, "Darwin") == 0
+        ET.parse(self._plist(home))
+        assert spindle._service_settings_from_file(self._plist(home))["home"] == "/srv/A&B"
+
+
+class TestServiceFileScanRobustness:
+    """A wrong read gets written back into the service; a missing read is safe."""
+
+    def test_execstartpre_cannot_supply_the_port(self, tmp_path):
+        unit = tmp_path / "svc.service"
+        unit.write_text(
+            "[Service]\n"
+            "ExecStartPre=/bin/echo serve --http --port 9999\n"
+            "ExecStart=/bin/spindle serve --http --port 8075\n"
+        )
+        assert spindle._service_settings_from_file(unit)["port"] == 8075
+
+    def test_a_nested_dict_cannot_override_the_real_environment(self, tmp_path):
+        plist = tmp_path / "com.svc.server.plist"
+        plist.write_text(
+            '<?xml version="1.0"?>\n<plist version="1.0"><dict>\n'
+            "<key>EnvironmentVariables</key><dict>"
+            "<key>SPINDLE_HOME</key><string>/real/store</string></dict>\n"
+            "<key>SomethingElse</key><dict>"
+            "<key>SPINDLE_HOME</key><string>/decoy</string></dict>\n"
+            "</dict></plist>\n"
+        )
+        assert spindle._service_settings_from_file(plist)["home"] == "/real/store"
+
+    def test_an_unrelated_array_cannot_supply_the_port(self, tmp_path):
+        plist = tmp_path / "com.svc.server.plist"
+        plist.write_text(
+            '<?xml version="1.0"?>\n<plist version="1.0"><dict>\n'
+            "<key>ProgramArguments</key><array>"
+            "<string>/bin/spindle</string><string>--port</string><string>8075</string></array>\n"
+            "<key>WatchPaths</key><array><string>--port</string><string>9999</string></array>\n"
+            "</dict></plist>\n"
+        )
+        assert spindle._service_settings_from_file(plist)["port"] == 8075
