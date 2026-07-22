@@ -1578,7 +1578,11 @@ def _publish_spawned_process(spool_id: str, pid: int) -> bool:
         # Recovery or cancellation finalized the reservation while Popen was
         # starting. Never leave that untracked process running in its shard.
         process_start_time = _process_start_time(pid)
-        cleanup_succeeded = _terminate_process_group(pid, 0.2)
+        spawned_process = {"id": spool_id, "pid": pid}
+        if process_start_time is not None:
+            spawned_process["process_start_time"] = process_start_time
+        group_resolution = _resolve_spool_process_group(spawned_process, 0.2)
+        cleanup_succeeded = group_resolution in {"gone", "terminated"}
         _pop_and_reap_process_handle(spool_id)
         if current is not None and not cleanup_succeeded:
             current["pid"] = pid
@@ -5602,6 +5606,33 @@ def _shard_abandon_locked(spool_id: str, keep_branch: bool, caller_cwd: str | No
 
     # Find the main repo path
     main_repo = Path(worktree_path).parent.parent
+
+    # Abandoning the shard cannot repair a conflicted or crash-interrupted
+    # merge in the main checkout. Keep the recovery record until Git proves
+    # that checkout is clean and no merge remains in progress.
+    merge_recovery_pending = bool(shard_info.get("merge_in_progress") or shard_info.get("merge_failed"))
+    if merge_recovery_pending:
+        try:
+            main_status = subprocess.run(
+                ["git", "status", "--porcelain"],
+                capture_output=True,
+                text=True,
+                cwd=str(main_repo),
+                timeout=10,
+            )
+            merge_head = subprocess.run(
+                ["git", "rev-parse", "-q", "--verify", "MERGE_HEAD"],
+                capture_output=True,
+                text=True,
+                cwd=str(main_repo),
+                timeout=10,
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
+            return f"Error: Could not verify main-checkout merge recovery for spool {spool_id}: {exc}"
+        if main_status.returncode != 0 or merge_head.returncode not in {0, 1}:
+            return f"Error: Could not verify main-checkout merge recovery for spool {spool_id}; shard preserved"
+        if main_status.stdout.strip() or merge_head.returncode == 0:
+            return f"Error: Spool {spool_id} has unresolved main-checkout merge recovery; shard preserved"
 
     # Signal only a process whose birth identity still matches this spool. A
     # preserved terminal record can outlive its PID and must never kill the

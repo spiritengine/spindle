@@ -5424,6 +5424,7 @@ class TestRecoverOrphansPending:
     def test_late_spawn_is_terminated_when_recovery_wins(self, tmp_path):
         spool_id = "recovered-before-pid"
         proc = MagicMock()
+        proc.pid = 737373
         proc.poll.return_value = -15
         with patch("spindle.SPINDLE_DIR", tmp_path):
             _write_spool(
@@ -5436,11 +5437,15 @@ class TestRecoverOrphansPending:
                 },
             )
             spindle._PROC_HANDLES[spool_id] = proc
-            with patch("spindle._terminate_process_group", return_value=True) as terminate:
-                assert spindle._publish_spawned_process(spool_id, 737373) is False
+            with patch("spindle._spool_process_group_is_alive", return_value=True):
+                with patch("spindle._spool_process_group_identity_matches", return_value=True):
+                    with patch("spindle._terminate_process_group", return_value=True) as terminate:
+                        assert spindle._publish_spawned_process(spool_id, 737373) is False
             saved = _read_spool(spool_id)
 
-        terminate.assert_called_once_with(737373, 0.2)
+        terminate.assert_called_once()
+        assert terminate.call_args.args == (737373, 0.2)
+        assert callable(terminate.call_args.kwargs["identity_check"])
         proc.poll.assert_called_once_with()
         assert spool_id not in spindle._PROC_HANDLES
         assert saved["status"] == "error"
@@ -5460,8 +5465,10 @@ class TestRecoverOrphansPending:
                 },
             )
             with patch("spindle._process_start_time", return_value="new-birth-token"):
-                with patch("spindle._terminate_process_group", return_value=False):
-                    assert spindle._publish_spawned_process(spool_id, 747474) is False
+                with patch("spindle._spool_process_group_is_alive", return_value=True):
+                    with patch("spindle._spool_process_group_identity_matches", return_value=True):
+                        with patch("spindle._terminate_process_group", return_value=False):
+                            assert spindle._publish_spawned_process(spool_id, 747474) is False
             saved = _read_spool(spool_id)
 
         assert saved["pid"] == 747474
@@ -6763,6 +6770,7 @@ class TestShardMergeCleanupFailure:
             stderr="Automatic merge failed; fix conflicts and commit the result.\n",
         )
         merge = shard_merge.fn if hasattr(shard_merge, "fn") else shard_merge
+        abandon = shard_abandon.fn if hasattr(shard_abandon, "fn") else shard_abandon
 
         with patch("spindle.SPINDLE_DIR", state_dir):
             _write_spool(spool_id, spool)
@@ -6770,6 +6778,12 @@ class TestShardMergeCleanupFailure:
                 with patch("spindle._cleanup_shard") as cleanup:
                     result = asyncio.run(merge(spool_id, caller_cwd=str(tmp_path / "outside")))
             saved = _read_spool(spool_id)
+            dirty_main = subprocess.CompletedProcess(args=[], returncode=0, stdout="UU file.py\n", stderr="")
+            merge_head = subprocess.CompletedProcess(args=[], returncode=0, stdout="abc123\n", stderr="")
+            with patch("spindle.subprocess.run", side_effect=[dirty_main, merge_head]):
+                with patch("spindle._cleanup_shard") as abandon_cleanup:
+                    abandon_result = asyncio.run(abandon(spool_id, caller_cwd=str(tmp_path / "outside")))
+            after_abandon_attempt = _read_spool(spool_id)
             spindle._cleanup_old_spools()
             retained = _read_spool(spool_id)
 
@@ -6777,8 +6791,14 @@ class TestShardMergeCleanupFailure:
         assert saved["shard"]["merge_failed"] is True
         assert "Automatic merge failed" in saved["shard"]["merge_error"]
         assert saved["shard_cleanup_preserved"] is True
+        assert abandon_result == (
+            f"Error: Spool {spool_id} has unresolved main-checkout merge recovery; shard preserved"
+        )
+        assert after_abandon_attempt["shard"]["merge_failed"] is True
+        assert after_abandon_attempt["shard_cleanup_preserved"] is True
         assert retained is not None
         cleanup.assert_not_called()
+        abandon_cleanup.assert_not_called()
 
     def test_successful_merge_preserves_handle_when_worktree_cleanup_fails(self, tmp_path):
         spool_id = "merge-cleanup-failure"
