@@ -5891,6 +5891,140 @@ class TestShardOpsBlockedBySubdirectorySpool:
 
 
 class TestShardMergeCleanupFailure:
+    def test_merge_blocks_new_process_publication_in_same_worktree(self, tmp_path):
+        state_dir = tmp_path / "spools"
+        worktree = tmp_path / "worktrees" / "shared-launch"
+        worktree.mkdir(parents=True)
+        merge_id = "merge-owner"
+        launch_id = "late-launch"
+        merge_spool = {
+            "id": merge_id,
+            "status": "complete",
+            "prompt": "merge",
+            "base_branch": "main",
+            "created_at": datetime.now().isoformat(),
+            "shard": {"worktree_path": str(worktree), "branch_name": "shard-shared-launch"},
+        }
+        launch_spool = {
+            "id": launch_id,
+            "status": "pending",
+            "working_dir": str(worktree),
+            "created_at": datetime.now().isoformat(),
+            "shard": {"worktree_path": str(worktree), "branch_name": "shard-shared-launch"},
+            "harness": "codex",
+        }
+        merge_entered = threading.Event()
+        release_merge = threading.Event()
+        process_spawned = threading.Event()
+        merge_results = []
+        launch_results = []
+
+        def git_run(*args, **kwargs):
+            if not merge_entered.is_set():
+                merge_entered.set()
+                assert release_merge.wait(timeout=5)
+            return subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+
+        def spawn(*args, **kwargs):
+            process_spawned.set()
+            return 757575
+
+        merge = shard_merge.fn if hasattr(shard_merge, "fn") else shard_merge
+        with patch("spindle.SPINDLE_DIR", state_dir):
+            _write_spool(merge_id, merge_spool)
+            _write_spool(launch_id, {"id": launch_id, "status": "pending", "created_at": datetime.now().isoformat()})
+            with patch("spindle.subprocess.run", side_effect=git_run):
+                with patch("spindle._cleanup_shard", return_value=True):
+                    with patch("spindle._close_tender_folios", return_value=None):
+                        with patch("spindle._spawn_detached", side_effect=spawn):
+                            merge_thread = threading.Thread(
+                                target=lambda: merge_results.append(
+                                    asyncio.run(merge(merge_id, caller_cwd=str(tmp_path / "outside")))
+                                )
+                            )
+                            merge_thread.start()
+                            assert merge_entered.wait(timeout=5)
+
+                            launch_thread = threading.Thread(
+                                target=lambda: launch_results.append(
+                                    spindle._start_spool_process(launch_spool, ["codex"], str(worktree), None)
+                                )
+                            )
+                            launch_thread.start()
+                            assert not process_spawned.wait(timeout=0.2)
+
+                            release_merge.set()
+                            merge_thread.join(timeout=5)
+                            launch_thread.join(timeout=5)
+            launched = _read_spool(launch_id)
+
+        assert not merge_thread.is_alive()
+        assert not launch_thread.is_alive()
+        assert merge_results == [f"Successfully merged shard {merge_id} to main"]
+        assert launch_results == [None]
+        assert launched["status"] == "running"
+        assert launched["pid"] == 757575
+
+    def test_different_spool_handles_serialize_operations_on_shared_worktree(self, tmp_path):
+        state_dir = tmp_path / "spools"
+        worktree = tmp_path / "worktrees" / "shared-operations"
+        worktree.mkdir(parents=True)
+        merge_id = "shared-merge"
+        abandon_id = "shared-abandon"
+        base_spool = {
+            "status": "complete",
+            "prompt": "resolve shared shard",
+            "base_branch": "main",
+            "created_at": datetime.now().isoformat(),
+            "shard": {"worktree_path": str(worktree), "branch_name": "shard-shared-operations"},
+        }
+        merge_entered = threading.Event()
+        release_merge = threading.Event()
+        abandon_finished = threading.Event()
+        cleanup_calls = []
+
+        def git_run(*args, **kwargs):
+            if not merge_entered.is_set():
+                merge_entered.set()
+                assert release_merge.wait(timeout=5)
+            return subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+
+        def cleanup(*args, **kwargs):
+            cleanup_calls.append(kwargs["spool_id"])
+            return True
+
+        merge = shard_merge.fn if hasattr(shard_merge, "fn") else shard_merge
+        abandon = shard_abandon.fn if hasattr(shard_abandon, "fn") else shard_abandon
+        with patch("spindle.SPINDLE_DIR", state_dir):
+            _write_spool(merge_id, {"id": merge_id, **base_spool})
+            _write_spool(abandon_id, {"id": abandon_id, **base_spool})
+            with patch("spindle.subprocess.run", side_effect=git_run):
+                with patch("spindle._cleanup_shard", side_effect=cleanup):
+                    with patch("spindle._close_tender_folios", return_value=None):
+                        merge_thread = threading.Thread(
+                            target=lambda: asyncio.run(merge(merge_id, caller_cwd=str(tmp_path / "outside")))
+                        )
+                        merge_thread.start()
+                        assert merge_entered.wait(timeout=5)
+
+                        abandon_thread = threading.Thread(
+                            target=lambda: (
+                                asyncio.run(abandon(abandon_id, caller_cwd=str(tmp_path / "outside"))),
+                                abandon_finished.set(),
+                            )
+                        )
+                        abandon_thread.start()
+                        assert not abandon_finished.wait(timeout=0.2)
+                        assert cleanup_calls == []
+
+                        release_merge.set()
+                        merge_thread.join(timeout=5)
+                        abandon_thread.join(timeout=5)
+
+        assert not merge_thread.is_alive()
+        assert not abandon_thread.is_alive()
+        assert cleanup_calls == [merge_id, abandon_id]
+
     def test_pending_target_cannot_be_merged_or_abandoned(self, tmp_path):
         spool_id = "pending-shard-operation"
         state_dir = tmp_path / "spools"

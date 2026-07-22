@@ -13,6 +13,7 @@ A background thread monitors completion by polling the PID.
 
 import asyncio
 import fcntl
+import hashlib
 import json
 import logging
 import os
@@ -1019,6 +1020,48 @@ def _spool_lock(spool_id: str, blocking: bool = True) -> Generator[bool, None, N
             os.close(lock_fd)
 
 
+def _canonical_worktree_path(worktree_path: Optional[str]) -> Optional[str]:
+    """Return the stable lock key for a shard worktree path."""
+    if not worktree_path:
+        return None
+    return str(Path(worktree_path).resolve())
+
+
+def _spool_worktree_path(spool: Optional[dict]) -> Optional[str]:
+    """Read a canonical shard worktree path from a spool record."""
+    shard = (spool or {}).get("shard") or {}
+    return _canonical_worktree_path(shard.get("worktree_path"))
+
+
+@contextmanager
+def _worktree_lock(worktree_path: Optional[str], blocking: bool = True) -> Generator[bool, None, None]:
+    """Serialize launch and destructive operations that share a shard worktree."""
+    canonical = _canonical_worktree_path(worktree_path)
+    if canonical is None:
+        yield True
+        return
+
+    digest = hashlib.sha256(canonical.encode()).hexdigest()
+    lock_path = SPINDLE_DIR / ".worktree-locks" / f"{digest}.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_fd = None
+    acquired = False
+    try:
+        lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR)
+        try:
+            flags = fcntl.LOCK_EX if blocking else fcntl.LOCK_EX | fcntl.LOCK_NB
+            fcntl.flock(lock_fd, flags)
+            acquired = True
+        except BlockingIOError:
+            acquired = False
+        yield acquired
+    finally:
+        if lock_fd is not None:
+            if acquired:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+
+
 def _list_spools() -> list[dict]:
     """List all spool files."""
     if not SPINDLE_DIR.exists():
@@ -1518,6 +1561,32 @@ def _publish_spawned_process(spool_id: str, pid: int) -> bool:
             )
             _write_spool(spool_id, current)
         return False
+
+
+def _start_spool_process(spool: dict, cmd: list, cwd: str, env: Optional[Dict[str, str]]) -> Optional[str]:
+    """Prepare, spawn, and publish a process while its shard worktree is locked."""
+    spool_id = spool["id"]
+    worktree_path = _spool_worktree_path(spool)
+    with _worktree_lock(worktree_path) as acquired:
+        if not acquired:
+            return f"Error: Could not lock shard worktree for spool {spool_id} startup"
+        if not _prepare_pending_spool_for_spawn(spool):
+            return f"Error: Spool {spool_id} was finalized before process startup completed"
+        try:
+            pid = _spawn_detached(spool_id, cmd, cwd, env)
+        except Exception as exc:
+            with _spool_lock(spool_id) as spool_acquired:
+                current = _read_spool(spool_id) if spool_acquired else None
+                if current and current.get("status") == "pending":
+                    current["status"] = "error"
+                    current["error"] = f"spawn failed: {exc}"
+                    current["completed_at"] = datetime.now().isoformat()
+                    _preserve_failed_spool_shard(current)
+                    _write_spool(spool_id, current)
+            return f"Error: Failed to spawn process: {exc}"
+        if not _publish_spawned_process(spool_id, pid):
+            return f"Error: Spool {spool_id} was finalized before process startup completed"
+    return None
 
 
 def _extract_last_json_object(text: str) -> Optional[dict]:
@@ -2434,16 +2503,23 @@ def _recover_orphans() -> None:
 
 
 def _handle_expired_session(spool_id: str, spool: dict) -> bool:
-    """Serialize transcript fallback with every terminal spool transition."""
-    with _spool_lock(spool_id, blocking=False) as acquired:
-        if not acquired:
+    """Serialize transcript fallback with spool and shared-worktree transitions."""
+    snapshot = _read_spool(spool_id) or spool
+    expected_worktree = _spool_worktree_path(snapshot)
+    with _worktree_lock(expected_worktree, blocking=False) as worktree_acquired:
+        if not worktree_acquired:
             return False
-        current = _read_spool(spool_id)
-        if current is not None:
-            if current.get("status") != "running":
-                return True
-            spool = current
-        return _handle_expired_session_locked(spool_id, spool)
+        with _spool_lock(spool_id, blocking=False) as spool_acquired:
+            if not spool_acquired:
+                return False
+            current = _read_spool(spool_id)
+            if current is not None:
+                if _spool_worktree_path(current) != expected_worktree:
+                    return False
+                if current.get("status") != "running":
+                    return True
+                spool = current
+            return _handle_expired_session_locked(spool_id, spool)
 
 
 def _handle_expired_session_locked(spool_id: str, spool: dict) -> bool:
@@ -2983,23 +3059,9 @@ Your task:
         "harness": "claude-code",
     }
 
-    if not _prepare_pending_spool_for_spawn(spool):
-        return f"Error: Spool {spool_id} was finalized before process startup completed"
-
-    # Spawn detached process (spawn_env carries any profile secrets; never persisted)
-    try:
-        pid = _spawn_detached(spool_id, cmd, cwd, spawn_env)
-    except Exception as e:
-        # Spawn failed - mark spool as error so the slot is freed
-        spool["status"] = "error"
-        spool["error"] = f"spawn failed: {e}"
-        spool["completed_at"] = datetime.now().isoformat()
-        _preserve_failed_spool_shard(spool)
-        _write_spool(spool_id, spool)
-        return f"Error: Failed to spawn process: {e}"
-
-    if not _publish_spawned_process(spool_id, pid):
-        return f"Error: Spool {spool_id} was finalized before process startup completed"
+    startup_error = _start_spool_process(spool, cmd, cwd, spawn_env)
+    if startup_error:
+        return startup_error
 
     # Start background monitor thread (daemon so it won't block shutdown)
     _start_spool_monitor(spool_id)
@@ -3762,6 +3824,7 @@ def _respin_sync(handle: str, prompt: str) -> str:
             "transcript_fallback_available": transcript_available,
             "env": caller_env,
             "profile": profile_name,
+            "shard": original_spool.get("shard"),
             "created_at": datetime.now().isoformat(),
             "completed_at": None,
             "pid": None,
@@ -3770,14 +3833,9 @@ def _respin_sync(handle: str, prompt: str) -> str:
             "harness": "claude-code",
         }
 
-        if not _prepare_pending_spool_for_spawn(spool):
-            return f"Error: Spool {spool_id} was finalized before process startup completed"
-
-        # Spawn detached process (spawn_env carries any profile secrets; never persisted)
-        pid = _spawn_detached(spool_id, cmd, cwd, spawn_env)
-
-        if not _publish_spawned_process(spool_id, pid):
-            return f"Error: Spool {spool_id} was finalized before process startup completed"
+        startup_error = _start_spool_process(spool, cmd, cwd, spawn_env)
+        if startup_error:
+            return startup_error
 
         # Start background monitor
         _start_spool_monitor(spool_id)
@@ -5131,14 +5189,19 @@ async def shard_merge(spool_id: str, keep_branch: bool = False, caller_cwd: str 
 
 
 def _shard_merge_sync(spool_id: str, keep_branch: bool, caller_cwd: str | None) -> str:
-    """Serialize shard merging with every spool lifecycle transition."""
+    """Serialize merging with both spool and canonical worktree lifecycles."""
     deadline = time.monotonic() + SPOOL_TERMINAL_LOCK_TIMEOUT
     while True:
-        with _spool_lock(spool_id, blocking=False) as acquired:
-            if acquired:
-                return _shard_merge_locked(spool_id, keep_branch, caller_cwd)
+        expected_worktree = _spool_worktree_path(_read_spool(spool_id))
+        with _worktree_lock(expected_worktree, blocking=False) as worktree_acquired:
+            if worktree_acquired:
+                with _spool_lock(spool_id, blocking=False) as spool_acquired:
+                    if spool_acquired:
+                        current = _read_spool(spool_id)
+                        if _spool_worktree_path(current) == expected_worktree:
+                            return _shard_merge_locked(spool_id, keep_branch, caller_cwd)
         if time.monotonic() >= deadline:
-            return f"Error: Could not lock spool {spool_id} for shard merge"
+            return f"Error: Could not lock spool {spool_id} and its worktree for shard merge"
         time.sleep(0.05)
 
 
@@ -5281,14 +5344,19 @@ async def shard_abandon(spool_id: str, keep_branch: bool = False, caller_cwd: st
 
 
 def _shard_abandon_sync(spool_id: str, keep_branch: bool, caller_cwd: str | None) -> str:
-    """Serialize explicit abandonment with every spool terminal transition."""
+    """Serialize abandonment with both spool and canonical worktree lifecycles."""
     deadline = time.monotonic() + SPOOL_TERMINAL_LOCK_TIMEOUT
     while True:
-        with _spool_lock(spool_id, blocking=False) as acquired:
-            if acquired:
-                return _shard_abandon_locked(spool_id, keep_branch, caller_cwd)
+        expected_worktree = _spool_worktree_path(_read_spool(spool_id))
+        with _worktree_lock(expected_worktree, blocking=False) as worktree_acquired:
+            if worktree_acquired:
+                with _spool_lock(spool_id, blocking=False) as spool_acquired:
+                    if spool_acquired:
+                        current = _read_spool(spool_id)
+                        if _spool_worktree_path(current) == expected_worktree:
+                            return _shard_abandon_locked(spool_id, keep_branch, caller_cwd)
         if time.monotonic() >= deadline:
-            return f"Error: Could not lock spool {spool_id} for shard abandonment"
+            return f"Error: Could not lock spool {spool_id} and its worktree for shard abandonment"
         time.sleep(0.05)
 
 
@@ -6139,24 +6207,9 @@ Your task:
         "harness": "codex",  # Mark as codex harness
     }
 
-    if not _prepare_pending_spool_for_spawn(spool):
-        return f"Error: Spool {spool_id} was finalized before process startup completed"
-
-    # Spawn detached process
-    try:
-        pid = _spawn_detached(spool_id, cmd, cwd, process_env)
-    except Exception as e:
-        # Spawn failed - mark spool as error so the slot is freed
-        spool["status"] = "error"
-        spool["error"] = f"spawn failed: {e}"
-        spool["completed_at"] = datetime.now().isoformat()
-        _write_spool(spool_id, spool)
-        _preserve_failed_spool_shard(spool)
-        _write_spool(spool_id, spool)
-        return f"Error: Failed to spawn process: {e}"
-
-    if not _publish_spawned_process(spool_id, pid):
-        return f"Error: Spool {spool_id} was finalized before process startup completed"
+    startup_error = _start_spool_process(spool, cmd, cwd, process_env)
+    if startup_error:
+        return startup_error
 
     # Start background monitor thread
     _start_spool_monitor(spool_id)
@@ -6315,21 +6368,9 @@ def _codex_respin_sync(session_id: str, prompt: str) -> str:
         "harness": "codex",
     }
 
-    if not _prepare_pending_spool_for_spawn(spool):
-        return f"Error: Spool {spool_id} was finalized before process startup completed"
-
-    # Spawn detached process
-    try:
-        pid = _spawn_detached(spool_id, cmd, working_dir, process_env)
-    except Exception as e:
-        spool["status"] = "error"
-        spool["error"] = f"spawn failed: {e}"
-        spool["completed_at"] = datetime.now().isoformat()
-        _write_spool(spool_id, spool)
-        return f"Error: Failed to spawn process: {e}"
-
-    if not _publish_spawned_process(spool_id, pid):
-        return f"Error: Spool {spool_id} was finalized before process startup completed"
+    startup_error = _start_spool_process(spool, cmd, working_dir, process_env)
+    if startup_error:
+        return startup_error
 
     # Start background monitor
     _start_spool_monitor(spool_id)
@@ -6703,23 +6744,9 @@ Your task:
         "harness": "gemini",
     }
 
-    if not _prepare_pending_spool_for_spawn(spool):
-        return f"Error: Spool {spool_id} was finalized before process startup completed"
-
-    # Spawn detached process
-    try:
-        pid = _spawn_detached(spool_id, gemini_cmd, cwd, env)
-    except Exception as e:
-        # Spawn failed - mark spool as error so the slot is freed
-        spool["status"] = "error"
-        spool["error"] = f"spawn failed: {e}"
-        spool["completed_at"] = datetime.now().isoformat()
-        _preserve_failed_spool_shard(spool)
-        _write_spool(spool_id, spool)
-        return f"Error: Failed to spawn process: {e}"
-
-    if not _publish_spawned_process(spool_id, pid):
-        return f"Error: Spool {spool_id} was finalized before process startup completed"
+    startup_error = _start_spool_process(spool, gemini_cmd, cwd, env)
+    if startup_error:
+        return startup_error
 
     # Start background monitor thread (reuse the standard monitor)
     _start_spool_monitor(spool_id)
@@ -6756,6 +6783,7 @@ def _gemini_respin_sync(session_id: str, prompt: str, original_spool: dict) -> s
         "tags": ["gemini", "respin"],
         "env": env,
         "model": model or "auto",
+        "shard": original_spool.get("shard"),
         "created_at": datetime.now().isoformat(),
         "completed_at": None,
         "pid": None,
@@ -6763,13 +6791,9 @@ def _gemini_respin_sync(session_id: str, prompt: str, original_spool: dict) -> s
         "harness": "gemini",
     }
 
-    if not _prepare_pending_spool_for_spawn(spool):
-        return f"Error: Spool {spool_id} was finalized before process startup completed"
-
-    pid = _spawn_detached(spool_id, gemini_cmd, working_dir, env)
-
-    if not _publish_spawned_process(spool_id, pid):
-        return f"Error: Spool {spool_id} was finalized before process startup completed"
+    startup_error = _start_spool_process(spool, gemini_cmd, working_dir, env)
+    if startup_error:
+        return startup_error
 
     _start_spool_monitor(spool_id)
 
@@ -6977,24 +7001,9 @@ Your task:
         "harness": "kimi",
     }
 
-    # Write spool to disk
-    if not _prepare_pending_spool_for_spawn(spool):
-        return f"Error: Spool {spool_id} was finalized before process startup completed"
-
-    # Spawn the process detached
-    try:
-        pid = _spawn_detached(spool_id, kimi_cmd, cwd, env)
-    except Exception as e:
-        # Spawn failed - mark spool as error so the slot is freed
-        spool["status"] = "error"
-        spool["error"] = f"spawn failed: {e}"
-        spool["completed_at"] = datetime.now().isoformat()
-        _preserve_failed_spool_shard(spool)
-        _write_spool(spool_id, spool)
-        return f"Error: Failed to spawn process: {e}"
-
-    if not _publish_spawned_process(spool_id, pid):
-        return f"Error: Spool {spool_id} was finalized before process startup completed"
+    startup_error = _start_spool_process(spool, kimi_cmd, cwd, env)
+    if startup_error:
+        return startup_error
 
     # Start background monitor thread
     _start_spool_monitor(spool_id)
@@ -7072,6 +7081,7 @@ def _kimi_respin_sync(
         "tags": tag_list,
         "timeout": original_spool.get("timeout"),
         "env": original_spool.get("env"),
+        "shard": original_spool.get("shard"),
         "created_at": datetime.now().isoformat(),
         "completed_at": None,
         "pid": None,
@@ -7079,15 +7089,9 @@ def _kimi_respin_sync(
         "harness": "kimi",
     }
 
-    # Write spool to disk
-    if not _prepare_pending_spool_for_spawn(spool):
-        return f"Error: Spool {spool_id} was finalized before process startup completed"
-
-    # Spawn the process detached
-    pid = _spawn_detached(spool_id, kimi_cmd, working_dir, original_spool.get("env"))
-
-    if not _publish_spawned_process(spool_id, pid):
-        return f"Error: Spool {spool_id} was finalized before process startup completed"
+    startup_error = _start_spool_process(spool, kimi_cmd, working_dir, original_spool.get("env"))
+    if startup_error:
+        return startup_error
 
     # Start background monitor thread
     _start_spool_monitor(spool_id)
