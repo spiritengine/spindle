@@ -7588,11 +7588,12 @@ def _service_settings_from_file(path: Path) -> dict:
     # Continuations are folded first: an ExecStart wrapped across lines is one
     # command to systemd, and anchoring without folding stopped seeing its port.
     for line in _join_line_continuations(text).splitlines():
-        if not line.strip().startswith("ExecStart="):
+        if not re.match(r"^\s*ExecStart\s*=", line):
             continue
-        match = re.search(r"serve\s+--http\s+--port\s+(\d+)", line)
-        if match:
-            settings["port"] = int(match.group(1))
+        # Last wins, as argparse resolves a repeated flag, and both spellings.
+        matches = re.findall(r"--port[= ]\s*(\d+)", line)
+        if matches:
+            settings["port"] = int(matches[-1])
     return settings
 
 
@@ -7699,6 +7700,42 @@ def _read_service_record(name: str) -> Optional[dict]:
     return record
 
 
+def _service_file_excerpt(path: Path, max_lines: int = 12) -> str:
+    """The lines of a service file that state its port and store, verbatim.
+
+    Quoted, never interpreted. This is what spindle shows instead of guessing:
+    the operator can read their own file's settings, and no value spindle
+    believes about the file can be pasted back into a command.
+    """
+    try:
+        text = path.read_text(errors="replace")
+    except OSError:
+        return ""
+    raw = [line.rstrip() for line in text.splitlines()]
+    if path.suffix == ".plist":
+        # In a plist the key and its value are on separate lines, so a match has
+        # to bring the following line with it or the excerpt shows key names and
+        # no settings.
+        wanted = ("--port", "SPINDLE_HOME", "SPINDLE_PORT", "ProgramArguments")
+        keep = set()
+        for i, line in enumerate(raw):
+            if any(token in line for token in wanted):
+                keep.add(i)
+                if i + 1 < len(raw):
+                    keep.add(i + 1)
+        lines = [raw[i] for i in sorted(keep)]
+    else:
+        wanted = ("ExecStart", "Environment", "EnvironmentFile")
+        lines = [line for line in raw if any(token in line for token in wanted)]
+    if not lines:
+        return ""
+    shown = lines[:max_lines]
+    excerpt = "\n".join(f"    {line}" for line in shown)
+    if len(lines) > max_lines:
+        excerpt += f"\n    ... and {len(lines) - max_lines} more line(s)"
+    return excerpt
+
+
 def _resolve_service_settings(
     existing: Path,
     arg_port: Optional[int],
@@ -7727,7 +7764,7 @@ def _resolve_service_settings(
     # edited since — a hand-tuned port, a replaced unit — the record is stale,
     # and regenerating from it would rewrite the service back to settings it is
     # no longer running with, announcing that it "kept" them.
-    if record is not None and not exists:
+    if record is not None and not exists and (arg_port is None or arg_home is None):
         notes.append(f"{existing.name} is gone; recreating it from spindle's record of what it installed.")
     if record is not None and exists:
         if _service_file_digest(existing) != record["service_sha256"]:
@@ -7735,64 +7772,31 @@ def _resolve_service_settings(
             record = None
 
     if record is None and exists and (arg_port is None or arg_home is None):
-        import shlex
-
-        guess = _service_settings_from_file(existing)
-        hint_home = guess["home"]
-        # Both flags always appear, because the refusal requires both; a remedy
-        # that omits one refuses again when pasted. --home '' asks for the
-        # default store explicitly.
-        caveat = ""
-        if not guess["readable"]:
-            # Nothing was read, so nothing may be suggested. A hint of
-            # "--port 8002 --home ''" here is not a reading of the file, it is
-            # the defaults wearing the file's name — and pasting it collides
-            # with the default install.
-            port_hint = "<port>"
-            home_hint = "<store>"
-            caveat = f"\n{existing.name} could not be read at all, so neither value below is a reading of it."
-        else:
-            # Per field, not per file. A unit can be perfectly readable and still
-            # hold its port somewhere this reader does not look — `--port=8115`,
-            # a `--host` argument before the port, a value from an
-            # EnvironmentFile. Printing 8002 there is not a reading of the file,
-            # it is the default install's port wearing the file's name, and it
-            # pastes as a command that moves the service onto it.
-            port_hint = str(guess["port"]) if guess["port"] is not None else "<port>"
-            if guess["port"] is None:
-                caveat += f"\n{existing.name} does not state a port anywhere spindle can read; supply the real one."
-            if guess.get("home_specifier"):
-                # A systemd specifier resolves against the service's runtime
-                # context, so it cannot be repeated back as a literal path.
-                # Deliberately NOT a runnable value: an operator pasting a
-                # working `--home ''` would move the store to the default, which
-                # is the defect this refusal exists to prevent.
-                home_hint = "<the directory you actually mean>"
-                caveat = (
-                    f"\n{existing.name} sets its store with a systemd specifier ({hint_home!r}), which is "
-                    f"resolved at run time. Substitute the real directory; do not paste that string."
-                )
-            elif hint_home:
-                home_hint = shlex.quote(hint_home)
-            elif guess.get("env_file"):
-                # SPINDLE_HOME may be coming from that file, so "no store here"
-                # cannot be read as "the default store".
-                home_hint = "<store>"
-                caveat += (
-                    f"\n{existing.name} pulls environment from an EnvironmentFile, which may set the store; "
-                    f"spindle cannot see it. Supply the real one, or '' for the default."
-                )
-            else:
-                home_hint = "''"
-        hint = f"--port {port_hint} --home {home_hint}"
+        # Deliberately NOT a runnable command.
+        #
+        # Four rounds in a row found this suggestion printing a pasteable
+        # command that would move the service: 8002 offered as "the file's
+        # port"; `--home ''` offered for a store set with a %h specifier; an
+        # Environment=SPINDLE_PORT fallback standing in for an ExecStart port
+        # the reader could not parse; a repeated --port read first-wins where
+        # systemd binds last-wins; a value overridden by an EnvironmentFile.
+        #
+        # Every one was the same shape: the reader interprets the file with less
+        # authority than systemd applies, and then prints its interpretation as
+        # something to run. The refusal exists precisely because this file cannot
+        # be interpreted reliably — so it quotes the file instead. The operator
+        # reads their own settings and types them; nothing spindle believes about
+        # the file can be pasted back into it.
+        excerpt = _service_file_excerpt(existing)
         blocker = (
             f"{existing} exists but spindle has no record of installing it (or the file changed "
             f"since), so what it currently runs with cannot be established from the file alone.\n"
-            f"Say what it should be, and spindle will record it from then on:\n"
-            f"  spindle install-service --name {name} {hint} --force\n"
-            f"(the values above are spindle's reading of the file — check them before trusting them)"
-            f"{caveat}"
+            f"Tell spindle what it should be, and it will keep the record from then on:\n"
+            f"  spindle install-service --name {name} --port <port> --home <store> --force\n"
+            f"(--home '' means the default store, ~/.spindle)"
         )
+        if excerpt:
+            blocker += f"\n\nWhat the file says:\n{excerpt}"
         return None, None, notes, blocker
 
     if arg_port is not None:

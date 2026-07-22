@@ -9295,8 +9295,8 @@ class TestRegenerationUsesTheRecord:
         assert (port, home) == (None, None)
         assert blocker is not None
         assert "no record of installing it" in blocker
-        assert "--port 8075" in blocker  # best reading offered as a hint
-        assert "--home /srv/store" in blocker
+        assert "--port <port>" in blocker
+        assert "What the file says:" in blocker
 
     def test_explicit_arguments_unblock_an_unrecorded_service(self, config, tmp_path):
         unit = self._existing(tmp_path)
@@ -9449,49 +9449,6 @@ class TestMalformedRecordsRefuseRatherThanDefault:
         assert record["port"] == 8075 and record["home"] is None
 
 
-class TestRefusalHintIsSafeToPaste:
-    @pytest.fixture
-    def config(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
-        return tmp_path
-
-    def test_a_systemd_specifier_is_not_offered_as_a_path(self, config, tmp_path):
-        """Pasting `--home %h/store` re-escapes the % and lands somewhere else."""
-        unit = tmp_path / "svc.service"
-        unit.write_text("[Service]\nEnvironment=SPINDLE_HOME=%h/store\nExecStart=/b serve --http --port 8115\n")
-        _, _, _, blocker = spindle._resolve_service_settings(unit, None, None, name="svc")
-        assert "--home %h/store" not in blocker
-        assert "systemd specifier" in blocker
-        assert "--port 8115" in blocker
-
-    def test_a_store_with_a_space_is_quoted(self, config, tmp_path):
-        unit = tmp_path / "svc.service"
-        unit.write_text('[Service]\nEnvironment="SPINDLE_HOME=/srv/my store"\nExecStart=/b serve --http --port 1\n')
-        _, _, _, blocker = spindle._resolve_service_settings(unit, None, None, name="svc")
-        assert "'/srv/my store'" in blocker
-
-    def test_the_hint_always_carries_both_flags(self, config, tmp_path):
-        """A remedy missing one flag refuses again when pasted."""
-        unit = tmp_path / "svc.service"
-        unit.write_text("[Unit]\nDescription=no store anywhere\n")
-        _, _, _, blocker = spindle._resolve_service_settings(unit, None, None, name="svc")
-        assert "--port" in blocker and "--home" in blocker
-
-    def test_pasting_the_hint_actually_unblocks(self, config, tmp_path):
-        """The remedy is executed, not just inspected."""
-        import shlex
-
-        unit = tmp_path / "svc.service"
-        unit.write_text('[Service]\nEnvironment="SPINDLE_HOME=/srv/store"\nExecStart=/b serve --http --port 8115\n')
-        _, _, _, blocker = spindle._resolve_service_settings(unit, None, None, name="svc")
-        argv = shlex.split([line for line in blocker.splitlines() if "install-service" in line][0])
-        port = int(argv[argv.index("--port") + 1])
-        home = argv[argv.index("--home") + 1]
-        p2, h2, _, blocker2 = spindle._resolve_service_settings(unit, port, home, name="svc")
-        assert blocker2 is None
-        assert (p2, h2) == (8115, "/srv/store")
-
-
 class TestRecordFollowsActivation:
     @pytest.fixture
     def home(self, tmp_path, monkeypatch):
@@ -9609,125 +9566,6 @@ class TestDigestIsRequiredNotOptional:
         assert spindle._service_port("8075") == 8075
 
 
-class TestTheHintIsNeverPasteableWhenItIsNotAReading:
-    @pytest.fixture
-    def config(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
-        return tmp_path
-
-    def _blocker(self, unit):
-        return spindle._resolve_service_settings(unit, None, None, name="svc")[3]
-
-    def _command(self, blocker):
-        return [line for line in blocker.splitlines() if "install-service" in line][0]
-
-    def test_a_specifier_store_yields_a_command_that_will_not_run(self, config, tmp_path):
-        """A runnable `--home ''` moved the store to the default when pasted."""
-        unit = tmp_path / "svc.service"
-        unit.write_text("[Service]\nEnvironment=SPINDLE_HOME=%h/store\nExecStart=/b serve --http --port 8115\n")
-        blocker = self._blocker(unit)
-        command = self._command(blocker)
-        assert "--home ''" not in command
-        assert "<the directory you actually mean>" in command
-        assert "systemd specifier" in blocker
-
-    def test_an_unreadable_file_yields_placeholders_not_defaults(self, config, tmp_path):
-        plist = tmp_path / "com.svc.server.plist"
-        plist.write_bytes(b"\x00\x01 not a plist")
-        command = self._command(self._blocker(plist))
-        assert "<port>" in command and "<store>" in command
-        assert "8002" not in command
-
-    def test_a_literal_percent_in_a_store_is_not_called_a_specifier(self, config, tmp_path):
-        """`%%` is a literal percent; only a bare `%` is a specifier."""
-        unit = tmp_path / "svc.service"
-        unit.write_text(spindle._systemd_unit_text("/bin/spindle", 8115, home="/srv/100%pure", name="svc"))
-        settings = spindle._service_settings_from_file(unit)
-        assert settings["home"] == "/srv/100%pure"
-        assert settings["home_specifier"] is False
-        blocker = self._blocker(unit)
-        assert "systemd specifier" not in blocker
-        assert "100%pure" in self._command(blocker)
-
-    def test_a_readable_ordinary_file_still_gives_a_pasteable_command(self, config, tmp_path):
-        import shlex
-
-        unit = tmp_path / "svc.service"
-        unit.write_text('[Service]\nEnvironment="SPINDLE_HOME=/srv/my store"\nExecStart=/b serve --http --port 8115\n')
-        argv = shlex.split(self._command(self._blocker(unit)))
-        port = int(argv[argv.index("--port") + 1])
-        home = argv[argv.index("--home") + 1]
-        p2, h2, _, blocker2 = spindle._resolve_service_settings(unit, port, home, name="svc")
-        assert (p2, h2, blocker2) == (8115, "/srv/my store", None)
-
-
-class TestHintNeverInventsAValueItDidNotRead:
-    """A readable file can still hold its settings where this reader cannot see."""
-
-    @pytest.fixture
-    def config(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
-        return tmp_path
-
-    def _blocker(self, unit):
-        return spindle._resolve_service_settings(unit, None, None, name="svc")[3]
-
-    def _command(self, blocker):
-        return [line for line in blocker.splitlines() if "install-service" in line][0]
-
-    def test_a_port_behind_another_flag_is_not_reported_as_8002(self, config, tmp_path):
-        """`--host` between `--http` and `--port` defeats the reader; 8002 is not the answer."""
-        unit = tmp_path / "svc.service"
-        unit.write_text(
-            '[Service]\nEnvironment="SPINDLE_HOME=/srv/store"\n'
-            "ExecStart=/usr/bin/spindle serve --http --host 127.0.0.1 --port 8115\n"
-        )
-        command = self._command(self._blocker(unit))
-        assert "--port <port>" in command
-        assert "8002" not in command
-        assert "/srv/store" in command  # the store WAS read, so it is still offered
-
-    def test_the_equals_form_of_port_likewise(self, config, tmp_path):
-        unit = tmp_path / "svc.service"
-        unit.write_text("[Service]\nExecStart=/usr/bin/spindle serve --http --port=8115\n")
-        assert "--port <port>" in self._command(self._blocker(unit))
-
-    def test_a_plist_without_a_port_argument_likewise(self, config, tmp_path):
-        import plistlib
-
-        path = tmp_path / "com.svc.server.plist"
-        with open(path, "wb") as fh:
-            plistlib.dump({"ProgramArguments": ["/bin/spindle", "serve"]}, fh)
-        assert "--port <port>" in self._command(self._blocker(path))
-
-    def test_an_environmentfile_makes_the_store_unknowable(self, config, tmp_path):
-        """Absent SPINDLE_HOME usually means the default — but not when a file supplies it."""
-        unit = tmp_path / "svc.service"
-        unit.write_text(
-            "[Service]\nEnvironmentFile=/etc/spindle.env\nExecStart=/usr/bin/spindle serve --http --port 8115\n"
-        )
-        blocker = self._blocker(unit)
-        assert "--home <store>" in self._command(blocker)
-        assert "EnvironmentFile" in blocker
-
-    def test_without_an_environmentfile_the_default_store_is_still_offered(self, config, tmp_path):
-        unit = tmp_path / "svc.service"
-        unit.write_text("[Service]\nExecStart=/usr/bin/spindle serve --http --port 8115\n")
-        assert "--home ''" in self._command(self._blocker(unit))
-
-    def test_a_fully_readable_file_still_pastes_back_exactly(self, config, tmp_path):
-        import shlex
-
-        unit = tmp_path / "svc.service"
-        unit.write_text(
-            '[Service]\nEnvironment="SPINDLE_HOME=/srv/store"\nExecStart=/usr/bin/spindle serve --http --port 8115\n'
-        )
-        argv = shlex.split(self._command(self._blocker(unit)))
-        port = int(argv[argv.index("--port") + 1])
-        home = argv[argv.index("--home") + 1]
-        assert spindle._resolve_service_settings(unit, port, home, name="svc")[:2] == (8115, "/srv/store")
-
-
 class TestOrphanedRecordIsAnnounced:
     @pytest.fixture
     def config(self, tmp_path, monkeypatch):
@@ -9743,3 +9581,130 @@ class TestOrphanedRecordIsAnnounced:
         port, home, notes, blocker = spindle._resolve_service_settings(unit, None, None, name="svc")
         assert (port, home, blocker) == (8115, "/srv/store", None)
         assert any("recreating it from spindle's record" in n for n in notes)
+
+
+class TestTheRefusalQuotesRatherThanInterprets:
+    """The suggestion must never be runnable.
+
+    Four consecutive review rounds found the suggestion printing a pasteable
+    command that would move the service: 8002 offered as the file's port; an
+    empty store offered for a `%h` specifier; an Environment=SPINDLE_PORT
+    fallback standing in for an unparsed ExecStart port; a repeated --port read
+    first-wins where systemd binds last-wins; a value an EnvironmentFile
+    overrides. All the same shape — the reader interprets with less authority
+    than systemd applies, then offers its interpretation as something to run.
+    So it offers nothing to run.
+    """
+
+    @pytest.fixture
+    def config(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
+        return tmp_path
+
+    def _blocker(self, unit):
+        return spindle._resolve_service_settings(unit, None, None, name="svc")[3]
+
+    def _command(self, blocker):
+        return [line for line in blocker.splitlines() if "install-service" in line][0]
+
+    # Every one of these is a shape a previous round found being mis-suggested.
+    UNITS = {
+        "host_before_port": "ExecStart=/b spindle serve --http --host 127.0.0.1 --port 8115\n",
+        "equals_form": "ExecStart=/b spindle serve --http --port=8115\n",
+        "repeated_port": "ExecStart=/b spindle serve --http --port 8115 --port 9000\n",
+        "env_port_fallback": "ExecStart=/b spindle serve --http --host 1.2.3.4 --port 9000\nEnvironment=SPINDLE_PORT=8115\n",
+        "specifier_store": "ExecStart=/b spindle serve --http --port 8115\nEnvironment=SPINDLE_HOME=%h/store\n",
+        "environment_file": "ExecStart=/b spindle serve --http --port 8115\nEnvironmentFile=/etc/spindle.env\n",
+        "spaced_execstart": "ExecStart = /b spindle serve --http --port 8115\n",
+        "nothing_readable": "Description=hand written\n",
+    }
+
+    @pytest.mark.parametrize("shape", sorted(UNITS))
+    def test_the_suggested_command_is_never_runnable(self, config, tmp_path, shape):
+        unit = tmp_path / "svc.service"
+        unit.write_text("[Service]\n" + self.UNITS[shape])
+        command = self._command(self._blocker(unit))
+        assert "--port <port>" in command
+        assert "--home <store>" in command
+        # no value read out of the file may appear as an argument
+        for value in ("8115", "9000", "8002", "%h/store"):
+            assert f"--port {value}" not in command
+            assert f"--home {value}" not in command
+
+    @pytest.mark.parametrize("shape", sorted(UNITS))
+    def test_the_file_is_quoted_so_the_operator_can_read_it(self, config, tmp_path, shape):
+        unit = tmp_path / "svc.service"
+        unit.write_text("[Service]\n" + self.UNITS[shape])
+        blocker = self._blocker(unit)
+        if shape == "nothing_readable":
+            assert "What the file says" not in blocker
+            return
+        assert "What the file says:" in blocker
+        for line in self.UNITS[shape].strip().splitlines():
+            assert line in blocker
+
+    def test_a_plist_is_quoted_too(self, config, tmp_path):
+        path = tmp_path / "com.svc.server.plist"
+        path.write_text(spindle._launchd_plist_text("com.svc.server", "/b/spindle", 8115, home="/srv/store"))
+        blocker = self._blocker(path)
+        assert "--port <port>" in self._command(blocker)
+        assert "SPINDLE_HOME" in blocker and "/srv/store" in blocker
+
+    def test_the_excerpt_is_bounded(self, config, tmp_path):
+        unit = tmp_path / "svc.service"
+        unit.write_text("[Service]\n" + "Environment=FOO=bar\n" * 50)
+        blocker = self._blocker(unit)
+        assert "and 38 more line(s)" in blocker
+
+    def test_an_unreadable_file_still_refuses_without_inventing(self, config, tmp_path):
+        path = tmp_path / "com.svc.server.plist"
+        path.write_bytes(b"\x00\x01 not a plist")
+        command = self._command(self._blocker(path))
+        assert "--port <port>" in command and "8002" not in command
+
+
+class TestExecStartPortReadingMatchesArgparse:
+    """The reader is probe-only now, but reload/doctor still ask it for a port."""
+
+    def _port(self, tmp_path, execstart):
+        unit = tmp_path / "svc.service"
+        unit.write_text(f"[Service]\n{execstart}\n")
+        return spindle._service_settings_from_file(unit)["port"]
+
+    def test_last_repeated_port_wins(self, tmp_path):
+        assert self._port(tmp_path, "ExecStart=/b spindle serve --http --port 8115 --port 9000") == 9000
+
+    def test_equals_form_is_read(self, tmp_path):
+        assert self._port(tmp_path, "ExecStart=/b spindle serve --http --port=8115") == 8115
+
+    def test_whitespace_around_the_directive(self, tmp_path):
+        assert self._port(tmp_path, "ExecStart = /b spindle serve --http --port 8115") == 8115
+
+    def test_a_port_after_another_flag_is_read(self, tmp_path):
+        assert self._port(tmp_path, "ExecStart=/b spindle serve --http --host 1.2.3.4 --port 8115") == 8115
+
+
+def test_service_files_are_written_as_utf8(tmp_path, monkeypatch):
+    """The digest is UTF-8; a locale-encoded write could never match it."""
+    monkeypatch.setattr(spindle.Path, "home", staticmethod(lambda: tmp_path))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
+    monkeypatch.delenv("SPINDLE_HOME", raising=False)
+    monkeypatch.delenv("SPINDLE_PORT", raising=False)
+    (tmp_path / "bin").mkdir()
+    (tmp_path / "bin" / "spindle").write_text("#!/bin/sh\n")
+
+    import platform as platform_mod
+
+    monkeypatch.setattr(platform_mod, "system", lambda: "Linux")
+    monkeypatch.setattr(spindle.subprocess, "run", lambda *a, **k: MagicMock(returncode=0, stdout="", stderr=""))
+    argv = ["spindle", "install-service", "--name", "svc", "--port", "8115", "--home", "/srv/café"]
+    with patch.object(spindle.sys, "argv", argv):
+        with pytest.raises(SystemExit) as exc:
+            spindle.main()
+    assert exc.value.code == 0
+
+    unit = tmp_path / ".config" / "systemd" / "user" / "svc.service"
+    assert unit.read_bytes().decode("utf-8")  # written as UTF-8, whatever the locale
+    # and therefore the record's digest matches the file on disk
+    assert spindle._read_service_record("svc")["service_sha256"] == spindle._service_file_digest(unit)
+    assert spindle._resolve_service_settings(unit, None, None, name="svc")[3] is None
