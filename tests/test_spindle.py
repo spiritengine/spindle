@@ -9,6 +9,7 @@ import os
 import signal
 import subprocess
 import threading
+import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -1409,7 +1410,7 @@ class TestCodexResultExtraction:
             cleanup_args, cleanup_kwargs = cleanup.call_args
             assert cleanup_args[0]["worktree_path"] == shard["worktree_path"]
             assert cleanup_args[1] == str(tmp_path / "repo")
-            assert cleanup_kwargs == {"spool_id": spool_id}
+            assert cleanup_kwargs == {"spool_id": spool_id, "force": False}
             assert _get_transcript_path(spool_id).read_text() == stream
 
     def test_finalize_waits_for_process_exit_after_failure_event(self, tmp_path):
@@ -1565,6 +1566,7 @@ class TestCodexResultExtraction:
                 spool_id,
                 ["/bin/sh", "-c", 'printf "%s\\n" "$1"; exit 7', "child", stream],
                 str(tmp_path),
+                {"PATH": str(tmp_path / "empty-path")},
             )
             proc = spindle._PROC_HANDLES.pop(spool_id)
             assert proc.wait(timeout=5) == 7
@@ -1578,6 +1580,7 @@ class TestCodexResultExtraction:
         assert spool["status"] == "error"
         assert spool["exit_code"] == 7
         assert "code 7" in spool["error"]
+        assert not list(tmp_path.glob(f"{spool_id}.exit.tmp.*"))
 
     def test_orphan_recovery_fails_closed_without_exit_status(self, tmp_path):
         spool_id = "codex-orphan-no-status"
@@ -1772,6 +1775,93 @@ class TestCodexResultExtraction:
             side_effect=[removed, subprocess.TimeoutExpired("git branch", 10)],
         ):
             assert _cleanup_shard(shard, str(tmp_path)) is True
+
+    def test_automatic_cleanup_nonforce_preserves_output_created_after_pristine_check(self, tmp_path):
+        repo, worktree = self._git_shard(tmp_path)
+        late_output = worktree / "late.txt"
+        spool = {
+            "id": "codex-late-output",
+            "status": "error",
+            "pid": None,
+            "working_dir": str(worktree),
+            "base_branch": "main",
+            "shard": {"worktree_path": str(worktree), "branch_name": "shard-test"},
+            "shard_created_by_spool": True,
+            "shard_source_dir": str(repo),
+        }
+
+        def pristine_then_write(_spool):
+            late_output.write_text("valuable late output\n")
+            return "pristine"
+
+        with patch("spindle.SPINDLE_DIR", tmp_path / "spools"):
+            with patch("spindle._shard_cleanup_state", side_effect=pristine_then_write):
+                assert spindle._cleanup_failed_spool_shard(spool) is False
+
+        assert worktree.exists()
+        assert late_output.read_text() == "valuable late output\n"
+        assert spool["shard_cleanup_pending"] is True
+
+    def test_cleanup_intent_is_persisted_before_removal_and_repairs_after_restart(self, tmp_path):
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        spool_id = "codex-cleanup-crash"
+        spool = {
+            "id": spool_id,
+            "status": "error",
+            "pid": None,
+            "working_dir": str(worktree),
+            "shard": {"worktree_path": str(worktree), "branch_name": "shard-crash"},
+            "shard_created_by_spool": True,
+            "shard_source_dir": str(tmp_path / "repo"),
+        }
+
+        def remove_then_crash(*args, **kwargs):
+            worktree.rmdir()
+            raise RuntimeError("simulated server crash")
+
+        with patch("spindle.SPINDLE_DIR", tmp_path / "spools"):
+            _write_spool(spool_id, spool)
+            with patch("spindle._shard_cleanup_state", return_value="pristine"):
+                with patch("spindle._cleanup_shard", side_effect=remove_then_crash):
+                    with pytest.raises(RuntimeError, match="simulated server crash"):
+                        spindle._cleanup_failed_spool_shard(spool)
+
+            persisted = _read_spool(spool_id)
+            assert persisted["shard_cleanup_pending"] is True
+            assert persisted["working_dir"] == str(worktree)
+            assert spindle._cleanup_failed_spool_shard(persisted) is True
+            _write_spool(spool_id, persisted)
+            repaired = _read_spool(spool_id)
+
+        assert repaired["working_dir"] == str(tmp_path / "repo")
+        assert repaired["shard"]["startup_failure_cleaned"] is True
+        assert "shard_cleanup_pending" not in repaired
+
+    def test_stale_pending_reservation_expires_then_stops_blocking(self, tmp_path):
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        stale_time = (datetime.now() - timedelta(seconds=PENDING_SPAWN_TIMEOUT + 1)).isoformat()
+        other = {"id": "stale-pending", "status": "pending", "created_at": stale_time}
+        shard = {"worktree_path": str(worktree)}
+        with patch("spindle.SPINDLE_DIR", tmp_path / "spools"):
+            _write_spool(other["id"], other)
+            assert spindle._shard_has_other_active_spool("owner", shard) is True
+            assert _read_spool(other["id"])["status"] == "error"
+            assert spindle._shard_has_other_active_spool("owner", shard) is False
+
+    def test_dead_post_restart_running_record_does_not_block_cleanup(self, tmp_path):
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        other = {
+            "id": "dead-running",
+            "status": "running",
+            "working_dir": str(worktree),
+            "pid": 999999999,
+        }
+        with patch("spindle.SPINDLE_DIR", tmp_path / "spools"):
+            _write_spool(other["id"], other)
+            assert spindle._shard_has_other_active_spool("owner", {"worktree_path": str(worktree)}) is False
 
     @pytest.mark.parametrize("created_by_spool,pristine", [(False, True), (True, False)])
     def test_finalize_preserves_reused_or_changed_failed_shard(self, tmp_path, created_by_spool, pristine):
@@ -2163,6 +2253,42 @@ class TestExitCodeCapture:
             assert spool["status"] == "error"
             assert spool["error"] == "Process exited with no output"
             assert "exit_code" not in spool
+
+
+class TestCancellationTermination:
+    @pytest.mark.parametrize("tool_path", ["sync", "async"])
+    def test_drop_escalates_and_does_not_leave_sigterm_ignoring_group(self, tmp_path, tool_path):
+        proc = subprocess.Popen(
+            ["/bin/sh", "-c", 'trap "" TERM; while :; do sleep 1; done'],
+            start_new_session=True,
+        )
+        spool_id = f"cancel-{tool_path}"
+        try:
+            time.sleep(0.2)
+            with patch("spindle.SPINDLE_DIR", tmp_path):
+                _write_spool(
+                    spool_id,
+                    {
+                        "id": spool_id,
+                        "status": "running",
+                        "pid": proc.pid,
+                        "created_at": datetime.now().isoformat(),
+                    },
+                )
+                if tool_path == "sync":
+                    result = spindle._spin_drop_sync(spool_id)
+                else:
+                    drop_tool = spindle.spin_drop.fn if hasattr(spindle.spin_drop, "fn") else spindle.spin_drop
+                    result = asyncio.run(drop_tool(spool_id))
+
+                assert result == f"Dropped spool {spool_id}"
+                assert spindle._is_process_group_alive(proc.pid) is False
+                assert _read_spool(spool_id)["status"] == "error"
+        finally:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
 
 
 class TestFableGateRefusal:
@@ -4507,17 +4633,18 @@ class TestSpawnFailureRecovery:
                                 with patch("spindle._codex_sandbox_enforces", return_value=True):
                                     with patch("spindle._spawn_detached", side_effect=OSError("boom")):
                                         with patch("spindle._shard_cleanup_state", return_value="pristine"):
-                                            with patch("spindle._cleanup_shard") as cleanup:
-                                                _codex_spin_sync(
-                                                    "do work",
-                                                    str(tmp_path),
-                                                    None,
-                                                    "workspace-write",
-                                                    None,
-                                                    None,
-                                                    None,
-                                                    shard=True,
-                                                )
+                                            with patch("spindle._is_pid_alive", return_value=True):
+                                                with patch("spindle._cleanup_shard") as cleanup:
+                                                    _codex_spin_sync(
+                                                        "do work",
+                                                        str(tmp_path),
+                                                        None,
+                                                        "workspace-write",
+                                                        None,
+                                                        None,
+                                                        None,
+                                                        shard=True,
+                                                    )
             cleanup.assert_not_called()
 
 
@@ -4564,6 +4691,22 @@ class TestRecoverOrphansPending:
 
             spool = _read_spool("fresh1")
             assert spool["status"] == "pending"
+
+    def test_recovery_restarts_monitor_for_still_running_process(self, tmp_path):
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool(
+                "running-after-restart",
+                {
+                    "id": "running-after-restart",
+                    "status": "running",
+                    "pid": 12345,
+                    "created_at": datetime.now().isoformat(),
+                },
+            )
+            with patch("spindle._check_and_finalize_spool", return_value=False):
+                with patch("spindle._start_spool_monitor") as start:
+                    _recover_orphans()
+            start.assert_called_once_with("running-after-restart")
 
     def test_pending_spool_with_pid_not_touched(self, tmp_path):
         """Pending spool that has a PID should not be marked as error."""

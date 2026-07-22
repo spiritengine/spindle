@@ -77,6 +77,8 @@ BUILTIN_HARNESSES = {"claude-code", "codex", "gemini", "kimi"}
 _PROC_HANDLES: Dict[str, "subprocess.Popen"] = {}
 _DEFERRED_CLEANUP_MONITORS: set[str] = set()
 _DEFERRED_CLEANUP_MONITORS_LOCK = threading.Lock()
+_SPOOL_MONITORS: set[str] = set()
+_SPOOL_MONITORS_LOCK = threading.Lock()
 
 # Set while a drain-then-restart is queued (spindle_reload without force), so a
 # second reload call doesn't stack another waiter. Process-local. The check-then-
@@ -804,7 +806,11 @@ def _close_tender_folios(worktree_name: str, working_dir: str) -> Optional[str]:
 
 
 def _cleanup_shard(
-    shard_info: Dict[str, str], working_dir: str, keep_branch: bool = False, spool_id: Optional[str] = None
+    shard_info: Dict[str, str],
+    working_dir: str,
+    keep_branch: bool = False,
+    spool_id: Optional[str] = None,
+    force: bool = True,
 ) -> bool:
     """
     Clean up a SHARD worktree.
@@ -814,6 +820,8 @@ def _cleanup_shard(
         working_dir: Base directory
         keep_branch: If True, don't delete the branch
         spool_id: Optional spool ID for better error logging
+        force: Whether Git may remove a dirty worktree. Automatic cleanup must
+            pass False so Git performs a final race-resistant dirty check.
 
     Returns:
         True if successful
@@ -827,8 +835,12 @@ def _cleanup_shard(
     worktree_removed = False
     try:
         # Remove worktree
+        remove_cmd = ["git", "worktree", "remove"]
+        if force:
+            remove_cmd.append("--force")
+        remove_cmd.append(worktree_path)
         result = subprocess.run(
-            ["git", "worktree", "remove", "--force", worktree_path],
+            remove_cmd,
             capture_output=True,
             text=True,
             cwd=working_dir,
@@ -905,6 +917,21 @@ def _shard_has_other_active_spool(spool_id: str, shard_info: dict) -> bool:
             continue
         status = other.get("status")
         if status == "pending":
+            created_at = other.get("created_at")
+            try:
+                created = datetime.fromisoformat(created_at) if created_at else None
+                now = datetime.now(timezone.utc) if created and created.tzinfo else datetime.now()
+                stale = created is not None and (now - created).total_seconds() > PENDING_SPAWN_TIMEOUT
+            except (TypeError, ValueError):
+                stale = False
+            if stale:
+                other["status"] = "error"
+                other["error"] = "spawn timeout - never started"
+                other["completed_at"] = now.isoformat()
+                _write_spool(other["id"], other)
+                # Give a slow in-process spawner one retry interval to publish
+                # a PID before cleanup stops treating this reservation as live.
+                return True
             return True
         other_working_dir = other.get("working_dir")
         if not other_working_dir:
@@ -913,10 +940,20 @@ def _shard_has_other_active_spool(spool_id: str, shard_info: dict) -> bool:
         if other_path != worktree and worktree not in other_path.parents:
             continue
         if status == "running":
-            return True
+            other_pid = other.get("pid")
+            if not other_pid:
+                return True
+            proc = _PROC_HANDLES.get(other.get("id"))
+            leader_alive = proc.poll() is None if proc is not None else _is_pid_alive(other_pid)
+            if leader_alive or _is_process_group_alive(other_pid):
+                return True
+            continue
         other_pid = other.get("pid")
-        if other_pid and (_is_pid_alive(other_pid) or _is_process_group_alive(other_pid)):
-            return True
+        if other_pid:
+            proc = _PROC_HANDLES.get(other.get("id"))
+            leader_alive = proc.poll() is None if proc is not None else _is_pid_alive(other_pid)
+            if leader_alive or _is_process_group_alive(other_pid):
+                return True
     return False
 
 
@@ -970,7 +1007,20 @@ def _cleanup_failed_spool_shard(spool: dict) -> bool:
             return False
         if cleanup_state != "pristine":
             return defer("Git cleanup state is uncertain")
-        if not _cleanup_shard(shard_info, cleanup_dir, spool_id=spool.get("id")):
+        # Persist intent before the destructive call. If Spindle dies after Git
+        # removes the worktree but before the caller writes the repaired record,
+        # startup recovery sees this flag, notices the missing path, and repairs
+        # working_dir to the source repository.
+        spool["shard_cleanup_pending"] = True
+        spool["shard_cleanup_pending_reason"] = "cleanup in progress"
+        if spool.get("id"):
+            _write_spool(spool["id"], spool)
+        if not _cleanup_shard(
+            shard_info,
+            cleanup_dir,
+            spool_id=spool.get("id"),
+            force=False,
+        ):
             if worktree_path and not Path(worktree_path).exists():
                 return cleaned()
             return defer("worktree cleanup failed")
@@ -1858,27 +1908,46 @@ def _is_process_group_alive(process_group_id: int) -> bool:
     """
     try:
         os.killpg(process_group_id, 0)
-        return True
     except ProcessLookupError:
         return False
     except (OSError, PermissionError):
         return True
 
+    # killpg(0) also succeeds for a group containing only zombies. Zombies
+    # cannot mutate a worktree and should not make cancellation report failure
+    # forever, so on Linux confirm that at least one non-zombie member remains.
+    if not Path("/proc").is_dir():
+        return True
+    try:
+        for status_path in Path("/proc").glob("[0-9]*/stat"):
+            try:
+                stat = status_path.read_text()
+            except FileNotFoundError:
+                continue  # Process exited between the directory scan and read.
+            except OSError:
+                return True
+            fields = stat[stat.rfind(")") + 2 :].split()
+            if len(fields) >= 3 and int(fields[2]) == process_group_id and fields[0] != "Z":
+                return True
+        return False
+    except (OSError, ValueError):
+        return True
 
-def _terminate_process_group(process_group_id: int, grace_seconds: float) -> None:
-    """Terminate a detached spool and every descendant in its process group."""
+
+def _terminate_process_group(process_group_id: int, grace_seconds: float) -> bool:
+    """Terminate a detached spool group, returning whether it is fully gone."""
     try:
         os.killpg(process_group_id, signal.SIGTERM)
     except ProcessLookupError:
-        return
+        return True
     except OSError:
         try:
             os.kill(process_group_id, signal.SIGTERM)
         except (ProcessLookupError, OSError):
-            return
+            return not _is_process_group_alive(process_group_id)
     time.sleep(grace_seconds)
     if not _is_process_group_alive(process_group_id):
-        return
+        return True
     try:
         os.killpg(process_group_id, signal.SIGKILL)
     except OSError:
@@ -1886,6 +1955,11 @@ def _terminate_process_group(process_group_id: int, grace_seconds: float) -> Non
             os.kill(process_group_id, signal.SIGKILL)
         except (ProcessLookupError, OSError):
             pass
+    # Reap our leader if it became a zombie, then give adopted descendants a
+    # brief chance to disappear before reporting failure.
+    _is_pid_alive(process_group_id)
+    time.sleep(0.1)
+    return not _is_process_group_alive(process_group_id)
 
 
 def _parse_duration(time_str: str) -> Optional[int]:
@@ -2322,7 +2396,8 @@ def _recover_orphans() -> None:
     now = datetime.now()
     for spool in _list_spools():
         if spool.get("status") == "running":
-            _check_and_finalize_spool(spool["id"])
+            if not _check_and_finalize_spool(spool["id"]):
+                _start_spool_monitor(spool["id"])
         elif spool.get("status") == "error" and spool.get("shard_cleanup_pending"):
             _schedule_deferred_shard_cleanup(spool["id"])
         elif spool.get("status") == "pending" and not spool.get("pid"):
@@ -2511,6 +2586,23 @@ def _monitor_spool(spool_id: str) -> None:
         time.sleep(MONITOR_POLL_INTERVAL)
 
 
+def _run_spool_monitor(spool_id: str) -> None:
+    try:
+        _monitor_spool(spool_id)
+    finally:
+        with _SPOOL_MONITORS_LOCK:
+            _SPOOL_MONITORS.discard(spool_id)
+
+
+def _start_spool_monitor(spool_id: str) -> None:
+    """Ensure exactly one background finalizer monitors a running spool."""
+    with _SPOOL_MONITORS_LOCK:
+        if spool_id in _SPOOL_MONITORS:
+            return
+        _SPOOL_MONITORS.add(spool_id)
+    threading.Thread(target=_run_spool_monitor, args=(spool_id,), daemon=True).start()
+
+
 def _spawn_detached(spool_id: str, cmd: list, cwd: str, env: Optional[Dict[str, str]] = None) -> int:
     """
     Spawn a detached process that survives parent death.
@@ -2537,14 +2629,11 @@ def _spawn_detached(spool_id: str, cmd: list, cwd: str, env: Optional[Dict[str, 
 
     # A Popen handle is process-local and disappears when the Spindle server
     # restarts. Keep a tiny detached shell as the process-group leader so it can
-    # atomically persist the real child exit status for orphan recovery. `"$@"`
-    # passes every argv item literally; prompts never enter shell source.
-    wrapper_script = (
-        'status_file="$1"; shift; "$@"; rc=$?; '
-        'tmp_file="${status_file}.tmp.$$"; '
-        'printf "%s\\n" "$rc" > "$tmp_file" && /bin/mv "$tmp_file" "$status_file"; '
-        'exit "$rc"'
-    )
+    # persist the real child exit status for orphan recovery. The shell writes
+    # one integer before exiting, so readers only inspect it after the PID is
+    # dead; a partial/missing write fails closed. `"$@"` passes every argv item
+    # literally, and no non-POSIX utility path is required.
+    wrapper_script = 'status_file="$1"; shift; "$@"; rc=$?; printf "%s\\n" "$rc" > "$status_file"; exit "$rc"'
     wrapped_cmd = ["/bin/sh", "-c", wrapper_script, "spindle-exit-status", str(exit_path), *cmd]
 
     with open(stdout_path, "w") as stdout_file, open(stderr_path, "w") as stderr_file:
@@ -2867,8 +2956,7 @@ Your task:
     _write_spool(spool_id, spool)
 
     # Start background monitor thread (daemon so it won't block shutdown)
-    monitor = threading.Thread(target=_monitor_spool, args=(spool_id,), daemon=True)
-    monitor.start()
+    _start_spool_monitor(spool_id)
 
     return spool_id
 
@@ -3284,17 +3372,8 @@ def _spin_drop_sync(spool_id: str) -> str:
     if not pid:
         return f"Spool {spool_id} has no PID recorded yet"
 
-    # Kill the process group (since we used start_new_session)
-    try:
-        os.killpg(pid, signal.SIGTERM)
-    except ProcessLookupError:
-        pass  # Already dead
-    except OSError:
-        # Try killing just the process
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except (ProcessLookupError, OSError):
-            pass
+    if not _terminate_process_group(pid, 0.5):
+        return f"Error: Could not terminate process group for spool {spool_id}"
 
     # Update spool status
     spool["status"] = "error"
@@ -3625,8 +3704,7 @@ def _respin_sync(handle: str, prompt: str) -> str:
         _write_spool(spool_id, spool)
 
         # Start background monitor
-        monitor = threading.Thread(target=_monitor_spool, args=(spool_id,), daemon=True)
-        monitor.start()
+        _start_spool_monitor(spool_id)
 
         return spool_id
 
@@ -3953,17 +4031,8 @@ async def spin_drop(spool_id: str) -> str:
     if not pid:
         return f"Spool {spool_id} has no PID recorded yet"
 
-    # Kill the process group (since we used start_new_session)
-    try:
-        os.killpg(pid, signal.SIGTERM)
-    except ProcessLookupError:
-        pass  # Already dead
-    except OSError:
-        # Try killing just the process
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except (ProcessLookupError, OSError):
-            pass
+    if not _terminate_process_group(pid, 0.5):
+        return f"Error: Could not terminate process group for spool {spool_id}"
 
     # Update spool status
     spool["status"] = "error"
@@ -5196,14 +5265,8 @@ async def shard_abandon(spool_id: str, keep_branch: bool = False, caller_cwd: st
     # If spool is running, kill it first
     if spool.get("status") == "running":
         pid = spool.get("pid")
-        if pid:
-            try:
-                os.killpg(pid, signal.SIGTERM)
-            except (ProcessLookupError, OSError):
-                try:
-                    os.kill(pid, signal.SIGTERM)
-                except (ProcessLookupError, OSError):
-                    pass
+        if pid and not _terminate_process_group(pid, 0.5):
+            return f"Error: Could not terminate process group for spool {spool_id}; shard preserved"
 
         spool["status"] = "error"
         spool["error"] = "Shard abandoned"
@@ -6005,8 +6068,7 @@ Your task:
     _write_spool(spool_id, spool)
 
     # Start background monitor thread
-    monitor = threading.Thread(target=_monitor_spool, args=(spool_id,), daemon=True)
-    monitor.start()
+    _start_spool_monitor(spool_id)
 
     return spool_id
 
@@ -6180,8 +6242,7 @@ def _codex_respin_sync(session_id: str, prompt: str) -> str:
     _write_spool(spool_id, spool)
 
     # Start background monitor
-    monitor = threading.Thread(target=_monitor_spool, args=(spool_id,), daemon=True)
-    monitor.start()
+    _start_spool_monitor(spool_id)
 
     return spool_id
 
@@ -6572,8 +6633,7 @@ Your task:
     _write_spool(spool_id, spool)
 
     # Start background monitor thread (reuse the standard monitor)
-    monitor = threading.Thread(target=_monitor_spool, args=(spool_id,), daemon=True)
-    monitor.start()
+    _start_spool_monitor(spool_id)
 
     return spool_id
 
@@ -6622,8 +6682,7 @@ def _gemini_respin_sync(session_id: str, prompt: str, original_spool: dict) -> s
     spool["status"] = "running"
     _write_spool(spool_id, spool)
 
-    monitor = threading.Thread(target=_monitor_spool, args=(spool_id,), daemon=True)
-    monitor.start()
+    _start_spool_monitor(spool_id)
 
     return spool_id
 
@@ -6850,7 +6909,7 @@ Your task:
     _write_spool(spool_id, spool)
 
     # Start background monitor thread
-    threading.Thread(target=_monitor_spool, args=(spool_id,), daemon=True).start()
+    _start_spool_monitor(spool_id)
 
     return spool_id
 
@@ -6944,7 +7003,7 @@ def _kimi_respin_sync(
     _write_spool(spool_id, spool)
 
     # Start background monitor thread
-    threading.Thread(target=_monitor_spool, args=(spool_id,), daemon=True).start()
+    _start_spool_monitor(spool_id)
 
     return spool_id
 
