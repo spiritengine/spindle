@@ -1546,6 +1546,9 @@ def _publish_spawned_process(spool_id: str, pid: int) -> bool:
         current = _read_spool(spool_id) if acquired else None
         if current and current.get("status") == "pending":
             current["pid"] = pid
+            process_start_time = _process_start_time(pid)
+            if process_start_time is not None:
+                current["process_start_time"] = process_start_time
             current["status"] = "running"
             _write_spool(spool_id, current)
             return True
@@ -1872,6 +1875,28 @@ def _extract_kimi_result(stdout: str) -> Optional[str]:
             if texts:
                 result_text = "\n".join(texts)
     return result_text
+
+
+def _process_start_time(pid: int) -> Optional[str]:
+    """Read Linux's non-repeating process birth token for PID reuse protection."""
+    try:
+        stat = (Path("/proc") / str(pid) / "stat").read_text()
+    except (FileNotFoundError, OSError):
+        return None
+    fields = stat[stat.rfind(")") + 2 :].split()
+    return fields[19] if len(fields) > 19 else None
+
+
+def _spool_process_identity_matches(spool: dict) -> bool:
+    """Prove that a stored PID still names the process Spindle launched."""
+    pid = spool.get("pid")
+    if not pid:
+        return False
+    expected_start_time = spool.get("process_start_time")
+    if expected_start_time is not None:
+        return _process_start_time(pid) == str(expected_start_time)
+    proc = _PROC_HANDLES.get(spool.get("id"))
+    return proc is not None and getattr(proc, "pid", None) == pid
 
 
 def _is_pid_alive(pid: int) -> bool:
@@ -3769,7 +3794,8 @@ def _respin_sync(handle: str, prompt: str) -> str:
         if orig_allowed_tools:
             cmd.extend(["--allowedTools", orig_allowed_tools])
 
-        cwd = os.getcwd()
+        shard_info = original_spool.get("shard")
+        cwd = original_spool.get("working_dir") or (shard_info or {}).get("worktree_path") or os.getcwd()
 
         # Check if we have a transcript for this session
         transcript_available = False
@@ -3811,6 +3837,14 @@ def _respin_sync(handle: str, prompt: str) -> str:
             if profile_extra_args:
                 cmd.extend(profile_extra_args)
 
+        if shard_info:
+            cmd = _codex_bwrap_wrap(
+                cmd,
+                shard_info,
+                cwd,
+                process_env=_process_env(spawn_env),
+            )
+
         spool = {
             "id": spool_id,
             "status": "pending",
@@ -3824,7 +3858,7 @@ def _respin_sync(handle: str, prompt: str) -> str:
             "transcript_fallback_available": transcript_available,
             "env": caller_env,
             "profile": profile_name,
-            "shard": original_spool.get("shard"),
+            "shard": shard_info,
             "created_at": datetime.now().isoformat(),
             "completed_at": None,
             "pid": None,
@@ -5240,6 +5274,8 @@ def _shard_merge_locked(spool_id: str, keep_branch: bool, caller_cwd: str | None
     wt_path = Path(worktree_path).resolve()
     for other in _list_spools():
         if other.get("status") in {"pending", "running"} and other.get("id") != spool_id:
+            if _spool_worktree_path(other) == str(wt_path):
+                return f"Error: Spool {other['id']} is still running in this worktree. Wait for it to complete or use spin_drop() first."
             other_wd = other.get("working_dir", "")
             if not other_wd:
                 continue
@@ -5255,8 +5291,8 @@ def _shard_merge_locked(spool_id: str, keep_branch: bool, caller_cwd: str | None
     # the shard. Resolve that explicit warning before any Git or cleanup work.
     if spool.get("process_group_cleanup_warning"):
         pid = spool.get("pid")
-        if not pid:
-            return f"Error: Spool {spool_id} has an unresolved process-group warning; shard preserved"
+        if not pid or not _spool_process_identity_matches(spool):
+            return f"Error: Spool {spool_id} has an unverifiable process-group warning; shard preserved"
         if _is_pid_alive(pid) or _is_process_group_alive(pid):
             if not _terminate_process_group(pid, 0.5):
                 return f"Error: Could not terminate process group for spool {spool_id}; shard preserved"
@@ -5394,6 +5430,8 @@ def _shard_abandon_locked(spool_id: str, keep_branch: bool, caller_cwd: str | No
     wt_path = Path(worktree_path).resolve()
     for other in _list_spools():
         if other.get("status") in {"pending", "running"} and other.get("id") != spool_id:
+            if _spool_worktree_path(other) == str(wt_path):
+                return f"Error: Spool {other['id']} is still running in this worktree. Wait for it to complete or use spin_drop() first."
             other_wd = other.get("working_dir", "")
             if not other_wd:
                 continue
@@ -5404,13 +5442,17 @@ def _shard_abandon_locked(spool_id: str, keep_branch: bool, caller_cwd: str | No
     # Find the main repo path
     main_repo = Path(worktree_path).parent.parent
 
-    # A terminal spool can still carry a warned-about live group. Never remove
-    # its worktree until that group is gone, and explicitly reap any stored
-    # wrapper handle before cleanup or replacement.
+    # Signal only a process whose birth identity still matches this spool. A
+    # preserved terminal record can outlive its PID and must never kill the
+    # unrelated process that later reused that number.
+    should_signal = spool.get("status") == "running" or bool(spool.get("process_group_cleanup_warning"))
     pid = spool.get("pid")
-    if pid and (_is_pid_alive(pid) or _is_process_group_alive(pid)):
-        if not _terminate_process_group(pid, 0.5):
-            return f"Error: Could not terminate process group for spool {spool_id}; shard preserved"
+    if should_signal:
+        if not _spool_process_identity_matches(spool):
+            return f"Error: Could not verify process identity for spool {spool_id}; shard preserved"
+        if _is_pid_alive(pid) or _is_process_group_alive(pid):
+            if not _terminate_process_group(pid, 0.5):
+                return f"Error: Could not terminate process group for spool {spool_id}; shard preserved"
     _pop_and_reap_process_handle(spool_id)
     spool.pop("process_group_cleanup_warning", None)
 

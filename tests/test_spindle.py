@@ -689,6 +689,51 @@ class TestClaudePermissionCommandShape:
         assert cmd[cmd.index("--permission-mode") + 1] == "auto"
         assert "--allowedTools" not in cmd
 
+    def test_claude_shard_respin_reuses_worktree_and_outer_wrapper(self, tmp_path):
+        spool_id = "claude-shard-respin"
+        worktree = tmp_path / "worktrees" / "claude-shard-respin"
+        worktree.mkdir(parents=True)
+        shard = {
+            "worktree_path": str(worktree),
+            "branch_name": "shard-claude-shard-respin",
+            "shard_id": "claude-shard-respin",
+        }
+        wrapped = []
+        spawned = []
+
+        def wrap(cmd, shard_info, cwd, **kwargs):
+            wrapped.append((list(cmd), shard_info, cwd))
+            return ["wrapped-claude"]
+
+        def spawn(spawn_id, cmd, cwd, env=None):
+            spawned.append((spawn_id, list(cmd), cwd))
+            return 787878
+
+        with patch("spindle.SPINDLE_DIR", tmp_path / "spools"):
+            _write_spool(
+                spool_id,
+                {
+                    "id": spool_id,
+                    "status": "complete",
+                    "session_id": "claude-shard-session",
+                    "harness": "claude-code",
+                    "permission": "careful+shard",
+                    "allowed_tools": None,
+                    "working_dir": str(worktree),
+                    "shard": shard,
+                },
+            )
+            with patch("spindle._codex_bwrap_wrap", side_effect=wrap):
+                with patch("spindle._spawn_detached", side_effect=spawn):
+                    with patch("spindle._start_spool_monitor"):
+                        result = _respin_sync(spool_id, "continue in shard")
+
+        assert not result.startswith("Error"), result
+        assert wrapped[0][1:] == (shard, str(worktree))
+        assert wrapped[0][0][0] == "claude"
+        assert "--resume" in wrapped[0][0]
+        assert spawned[0][1:] == (["wrapped-claude"], str(worktree))
+
     def test_respin_readonly_reemits_acceptedits_and_allowlist(self, tmp_path):
         """A claude respin of a readonly spool must re-apply acceptEdits + the
         stored allowlist so the resumed spool stays as tight as the original."""
@@ -3095,11 +3140,66 @@ class TestOrphanedLockSweep:
         assert "shard_cleanup_preserved" not in saved
         assert "shard_cleanup_preserved_reason" not in saved
 
+    def test_terminal_shard_abandon_never_signals_unwarned_stale_pid(self, tmp_path):
+        spool_id = "terminal-stale-pid"
+        worktree = tmp_path / "worktrees" / "terminal-stale-pid"
+        worktree.mkdir(parents=True)
+        with patch("spindle.SPINDLE_DIR", tmp_path / "spools"):
+            _write_spool(
+                spool_id,
+                {
+                    "id": spool_id,
+                    "status": "error",
+                    "pid": 767676,
+                    "created_at": datetime.now().isoformat(),
+                    "shard_cleanup_preserved": True,
+                    "shard": {
+                        "worktree_path": str(worktree),
+                        "branch_name": "shard-terminal-stale-pid",
+                    },
+                },
+            )
+            abandon = shard_abandon.fn if hasattr(shard_abandon, "fn") else shard_abandon
+            with patch("spindle._is_pid_alive", side_effect=AssertionError("must not probe stale PID")):
+                with patch("spindle._terminate_process_group", side_effect=AssertionError("must not signal stale PID")):
+                    with patch("spindle._cleanup_shard", return_value=True):
+                        result = asyncio.run(abandon(spool_id, caller_cwd=str(tmp_path / "outside")))
+
+        assert result == f"Abandoned shard {spool_id}"
+
+    def test_running_shard_abandon_refuses_unverifiable_pid(self, tmp_path):
+        spool_id = "running-unverifiable-pid"
+        worktree = tmp_path / "worktrees" / "running-unverifiable-pid"
+        worktree.mkdir(parents=True)
+        with patch("spindle.SPINDLE_DIR", tmp_path / "spools"):
+            _write_spool(
+                spool_id,
+                {
+                    "id": spool_id,
+                    "status": "running",
+                    "pid": 777777,
+                    "created_at": datetime.now().isoformat(),
+                    "shard": {
+                        "worktree_path": str(worktree),
+                        "branch_name": "shard-running-unverifiable-pid",
+                    },
+                },
+            )
+            abandon = shard_abandon.fn if hasattr(shard_abandon, "fn") else shard_abandon
+            with patch("spindle._terminate_process_group") as terminate:
+                with patch("spindle._cleanup_shard") as cleanup:
+                    result = asyncio.run(abandon(spool_id, caller_cwd=str(tmp_path / "outside")))
+
+        assert result == f"Error: Could not verify process identity for spool {spool_id}; shard preserved"
+        terminate.assert_not_called()
+        cleanup.assert_not_called()
+
     def test_running_shard_abandon_serializes_finalizer_and_reaps_handle(self, tmp_path):
         spool_id = "running-abandon-race"
         worktree = tmp_path / "worktrees" / "running-abandon-race"
         worktree.mkdir(parents=True)
         proc = MagicMock()
+        proc.pid = 636363
         proc.poll.return_value = -15
         finalize_attempts = []
 
@@ -3145,6 +3245,14 @@ class TestProcessUtils:
         """Current process PID should be alive."""
 
         assert _is_pid_alive(os.getpid()) is True
+
+    def test_process_identity_detects_pid_reuse_token_mismatch(self):
+        token = spindle._process_start_time(os.getpid())
+        assert token is not None
+        spool = {"id": "identity", "pid": os.getpid(), "process_start_time": token}
+        assert spindle._spool_process_identity_matches(spool) is True
+        spool["process_start_time"] = "different-process-birth"
+        assert spindle._spool_process_identity_matches(spool) is False
 
     def test_is_pid_alive_nonexistent(self):
         """Nonexistent PID should not be alive."""
@@ -5891,6 +5999,44 @@ class TestShardOpsBlockedBySubdirectorySpool:
 
 
 class TestShardMergeCleanupFailure:
+    def test_shard_identity_blocks_active_respin_even_when_cwd_is_outside(self, tmp_path):
+        state_dir = tmp_path / "spools"
+        worktree = tmp_path / "worktrees" / "shared-identity"
+        worktree.mkdir(parents=True)
+        target_id = "shared-identity-target"
+        active_id = "shared-identity-respin"
+        shard = {"worktree_path": str(worktree), "branch_name": "shard-shared-identity"}
+        with patch("spindle.SPINDLE_DIR", state_dir):
+            _write_spool(
+                target_id,
+                {
+                    "id": target_id,
+                    "status": "complete",
+                    "base_branch": "main",
+                    "created_at": datetime.now().isoformat(),
+                    "shard": shard,
+                },
+            )
+            _write_spool(
+                active_id,
+                {
+                    "id": active_id,
+                    "status": "running",
+                    "working_dir": str(tmp_path / "outside"),
+                    "created_at": datetime.now().isoformat(),
+                    "shard": shard,
+                },
+            )
+            merge = shard_merge.fn if hasattr(shard_merge, "fn") else shard_merge
+            abandon = shard_abandon.fn if hasattr(shard_abandon, "fn") else shard_abandon
+            with patch("spindle._cleanup_shard") as cleanup:
+                merge_result = asyncio.run(merge(target_id, caller_cwd=str(tmp_path / "outside")))
+                abandon_result = asyncio.run(abandon(target_id, caller_cwd=str(tmp_path / "outside")))
+
+        assert active_id in merge_result
+        assert active_id in abandon_result
+        cleanup.assert_not_called()
+
     def test_merge_blocks_new_process_publication_in_same_worktree(self, tmp_path):
         state_dir = tmp_path / "spools"
         worktree = tmp_path / "worktrees" / "shared-launch"
@@ -5927,14 +6073,20 @@ class TestShardMergeCleanupFailure:
 
         def spawn(*args, **kwargs):
             process_spawned.set()
+            if not Path(args[2]).exists():
+                raise FileNotFoundError("worktree was merged and removed")
             return 757575
+
+        def cleanup(*args, **kwargs):
+            worktree.rmdir()
+            return True
 
         merge = shard_merge.fn if hasattr(shard_merge, "fn") else shard_merge
         with patch("spindle.SPINDLE_DIR", state_dir):
             _write_spool(merge_id, merge_spool)
             _write_spool(launch_id, {"id": launch_id, "status": "pending", "created_at": datetime.now().isoformat()})
             with patch("spindle.subprocess.run", side_effect=git_run):
-                with patch("spindle._cleanup_shard", return_value=True):
+                with patch("spindle._cleanup_shard", side_effect=cleanup):
                     with patch("spindle._close_tender_folios", return_value=None):
                         with patch("spindle._spawn_detached", side_effect=spawn):
                             merge_thread = threading.Thread(
@@ -5961,9 +6113,9 @@ class TestShardMergeCleanupFailure:
         assert not merge_thread.is_alive()
         assert not launch_thread.is_alive()
         assert merge_results == [f"Successfully merged shard {merge_id} to main"]
-        assert launch_results == [None]
-        assert launched["status"] == "running"
-        assert launched["pid"] == 757575
+        assert launch_results == ["Error: Failed to spawn process: worktree was merged and removed"]
+        assert launched["status"] == "error"
+        assert "worktree was merged and removed" in launched["error"]
 
     def test_different_spool_handles_serialize_operations_on_shared_worktree(self, tmp_path):
         state_dir = tmp_path / "spools"
@@ -6066,6 +6218,7 @@ class TestShardMergeCleanupFailure:
             "prompt": "merge me",
             "base_branch": "main",
             "pid": 747474,
+            "process_start_time": "warned-start-token",
             "process_group_cleanup_warning": "group survived normal finalization",
             "created_at": datetime.now().isoformat(),
             "shard": {
@@ -6084,13 +6237,14 @@ class TestShardMergeCleanupFailure:
         merge = shard_merge.fn if hasattr(shard_merge, "fn") else shard_merge
         with patch("spindle.SPINDLE_DIR", state_dir):
             _write_spool(spool_id, spool)
-            with patch("spindle._is_pid_alive", return_value=True):
-                with patch("spindle._terminate_process_group", return_value=True) as terminate:
-                    with patch("spindle._pop_and_reap_process_handle") as reap:
-                        with patch("spindle.subprocess.run", side_effect=git_run):
-                            with patch("spindle._cleanup_shard", return_value=True):
-                                with patch("spindle._close_tender_folios", return_value=None):
-                                    result = asyncio.run(merge(spool_id, caller_cwd=str(tmp_path / "outside")))
+            with patch("spindle._process_start_time", return_value="warned-start-token"):
+                with patch("spindle._is_pid_alive", return_value=True):
+                    with patch("spindle._terminate_process_group", return_value=True) as terminate:
+                        with patch("spindle._pop_and_reap_process_handle") as reap:
+                            with patch("spindle.subprocess.run", side_effect=git_run):
+                                with patch("spindle._cleanup_shard", return_value=True):
+                                    with patch("spindle._close_tender_folios", return_value=None):
+                                        result = asyncio.run(merge(spool_id, caller_cwd=str(tmp_path / "outside")))
             saved = _read_spool(spool_id)
 
         assert result == f"Successfully merged shard {spool_id} to main"
