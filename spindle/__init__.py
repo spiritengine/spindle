@@ -7700,40 +7700,81 @@ def _read_service_record(name: str) -> Optional[dict]:
     return record
 
 
-def _service_file_excerpt(path: Path, max_lines: int = 12) -> str:
-    """The lines of a service file that state its port and store, verbatim.
+def _service_file_excerpt(path: Path, max_lines: int = 12, max_chars: int = 200) -> Tuple[str, str]:
+    """The lines of a service file that state its port and store, quoted safely.
 
-    Quoted, never interpreted. This is what spindle shows instead of guessing:
-    the operator can read their own file's settings, and no value spindle
-    believes about the file can be pasted back into a command.
+    Returns ``(excerpt, note)``. Quoted, never interpreted — but "verbatim" is
+    not the same as "raw", and the difference matters here because this text is
+    what the operator reads and retypes:
+
+    - continuations are folded first, or a wrapped ExecStart shows its head and
+      hides the `--port` on the next line, and the operator concludes the file
+      states no port;
+    - only spindle's own settings are shown. Emitting every `Environment=` line
+      put unrelated secrets into an error message that lands in agent
+      transcripts and spool records;
+    - control characters are stripped and long lines truncated. A value carrying
+      an escape sequence could clear the terminal and hide the lines above it,
+      and a multi-megabyte line went out whole;
+    - a file that cannot be decoded as text (a binary plist, which launchd
+      accepts and `plutil -convert binary1` produces routinely) is named as such
+      and pointed at the tool that reads it, rather than dumped as mojibake.
     """
     try:
-        text = path.read_text(errors="replace")
-    except OSError:
-        return ""
-    raw = [line.rstrip() for line in text.splitlines()]
+        raw_bytes = path.read_bytes()[: 256 * 1024]
+    except OSError as exc:
+        return "", f"{path.name} could not be read ({exc}); nothing below is a reading of it."
+    try:
+        text = raw_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        if path.suffix == ".plist":
+            return "", f"{path.name} is a binary plist; read it with: plutil -p {path}"
+        return "", f"{path.name} is not text, so spindle cannot quote it."
+
+    def clean(line: str) -> str:
+        line = "".join(ch for ch in line.rstrip() if ch == "\t" or ch.isprintable())
+        return line if len(line) <= max_chars else line[:max_chars] + " ..."
+
+    note = ""
+    lines = []
     if path.suffix == ".plist":
-        # In a plist the key and its value are on separate lines, so a match has
-        # to bring the following line with it or the excerpt shows key names and
-        # no settings.
         wanted = ("--port", "SPINDLE_HOME", "SPINDLE_PORT", "ProgramArguments")
+        raw = text.splitlines()
         keep = set()
         for i, line in enumerate(raw):
             if any(token in line for token in wanted):
                 keep.add(i)
                 if i + 1 < len(raw):
-                    keep.add(i + 1)
-        lines = [raw[i] for i in sorted(keep)]
+                    keep.add(i + 1)  # in a plist the value is the next line
+        lines = [clean(raw[i]) for i in sorted(keep)]
     else:
-        wanted = ("ExecStart", "Environment", "EnvironmentFile")
-        lines = [line for line in raw if any(token in line for token in wanted)]
+        for line in _join_line_continuations(text).splitlines():
+            stripped = line.strip()
+            if re.match(r"^ExecStart\s*=", stripped) or re.match(r"^EnvironmentFile\s*=", stripped):
+                lines.append(clean(stripped))
+            elif re.match(r"^Environment\s*=", stripped) and "SPINDLE_" in stripped:
+                # Only spindle's own variables; other Environment= lines are none
+                # of spindle's business and may hold credentials.
+                lines.append(clean(stripped))
+        # A bare % is a systemd specifier resolved at run time. That is a
+        # syntactic fact about the text, not an interpretation of its value —
+        # and without saying so, "type what you read" turns %h/store into a
+        # literal directory called %h/store.
+        for line in lines:
+            if "SPINDLE_HOME" in line and re.search(r"(?<!%)%(?!%)", line):
+                note = (
+                    "The store above uses a systemd specifier (a bare %), which systemd resolves "
+                    "at run time. Type the real directory, not that string."
+                )
+                break
+
     if not lines:
-        return ""
+        return "", note
     shown = lines[:max_lines]
     excerpt = "\n".join(f"    {line}" for line in shown)
     if len(lines) > max_lines:
         excerpt += f"\n    ... and {len(lines) - max_lines} more line(s)"
-    return excerpt
+    return excerpt, note
 
 
 def _resolve_service_settings(
@@ -7787,7 +7828,7 @@ def _resolve_service_settings(
         # be interpreted reliably — so it quotes the file instead. The operator
         # reads their own settings and types them; nothing spindle believes about
         # the file can be pasted back into it.
-        excerpt = _service_file_excerpt(existing)
+        excerpt, excerpt_note = _service_file_excerpt(existing)
         blocker = (
             f"{existing} exists but spindle has no record of installing it (or the file changed "
             f"since), so what it currently runs with cannot be established from the file alone.\n"
@@ -7797,6 +7838,8 @@ def _resolve_service_settings(
         )
         if excerpt:
             blocker += f"\n\nWhat the file says:\n{excerpt}"
+        if excerpt_note:
+            blocker += f"\n{excerpt_note}"
         return None, None, notes, blocker
 
     if arg_port is not None:
@@ -7835,9 +7878,13 @@ def _port_from_unit(name: str) -> Optional[int]:
     ExecStart wins over the Environment line: it is what the service actually
     binds, so if someone edited only one of the two, that is the truthful one.
     """
-    # One reader, so `reload`/`doctor` cannot be misled by a file shape that
-    # install-service reads correctly (an ExecStartPre mentioning the flag, a
-    # repeated Environment= line).
+    # The record is authoritative when there is one; reading the file is the
+    # fallback and can be fooled by shapes that are not argv (a `--port=` inside
+    # a shell-wrapped command, a decoy in a comment). Wrong here only
+    # mis-addresses a probe, but the record costs nothing and is exact.
+    record = _read_service_record(name)
+    if record is not None:
+        return record["port"]
     return _service_settings_from_file(_unit_file_path(name))["port"]
 
 

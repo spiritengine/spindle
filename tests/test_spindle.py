@@ -9652,7 +9652,7 @@ class TestTheRefusalQuotesRatherThanInterprets:
 
     def test_the_excerpt_is_bounded(self, config, tmp_path):
         unit = tmp_path / "svc.service"
-        unit.write_text("[Service]\n" + "Environment=FOO=bar\n" * 50)
+        unit.write_text("[Service]\n" + "Environment=SPINDLE_EXTRA=x\n" * 50)
         blocker = self._blocker(unit)
         assert "and 38 more line(s)" in blocker
 
@@ -9708,3 +9708,155 @@ def test_service_files_are_written_as_utf8(tmp_path, monkeypatch):
     # and therefore the record's digest matches the file on disk
     assert spindle._read_service_record("svc")["service_sha256"] == spindle._service_file_digest(unit)
     assert spindle._resolve_service_settings(unit, None, None, name="svc")[3] is None
+
+
+class TestTheExcerptIsSafeToRead:
+    """Quoting is what the operator now retypes, so "verbatim" is not enough."""
+
+    @pytest.fixture
+    def config(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
+        return tmp_path
+
+    def _blocker(self, unit):
+        return spindle._resolve_service_settings(unit, None, None, name="svc")[3]
+
+    def test_a_wrapped_execstart_still_shows_its_port(self, config, tmp_path):
+        """Unfolded, the port sat on a continuation line and vanished from view."""
+        unit = tmp_path / "svc.service"
+        unit.write_text(
+            "[Service]\nExecStart=/usr/bin/spindle serve --http \\\n    --port 8115 \\\n    --host 127.0.0.1\n"
+        )
+        blocker = self._blocker(unit)
+        assert "--port 8115" in blocker
+
+    def test_a_specifier_store_is_flagged_even_though_it_is_quoted(self, config, tmp_path):
+        """ "Type what you read" turns %h/store into a literal directory."""
+        unit = tmp_path / "svc.service"
+        unit.write_text("[Service]\nEnvironment=SPINDLE_HOME=%h/store\nExecStart=/b serve --http --port 8115\n")
+        blocker = self._blocker(unit)
+        assert "%h/store" in blocker  # still quoted verbatim
+        assert "systemd specifier" in blocker
+        assert "Type the real directory" in blocker
+
+    def test_a_literal_percent_is_not_flagged(self, config, tmp_path):
+        unit = tmp_path / "svc.service"
+        unit.write_text(spindle._systemd_unit_text("/bin/spindle", 8115, home="/srv/100%pure", name="svc"))
+        assert "systemd specifier" not in self._blocker(unit)
+
+    def test_unrelated_environment_lines_are_not_printed(self, config, tmp_path):
+        """This text lands in agent transcripts and spool records."""
+        unit = tmp_path / "svc.service"
+        unit.write_text(
+            "[Service]\nEnvironment=OPENAI_API_KEY=sk-do-not-print-me\n"
+            'Environment="SPINDLE_HOME=/srv/store"\nExecStart=/b serve --http --port 8115\n'
+        )
+        blocker = self._blocker(unit)
+        assert "sk-do-not-print-me" not in blocker
+        assert "/srv/store" in blocker
+
+    def test_an_environmentfile_path_is_still_shown(self, config, tmp_path):
+        """The path matters (it may hold the store); its contents are not read."""
+        unit = tmp_path / "svc.service"
+        unit.write_text("[Service]\nEnvironmentFile=/etc/spindle.env\nExecStart=/b serve --http --port 8115\n")
+        assert "/etc/spindle.env" in self._blocker(unit)
+
+    def test_control_characters_are_stripped(self, config, tmp_path):
+        """An escape sequence in a value could clear the screen and hide the rest."""
+        unit = tmp_path / "svc.service"
+        unit.write_text('[Service]\nEnvironment="SPINDLE_HOME=/srv/\x1b[2Jstore"\nExecStart=/b --port 1\n')
+        blocker = self._blocker(unit)
+        assert "\x1b" not in blocker
+
+    def test_a_very_long_line_is_truncated(self, config, tmp_path):
+        unit = tmp_path / "svc.service"
+        unit.write_text('[Service]\nEnvironment="SPINDLE_HOME=/srv/' + "x" * 5000 + '"\n')
+        blocker = self._blocker(unit)
+        assert len(max(blocker.splitlines(), key=len)) < 300
+        assert "..." in blocker
+
+    def test_a_binary_plist_is_named_not_dumped(self, config, tmp_path):
+        import plistlib
+
+        path = tmp_path / "com.svc.server.plist"
+        with open(path, "wb") as fh:
+            plistlib.dump({"EnvironmentVariables": {"SPINDLE_HOME": "/srv/store"}}, fh, fmt=plistlib.FMT_BINARY)
+        blocker = self._blocker(path)
+        assert "binary plist" in blocker
+        assert "plutil -p" in blocker
+        assert "bplist" not in blocker
+
+    def test_an_unreadable_file_says_so(self, config, tmp_path):
+        unit = tmp_path / "svc.service"
+        unit.write_text("[Service]\nExecStart=/b serve --http --port 1\n")
+        unit.chmod(0o000)
+        try:
+            blocker = self._blocker(unit)
+        finally:
+            unit.chmod(0o600)
+        assert "could not be read" in blocker
+
+    def test_a_file_with_nothing_to_say_is_not_confused_with_one_that_could_not_be_read(self, config, tmp_path):
+        unit = tmp_path / "svc.service"
+        unit.write_text("[Unit]\nDescription=nothing here\n")
+        blocker = self._blocker(unit)
+        assert "could not be read" not in blocker
+        assert "What the file says" not in blocker
+
+
+class TestPortProbePrefersTheRecord:
+    @pytest.fixture
+    def config(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
+        return tmp_path
+
+    def test_a_recorded_port_beats_a_decoy_in_the_unit(self, config):
+        """`sh -c '... --port 8115 # --port=9001'` binds 8115; the text says otherwise."""
+        unit = spindle._unit_file_path("svc")
+        unit.parent.mkdir(parents=True, exist_ok=True)
+        body = "[Service]\nExecStart=/bin/sh -c '/b/spindle serve --http --port 8115 # --port=9001'\n"
+        unit.write_text(body)
+        spindle._write_service_record("svc", 8115, None, unit, body)
+        assert spindle._port_from_unit("svc") == 8115
+
+    def test_without_a_record_it_falls_back_to_the_file(self, config):
+        unit = spindle._unit_file_path("svc")
+        unit.parent.mkdir(parents=True, exist_ok=True)
+        unit.write_text("[Service]\nExecStart=/b/spindle serve --http --port 8115\n")
+        assert spindle._port_from_unit("svc") == 8115
+
+
+def test_the_recreate_note_is_silent_when_both_values_came_from_argv(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
+    unit = tmp_path / "svc.service"
+    unit.write_text("body")
+    spindle._write_service_record("svc", 8115, "/srv/store", unit, "body")
+    unit.unlink()
+    _, _, notes_argv, _ = spindle._resolve_service_settings(unit, 9001, "/srv/new", name="svc")
+    assert notes_argv == []
+    _, _, notes_bare, _ = spindle._resolve_service_settings(unit, None, None, name="svc")
+    assert any("recreating it from spindle's record" in n for n in notes_bare)
+
+
+def test_service_files_are_written_utf8_under_a_c_locale(tmp_path):
+    """The suite's own locale hides this; PEP 540 turns UTF-8 mode on for C."""
+    script = tmp_path / "probe.py"
+    script.write_text(
+        "import sys, pathlib\n"
+        f"sys.path.insert(0, {str(Path(spindle.__file__).parent.parent)!r})\n"
+        "import spindle\n"
+        "p = pathlib.Path(sys.argv[1])\n"
+        "content = spindle._systemd_unit_text('/bin/spindle', 8115, home='/srv/caf\\u00e9')\n"
+        "p.write_text(content, encoding='utf-8')\n"
+        "print(spindle._digest_text(content) == spindle._service_file_digest(p))\n"
+    )
+    env = dict(os.environ, LC_ALL="C", LANG="C", PYTHONUTF8="0", PYTHONCOERCECLOCALE="0")
+    proc = subprocess.run(
+        [sys.executable, str(script), str(tmp_path / "svc.service")],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=120,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip().endswith("True"), proc.stdout
