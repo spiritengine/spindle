@@ -2971,6 +2971,37 @@ class TestOrphanedLockSweep:
             assert _read_spool("preserved") is not None
             assert _read_spool("ordinary") is None
 
+    def test_old_pending_reservation_survives_sweep_for_recovery(self, tmp_path):
+        spool_id = "old-pending-shard"
+        old_created = (datetime.now() - timedelta(hours=25)).isoformat()
+        worktree = tmp_path / "worktree"
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool(
+                spool_id,
+                {
+                    "id": spool_id,
+                    "status": "pending",
+                    "pid": None,
+                    "created_at": old_created,
+                    "shard": {"worktree_path": str(worktree)},
+                    "shard_created_by_spool": True,
+                },
+            )
+            _get_output_path(spool_id).write_text("startup diagnostics")
+
+            spindle._cleanup_old_spools()
+
+            assert _read_spool(spool_id) is not None
+            assert _get_output_path(spool_id).read_text() == "startup diagnostics"
+
+            _recover_orphans()
+
+            recovered = _read_spool(spool_id)
+            assert recovered["status"] == "error"
+            assert recovered["shard_cleanup_preserved"] is True
+            assert recovered["shard"]["startup_failure_preserved"] is True
+            assert _get_output_path(spool_id).read_text() == "startup diagnostics"
+
     def test_live_warned_process_keeps_old_spool_record_and_captures(self, tmp_path):
         old_created = (datetime.now() - timedelta(hours=25)).isoformat()
         spool_id = "warned-live-group"
@@ -5043,6 +5074,34 @@ class TestRecoverOrphansPending:
             assert spool["completed_at"] is not None
             assert spool["shard_cleanup_preserved"] is True
             assert spool["shard"]["startup_failure_preserved"] is True
+
+    def test_stale_pending_preservation_holds_terminal_lock(self, tmp_path):
+        stale_time = (datetime.now() - timedelta(seconds=PENDING_SPAWN_TIMEOUT + 60)).isoformat()
+        original_preserve = spindle._preserve_failed_spool_shard
+        lock_attempts = []
+
+        def assert_locked(spool):
+            with spindle._spool_lock(spool["id"], blocking=False) as acquired:
+                lock_attempts.append(acquired)
+            original_preserve(spool)
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool(
+                "locked-stale",
+                {
+                    "id": "locked-stale",
+                    "status": "pending",
+                    "pid": None,
+                    "created_at": stale_time,
+                    "shard": {"worktree_path": str(tmp_path / "worktree")},
+                    "shard_created_by_spool": True,
+                },
+            )
+            with patch("spindle._preserve_failed_spool_shard", side_effect=assert_locked):
+                _recover_orphans()
+
+            assert lock_attempts == [False]
+            assert _read_spool("locked-stale")["shard_cleanup_preserved"] is True
 
     def test_fresh_pending_spool_not_touched(self, tmp_path):
         """Pending spool within timeout should remain pending."""

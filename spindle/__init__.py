@@ -1955,6 +1955,11 @@ def _cleanup_old_spools() -> None:
                     data = json.load(f)
                 if data.get("id", spool_id) != spool_id:
                     continue
+                # Startup recovery owns classification of live reservations.
+                # Never delete them merely because their creation timestamp is
+                # old; recovery may need to finalize them or preserve a shard.
+                if data.get("status") in {"pending", "running"}:
+                    continue
                 # A preserved shard is intentionally recoverable through its
                 # spool handle until explicit merge/abandon resolves it.
                 if data.get("shard_cleanup_preserved"):
@@ -2351,19 +2356,26 @@ def _recover_orphans() -> None:
             if not _check_and_finalize_spool(spool["id"]):
                 _start_spool_monitor(spool["id"])
         elif spool.get("status") == "pending" and not spool.get("pid"):
-            # Check if this pending spool has been stuck too long
-            created_at = spool.get("created_at")
-            if created_at:
-                try:
-                    created_time = datetime.fromisoformat(created_at)
-                    if (now - created_time).total_seconds() > PENDING_SPAWN_TIMEOUT:
-                        spool["status"] = "error"
-                        spool["error"] = "spawn timeout - never started"
-                        spool["completed_at"] = now.isoformat()
-                        _preserve_failed_spool_shard(spool)
-                        _write_spool(spool["id"], spool)
-                except (ValueError, TypeError):
-                    pass
+            # Serialize with old-spool cleanup, then re-read so a concurrent
+            # terminal transition or PID publication cannot be overwritten.
+            with _spool_lock(spool["id"]) as acquired:
+                if not acquired:
+                    continue
+                current = _read_spool(spool["id"])
+                if not current or current.get("status") != "pending" or current.get("pid"):
+                    continue
+                created_at = current.get("created_at")
+                if created_at:
+                    try:
+                        created_time = datetime.fromisoformat(created_at)
+                        if (now - created_time).total_seconds() > PENDING_SPAWN_TIMEOUT:
+                            current["status"] = "error"
+                            current["error"] = "spawn timeout - never started"
+                            current["completed_at"] = now.isoformat()
+                            _preserve_failed_spool_shard(current)
+                            _write_spool(current["id"], current)
+                    except (ValueError, TypeError):
+                        pass
 
 
 def _handle_expired_session(spool_id: str, spool: dict) -> bool:
