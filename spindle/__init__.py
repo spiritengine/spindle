@@ -7576,76 +7576,116 @@ def _service_settings_from_file(path: Path) -> dict:
     return settings
 
 
+def _service_record_path(name: str) -> Path:
+    """Where spindle records what it installed a service with.
+
+    Six review rounds went into reading spindle's own settings back out of a
+    systemd unit, and each round found another place where the reader and
+    systemd disagreed: multi-assignment lines, single quotes, whitespace around
+    the `=`, C escapes, the bare `Environment=` reset, numeric escapes, and
+    finally `%h` and friends — specifiers whose value depends on the runtime
+    context of the service, which a file parser cannot know at all. Reading a
+    value slightly wrong is worse than not reading it, because it is written
+    straight back and moves the service somewhere that does not exist.
+
+    So spindle keeps its own record of what it installed, in a format it owns.
+    The unit file stays systemd's; this is spindle's. Nothing here needs to
+    parse anyone else's syntax.
+    """
+    base = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+    return Path(base) / "spindle" / "services" / f"{name}.json"
+
+
+def _write_service_record(name: str, port: int, home: Optional[str], service_file: Path) -> None:
+    """Record what a service was installed with, beside the service file."""
+    record = {
+        "name": name,
+        "port": port,
+        "home": home,
+        "service_file": str(service_file),
+        "spindle_version": __version__,
+    }
+    path = _service_record_path(name)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(record, indent=2) + "\n")
+    except OSError as exc:
+        # Not fatal: the service is installed and works. The next regeneration
+        # just has to be told its settings instead of reading them back.
+        logger.warning("spindle: could not record service settings in %s: %s", path, exc)
+
+
+def _read_service_record(name: str) -> Optional[dict]:
+    """What spindle installed this service with, or None if it has no record."""
+    try:
+        record = json.loads(_service_record_path(name).read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    return record if isinstance(record, dict) else None
+
+
 def _resolve_service_settings(
     existing: Path,
     arg_port: Optional[int],
     arg_home: Optional[str],
-) -> Tuple[int, Optional[str], list]:
-    """Apply the precedence rule to BOTH fields. Returns (port, home, notes).
+    name: Optional[str] = None,
+) -> Tuple[Optional[int], Optional[str], list, Optional[str]]:
+    """Decide what to regenerate a service with.
 
         an explicit argument
-          > what the service is already configured with
-            > the default
+          > spindle's own record of what it installed
+            > the default, for a service that does not exist yet
 
-    The third term is where this kept going wrong. "Already configured" includes
-    being configured with the default: a service installed without --home has no
-    SPINDLE_HOME line and runs on ~/.spindle, and one whose port cannot be read
-    runs on 8002. Those are settings expressed by absence, and consulting the
-    calling shell's SPINDLE_HOME/SPINDLE_PORT for them moves a running service
-    onto whatever that shell happens to export.
-
-    So the environment is consulted only when the service does not exist yet.
-    Both fields, symmetrically — fixing one and not the other is how this defect
-    survived three rounds of review.
-
-    ``arg_home=""`` is an explicit request for the default store, which is
-    otherwise unreachable once a store has been baked in.
+    Returns ``(port, home, notes, blocker)``. A non-None ``blocker`` means the
+    settings could NOT be established and the caller must not write: a service
+    file exists that spindle has no record of, so its port and store are
+    whatever a human put there. Guessing them from the file is what the previous
+    six rounds kept getting wrong, and a wrong guess silently moves a running
+    service. Asking for them explicitly is one copy-paste, and the message
+    carries spindle's best reading of the file as the hint.
     """
-    persisted = _service_settings_from_file(existing)
-    exists = existing.exists()
-    # Parsed successfully, so an absent setting really is "configured with the
-    # default". A file that exists but could not be read tells us nothing, and
-    # claiming to keep a value we never saw is worse than falling back quietly.
-    readable = persisted["readable"]
     notes = []
+    record = _read_service_record(name) if name else None
+    exists = existing.exists()
+
+    if record is None and exists and (arg_port is None or arg_home is None):
+        guess = _service_settings_from_file(existing)
+        hint_port = guess["port"] if guess["port"] is not None else _BASE_DEFAULT_PORT
+        hint_home = guess["home"]
+        hint = f"--port {hint_port}"
+        if hint_home:
+            hint += f" --home {hint_home}"
+        blocker = (
+            f"{existing} exists but spindle has no record of installing it, so what it currently "
+            f"runs with cannot be established from the file alone.\n"
+            f"Say what it should be, and spindle will record it from then on:\n"
+            f"  spindle install-service --name {name} {hint} --force\n"
+            f"(reading the file suggests {hint} — check it against the file before trusting it)"
+        )
+        return None, None, notes, blocker
 
     if arg_port is not None:
         port = arg_port
-    elif persisted["port"] is not None:
-        port = persisted["port"]
-        notes.append(f"Keeping the port {existing.name} already binds: {port} (pass --port to change it)")
+    elif record is not None and isinstance(record.get("port"), int):
+        port = record["port"]
+        notes.append(f"Keeping the port spindle installed {name} with: {port} (pass --port to change it)")
     elif exists:
         port = _BASE_DEFAULT_PORT
-        if not readable:
-            notes.append(f"Could not read {existing.name}; falling back to port {port}")
-        elif os.environ.get("SPINDLE_PORT"):
-            notes.append(
-                f"Keeping the default port {existing.name} already binds: {port} "
-                "(ignoring SPINDLE_PORT in this shell; pass --port to change it)"
-            )
     else:
         port = DEFAULT_PORT
 
     if arg_home is not None:
         home = arg_home or None
-    elif persisted["home"] is not None:
-        # `is not None`, not truthiness: a persisted empty SPINDLE_HOME is a
-        # setting the running service behaves by, and dropping it would move the
-        # store just as surely as replacing it.
-        home = persisted["home"]
-        shown = home or "(empty)"
-        notes.append(f"Keeping the spool store {existing.name} already uses: {shown} (pass --home to change it)")
+    elif record is not None and "home" in record:
+        home = record["home"] if isinstance(record["home"], str) else None
+        shown = home if home else "the default"
+        notes.append(f"Keeping the spool store spindle installed {name} with: {shown} (pass --home to change it)")
     elif exists:
         home = None
-        if readable and os.environ.get("SPINDLE_HOME"):
-            notes.append(
-                f"Keeping the default spool store {existing.name} already uses "
-                "(ignoring SPINDLE_HOME in this shell; pass --home to change it)"
-            )
     else:
         home = os.environ.get("SPINDLE_HOME")
 
-    return port, home, notes
+    return port, home, notes, None
 
 
 def _port_from_unit(name: str) -> Optional[int]:
@@ -8568,7 +8608,12 @@ def main():
 
             # Explicit argument > what this service is already configured with >
             # default. Read before anything is written.
-            service_port, service_home, notes = _resolve_service_settings(service_file, args.port, args.home)
+            service_port, service_home, notes, blocker = _resolve_service_settings(
+                service_file, args.port, args.home, name=args.name
+            )
+            if blocker:
+                print(blocker, file=sys.stderr)
+                sys.exit(1)
             for note in notes:
                 print(note)
             service_content = _systemd_unit_text(spindle_path, service_port, home=service_home, name=args.name)
@@ -8596,6 +8641,7 @@ def main():
                 origin = "was not written by spindle" if unmanaged else "is being regenerated"
                 print(f"{service_file} {origin}; backed it up to {backup}")
             service_file.write_text(service_content)
+            _write_service_record(args.name, service_port, service_home, service_file)
             print(f"Wrote {service_file} (port {service_port}, spindle {__version__})")
             if service_home:
                 print(f"Spool store baked into the unit: {service_home}")
@@ -8627,7 +8673,12 @@ def main():
             # Same precedence rule as the systemd branch, from the same reader.
             # This branch previously rebuilt the agent from argv alone, so a
             # reinstall without --port/--home moved it off both.
-            service_port, service_home, notes = _resolve_service_settings(plist_file, args.port, args.home)
+            service_port, service_home, notes, blocker = _resolve_service_settings(
+                plist_file, args.port, args.home, name=args.name
+            )
+            if blocker:
+                print(blocker, file=sys.stderr)
+                sys.exit(1)
             for note in notes:
                 print(note)
             plist_content = _launchd_plist_text(label, spindle_path, service_port, home=service_home, name=args.name)
@@ -8705,6 +8756,7 @@ def main():
             except OSError as exc:
                 _restore_previous(f"Could not write {plist_file}: {exc}")
                 sys.exit(1)
+            _write_service_record(args.name, service_port, service_home, plist_file)
             print(f"Wrote {plist_file} (port {service_port}, spindle {__version__})")
 
             # Ensure log directory exists

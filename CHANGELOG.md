@@ -40,12 +40,22 @@ and run alongside another install without confusing the two.
   not spindle wrote the file; and ownership cannot be inferred anyway, since the
   shape spindle generates is the shape users copy out of `examples/` and edit.
   Regeneration follows one rule on both platforms: an explicit argument beats
-  what the service is already configured with, which beats the default. Without
-  the middle term, re-running `install-service --name X --force` — which is what
-  doctor's own remedies tell you to do — rebuilt the service from the command
-  line alone, moving it off its port onto 8002 (colliding with the default
-  install) and off its spool store onto `~/.spindle`, stranding every spool
-  there. On macOS it also took no backup at all.
+  what spindle recorded installing the service with, which beats the default.
+  Without the middle term, re-running `install-service --name X --force` — which
+  is what doctor's own remedies tell you to do — rebuilt the service from the
+  command line alone, moving it off its port onto 8002 (colliding with the
+  default install) and off its spool store onto `~/.spindle`, stranding every
+  spool there.
+- Spindle keeps its own record of what it installed each service with, in
+  `$XDG_CONFIG_HOME/spindle/services/<name>.json`. Regeneration reads that,
+  not the unit file. Reading settings back out of a systemd unit means
+  reimplementing systemd's `Environment=` syntax — quoting, escapes, resets,
+  and `%h`-style specifiers whose value depends on the service's runtime
+  context and cannot be known from the file at all — and a value read slightly
+  wrong is worse than one not read, because it is written straight back.
+  A service file spindle has no record of is never regenerated from a guess:
+  `install-service` stops and asks for the port and store explicitly, offering
+  its best reading of the file as a hint to check rather than to trust.
 - A launchd agent whose new plist fails to load is restored from its backup and
   reloaded, rather than leaving the machine with the old agent unloaded and a
   rejected plist in place.
