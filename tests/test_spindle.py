@@ -9100,10 +9100,12 @@ class TestSystemdEnvironmentSyntax:
     def test_matches_systemd(self, line, expected):
         assert spindle._env_from_unit_text(line + "\n", "V") == expected
 
-    def test_unterminated_quote_drops_the_line(self):
-        """systemd rejects the line, so the variable is unset — not empty."""
+    def test_an_unterminated_quote_drops_that_word_and_the_rest(self):
+        """systemd keeps what parsed before the bad word; only the tail is lost."""
         assert spindle._env_from_unit_text('Environment="V=/srv/open\n', "V") is None
-        assert spindle._parse_systemd_env_line('"V=/srv/open') is None
+        assert spindle._parse_systemd_env_line('"V=/srv/open') == []
+        # an assignment before the break survives, as it does in systemd
+        assert spindle._env_from_unit_text('Environment=V=/srv/kept "X=/srv/open\n', "V") == "/srv/kept"
 
     def test_a_bare_environment_line_resets_everything_before_it(self):
         assert spindle._env_from_unit_text("Environment=V=gone\nEnvironment=\n", "V") is None
@@ -9739,19 +9741,14 @@ class TestTheExcerptIsSafeToRead:
         blocker = self._blocker(unit)
         assert "--port 8115" in blocker
 
-    def test_a_specifier_store_is_flagged_even_though_it_is_quoted(self, config, tmp_path):
-        """ "Type what you read" turns %h/store into a literal directory."""
+    def test_no_resolution_is_claimed_for_a_specifier_store(self, config, tmp_path):
+        """Spindle shows the line and sends the operator to systemd for its value."""
         unit = tmp_path / "svc.service"
         unit.write_text("[Service]\nEnvironment=SPINDLE_HOME=%h/store\nExecStart=/b serve --http --port 8115\n")
         blocker = self._blocker(unit)
-        assert "%h/store" in blocker  # still quoted verbatim
-        assert "systemd specifier" in blocker
-        assert "Type the real directory" in blocker
-
-    def test_a_literal_percent_is_not_flagged(self, config, tmp_path):
-        unit = tmp_path / "svc.service"
-        unit.write_text(spindle._systemd_unit_text("/bin/spindle", 8115, home="/srv/100%pure", name="svc"))
-        assert "systemd specifier" not in self._blocker(unit)
+        assert "%h/store" in blocker
+        assert "will not tell you what these resolve to" in blocker
+        assert "systemctl --user show -p Environment" in blocker
 
     def test_unrelated_environment_lines_are_not_printed(self, config, tmp_path):
         """This text lands in agent transcripts and spool records."""
@@ -9778,16 +9775,14 @@ class TestTheExcerptIsSafeToRead:
         assert "\x1b" not in blocker
 
     def test_a_very_long_quoted_line_is_truncated(self, config, tmp_path):
-        """The quoted line is bounded; the resolved value below it is not, because
-        that is the one the operator has to type in full."""
+        """The quoted line is bounded, so a value cannot run to megabytes."""
         unit = tmp_path / "svc.service"
         unit.write_text('[Service]\nEnvironment="SPINDLE_HOME=/srv/' + "x" * 5000 + '"\n')
         blocker = self._blocker(unit)
         quoted = [ln for ln in blocker.splitlines() if ln.startswith("    Environment=")][0]
         assert len(quoted) < 300
         assert quoted.endswith("...")
-        resolved = [ln for ln in blocker.splitlines() if ln.startswith("The store resolves to:")][0]
-        assert resolved.endswith("x" * 20)  # complete, not truncated
+        assert "will not tell you what these resolve to" in blocker
 
     def test_a_binary_plist_is_named_not_dumped(self, config, tmp_path):
         import plistlib
@@ -9897,11 +9892,6 @@ class TestExcerptPrecedenceAndLeaks:
         assert "clears every assignment above" in blocker
         assert "default store" in blocker
 
-    def test_a_reset_store_is_reported_as_the_default(self, config, tmp_path):
-        unit = tmp_path / "svc.service"
-        unit.write_text("[Service]\nEnvironment=SPINDLE_HOME=/data/store\nEnvironment=\n")
-        assert "No store survives" in self._blocker(unit)
-
     def test_a_secret_sharing_a_line_with_the_store_is_hidden(self, config, tmp_path):
         """systemd allows several assignments per line; the filter must be per assignment."""
         unit = tmp_path / "svc.service"
@@ -9919,27 +9909,6 @@ class TestExcerptPrecedenceAndLeaks:
         unit = tmp_path / "svc.service"
         unit.write_text('[Service]\nEnvironment="SPINDLE_HOME=/srv/store" \\\n    "OPENAI_API_KEY=sk-continued"\n')
         assert "sk-continued" not in self._blocker(unit)
-
-    def test_the_resolved_store_is_what_to_type_not_the_escaped_text(self, config, tmp_path):
-        """The raw line is in systemd's escaping: /srv/100%pure appears as 100%%pure."""
-        unit = tmp_path / "svc.service"
-        unit.write_text(spindle._systemd_unit_text("/bin/spindle", 8115, home="/srv/100%pure", name="svc"))
-        blocker = self._blocker(unit)
-        assert "The store resolves to: /srv/100%pure" in blocker
-        assert "systemd specifier" not in blocker
-
-    @pytest.mark.parametrize("store", ["%h/store", "%%%h/store", "/srv/%t/x"])
-    def test_specifier_runs_of_any_length_are_flagged(self, config, tmp_path, store):
-        """`%%%h` is a literal % then a specifier; a lookaround regex missed it."""
-        unit = tmp_path / "svc.service"
-        unit.write_text(f"[Service]\nEnvironment=SPINDLE_HOME={store}\nExecStart=/b serve --http --port 1\n")
-        assert "systemd specifier" in self._blocker(unit)
-
-    @pytest.mark.parametrize("store", ["/srv/100%pure", "/srv/plain", "/srv/a b"])
-    def test_ordinary_stores_are_not_flagged(self, config, tmp_path, store):
-        unit = tmp_path / "svc.service"
-        unit.write_text(spindle._systemd_unit_text("/bin/spindle", 8115, home=store, name="svc"))
-        assert "systemd specifier" not in self._blocker(unit)
 
 
 class TestPortProbeVerifiesTheRecord:
@@ -9985,51 +9954,8 @@ class TestNumericEscapesMatchSystemd:
     def test_decoded_like_systemd(self, line, expected):
         assert dict(spindle._parse_systemd_env_line(line))["V"] == expected
 
-    def test_a_malformed_escape_voids_the_assignment(self):
-        """systemd discards the line; reading it as `axZZb` would be a wrong store."""
-        assert spindle._parse_systemd_env_line("V=/srv/a\\xZZb") is None
-        assert spindle._env_from_unit_text("Environment=V=/srv/a\\xZZb\n", "V") is None
-
-    def test_a_truncated_escape_voids_the_assignment(self):
-        assert spindle._parse_systemd_env_line("V=/srv/a\\x2") is None
-
     def test_octal_of_one_and_two_digits(self):
         assert dict(spindle._parse_systemd_env_line("V=a\\101\\102b"))["V"] == "aABb"
-
-
-class TestEnvironmentFileIsNotOverclaimed:
-    """systemd applies EnvironmentFile after Environment=, so it wins."""
-
-    @pytest.fixture
-    def config(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
-        return tmp_path
-
-    def _blocker(self, unit):
-        return spindle._resolve_service_settings(unit, None, None, name="svc")[3]
-
-    def test_no_store_in_the_unit_is_not_reported_as_the_default(self, config, tmp_path):
-        unit = tmp_path / "svc.service"
-        unit.write_text("[Service]\nEnvironmentFile=/etc/spindle/env\nExecStart=/b serve --http --port 8115\n")
-        blocker = self._blocker(unit)
-        assert "runs on the default store" not in blocker
-        assert "EnvironmentFile" in blocker and "may set the store" in blocker
-
-    def test_a_store_in_the_unit_is_not_asserted_either(self, config, tmp_path):
-        unit = tmp_path / "svc.service"
-        unit.write_text(
-            "[Service]\nEnvironment=SPINDLE_HOME=/srv/old\nEnvironmentFile=/etc/spindle/env\n"
-            "ExecStart=/b serve --http --port 8115\n"
-        )
-        blocker = self._blocker(unit)
-        assert "The store resolves to:" not in blocker
-        assert "This file's own lines give: /srv/old" in blocker
-        assert "applies afterwards" in blocker
-
-    def test_without_one_the_store_is_still_asserted(self, config, tmp_path):
-        unit = tmp_path / "svc.service"
-        unit.write_text('[Service]\nEnvironment="SPINDLE_HOME=/srv/store"\n')
-        assert "The store resolves to: /srv/store" in self._blocker(unit)
 
 
 class TestMalformedLinesAreNotEchoed:
@@ -10047,24 +9973,14 @@ class TestMalformedLinesAreNotEchoed:
         unit.write_text('[Service]\nEnvironment=OPENAI_API_KEY="sk-proj-LEAKME\nExecStart=/b --port 1\n')
         blocker = self._blocker(unit)
         assert "sk-proj-LEAKME" not in blocker
-        assert "malformed line" in blocker
+        assert "malformed" in blocker
 
-    def test_a_mixed_malformed_line_does_not_show_its_store_either(self, config, tmp_path):
-        unit = tmp_path / "svc.service"
-        unit.write_text('[Service]\nEnvironment=SPINDLE_HOME=/srv/s OPENAI_API_KEY="sk-LEAK2\n')
-        blocker = self._blocker(unit)
-        assert "sk-LEAK2" not in blocker
-        assert "/srv/s" not in blocker
-
-    def test_rendered_lines_are_re_escaped(self, config, tmp_path):
-        """Rendering the decoded value turned a literal backslash into a backspace."""
+    def test_the_shown_assignment_keeps_the_files_own_text(self, config, tmp_path):
+        """Not decoded and re-encoded — that changed what the assignment meant."""
         unit = tmp_path / "svc.service"
         unit.write_text('[Service]\nEnvironment="SPINDLE_HOME=/srv/a\\\\b"\n')
         blocker = self._blocker(unit)
-        rendered = [ln for ln in blocker.splitlines() if "SPINDLE_HOME" in ln and ln.startswith("    ")][0]
-        # what is displayed must parse back to the same value systemd sees
-        reparsed = spindle._env_from_unit_text(rendered.strip() + "\n", "SPINDLE_HOME")
-        assert reparsed == spindle._env_from_unit_text(unit.read_text(), "SPINDLE_HOME")
+        assert "SPINDLE_HOME=/srv/a\\\\b" in blocker
 
 
 def test_port_probe_digests_the_file_the_record_names(tmp_path, monkeypatch):
@@ -10075,3 +9991,94 @@ def test_port_probe_digests_the_file_the_record_names(tmp_path, monkeypatch):
     plist.write_text(body)
     spindle._write_service_record("svc", 8115, None, plist, body)
     assert spindle._port_from_unit("svc") == 8115
+
+
+class TestTheExcerptClaimsNothing:
+    """The end state of six rounds of trying to state the effective settings.
+
+    Each attempt had to model more of systemd — quoting, escapes, resets,
+    EnvironmentFile precedence, byte-level numeric escapes — and each round a
+    reviewer found a value systemd resolves differently, printed as the one to
+    type. systemd is the only thing that knows, and it can be asked.
+    """
+
+    @pytest.fixture
+    def config(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
+        return tmp_path
+
+    def _blocker(self, unit):
+        return spindle._resolve_service_settings(unit, None, None, name="svc")[3]
+
+    # every shape a previous round found being mis-resolved
+    UNITS = {
+        "specifier": "Environment=SPINDLE_HOME=%h/store\n",
+        "literal_percent": "Environment=SPINDLE_HOME=/srv/100%%pure\n",
+        "reset": "Environment=SPINDLE_HOME=/data/store\nEnvironment=\n",
+        "env_file": "Environment=SPINDLE_HOME=/srv/unit\nEnvironmentFile=/etc/spindle/env\n",
+        "numeric_escape": "Environment=SPINDLE_HOME=/srv/a\\x20b\n",
+        "bad_octal": "Environment=SPINDLE_HOME=/srv/a\\41b\n",
+        "utf8_octal": "Environment=SPINDLE_HOME=/srv/caf\\303\\251\n",
+        "partial_malformed": 'Environment=SPINDLE_HOME=/srv/s OTHER="sk-LEAK\n',
+    }
+
+    @pytest.mark.parametrize("shape", sorted(UNITS))
+    def test_no_effective_value_is_ever_asserted(self, config, tmp_path, shape):
+        unit = tmp_path / "svc.service"
+        unit.write_text("[Service]\n" + self.UNITS[shape] + "ExecStart=/b serve --http --port 8115\n")
+        blocker = self._blocker(unit)
+        for claim in ("The store resolves to", "No store survives", "runs on the default store"):
+            assert claim not in blocker, shape
+        assert "will not tell you what these resolve to" in blocker
+        assert "systemctl --user show -p Environment svc" in blocker
+
+    def test_an_environmentfile_is_still_pointed_out(self, config, tmp_path):
+        unit = tmp_path / "svc.service"
+        unit.write_text("[Service]\nEnvironmentFile=/etc/spindle/env\nExecStart=/b serve --http --port 8115\n")
+        blocker = self._blocker(unit)
+        assert "applies after Environment=" in blocker
+        assert "does not expand it either" in blocker
+
+    def test_a_continued_environmentfile_is_still_seen(self, config, tmp_path):
+        """`EnvironmentFile\\` + newline + `=/path` is one directive to systemd."""
+        unit = tmp_path / "svc.service"
+        unit.write_text("[Service]\nEnvironmentFile \\\n    =/etc/spindle/env\nExecStart=/b --port 1\n")
+        assert "applies after Environment=" in self._blocker(unit)
+
+    def test_a_unit_without_one_gets_no_environmentfile_caveat(self, config, tmp_path):
+        unit = tmp_path / "svc.service"
+        unit.write_text('[Service]\nEnvironment="SPINDLE_HOME=/srv/store"\n')
+        assert "applies after Environment=" not in self._blocker(unit)
+
+
+class TestPartialLinesFollowSystemd:
+    """systemd drops the bad word and everything after it, keeping what parsed."""
+
+    def test_an_assignment_before_a_bad_quote_survives(self):
+        assert spindle._env_from_unit_text('Environment=V=/srv/kept "X=open\n', "V") == "/srv/kept"
+
+    def test_an_assignment_before_a_bad_escape_survives(self):
+        assert spindle._env_from_unit_text("Environment=V=/srv/kept X=/x\\x2\n", "V") == "/srv/kept"
+
+    def test_the_bad_word_itself_is_dropped(self):
+        assert spindle._env_from_unit_text('Environment=V=/srv/kept "X=open\n', "X") is None
+
+    def test_the_store_is_still_shown_when_its_line_breaks_later(self, tmp_path, monkeypatch):
+        """Hiding it made the refusal claim the service was on the default store."""
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
+        unit = tmp_path / "svc.service"
+        unit.write_text('[Service]\nEnvironment=SPINDLE_HOME=/srv/s OTHER="sk-LEAK\n')
+        blocker = spindle._resolve_service_settings(unit, None, None, name="svc")[3]
+        assert "/srv/s" in blocker
+        assert "sk-LEAK" not in blocker
+        assert "malformed" in blocker
+
+
+def test_shown_assignments_are_not_decoded(tmp_path, monkeypatch):
+    """Values are shown as the file writes them; decoding was where every round went wrong."""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
+    unit = tmp_path / "svc.service"
+    unit.write_text('[Service]\nEnvironment="SPINDLE_HOME=/srv/a\\x20b" "SPINDLE_ALT=%h/x"\n')
+    blocker = spindle._resolve_service_settings(unit, None, None, name="svc")[3]
+    assert "/srv/a\\x20b" in blocker  # not "/srv/a b"
+    assert "%h/x" in blocker  # not "%%h/x", and not expanded

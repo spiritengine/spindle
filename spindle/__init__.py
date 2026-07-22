@@ -7465,8 +7465,10 @@ def _parse_systemd_env_line(line: str) -> Optional[list]:
             if nxt in "xuU01234567":
                 decoded, consumed = _decode_systemd_numeric_escape(line, i)
                 if decoded is None:
-                    # systemd rejects the whole assignment on a malformed escape.
-                    return None
+                    # systemd drops the bad assignment and everything after it,
+                    # but keeps what came before — returning None for the whole
+                    # line lost a store the service is genuinely running on.
+                    return assignments
                 buf.append(decoded)
                 started = True
                 i += consumed
@@ -7499,7 +7501,9 @@ def _parse_systemd_env_line(line: str) -> Optional[list]:
         i += 1
 
     if quote is not None:
-        return None  # unterminated quote: systemd drops the line
+        # Unterminated quote: systemd drops this word and the rest of the line,
+        # keeping the assignments that parsed before it.
+        return assignments
     if started:
         token = "".join(buf)
         if "=" in token:
@@ -7745,28 +7749,80 @@ def _read_service_record(name: str) -> Optional[dict]:
     return record
 
 
+def _split_systemd_words(rhs: str) -> Optional[list]:
+    """Split an `Environment=` value into its raw, undecoded words.
+
+    Quoting is honoured (so a quoted space does not split a word) but escapes
+    are NOT decoded — this exists only to decide which assignments belong to
+    spindle, and deciding that needs the variable NAME, never the value. Every
+    round that tried to decode values for display ended up reimplementing
+    systemd's byte-level unescaping and getting it wrong in a new way.
+
+    Returns None if quoting is unbalanced.
+    """
+    words = []
+    buf = []
+    quote = None
+    started = False
+    i = 0
+    while i < len(rhs):
+        char = rhs[i]
+        if char == "\\" and i + 1 < len(rhs):
+            buf.append(char)
+            buf.append(rhs[i + 1])
+            started = True
+            i += 2
+            continue
+        if quote is None and char in "\"'":
+            quote = char
+            started = True
+            i += 1
+            continue
+        if quote is not None and char == quote:
+            quote = None
+            i += 1
+            continue
+        if char.isspace() and quote is None:
+            if started:
+                words.append("".join(buf))
+                buf = []
+                started = False
+            i += 1
+            continue
+        buf.append(char)
+        started = True
+        i += 1
+    if quote is not None:
+        return None
+    if started:
+        words.append("".join(buf))
+    return words
+
+
 def _redact_foreign_assignments(line: str) -> Optional[str]:
     """An `Environment=` line with non-spindle variables hidden.
 
-    Returns None if the line carries nothing of spindle's. The filter has to be
-    per assignment, not per line: systemd allows several on one line, so
-    `Environment=SPINDLE_HOME=/srv/store OPENAI_API_KEY=sk-...` matched a
-    line-level test for "SPINDLE_" and printed the key with it.
+    Per assignment, because systemd allows several on one line and a line-level
+    filter printed a secret that shared a line with the store. Spindle's own
+    assignments are shown with their text exactly as the file has it — not
+    decoded and re-encoded, which changed what they meant.
     """
     _, _, rhs = line.partition("=")
-    assignments = _parse_systemd_env_line(rhs.strip())
-    if assignments is None:
-        # systemd discards a malformed line, and echoing it verbatim put a
-        # secret straight back into the excerpt the filter exists to keep out.
-        return "Environment=<malformed line; systemd ignores it>"
-    ours = [(k, v) for k, v in assignments if k.startswith("SPINDLE_")]
+    words = _split_systemd_words(rhs.strip())
+    if words is None:
+        # Unbalanced quoting. systemd keeps whatever preceded the bad word, so
+        # spindle's own assignments before it are still real and still shown;
+        # everything from the break onward is dropped rather than echoed.
+        prefix = rhs.strip().split('"')[0].split("'")[0]
+        words = [w for w in prefix.split() if w]
+        ours = [w for w in words if w.startswith("SPINDLE_")]
+        shown = " ".join(ours) if ours else ""
+        return f"Environment={shown}   [rest of line malformed; systemd drops it from there]".strip()
+    ours = [w for w in words if w.startswith("SPINDLE_")]
     if not ours:
         return None
-    hidden = len(assignments) - len(ours)
-    # Re-escaped, so the displayed line is valid systemd meaning the same thing;
-    # rendering the decoded value turned `a\\\\b` (a literal backslash) into
-    # `a\\b`, which systemd reparses as a backspace.
-    rendered = " ".join(_systemd_quote(f"{k}={v}") for k, v in ours)
+    hidden = len(words) - len(ours)
+    rendered = " ".join(f'"{w}"' if " " in w else w for w in ours)
     suffix = f"   [{hidden} other assignment(s) hidden]" if hidden else ""
     return f"Environment={rendered}{suffix}"
 
@@ -7833,41 +7889,24 @@ def _service_file_excerpt(path: Path, max_lines: int = 12, max_chars: int = 200)
                 if redacted is not None:
                     lines.append(clean(redacted))
 
-        # Report the store as systemd will actually resolve it. The reader used
-        # here is the one differential-tested against systemd, so it handles the
-        # escaping, the resets and the multi-assignment lines that make the raw
-        # text unsafe to copy character by character.
-        has_env_file = bool(re.search(r"^\s*EnvironmentFile\s*=", text, re.MULTILINE))
-        resolved = _env_from_unit_text(text, "SPINDLE_HOME")
-        if has_env_file:
-            # systemd applies EnvironmentFile AFTER Environment=, so it wins.
-            # Whatever this file's own lines say, the store cannot be asserted.
-            seen = (
-                f"This file's own lines give: {clean(resolved)}"
-                if resolved is not None
-                else ("This file's own lines set no store")
+        # No claim about what any of this resolves to.
+        #
+        # Every round that tried to state the effective store had to model more
+        # of systemd to do it: quoting, then escapes, then resets, then
+        # EnvironmentFile precedence, then byte-level numeric escapes — and each
+        # round a reviewer found a value systemd resolves differently, printed
+        # as the one to type. systemd is the only thing that knows; it can be
+        # asked directly, so it is asked directly.
+        note = (
+            "Spindle will not tell you what these resolve to — systemd applies quoting, escapes, "
+            "resets and any EnvironmentFile, and getting that subtly wrong would move your service. "
+            f"Ask systemd instead:\n    systemctl --user show -p Environment {path.stem}"
+        )
+        if re.search(r"^\s*EnvironmentFile\s*=", _join_line_continuations(text), re.MULTILINE):
+            note += (
+                "\nThis unit also reads an EnvironmentFile, which systemd applies after Environment= "
+                "and which may set the store; `systemctl show` does not expand it either."
             )
-            note = (
-                f"{seen} — but it also reads an EnvironmentFile, which systemd applies afterwards "
-                f"and which may set the store. Check that file before deciding."
-            )
-        elif resolved is None:
-            note = "No store survives in this file, so it runs on the default store (~/.spindle)."
-        else:
-            # Same sanitising as the quoted lines: this value came out of the
-            # file too, and a note is no safer a place for an escape sequence.
-            # Not clean()'s 200-char cap: this is the value the operator has to
-            # type, and a truncated path is not one. Control characters still go.
-            printable = "".join(ch for ch in resolved if ch == "\t" or ch.isprintable())
-            note = f"The store resolves to: {printable}"
-            # A bare % is a specifier systemd expands at run time; the sentinel
-            # swap is how %% (a literal percent) is told apart from it, and it
-            # handles odd runs like %%%h that a lookaround regex misses.
-            if "%" in _env_from_unit_text(text.replace("%%", "\x00PCT\x00"), "SPINDLE_HOME").replace("\x00PCT\x00", ""):
-                note += (
-                    "\nThat value contains a systemd specifier (a bare %), which systemd resolves at "
-                    "run time. Type the real directory, not that string."
-                )
 
     if not lines:
         return "", note
