@@ -29,7 +29,7 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, Generator, Optional, Tuple
+from typing import Callable, Dict, Generator, Optional, Tuple
 
 from fastmcp import Context, FastMCP
 from starlette.requests import Request
@@ -914,6 +914,9 @@ def _clear_preserved_spool_shard(spool: dict) -> None:
     shard_info.pop("startup_failure_preserved", None)
     shard_info.pop("merge_in_progress", None)
     shard_info.pop("merge_in_progress_at", None)
+    shard_info.pop("merge_failed", None)
+    shard_info.pop("merge_failed_at", None)
+    shard_info.pop("merge_error", None)
     shard_info.pop("abandon_in_progress", None)
     shard_info.pop("abandon_in_progress_at", None)
 
@@ -1920,7 +1923,27 @@ def _spool_process_identity_matches(spool: dict) -> bool:
     if expected_start_time is not None:
         return _process_start_time(pid) == str(expected_start_time)
     proc = _PROC_HANDLES.get(spool.get("id"))
-    return proc is not None and getattr(proc, "pid", None) == pid
+    return proc is not None and getattr(proc, "pid", None) == pid and proc.poll() is None
+
+
+def _spool_process_group_identity_matches(spool: dict) -> bool:
+    """Prove a live group still belongs to the spool before signaling it.
+
+    A detached leader can exit while descendants keep its process-group ID
+    reserved. In that case the missing leader is safe: Linux cannot reuse its
+    PID as a new group leader until the old group disappears. A live leader
+    must still match its recorded birth token (or a live local Popen handle).
+    """
+    pid = spool.get("pid")
+    if not pid:
+        return False
+    expected_start_time = spool.get("process_start_time")
+    if expected_start_time is not None:
+        current_start_time = _process_start_time(pid)
+        if current_start_time is not None:
+            return current_start_time == str(expected_start_time)
+        return not _is_pid_alive(pid) and _is_process_group_alive(pid)
+    return _spool_process_identity_matches(spool)
 
 
 def _spool_process_group_is_alive(spool: dict) -> bool:
@@ -1938,10 +1961,16 @@ def _resolve_spool_process_group(spool: dict, grace_seconds: float) -> str:
     """
     if not _spool_process_group_is_alive(spool):
         return "gone"
-    if not _spool_process_identity_matches(spool):
+    if not _spool_process_group_identity_matches(spool):
         return "unverifiable"
-    if _terminate_process_group(spool["pid"], grace_seconds):
+    if _terminate_process_group(
+        spool["pid"],
+        grace_seconds,
+        identity_check=lambda: _spool_process_group_identity_matches(spool),
+    ):
         return "terminated"
+    if not _spool_process_group_identity_matches(spool):
+        return "unverifiable"
     return "survived"
 
 
@@ -2007,13 +2036,21 @@ def _is_process_group_alive(process_group_id: int) -> bool:
         return True
 
 
-def _terminate_process_group(process_group_id: int, grace_seconds: float) -> bool:
-    """Terminate a detached spool group, returning whether it is fully gone."""
+def _terminate_process_group(
+    process_group_id: int,
+    grace_seconds: float,
+    identity_check: Optional[Callable[[], bool]] = None,
+) -> bool:
+    """Terminate a detached spool group, revalidating identity before signals."""
+    if identity_check is not None and not identity_check():
+        return False
     try:
         os.killpg(process_group_id, signal.SIGTERM)
     except ProcessLookupError:
         return True
     except OSError:
+        if identity_check is not None and not identity_check():
+            return False
         try:
             os.kill(process_group_id, signal.SIGTERM)
         except (ProcessLookupError, OSError):
@@ -2021,9 +2058,13 @@ def _terminate_process_group(process_group_id: int, grace_seconds: float) -> boo
     time.sleep(grace_seconds)
     if not _is_process_group_alive(process_group_id):
         return True
+    if identity_check is not None and not identity_check():
+        return False
     try:
         os.killpg(process_group_id, signal.SIGKILL)
     except OSError:
+        if identity_check is not None and not identity_check():
+            return False
         try:
             os.kill(process_group_id, signal.SIGKILL)
         except (ProcessLookupError, OSError):
@@ -5398,8 +5439,11 @@ def _shard_merge_locked(spool_id: str, keep_branch: bool, caller_cwd: str | None
 
         # Persist intent before Git can change the main checkout. A crash during
         # or immediately after merge must leave a durable recovery clue.
+        merge_reason = "shard merge in progress; inspect the main checkout before cleanup"
         spool["shard"]["merge_in_progress"] = True
         spool["shard"]["merge_in_progress_at"] = datetime.now().isoformat()
+        spool["shard_cleanup_preserved"] = True
+        spool["shard_cleanup_preserved_reason"] = merge_reason
         _write_spool(spool_id, spool)
 
         # Merge branch into the main repo's current HEAD
@@ -5413,6 +5457,12 @@ def _shard_merge_locked(spool_id: str, keep_branch: bool, caller_cwd: str | None
         if result.returncode != 0:
             spool["shard"].pop("merge_in_progress", None)
             spool["shard"].pop("merge_in_progress_at", None)
+            spool["shard"]["merge_failed"] = True
+            spool["shard"]["merge_failed_at"] = datetime.now().isoformat()
+            spool["shard"]["merge_error"] = result.stderr.strip() or result.stdout.strip() or "git merge failed"
+            reason = "git merge failed; inspect and resolve the main checkout before shard cleanup"
+            spool["shard_cleanup_preserved"] = True
+            spool["shard_cleanup_preserved_reason"] = reason
             _write_spool(spool_id, spool)
             return f"Error: Merge failed: {result.stderr}"
 
@@ -5422,6 +5472,9 @@ def _shard_merge_locked(spool_id: str, keep_branch: bool, caller_cwd: str | None
         spool["shard"]["merged_at"] = datetime.now().isoformat()
         spool["shard"].pop("merge_in_progress", None)
         spool["shard"].pop("merge_in_progress_at", None)
+        spool["shard"].pop("merge_failed", None)
+        spool["shard"].pop("merge_failed_at", None)
+        spool["shard"].pop("merge_error", None)
         cleanup_reason = "merge succeeded; shard worktree cleanup pending"
         spool["shard_cleanup_pending"] = True
         spool["shard_cleanup_pending_reason"] = cleanup_reason

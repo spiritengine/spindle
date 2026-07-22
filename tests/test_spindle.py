@@ -1775,11 +1775,13 @@ class TestCodexResultExtraction:
             )
             _get_output_path(spool_id).write_text(stream)
             with patch("spindle._is_process_group_alive", return_value=True):
-                with patch("spindle._spool_process_identity_matches", return_value=True):
+                with patch("spindle._spool_process_group_identity_matches", return_value=True):
                     with patch("spindle._terminate_process_group", return_value=False) as terminate:
                         with patch("spindle._cleanup_shard") as cleanup:
                             assert _check_and_finalize_spool(spool_id) is True
-            terminate.assert_called_once_with(999999999, 0.5)
+            terminate.assert_called_once()
+            assert terminate.call_args.args == (999999999, 0.5)
+            assert callable(terminate.call_args.kwargs["identity_check"])
             cleanup.assert_not_called()
             saved = _read_spool(spool_id)
             assert saved["status"] == "error"
@@ -2303,10 +2305,12 @@ class TestExitCodeCapture:
             _get_output_path(sid).write_text(stream)
 
             with patch("spindle._is_process_group_alive", return_value=True):
-                with patch("spindle._spool_process_identity_matches", return_value=True):
+                with patch("spindle._spool_process_group_identity_matches", return_value=True):
                     with patch("spindle._terminate_process_group", return_value=True) as terminate:
                         assert _check_and_finalize_spool(sid) is True
-            terminate.assert_called_once_with(454545, 0.5)
+            terminate.assert_called_once()
+            assert terminate.call_args.args == (454545, 0.5)
+            assert callable(terminate.call_args.kwargs["identity_check"])
             assert _read_spool(sid)["status"] == "complete"
             assert not _get_output_path(sid).exists()
 
@@ -2347,7 +2351,9 @@ class TestExitCodeCapture:
 
             saved = _read_spool(sid)
 
-        terminate.assert_called_once_with(565656, 0.5)
+        terminate.assert_called_once()
+        assert terminate.call_args.args == (565656, 0.5)
+        assert callable(terminate.call_args.kwargs["identity_check"])
         assert saved["status"] == "complete"
         assert saved["result"] == "done"
         assert saved["session_id"] == "session-live"
@@ -2381,6 +2387,7 @@ class TestExitCodeCapture:
             )
             spool = _read_spool(sid)
             spool["pid"] = pid
+            spool["process_start_time"] = spindle._process_start_time(pid)
             _write_spool(sid, spool)
             assert spindle._PROC_HANDLES[sid].wait(timeout=5) == 0
             assert spindle._is_process_group_alive(pid) is True
@@ -2435,7 +2442,7 @@ class TestCancellationTermination:
         spool_id = f"cancel-finalize-race-{tool_path}"
         finalize_attempts = []
 
-        def terminate_while_finalizer_races(pid, grace):
+        def terminate_while_finalizer_races(pid, grace, **kwargs):
             finalize_attempts.append(_check_and_finalize_spool(spool_id))
             return True
 
@@ -2453,7 +2460,7 @@ class TestCancellationTermination:
             )
             _get_output_path(spool_id).write_text(json.dumps({"type": "turn.completed", "usage": {}}))
             _get_exit_path(spool_id).write_text("0\n")
-            with patch("spindle._spool_process_identity_matches", return_value=True):
+            with patch("spindle._spool_process_group_identity_matches", return_value=True):
                 with patch("spindle._spool_process_group_is_alive", return_value=True):
                     with patch("spindle._terminate_process_group", side_effect=terminate_while_finalizer_races):
                         if tool_path == "sync":
@@ -2486,7 +2493,7 @@ class TestCancellationTermination:
             )
             _get_output_path(spool_id).write_text("partial output")
             with patch("spindle._spool_process_group_is_alive", return_value=True):
-                with patch("spindle._spool_process_identity_matches", return_value=True):
+                with patch("spindle._spool_process_group_identity_matches", return_value=True):
                     with patch("spindle._terminate_process_group", return_value=False):
                         result = spindle._spin_drop_sync(spool_id)
             saved = _read_spool(spool_id)
@@ -3392,9 +3399,10 @@ class TestOrphanedLockSweep:
             )
             abandon = shard_abandon.fn if hasattr(shard_abandon, "fn") else shard_abandon
             with patch("spindle._is_pid_alive", return_value=True):
-                with patch("spindle._terminate_process_group", return_value=True):
-                    with patch("spindle._cleanup_shard", side_effect=cleanup_while_finalizer_races):
-                        result = asyncio.run(abandon(spool_id, caller_cwd=str(tmp_path / "outside")))
+                with patch("spindle._spool_process_group_identity_matches", return_value=True):
+                    with patch("spindle._terminate_process_group", return_value=True):
+                        with patch("spindle._cleanup_shard", side_effect=cleanup_while_finalizer_races):
+                            result = asyncio.run(abandon(spool_id, caller_cwd=str(tmp_path / "outside")))
             saved = _read_spool(spool_id)
 
         assert result == f"Abandoned shard {spool_id}"
@@ -3421,6 +3429,40 @@ class TestProcessUtils:
         assert spindle._spool_process_identity_matches(spool) is True
         spool["process_start_time"] = "different-process-birth"
         assert spindle._spool_process_identity_matches(spool) is False
+
+    def test_dead_popen_handle_is_not_process_identity(self):
+        spool_id = "stale-popen-identity"
+        proc = MagicMock()
+        proc.pid = 12345
+        proc.poll.return_value = 0
+        spindle._PROC_HANDLES[spool_id] = proc
+        try:
+            assert spindle._spool_process_identity_matches({"id": spool_id, "pid": 12345}) is False
+        finally:
+            spindle._PROC_HANDLES.pop(spool_id, None)
+
+    def test_orphan_group_identity_allows_missing_leader_but_rejects_reuse(self):
+        spool = {"id": "orphan-group", "pid": 22334, "process_start_time": "original-birth"}
+        with patch("spindle._process_start_time", return_value=None):
+            with patch("spindle._is_pid_alive", return_value=False):
+                with patch("spindle._is_process_group_alive", return_value=True):
+                    assert spindle._spool_process_group_identity_matches(spool) is True
+        with patch("spindle._process_start_time", return_value="replacement-birth"):
+            assert spindle._spool_process_group_identity_matches(spool) is False
+
+    def test_termination_revalidates_identity_before_sigkill(self):
+        identity_results = iter([True, False])
+        with patch("spindle.os.killpg") as killpg:
+            with patch("spindle._is_process_group_alive", return_value=True):
+                with patch("spindle.time.sleep", return_value=None):
+                    terminated = spindle._terminate_process_group(
+                        23456,
+                        0.5,
+                        identity_check=lambda: next(identity_results),
+                    )
+
+        assert terminated is False
+        killpg.assert_called_once_with(23456, signal.SIGTERM)
 
     def test_is_pid_alive_nonexistent(self):
         """Nonexistent PID should not be alive."""
@@ -6566,7 +6608,9 @@ class TestShardMergeCleanupFailure:
 
         assert result == f"Successfully merged shard {spool_id} to main"
         assert lock_attempts == [False, False]
-        terminate.assert_called_once_with(747474, 0.5)
+        terminate.assert_called_once()
+        assert terminate.call_args.args == (747474, 0.5)
+        assert callable(terminate.call_args.kwargs["identity_check"])
         reap.assert_called_once_with(spool_id)
         assert "process_group_cleanup_warning" not in saved
 
@@ -6597,7 +6641,7 @@ class TestShardMergeCleanupFailure:
             with patch("spindle._is_pid_alive", return_value=False):
                 with patch("spindle._is_process_group_alive", return_value=False):
                     with patch(
-                        "spindle._spool_process_identity_matches",
+                        "spindle._spool_process_group_identity_matches",
                         side_effect=AssertionError("dead groups need no identity proof"),
                     ):
                         with patch(
@@ -6637,7 +6681,7 @@ class TestShardMergeCleanupFailure:
             with patch("spindle._is_pid_alive", return_value=False):
                 with patch("spindle._is_process_group_alive", return_value=False):
                     with patch(
-                        "spindle._spool_process_identity_matches",
+                        "spindle._spool_process_group_identity_matches",
                         side_effect=AssertionError("dead groups need no identity proof"),
                     ):
                         with patch(
@@ -6689,10 +6733,52 @@ class TestShardMergeCleanupFailure:
 
         assert result == f"Successfully merged shard {spool_id} to main"
         assert observed["before_merge"]["shard"]["merge_in_progress"] is True
+        assert observed["before_merge"]["shard_cleanup_preserved"] is True
         assert observed["before_cleanup"]["shard"]["merged"] is True
         assert observed["before_cleanup"]["shard_cleanup_pending"] is True
         assert "merge_in_progress" not in saved["shard"]
         assert "shard_cleanup_pending" not in saved
+
+    def test_failed_merge_keeps_durable_recovery_marker(self, tmp_path):
+        spool_id = "merge-conflict-preserved"
+        state_dir = tmp_path / "spools"
+        worktree = tmp_path / "worktrees" / "merge-conflict-preserved"
+        worktree.mkdir(parents=True)
+        spool = {
+            "id": spool_id,
+            "status": "complete",
+            "prompt": "merge me",
+            "base_branch": "main",
+            "created_at": (datetime.now() - timedelta(hours=25)).isoformat(),
+            "shard": {
+                "worktree_path": str(worktree),
+                "branch_name": "shard-merge-conflict-preserved",
+            },
+        }
+        clean = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+        conflict = subprocess.CompletedProcess(
+            args=[],
+            returncode=1,
+            stdout="Auto-merging file.py\nCONFLICT",
+            stderr="Automatic merge failed; fix conflicts and commit the result.\n",
+        )
+        merge = shard_merge.fn if hasattr(shard_merge, "fn") else shard_merge
+
+        with patch("spindle.SPINDLE_DIR", state_dir):
+            _write_spool(spool_id, spool)
+            with patch("spindle.subprocess.run", side_effect=[clean, conflict]):
+                with patch("spindle._cleanup_shard") as cleanup:
+                    result = asyncio.run(merge(spool_id, caller_cwd=str(tmp_path / "outside")))
+            saved = _read_spool(spool_id)
+            spindle._cleanup_old_spools()
+            retained = _read_spool(spool_id)
+
+        assert result.startswith("Error: Merge failed:")
+        assert saved["shard"]["merge_failed"] is True
+        assert "Automatic merge failed" in saved["shard"]["merge_error"]
+        assert saved["shard_cleanup_preserved"] is True
+        assert retained is not None
+        cleanup.assert_not_called()
 
     def test_successful_merge_preserves_handle_when_worktree_cleanup_fails(self, tmp_path):
         spool_id = "merge-cleanup-failure"
@@ -8347,12 +8433,14 @@ class TestReviewTagTimeout:
             _write_spool(spool_id, spool)
             with patch("spindle._is_pid_alive", return_value=False):
                 with patch("spindle._is_process_group_alive", return_value=True):
-                    with patch("spindle._spool_process_identity_matches", return_value=True):
+                    with patch("spindle._spool_process_group_identity_matches", return_value=True):
                         with patch("spindle._terminate_process_group", return_value=True) as terminate:
                             _monitor_spool(spool_id)
             result = _read_spool(spool_id)
 
-        terminate.assert_called_once_with(424242, 0.5)
+        terminate.assert_called_once()
+        assert terminate.call_args.args == (424242, 0.5)
+        assert callable(terminate.call_args.kwargs["identity_check"])
         assert result["status"] == "timeout"
 
     def test_monitor_spool_terminalizes_timeout_when_group_survives_kill(self, tmp_path):
@@ -8372,7 +8460,7 @@ class TestReviewTagTimeout:
             _write_spool(spool_id, spool)
             with patch("spindle._is_pid_alive", return_value=False):
                 with patch("spindle._is_process_group_alive", return_value=True):
-                    with patch("spindle._spool_process_identity_matches", return_value=True):
+                    with patch("spindle._spool_process_group_identity_matches", return_value=True):
                         with patch("spindle._terminate_process_group", return_value=False):
                             _monitor_spool(spool_id)
             result = _read_spool(spool_id)
