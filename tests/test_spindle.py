@@ -10082,3 +10082,65 @@ def test_shown_assignments_are_not_decoded(tmp_path, monkeypatch):
     blocker = spindle._resolve_service_settings(unit, None, None, name="svc")[3]
     assert "/srv/a\\x20b" in blocker  # not "/srv/a b"
     assert "%h/x" in blocker  # not "%%h/x", and not expanded
+
+
+class TestMalformedTailKeepsWhatSystemdKeeps:
+    """The fallback used to re-split naively and falsify spindle's own values."""
+
+    def _shown(self, rhs):
+        return spindle._redact_foreign_assignments("Environment=" + rhs)
+
+    def test_a_quoted_store_before_the_break_survives(self):
+        """Cutting at the first quote showed an empty store for a real one."""
+        shown = self._shown('SPINDLE_HOME="/srv/spindle store" SPINDLE_PORT=7 KEY="sk-LEAK')
+        assert "/srv/spindle store" in shown
+        assert "SPINDLE_PORT=7" in shown
+        assert "sk-LEAK" not in shown
+        assert "malformed" in shown
+
+    def test_an_escaped_quote_does_not_truncate(self):
+        shown = self._shown('SPINDLE_HOME=/srv/a\\"b SPINDLE_PORT=1 KEY="sk-LEAK')
+        assert '/srv/a\\"b' in shown
+        assert "SPINDLE_PORT=1" in shown
+        assert "sk-LEAK" not in shown
+
+    def test_a_quoted_foreign_assignment_ahead_of_the_break_is_counted_not_shown(self):
+        shown = self._shown("TZ='UTC' SPINDLE_HOME=/srv/store KEY=\"sk-LEAK")
+        assert "/srv/store" in shown
+        assert "UTC" not in shown
+        assert "1 other assignment(s) hidden" in shown
+
+    def test_an_escaped_space_voids_the_line(self):
+        """systemd rejects `\\ ` and drops the line; merging the words leaked the next one."""
+        shown = self._shown("SPINDLE_HOME=/srv/a\\ OPENAI_API_KEY=sk-SECRET1")
+        assert "sk-SECRET1" not in shown
+        assert "malformed" in shown
+
+    def test_a_balanced_line_carries_no_malformed_marker(self):
+        shown = self._shown('SPINDLE_HOME="/srv/a b" OTHER=x')
+        assert "malformed" not in shown
+        assert "/srv/a b" in shown
+
+
+class TestRedactionMatchesOnTheVariableName:
+    def test_a_spindle_prefixed_non_assignment_is_not_shown(self):
+        """`SPINDLE_TOKEN_sk-secret` is not an assignment; printing it is the leak."""
+        assert spindle._redact_foreign_assignments("Environment=SPINDLE_TOKEN_sk-secret") is None
+
+    def test_a_real_assignment_is_shown(self):
+        shown = spindle._redact_foreign_assignments("Environment=SPINDLE_HOME=/srv/store")
+        assert "/srv/store" in shown
+
+    def test_a_word_without_an_equals_does_not_count_as_ours(self):
+        shown = spindle._redact_foreign_assignments("Environment=SPINDLE_HOME=/srv/store SPINDLE_BARE")
+        assert "/srv/store" in shown
+        assert "SPINDLE_BARE" not in shown
+
+
+def test_a_continuation_across_a_comment_is_still_one_directive(tmp_path, monkeypatch):
+    """systemd skips comment lines inside a continuation; the caveat must too."""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
+    unit = tmp_path / "svc.service"
+    unit.write_text("[Service]\nEnvironmentFile \\\n# a comment in the middle\n    =/etc/spindle/env\nExecStart=/b\n")
+    blocker = spindle._resolve_service_settings(unit, None, None, name="svc")[3]
+    assert "applies after Environment=" in blocker

@@ -7376,7 +7376,11 @@ def _join_line_continuations(text: str) -> str:
     matches newlines, which folded a blank line and then the NEXT directive into
     the continued line — so an `Environment=` following a wrapped `ExecStart`
     disappeared from the parse entirely.
+
+    Comment lines inside a continuation are skipped, as systemd skips them: a
+    directive continued across a comment is still one directive.
     """
+    text = re.sub(r"\\\n[^\S\n]*[#;][^\n]*(?=\n)", "\\\\", text)
     return re.sub(r"\\\n[^\S\n]*", " ", text)
 
 
@@ -7749,16 +7753,20 @@ def _read_service_record(name: str) -> Optional[dict]:
     return record
 
 
-def _split_systemd_words(rhs: str) -> Optional[list]:
+def _split_systemd_words(rhs: str) -> Tuple[list, bool]:
     """Split an `Environment=` value into its raw, undecoded words.
 
-    Quoting is honoured (so a quoted space does not split a word) but escapes
-    are NOT decoded — this exists only to decide which assignments belong to
-    spindle, and deciding that needs the variable NAME, never the value. Every
-    round that tried to decode values for display ended up reimplementing
-    systemd's byte-level unescaping and getting it wrong in a new way.
+    Quoting is honoured so a quoted space does not split a word, but escapes are
+    NOT decoded — this decides which assignments belong to spindle, and that
+    needs the variable NAME, never the value. Every round that decoded values
+    for display ended up reimplementing systemd's unescaping and getting it
+    wrong somewhere new.
 
-    Returns None if quoting is unbalanced.
+    Returns ``(words, ok)``. ``ok`` is False when the value breaks partway, and
+    the words are the ones that completed BEFORE the break — which is what
+    systemd keeps. Re-splitting the raw text to recover them, as this used to,
+    cut at the first quote character even when it was properly closed, so a
+    store of "/srv/spindle store" displayed as empty.
     """
     words = []
     buf = []
@@ -7768,6 +7776,11 @@ def _split_systemd_words(rhs: str) -> Optional[list]:
     while i < len(rhs):
         char = rhs[i]
         if char == "\\" and i + 1 < len(rhs):
+            if rhs[i + 1].isspace():
+                # systemd rejects a backslash-escaped space and drops the line
+                # from there. Treating it as an ordinary escape merged the next
+                # assignment into this word, printing a foreign one.
+                return words, False
             buf.append(char)
             buf.append(rhs[i + 1])
             started = True
@@ -7793,10 +7806,21 @@ def _split_systemd_words(rhs: str) -> Optional[list]:
         started = True
         i += 1
     if quote is not None:
-        return None
+        return words, False  # unterminated: systemd keeps what completed before it
     if started:
         words.append("".join(buf))
-    return words
+    return words, True
+
+
+def _is_spindle_assignment(word: str) -> bool:
+    """True if this word assigns one of spindle's own variables.
+
+    The NAME has to be checked, not the word's prefix: `SPINDLE_TOKEN_sk-secret`
+    is not an assignment at all, and printing it because it starts with the
+    right letters is the leak this filter exists to prevent.
+    """
+    name, sep, _ = word.partition("=")
+    return bool(sep) and name.startswith("SPINDLE_")
 
 
 def _redact_foreign_assignments(line: str) -> Optional[str]:
@@ -7804,27 +7828,23 @@ def _redact_foreign_assignments(line: str) -> Optional[str]:
 
     Per assignment, because systemd allows several on one line and a line-level
     filter printed a secret that shared a line with the store. Spindle's own
-    assignments are shown with their text exactly as the file has it — not
-    decoded and re-encoded, which changed what they meant.
+    assignments keep the file's own text; nothing is decoded and re-encoded,
+    which changed what they meant.
     """
     _, _, rhs = line.partition("=")
-    words = _split_systemd_words(rhs.strip())
-    if words is None:
-        # Unbalanced quoting. systemd keeps whatever preceded the bad word, so
-        # spindle's own assignments before it are still real and still shown;
-        # everything from the break onward is dropped rather than echoed.
-        prefix = rhs.strip().split('"')[0].split("'")[0]
-        words = [w for w in prefix.split() if w]
-        ours = [w for w in words if w.startswith("SPINDLE_")]
-        shown = " ".join(ours) if ours else ""
-        return f"Environment={shown}   [rest of line malformed; systemd drops it from there]".strip()
-    ours = [w for w in words if w.startswith("SPINDLE_")]
-    if not ours:
-        return None
+    words, ok = _split_systemd_words(rhs.strip())
+    ours = [w for w in words if _is_spindle_assignment(w)]
     hidden = len(words) - len(ours)
+    if not ours and ok:
+        return None
     rendered = " ".join(f'"{w}"' if " " in w else w for w in ours)
-    suffix = f"   [{hidden} other assignment(s) hidden]" if hidden else ""
-    return f"Environment={rendered}{suffix}"
+    parts = []
+    if hidden:
+        parts.append(f"{hidden} other assignment(s) hidden")
+    if not ok:
+        parts.append("rest of line malformed; systemd drops it from there")
+    suffix = f"   [{'; '.join(parts)}]" if parts else ""
+    return f"Environment={rendered}{suffix}".replace("Environment=   [", "Environment=  [")
 
 
 def _service_file_excerpt(path: Path, max_lines: int = 12, max_chars: int = 200) -> Tuple[str, str]:
