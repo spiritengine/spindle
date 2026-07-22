@@ -2376,6 +2376,46 @@ class TestCancellationTermination:
         assert saved["status"] == "error"
         assert saved["error"] == "Cancelled by user"
 
+    def test_expired_session_fallback_reaps_old_handle_before_replacement(self, tmp_path):
+        spool_id = "fallback-handle-replacement"
+        original = {
+            "id": "fallback-original-handle",
+            "status": "complete",
+            "session_id": "fallback-handle-session",
+            "permission": "careful",
+        }
+        failing = {
+            "id": spool_id,
+            "status": "running",
+            "session_id": "fallback-handle-session",
+            "prompt": "Continue fallback-handle-session: work",
+            "working_dir": str(tmp_path),
+            "pid": 616161,
+        }
+        transcript = tmp_path / "transcript-handle.txt"
+        transcript.write_text("prior context")
+        old_proc = MagicMock()
+        old_proc.poll.return_value = 0
+
+        def replacement_spawn(*args, **kwargs):
+            assert spool_id not in spindle._PROC_HANDLES
+            return 626262
+
+        with patch("spindle.SPINDLE_DIR", tmp_path / "spools"):
+            spindle._PROC_HANDLES[spool_id] = old_proc
+            _write_spool(spool_id, failing)
+            with patch("spindle._find_spool_by_session", return_value=original):
+                with patch("spindle._get_transcript_path", return_value=transcript):
+                    with patch("spindle._is_pid_alive", return_value=False):
+                        with patch("spindle._is_process_group_alive", return_value=False):
+                            with patch("spindle._spawn_detached", side_effect=replacement_spawn):
+                                assert _handle_expired_session(spool_id, failing) is True
+            saved = _read_spool(spool_id)
+
+        old_proc.poll.assert_called_once_with()
+        assert saved["pid"] == 626262
+        assert saved["used_transcript_fallback"] is True
+
     def test_drop_lock_contention_returns_bounded_error(self, tmp_path):
         spool_id = "cancel-lock-contention"
         with patch("spindle.SPINDLE_DIR", tmp_path):
@@ -2963,6 +3003,36 @@ class TestOrphanedLockSweep:
             assert not _get_output_path(spool_id).exists()
             assert not _get_stderr_path(spool_id).exists()
 
+    def test_old_spool_sweep_rechecks_preservation_after_lock(self, tmp_path):
+        spool_id = "cleanup-lock-race"
+        old_created = (datetime.now() - timedelta(hours=25)).isoformat()
+
+        @contextmanager
+        def publish_warning_before_lock_yields(*args, **kwargs):
+            current = _read_spool(spool_id)
+            current["pid"] = 646464
+            current["process_group_cleanup_warning"] = "group survived"
+            _write_spool(spool_id, current)
+            yield True
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool(
+                spool_id,
+                {
+                    "id": spool_id,
+                    "status": "complete",
+                    "created_at": old_created,
+                },
+            )
+            _get_output_path(spool_id).write_text("still open")
+            with patch("spindle._spool_lock", side_effect=publish_warning_before_lock_yields):
+                with patch("spindle._is_pid_alive", return_value=False):
+                    with patch("spindle._is_process_group_alive", return_value=True):
+                        spindle._cleanup_old_spools()
+
+            assert _read_spool(spool_id) is not None
+            assert _get_output_path(spool_id).read_text() == "still open"
+
     def test_explicit_shard_abandon_clears_preservation_marker(self, tmp_path):
         spool_id = "preserved-abandon"
         worktree = tmp_path / "worktrees" / "preserved-abandon"
@@ -2993,6 +3063,48 @@ class TestOrphanedLockSweep:
         assert "startup_failure_preserved" not in saved["shard"]
         assert "shard_cleanup_preserved" not in saved
         assert "shard_cleanup_preserved_reason" not in saved
+
+    def test_running_shard_abandon_serializes_finalizer_and_reaps_handle(self, tmp_path):
+        spool_id = "running-abandon-race"
+        worktree = tmp_path / "worktrees" / "running-abandon-race"
+        worktree.mkdir(parents=True)
+        proc = MagicMock()
+        proc.poll.return_value = -15
+        finalize_attempts = []
+
+        def cleanup_while_finalizer_races(*args, **kwargs):
+            finalize_attempts.append(_check_and_finalize_spool(spool_id))
+            return True
+
+        with patch("spindle.SPINDLE_DIR", tmp_path / "spools"):
+            spindle._PROC_HANDLES[spool_id] = proc
+            _write_spool(
+                spool_id,
+                {
+                    "id": spool_id,
+                    "status": "running",
+                    "created_at": datetime.now().isoformat(),
+                    "pid": 636363,
+                    "shard": {
+                        "worktree_path": str(worktree),
+                        "branch_name": "shard-running-abandon-race",
+                    },
+                },
+            )
+            abandon = shard_abandon.fn if hasattr(shard_abandon, "fn") else shard_abandon
+            with patch("spindle._is_pid_alive", return_value=True):
+                with patch("spindle._terminate_process_group", return_value=True):
+                    with patch("spindle._cleanup_shard", side_effect=cleanup_while_finalizer_races):
+                        result = asyncio.run(abandon(spool_id, caller_cwd=str(tmp_path / "outside")))
+            saved = _read_spool(spool_id)
+
+        assert result == f"Abandoned shard {spool_id}"
+        assert finalize_attempts == [False]
+        assert spool_id not in spindle._PROC_HANDLES
+        proc.poll.assert_called_once_with()
+        assert saved["status"] == "error"
+        assert saved["error"] == "Shard abandoned"
+        assert saved["shard"]["abandoned"] is True
 
 
 class TestProcessUtils:
@@ -4918,6 +5030,8 @@ class TestRecoverOrphansPending:
                     "status": "pending",
                     "pid": None,
                     "created_at": stale_time,
+                    "shard": {"worktree_path": str(tmp_path / "worktree")},
+                    "shard_created_by_spool": True,
                 },
             )
 
@@ -4927,6 +5041,8 @@ class TestRecoverOrphansPending:
             assert spool["status"] == "error"
             assert "spawn timeout" in spool["error"]
             assert spool["completed_at"] is not None
+            assert spool["shard_cleanup_preserved"] is True
+            assert spool["shard"]["startup_failure_preserved"] is True
 
     def test_fresh_pending_spool_not_touched(self, tmp_path):
         """Pending spool within timeout should remain pending."""

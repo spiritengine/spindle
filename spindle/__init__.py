@@ -1851,6 +1851,17 @@ def _reap_process_handle_later(proc: "subprocess.Popen") -> None:
     threading.Thread(target=wait_for_exit, daemon=True).start()
 
 
+def _pop_and_reap_process_handle(spool_id: str) -> Optional[int]:
+    """Remove a stored process handle and ensure its child is eventually reaped."""
+    proc = _PROC_HANDLES.pop(spool_id, None)
+    if proc is None:
+        return None
+    exit_code = proc.poll()
+    if exit_code is None:
+        _reap_process_handle_later(proc)
+    return exit_code
+
+
 def _parse_duration(time_str: str) -> Optional[int]:
     """
     Parse a duration string into seconds.
@@ -1932,42 +1943,46 @@ def _cleanup_old_spools() -> None:
     cutoff = datetime.now() - timedelta(hours=24)
 
     for path in SPINDLE_DIR.glob("*.json"):
+        spool_id = path.stem
         try:
-            with open(path) as f:
-                data = json.load(f)
-
-            spool_id = data.get("id", path.stem)
-            # A preserved shard is intentionally recoverable through its spool
-            # handle until an explicit merge/abandon operation resolves it.
-            if data.get("shard_cleanup_preserved"):
-                continue
-            # A terminal spool may still have an unsignalable process holding
-            # its capture descriptors. Keep the record and captures until the
-            # warned-about process group is verifiably gone.
-            if data.get("process_group_cleanup_warning"):
-                pid = data.get("pid")
-                if not pid or _is_pid_alive(pid) or _is_process_group_alive(pid):
+            # Read and decide only after taking the terminal lock. Otherwise a
+            # finalizer can publish a shard/capture preservation marker after
+            # this sweep's read but before its unlink.
+            with _spool_lock(spool_id, blocking=False) as acquired:
+                if not acquired:
                     continue
-            created = datetime.fromisoformat(data.get("created_at", ""))
-            if created < cutoff:
-                # Use lock to prevent race with finalization
-                with _spool_lock(spool_id, blocking=False) as acquired:
-                    if not acquired:
-                        continue  # Skip if locked
-                    path.unlink()
-                    # Also clean up output, lock, and transcript files
-                    stdout_path = _get_output_path(spool_id)
-                    stderr_path = _get_stderr_path(spool_id)
-                    exit_path = _get_exit_path(spool_id)
-                    lock_path = _get_lock_path(spool_id)
-                    if stdout_path.exists():
-                        stdout_path.unlink()
-                    if stderr_path.exists():
-                        stderr_path.unlink()
-                    if exit_path.exists():
-                        exit_path.unlink()
-                    if lock_path.exists():
-                        lock_path.unlink()
+                with open(path) as f:
+                    data = json.load(f)
+                if data.get("id", spool_id) != spool_id:
+                    continue
+                # A preserved shard is intentionally recoverable through its
+                # spool handle until explicit merge/abandon resolves it.
+                if data.get("shard_cleanup_preserved"):
+                    continue
+                # A terminal spool may still have an unsignalable process
+                # holding its capture descriptors. Keep both until the warned-
+                # about process group is verifiably gone.
+                if data.get("process_group_cleanup_warning"):
+                    pid = data.get("pid")
+                    if not pid or _is_pid_alive(pid) or _is_process_group_alive(pid):
+                        continue
+                created = datetime.fromisoformat(data.get("created_at", ""))
+                if created >= cutoff:
+                    continue
+                path.unlink()
+                # Also clean up output, lock, and transcript files
+                stdout_path = _get_output_path(spool_id)
+                stderr_path = _get_stderr_path(spool_id)
+                exit_path = _get_exit_path(spool_id)
+                lock_path = _get_lock_path(spool_id)
+                if stdout_path.exists():
+                    stdout_path.unlink()
+                if stderr_path.exists():
+                    stderr_path.unlink()
+                if exit_path.exists():
+                    exit_path.unlink()
+                if lock_path.exists():
+                    lock_path.unlink()
         except Exception:
             pass
 
@@ -2345,6 +2360,7 @@ def _recover_orphans() -> None:
                         spool["status"] = "error"
                         spool["error"] = "spawn timeout - never started"
                         spool["completed_at"] = now.isoformat()
+                        _preserve_failed_spool_shard(spool)
                         _write_spool(spool["id"], spool)
                 except (ValueError, TypeError):
                     pass
@@ -2402,6 +2418,7 @@ def _handle_expired_session_locked(spool_id: str, spool: dict) -> bool:
         if not _terminate_process_group(pid, 0.2):
             logger.error("spindle: cannot retry %s while its old process group remains alive", spool_id)
             return False
+    _pop_and_reap_process_handle(spool_id)
 
     # Read transcript
     try:
@@ -5151,6 +5168,23 @@ async def shard_abandon(spool_id: str, keep_branch: bool = False, caller_cwd: st
     Example:
         shard_abandon("abc123")  # discard shard
     """
+    return await asyncio.to_thread(_shard_abandon_sync, spool_id, keep_branch, caller_cwd)
+
+
+def _shard_abandon_sync(spool_id: str, keep_branch: bool, caller_cwd: str | None) -> str:
+    """Serialize explicit abandonment with every spool terminal transition."""
+    deadline = time.monotonic() + SPOOL_TERMINAL_LOCK_TIMEOUT
+    while True:
+        with _spool_lock(spool_id, blocking=False) as acquired:
+            if acquired:
+                return _shard_abandon_locked(spool_id, keep_branch, caller_cwd)
+        if time.monotonic() >= deadline:
+            return f"Error: Could not lock spool {spool_id} for shard abandonment"
+        time.sleep(0.05)
+
+
+def _shard_abandon_locked(spool_id: str, keep_branch: bool, caller_cwd: str | None) -> str:
+    """Abandon a shard while holding its terminal-transition lock."""
     if not caller_cwd:
         return "Error: caller_cwd required. Pass your current working directory to prevent deleting a worktree you're inside of."
 
@@ -5190,12 +5224,17 @@ async def shard_abandon(spool_id: str, keep_branch: bool = False, caller_cwd: st
     # Find the main repo path
     main_repo = Path(worktree_path).parent.parent
 
-    # If spool is running, kill it first
-    if spool.get("status") == "running":
-        pid = spool.get("pid")
-        if pid and not _terminate_process_group(pid, 0.5):
+    # A terminal spool can still carry a warned-about live group. Never remove
+    # its worktree until that group is gone, and explicitly reap any stored
+    # wrapper handle before cleanup or replacement.
+    pid = spool.get("pid")
+    if pid and (_is_pid_alive(pid) or _is_process_group_alive(pid)):
+        if not _terminate_process_group(pid, 0.5):
             return f"Error: Could not terminate process group for spool {spool_id}; shard preserved"
+    _pop_and_reap_process_handle(spool_id)
+    spool.pop("process_group_cleanup_warning", None)
 
+    if spool.get("status") == "running":
         spool["status"] = "error"
         spool["error"] = "Shard abandoned"
         spool["completed_at"] = datetime.now().isoformat()
@@ -5210,6 +5249,11 @@ async def shard_abandon(spool_id: str, keep_branch: bool = False, caller_cwd: st
         _write_spool(spool_id, spool)
         return f"Abandoned shard {spool_id}" + (" (branch kept)" if keep_branch else "")
     else:
+        spool["status"] = "error"
+        spool["error"] = "Shard abandonment failed during worktree cleanup"
+        spool["completed_at"] = datetime.now().isoformat()
+        _preserve_failed_spool_shard(spool)
+        _write_spool(spool_id, spool)
         return f"Warning: Shard cleanup may have been incomplete for {spool_id}"
 
 
