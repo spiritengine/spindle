@@ -149,6 +149,12 @@ HARNESS_COMMANDS = {
 DEFAULT_HOST = os.environ.get("SPINDLE_HOST", "127.0.0.1")
 
 
+# The port with no configuration of any kind behind it. Kept separate from
+# DEFAULT_PORT, which folds in $SPINDLE_PORT: regenerating an existing service
+# must fall back to the former, never to whatever the calling shell exports.
+_BASE_DEFAULT_PORT = 8002
+
+
 def _default_port() -> int:
     """Service port from SPINDLE_PORT, falling back to 8002 on a bad value."""
     raw = os.environ.get("SPINDLE_PORT", "")
@@ -156,8 +162,8 @@ def _default_port() -> int:
         try:
             return int(raw)
         except ValueError:
-            logger.warning("spindle: ignoring non-numeric SPINDLE_PORT=%r, using 8002", raw)
-    return 8002
+            logger.warning("spindle: ignoring non-numeric SPINDLE_PORT=%r, using %d", raw, _BASE_DEFAULT_PORT)
+    return _BASE_DEFAULT_PORT
 
 
 DEFAULT_PORT = _default_port()
@@ -7350,14 +7356,65 @@ def _unit_file_path(name: str) -> Path:
     return _systemd_user_dir() / f"{name}.service"
 
 
+def _join_line_continuations(text: str) -> str:
+    """Fold systemd's backslash-newline continuations into single lines."""
+    return re.sub(r"\\\n\s*", " ", text)
+
+
+def _parse_systemd_env_line(line: str) -> list:
+    """Split one `Environment=` line into its (name, value) assignments.
+
+    systemd allows SEVERAL space-separated assignments per line, each optionally
+    quoted, with backslash escapes inside the quotes. A regex that grabs from the
+    first `VAR=` to end-of-line reads `"SPINDLE_HOME=/srv/store" "FOO=bar"` as a
+    store literally named `/srv/store" "FOO=bar`, and that value gets written
+    back into the regenerated service — the service then starts on a directory
+    that does not exist and every spool in the real store is stranded.
+    """
+    assignments = []
+    buf = []
+    quoted = False
+    i = 0
+    while i <= len(line):
+        char = line[i] if i < len(line) else " "  # sentinel flushes the last token
+        if char == "\\" and i + 1 < len(line):
+            buf.append(line[i + 1])
+            i += 2
+            continue
+        if char == '"':
+            quoted = not quoted
+            i += 1
+            continue
+        if char.isspace() and not quoted:
+            token = "".join(buf)
+            buf = []
+            if "=" in token:
+                name, _, value = token.partition("=")
+                # %% is systemd's literal percent; undo it as systemd would.
+                assignments.append((name, value.replace("%%", "%")))
+            i += 1
+            continue
+        buf.append(char)
+        i += 1
+    return assignments
+
+
 def _env_from_unit_text(text: str, var: str) -> Optional[str]:
-    """Read one Environment= value out of unit text, quoted or not."""
-    match = re.search(rf'^Environment=(?:"{var}=(.*?)"|{var}=(\S*))\s*$', text, re.MULTILINE)
-    if not match:
-        return None
-    value = match.group(1) if match.group(1) is not None else match.group(2)
-    # Undo the escaping _systemd_quote applied.
-    return value.replace("%%", "%").replace('\\"', '"').replace("\\\\", "\\")
+    """Read one Environment= value out of unit text.
+
+    Later assignments win, which is systemd's own rule: a unit that sets a
+    variable twice runs with the second value, so regenerating from the first
+    would move the service off what it is actually running.
+    """
+    found = None
+    for line in _join_line_continuations(text).splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("Environment="):
+            continue
+        for name, value in _parse_systemd_env_line(stripped[len("Environment=") :]):
+            if name == var:
+                found = value
+    return found
 
 
 def _env_from_unit(name: str, var: str) -> Optional[str]:
@@ -7453,9 +7510,14 @@ def _service_settings_from_file(path: Path) -> dict:
             settings["port"] = int(env_port)
         except ValueError:
             pass
-    match = re.search(r"^ExecStart=.*?serve\s+--http\s+--port\s+(\d+)", text, re.MULTILINE)
-    if match:
-        settings["port"] = int(match.group(1))
+    # Continuations are folded first: an ExecStart wrapped across lines is one
+    # command to systemd, and anchoring without folding stopped seeing its port.
+    for line in _join_line_continuations(text).splitlines():
+        if not line.strip().startswith("ExecStart="):
+            continue
+        match = re.search(r"serve\s+--http\s+--port\s+(\d+)", line)
+        if match:
+            settings["port"] = int(match.group(1))
     return settings
 
 
@@ -7464,8 +7526,28 @@ def _resolve_service_settings(
     arg_port: Optional[int],
     arg_home: Optional[str],
 ) -> Tuple[int, Optional[str], list]:
-    """Apply the precedence rule. Returns (port, home, notes to print)."""
+    """Apply the precedence rule to BOTH fields. Returns (port, home, notes).
+
+        an explicit argument
+          > what the service is already configured with
+            > the default
+
+    The third term is where this kept going wrong. "Already configured" includes
+    being configured with the default: a service installed without --home has no
+    SPINDLE_HOME line and runs on ~/.spindle, and one whose port cannot be read
+    runs on 8002. Those are settings expressed by absence, and consulting the
+    calling shell's SPINDLE_HOME/SPINDLE_PORT for them moves a running service
+    onto whatever that shell happens to export.
+
+    So the environment is consulted only when the service does not exist yet.
+    Both fields, symmetrically — fixing one and not the other is how this defect
+    survived three rounds of review.
+
+    ``arg_home=""`` is an explicit request for the default store, which is
+    otherwise unreachable once a store has been baked in.
+    """
     persisted = _service_settings_from_file(existing)
+    exists = existing.exists()
     notes = []
 
     if arg_port is not None:
@@ -7473,26 +7555,27 @@ def _resolve_service_settings(
     elif persisted["port"] is not None:
         port = persisted["port"]
         notes.append(f"Keeping the port {existing.name} already binds: {port} (pass --port to change it)")
+    elif exists:
+        port = _BASE_DEFAULT_PORT
+        if os.environ.get("SPINDLE_PORT"):
+            notes.append(
+                f"Keeping the default port {existing.name} already binds: {port} "
+                "(ignoring SPINDLE_PORT in this shell; pass --port to change it)"
+            )
     else:
         port = DEFAULT_PORT
 
-    if arg_home:
-        home = arg_home
+    if arg_home is not None:
+        home = arg_home or None
     elif persisted["home"]:
         home = persisted["home"]
         notes.append(f"Keeping the spool store {existing.name} already uses: {home} (pass --home to change it)")
-    elif existing.exists():
-        # A service installed without --home has no SPINDLE_HOME line and runs on
-        # the default store. That IS what it is configured with, so reading the
-        # ambient SPINDLE_HOME here would move it — the reported failure, in the
-        # one corner where the setting is expressed by its absence. Whether the
-        # file exists is the signal that separates "already configured" from
-        # "being configured for the first time".
+    elif exists:
         home = None
         if os.environ.get("SPINDLE_HOME"):
             notes.append(
                 f"Keeping the default spool store {existing.name} already uses "
-                f"(ignoring SPINDLE_HOME in this shell; pass --home to change it)"
+                "(ignoring SPINDLE_HOME in this shell; pass --home to change it)"
             )
     else:
         home = os.environ.get("SPINDLE_HOME")
@@ -7512,18 +7595,10 @@ def _port_from_unit(name: str) -> Optional[int]:
     ExecStart wins over the Environment line: it is what the service actually
     binds, so if someone edited only one of the two, that is the truthful one.
     """
-    try:
-        text = _unit_file_path(name).read_text(errors="replace")
-    except OSError:
-        return None
-    match = re.search(r"serve\s+--http\s+--port\s+(\d+)", text)
-    if match:
-        return int(match.group(1))
-    value = _env_from_unit(name, "SPINDLE_PORT")
-    try:
-        return int(value) if value else None
-    except ValueError:
-        return None
+    # One reader, so `reload`/`doctor` cannot be misled by a file shape that
+    # install-service reads correctly (an ExecStartPre mentioning the flag, a
+    # repeated Environment= line).
+    return _service_settings_from_file(_unit_file_path(name))["port"]
 
 
 def _reload_warn_on_store_mismatch(host: str, port: int) -> Optional[str]:
@@ -8511,46 +8586,63 @@ def main():
                 origin = "was not written by spindle" if unmanaged else "is being regenerated"
                 print(f"{plist_file} {origin}; backed it up to {backup}")
 
-            # Unload if already loaded
-            if plist_file.exists():
-                subprocess.run(["launchctl", "unload", str(plist_file)], capture_output=True)
+            # Unload if already loaded. Its exit code decides what a later
+            # failure means: if the unload failed, the OLD agent is still running,
+            # so "no agent is loaded" would be exactly wrong.
+            was_loaded = plist_file.exists()
+            unload_failed = False
+            if was_loaded:
+                unloaded = subprocess.run(["launchctl", "unload", str(plist_file)], capture_output=True, text=True)
+                unload_failed = unloaded.returncode != 0
 
-            plist_file.write_text(plist_content)
+            def _restore_previous(reason: str) -> None:
+                """Put the old agent back after any failure past the unload."""
+                print(reason)
+                if backup is None:
+                    return
+                try:
+                    shutil.copy2(backup, plist_file)
+                except OSError as exc:
+                    print(f"Could not restore the previous plist from {backup}: {exc}")
+                    return
+                if unload_failed:
+                    print(f"Restored the previous plist from {backup}; it was never unloaded, so it is still running.")
+                    return
+                reloaded = subprocess.run(["launchctl", "load", str(plist_file)], capture_output=True, text=True)
+                if reloaded.returncode == 0:
+                    print(f"Restored the previous plist from {backup} and reloaded it.")
+                else:
+                    print(
+                        f"Restored the previous plist from {backup}, but reloading it also failed "
+                        f"(exit {reloaded.returncode}): {(reloaded.stderr or '').strip()}. "
+                        f"Run: launchctl load {plist_file}"
+                    )
+
+            # Everything from here has already unloaded the old agent, so every
+            # failure below must put it back — not just a rejected load. A write
+            # that fails on a full disk used to leave the machine with no agent,
+            # a truncated plist, and a backup nothing would ever mention again.
+            try:
+                plist_file.write_text(plist_content)
+            except OSError as exc:
+                _restore_previous(f"Could not write {plist_file}: {exc}")
+                sys.exit(1)
             print(f"Wrote {plist_file} (port {service_port}, spindle {__version__})")
 
             # Ensure log directory exists
-            (Path.home() / ".spindle").mkdir(parents=True, exist_ok=True)
+            try:
+                (Path.home() / ".spindle").mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                _restore_previous(f"Could not create the log directory: {exc}")
+                sys.exit(1)
 
             # Load the service. launchctl's exit code is the only signal that the
             # plist was accepted; announcing success without it means a plist that
             # never loads reads as a successful install.
             loaded = subprocess.run(["launchctl", "load", str(plist_file)], capture_output=True, text=True)
             if loaded.returncode != 0:
-                print(f"launchctl load failed (exit {loaded.returncode}): {(loaded.stderr or '').strip()}")
                 print(f"Check the plist with: plutil -lint {plist_file}")
-                # The old agent was unloaded and its file overwritten. Put it back
-                # and reload it, so a rejected new plist does not leave the machine
-                # with no service at all.
-                if backup is not None:
-                    try:
-                        shutil.copy2(backup, plist_file)
-                    except OSError as exc:
-                        print(f"Could not restore the previous plist from {backup}: {exc}")
-                    else:
-                        # Check this reload too. Claiming the old agent is back
-                        # when it is not leaves the machine with no service and
-                        # the operator with no reason to look.
-                        reloaded = subprocess.run(
-                            ["launchctl", "load", str(plist_file)], capture_output=True, text=True
-                        )
-                        if reloaded.returncode == 0:
-                            print(f"Restored the previous plist from {backup} and reloaded it.")
-                        else:
-                            print(
-                                f"Restored the previous plist from {backup}, but reloading it also failed "
-                                f"(exit {reloaded.returncode}): {(reloaded.stderr or '').strip()}. "
-                                f"No agent is loaded; run: launchctl load {plist_file}"
-                            )
+                _restore_previous(f"launchctl load failed (exit {loaded.returncode}): {(loaded.stderr or '').strip()}")
                 sys.exit(1)
             print("Loaded launchd service")
 

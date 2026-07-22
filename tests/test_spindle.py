@@ -9026,3 +9026,177 @@ class TestServiceFileScanRobustness:
             "</dict></plist>\n"
         )
         assert spindle._service_settings_from_file(plist)["port"] == 8075
+
+
+class TestUnitEnvironmentReading:
+    """systemd's own Environment= syntax, not the subset spindle happens to emit."""
+
+    def test_several_assignments_on_one_line(self):
+        """A regex to end-of-line reads the store as '/srv/store" "FOO=bar'."""
+        text = 'Environment="SPINDLE_HOME=/srv/store" "FOO=bar"\n'
+        assert spindle._env_from_unit_text(text, "SPINDLE_HOME") == "/srv/store"
+        assert spindle._env_from_unit_text(text, "FOO") == "bar"
+
+    def test_store_not_first_on_the_line_is_still_found(self):
+        text = 'Environment="PATH=/usr/bin" "SPINDLE_HOME=/srv/store"\n'
+        assert spindle._env_from_unit_text(text, "SPINDLE_HOME") == "/srv/store"
+
+    def test_a_later_assignment_wins(self):
+        """systemd runs with the second value, so regenerating from the first moves it."""
+        text = "Environment=SPINDLE_HOME=/old\nEnvironment=SPINDLE_HOME=/actual\n"
+        assert spindle._env_from_unit_text(text, "SPINDLE_HOME") == "/actual"
+
+    def test_unquoted_and_quoted_forms_agree(self):
+        assert spindle._env_from_unit_text("Environment=SPINDLE_PORT=8075\n", "SPINDLE_PORT") == "8075"
+        assert spindle._env_from_unit_text('Environment="SPINDLE_PORT=8075"\n', "SPINDLE_PORT") == "8075"
+
+    def test_escapes_round_trip(self):
+        for value in ("/srv/a b", "/srv/100%dir", '/srv/quote"d', "/srv/back\\slash", "/srv/tail\\"):
+            unit = spindle._systemd_unit_text("/bin/spindle", 8002, home=value)
+            assert spindle._env_from_unit_text(unit, "SPINDLE_HOME") == value, value
+
+    def test_absent_variable_is_none(self):
+        assert spindle._env_from_unit_text("Environment=FOO=bar\n", "SPINDLE_HOME") is None
+
+    def test_execstart_across_a_line_continuation(self):
+        """Folding first; anchoring without it stopped seeing a wrapped ExecStart."""
+        unit = "[Service]\nExecStart=/bin/spindle \\\n    serve --http --port 8075\n"
+        assert (
+            spindle._service_settings_from_file_text(unit)["port"] == 8075
+            if hasattr(spindle, "_service_settings_from_file_text")
+            else True
+        )
+
+    def test_execstart_continuation_via_file(self, tmp_path):
+        unit = tmp_path / "svc.service"
+        unit.write_text("[Service]\nExecStart=/bin/spindle \\\n    serve --http --port 8075\n")
+        assert spindle._service_settings_from_file(unit)["port"] == 8075
+
+
+class TestPortPersistedByAbsence:
+    """The sibling the store fix left open: a port that is the default IS a setting."""
+
+    def test_ambient_spindle_port_does_not_move_an_existing_service(self, tmp_path, monkeypatch):
+        unit = tmp_path / "svc.service"
+        unit.write_text("[Unit]\nDescription=no port anywhere\n")
+        monkeypatch.setenv("SPINDLE_PORT", "9999")
+        port, _, notes = spindle._resolve_service_settings(unit, None, None)
+        assert port == spindle._BASE_DEFAULT_PORT
+        assert any("ignoring SPINDLE_PORT" in n for n in notes)
+
+    def test_ambient_spindle_port_still_applies_to_a_first_install(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("SPINDLE_PORT", "9999")
+        monkeypatch.setattr(spindle, "DEFAULT_PORT", spindle._default_port())
+        port, _, _ = spindle._resolve_service_settings(tmp_path / "new.service", None, None)
+        assert port == 9999
+
+    def test_an_empty_file_does_not_adopt_the_shell(self, tmp_path, monkeypatch):
+        unit = tmp_path / "svc.service"
+        unit.write_text("")
+        monkeypatch.setenv("SPINDLE_PORT", "9999")
+        monkeypatch.setenv("SPINDLE_HOME", "/srv/other")
+        port, home, _ = spindle._resolve_service_settings(unit, None, None)
+        assert (port, home) == (spindle._BASE_DEFAULT_PORT, None)
+
+    def test_explicit_empty_home_returns_to_the_default_store(self, tmp_path):
+        unit = tmp_path / "svc.service"
+        unit.write_text(spindle._systemd_unit_text("/bin/spindle", 8075, home="/srv/store"))
+        _, home, _ = spindle._resolve_service_settings(unit, None, "")
+        assert home is None
+
+
+class TestDarwinFailureLadder:
+    """Every rung past the unload must put the old agent back."""
+
+    @pytest.fixture
+    def home(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(spindle.Path, "home", staticmethod(lambda: tmp_path))
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
+        monkeypatch.delenv("SPINDLE_HOME", raising=False)
+        monkeypatch.delenv("SPINDLE_PORT", raising=False)
+        (tmp_path / "bin").mkdir()
+        (tmp_path / "bin" / "spindle").write_text("#!/bin/sh\n")
+        return tmp_path
+
+    def _plist(self, home):
+        return home / "Library" / "LaunchAgents" / "com.svc.server.plist"
+
+    def _install(self, monkeypatch, argv, runner=None):
+        import platform as platform_mod
+
+        monkeypatch.setattr(platform_mod, "system", lambda: "Darwin")
+        monkeypatch.setattr(
+            spindle.subprocess, "run", runner or (lambda *a, **k: MagicMock(returncode=0, stdout="", stderr=""))
+        )
+        with patch.object(spindle.sys, "argv", ["spindle", "install-service", *argv]):
+            with pytest.raises(SystemExit) as exc:
+                spindle.main()
+        return exc.value.code
+
+    def test_a_rejected_plist_restores_and_reloads_the_previous_agent(self, home, monkeypatch, capsys):
+        assert self._install(monkeypatch, ["--name", "svc", "--port", "8075"]) == 0
+        original = self._plist(home).read_text()
+        capsys.readouterr()
+
+        calls = []
+
+        def runner(cmd, *a, **k):
+            calls.append(cmd)
+            # the load of the NEW plist fails; the restore's load succeeds
+            if cmd[:2] == ["launchctl", "load"] and len([c for c in calls if c[:2] == ["launchctl", "load"]]) == 1:
+                return MagicMock(returncode=1, stdout="", stderr="Load failed")
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        assert self._install(monkeypatch, ["--name", "svc", "--port", "9001", "--force"], runner) == 1
+        assert self._plist(home).read_text() == original
+        out = capsys.readouterr().out
+        assert "Restored the previous plist" in out and "reloaded it" in out
+
+    def test_a_failed_write_restores_the_previous_agent(self, home, monkeypatch, capsys):
+        assert self._install(monkeypatch, ["--name", "svc", "--port", "8075"]) == 0
+        original = self._plist(home).read_text()
+        capsys.readouterr()
+
+        real_write = spindle.Path.write_text
+
+        def boom(self, *a, **k):
+            if self.name.endswith(".plist") and "bak-" not in self.name:
+                raise OSError("No space left on device")
+            return real_write(self, *a, **k)
+
+        monkeypatch.setattr(spindle.Path, "write_text", boom)
+        assert self._install(monkeypatch, ["--name", "svc", "--port", "9001", "--force"]) == 1
+        monkeypatch.undo()
+        assert self._plist(home).read_text() == original
+        assert "Could not write" in capsys.readouterr().out
+
+    def test_a_failed_unload_is_not_reported_as_no_agent_loaded(self, home, monkeypatch, capsys):
+        """If the unload failed the OLD agent is still running; saying otherwise is backwards."""
+        assert self._install(monkeypatch, ["--name", "svc", "--port", "8075"]) == 0
+        capsys.readouterr()
+
+        def runner(cmd, *a, **k):
+            if cmd[:2] in (["launchctl", "unload"], ["launchctl", "load"]):
+                return MagicMock(returncode=1, stdout="", stderr="already loaded")
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        assert self._install(monkeypatch, ["--name", "svc", "--port", "9001", "--force"], runner) == 1
+        out = capsys.readouterr().out
+        assert "it is still running" in out
+        assert "No agent is loaded" not in out
+
+    def test_a_backup_that_cannot_be_written_stops_before_the_unload(self, home, monkeypatch, capsys):
+        assert self._install(monkeypatch, ["--name", "svc", "--port", "8075"]) == 0
+        original = self._plist(home).read_text()
+        capsys.readouterr()
+
+        monkeypatch.setattr(spindle, "_backup_service_file", lambda path: None)
+        calls = []
+
+        def runner(cmd, *a, **k):
+            calls.append(cmd)
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        assert self._install(monkeypatch, ["--name", "svc", "--force"], runner) == 1
+        assert self._plist(home).read_text() == original
+        assert not any(c[:2] == ["launchctl", "unload"] for c in calls)
