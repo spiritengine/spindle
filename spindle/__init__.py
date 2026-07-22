@@ -5127,6 +5127,23 @@ async def shard_merge(spool_id: str, keep_branch: bool = False, caller_cwd: str 
     Example:
         shard_merge("abc123")  # merge and cleanup
     """
+    return await asyncio.to_thread(_shard_merge_sync, spool_id, keep_branch, caller_cwd)
+
+
+def _shard_merge_sync(spool_id: str, keep_branch: bool, caller_cwd: str | None) -> str:
+    """Serialize shard merging with every spool lifecycle transition."""
+    deadline = time.monotonic() + SPOOL_TERMINAL_LOCK_TIMEOUT
+    while True:
+        with _spool_lock(spool_id, blocking=False) as acquired:
+            if acquired:
+                return _shard_merge_locked(spool_id, keep_branch, caller_cwd)
+        if time.monotonic() >= deadline:
+            return f"Error: Could not lock spool {spool_id} for shard merge"
+        time.sleep(0.05)
+
+
+def _shard_merge_locked(spool_id: str, keep_branch: bool, caller_cwd: str | None) -> str:
+    """Merge a shard while holding its terminal-transition lock."""
     if not caller_cwd:
         return "Error: caller_cwd required. Pass your current working directory to prevent deleting a worktree you're inside of."
 
@@ -5135,8 +5152,8 @@ async def shard_merge(spool_id: str, keep_branch: bool = False, caller_cwd: str 
     if not spool:
         return f"Error: Unknown spool_id '{spool_id}'"
 
-    if spool.get("status") == "running":
-        return f"Error: Spool {spool_id} is still running. Wait for completion."
+    if spool.get("status") in {"pending", "running"}:
+        return f"Error: Spool {spool_id} is still starting or running. Wait for completion."
 
     shard_info = spool.get("shard")
     if not shard_info:
@@ -5156,10 +5173,10 @@ async def shard_merge(spool_id: str, keep_branch: bool = False, caller_cwd: str 
             main_repo = wt_path.parent.parent
             return f"Error: Cannot delete worktree - your working directory is inside it. Run `cd {main_repo}` first."
 
-    # Check if any running spool has working_dir inside this worktree
+    # Check if any active spool has working_dir inside this worktree.
     wt_path = Path(worktree_path).resolve()
     for other in _list_spools():
-        if other.get("status") == "running" and other.get("id") != spool_id:
+        if other.get("status") in {"pending", "running"} and other.get("id") != spool_id:
             other_wd = other.get("working_dir", "")
             if not other_wd:
                 continue
@@ -5170,6 +5187,19 @@ async def shard_merge(spool_id: str, keep_branch: bool = False, caller_cwd: str 
     # Find the main repo path
     main_repo = Path(worktree_path).parent.parent  # worktrees/name -> repo
     base_branch = _shard_base_branch(spool)
+
+    # A terminal result can outlive a process group that is still writing into
+    # the shard. Resolve that explicit warning before any Git or cleanup work.
+    if spool.get("process_group_cleanup_warning"):
+        pid = spool.get("pid")
+        if not pid:
+            return f"Error: Spool {spool_id} has an unresolved process-group warning; shard preserved"
+        if _is_pid_alive(pid) or _is_process_group_alive(pid):
+            if not _terminate_process_group(pid, 0.5):
+                return f"Error: Could not terminate process group for spool {spool_id}; shard preserved"
+        _pop_and_reap_process_handle(spool_id)
+        spool.pop("process_group_cleanup_warning", None)
+        _write_spool(spool_id, spool)
 
     try:
         # Check for uncommitted changes
@@ -5272,6 +5302,9 @@ def _shard_abandon_locked(spool_id: str, keep_branch: bool, caller_cwd: str | No
     if not spool:
         return f"Error: Unknown spool_id '{spool_id}'"
 
+    if spool.get("status") == "pending":
+        return f"Error: Spool {spool_id} is still starting. Wait for PID publication or cancel it first."
+
     shard_info = spool.get("shard")
     if not shard_info:
         return f"Error: Spool {spool_id} has no shard"
@@ -5289,10 +5322,10 @@ def _shard_abandon_locked(spool_id: str, keep_branch: bool, caller_cwd: str | No
             main_repo = wt_path.parent.parent
             return f"Error: Cannot delete worktree - your working directory is inside it. Run `cd {main_repo}` first."
 
-    # Check if any OTHER running spool has working_dir inside this worktree
+    # Check if any OTHER active spool has working_dir inside this worktree.
     wt_path = Path(worktree_path).resolve()
     for other in _list_spools():
-        if other.get("status") == "running" and other.get("id") != spool_id:
+        if other.get("status") in {"pending", "running"} and other.get("id") != spool_id:
             other_wd = other.get("working_dir", "")
             if not other_wd:
                 continue

@@ -5891,6 +5891,80 @@ class TestShardOpsBlockedBySubdirectorySpool:
 
 
 class TestShardMergeCleanupFailure:
+    def test_pending_target_cannot_be_merged_or_abandoned(self, tmp_path):
+        spool_id = "pending-shard-operation"
+        state_dir = tmp_path / "spools"
+        worktree = tmp_path / "worktrees" / "pending-shard-operation"
+        worktree.mkdir(parents=True)
+        spool = {
+            "id": spool_id,
+            "status": "pending",
+            "working_dir": str(worktree),
+            "created_at": datetime.now().isoformat(),
+            "shard": {
+                "worktree_path": str(worktree),
+                "branch_name": "shard-pending-operation",
+            },
+        }
+        merge = shard_merge.fn if hasattr(shard_merge, "fn") else shard_merge
+        abandon = shard_abandon.fn if hasattr(shard_abandon, "fn") else shard_abandon
+
+        with patch("spindle.SPINDLE_DIR", state_dir):
+            _write_spool(spool_id, spool)
+            with patch("spindle._cleanup_shard") as cleanup:
+                merge_result = asyncio.run(merge(spool_id, caller_cwd=str(tmp_path / "outside")))
+                abandon_result = asyncio.run(abandon(spool_id, caller_cwd=str(tmp_path / "outside")))
+            saved = _read_spool(spool_id)
+
+        assert "still starting" in merge_result
+        assert "still starting" in abandon_result
+        assert saved["status"] == "pending"
+        cleanup.assert_not_called()
+
+    def test_merge_holds_terminal_lock_and_drains_warned_group(self, tmp_path):
+        spool_id = "merge-warned-group"
+        state_dir = tmp_path / "spools"
+        worktree = tmp_path / "worktrees" / "merge-warned-group"
+        worktree.mkdir(parents=True)
+        spool = {
+            "id": spool_id,
+            "status": "complete",
+            "prompt": "merge me",
+            "base_branch": "main",
+            "pid": 747474,
+            "process_group_cleanup_warning": "group survived normal finalization",
+            "created_at": datetime.now().isoformat(),
+            "shard": {
+                "worktree_path": str(worktree),
+                "branch_name": "shard-merge-warned-group",
+                "shard_id": "merge-warned-group",
+            },
+        }
+        lock_attempts = []
+
+        def git_run(*args, **kwargs):
+            with spindle._spool_lock(spool_id, blocking=False) as acquired:
+                lock_attempts.append(acquired)
+            return subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+
+        merge = shard_merge.fn if hasattr(shard_merge, "fn") else shard_merge
+        with patch("spindle.SPINDLE_DIR", state_dir):
+            _write_spool(spool_id, spool)
+            with patch("spindle._is_pid_alive", return_value=True):
+                with patch("spindle._terminate_process_group", return_value=True) as terminate:
+                    with patch("spindle._pop_and_reap_process_handle") as reap:
+                        with patch("spindle.subprocess.run", side_effect=git_run):
+                            with patch("spindle._cleanup_shard", return_value=True):
+                                with patch("spindle._close_tender_folios", return_value=None):
+                                    result = asyncio.run(merge(spool_id, caller_cwd=str(tmp_path / "outside")))
+            saved = _read_spool(spool_id)
+
+        assert result == f"Successfully merged shard {spool_id} to main"
+        assert lock_attempts == [False, False]
+        terminate.assert_called_once_with(747474, 0.5)
+        reap.assert_called_once_with(spool_id)
+        assert "process_group_cleanup_warning" not in saved
+
     def test_successful_merge_preserves_handle_when_worktree_cleanup_fails(self, tmp_path):
         spool_id = "merge-cleanup-failure"
         state_dir = tmp_path / "spools"
