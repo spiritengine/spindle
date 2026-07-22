@@ -7596,13 +7596,31 @@ def _service_record_path(name: str) -> Path:
     return Path(base) / "spindle" / "services" / f"{name}.json"
 
 
+def _service_file_digest(path: Path) -> Optional[str]:
+    """SHA-256 of a service file, or None if it cannot be read."""
+    import hashlib
+
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
 def _write_service_record(name: str, port: int, home: Optional[str], service_file: Path) -> None:
-    """Record what a service was installed with, beside the service file."""
+    """Record what a service was installed with, and which exact file that was.
+
+    The digest is what makes the record trustworthy later. A record on its own
+    is just state that can drift: someone edits the unit's port by hand, and a
+    later regeneration would confidently rewrite it back to the recorded value.
+    Comparing the digest tells us whether the file on disk is still the one this
+    record describes — without parsing it, which is the thing that never worked.
+    """
     record = {
         "name": name,
         "port": port,
         "home": home,
         "service_file": str(service_file),
+        "service_sha256": _service_file_digest(service_file),
         "spindle_version": __version__,
     }
     path = _service_record_path(name)
@@ -7610,18 +7628,39 @@ def _write_service_record(name: str, port: int, home: Optional[str], service_fil
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(record, indent=2) + "\n")
     except OSError as exc:
-        # Not fatal: the service is installed and works. The next regeneration
-        # just has to be told its settings instead of reading them back.
+        # Not fatal: the service is installed and running. The next regeneration
+        # simply has to be told its settings rather than reading them back.
         logger.warning("spindle: could not record service settings in %s: %s", path, exc)
+        print(
+            f"Warning: could not write {path} ({exc}). The service is installed, but the next "
+            f"`install-service --name {name} --force` will ask you to restate --port and --home.",
+            file=sys.stderr,
+        )
 
 
 def _read_service_record(name: str) -> Optional[dict]:
-    """What spindle installed this service with, or None if it has no record."""
+    """What spindle installed this service with, or None if there is no usable record.
+
+    Every field is type-checked. A record that is present but malformed must
+    read as "no record" so the caller takes the refuse-and-ask path: falling
+    through to the defaults instead is how a wrong record silently moved a
+    service onto port 8002 and the default store.
+    """
     try:
         record = json.loads(_service_record_path(name).read_text())
     except (OSError, json.JSONDecodeError):
         return None
-    return record if isinstance(record, dict) else None
+    if not isinstance(record, dict):
+        return None
+    # bool is a subclass of int; `"port": true` would otherwise render as --port True.
+    port = record.get("port")
+    if isinstance(port, bool) or not isinstance(port, int):
+        return None
+    if "home" not in record or not isinstance(record["home"], (str, type(None))):
+        return None
+    if not isinstance(record.get("service_sha256"), (str, type(None))):
+        return None
+    return record
 
 
 def _resolve_service_settings(
@@ -7648,19 +7687,44 @@ def _resolve_service_settings(
     record = _read_service_record(name) if name else None
     exists = existing.exists()
 
+    # A record only describes the file it was written for. If the file has been
+    # edited since — a hand-tuned port, a replaced unit — the record is stale,
+    # and regenerating from it would rewrite the service back to settings it is
+    # no longer running with, announcing that it "kept" them.
+    if record is not None and exists:
+        recorded_digest = record.get("service_sha256")
+        if recorded_digest and _service_file_digest(existing) != recorded_digest:
+            notes.append(f"{existing.name} has been edited since spindle installed it; its record is stale.")
+            record = None
+
     if record is None and exists and (arg_port is None or arg_home is None):
+        import shlex
+
         guess = _service_settings_from_file(existing)
         hint_port = guess["port"] if guess["port"] is not None else _BASE_DEFAULT_PORT
         hint_home = guess["home"]
-        hint = f"--port {hint_port}"
-        if hint_home:
-            hint += f" --home {hint_home}"
+        # Both flags always appear, because the refusal requires both; a remedy
+        # that omits one refuses again when pasted. --home '' asks for the
+        # default store explicitly.
+        caveat = ""
+        if hint_home and "%" in hint_home:
+            # A systemd specifier: its value depends on the service's runtime
+            # context, so it cannot be repeated back as a literal path. Pasting
+            # it would re-escape the % and land the store somewhere else — the
+            # exact defect this refusal exists to prevent, via the operator.
+            caveat = (
+                f"\n{existing.name} sets its store to {hint_home!r}, which is a systemd specifier "
+                f"resolved at runtime. Pass the actual directory you mean, not that string."
+            )
+            hint_home = None
+        hint = f"--port {hint_port} --home {shlex.quote(hint_home or '')}"
         blocker = (
-            f"{existing} exists but spindle has no record of installing it, so what it currently "
-            f"runs with cannot be established from the file alone.\n"
+            f"{existing} exists but spindle has no record of installing it (or the file changed "
+            f"since), so what it currently runs with cannot be established from the file alone.\n"
             f"Say what it should be, and spindle will record it from then on:\n"
             f"  spindle install-service --name {name} {hint} --force\n"
             f"(reading the file suggests {hint} — check it against the file before trusting it)"
+            f"{caveat}"
         )
         return None, None, notes, blocker
 
@@ -8641,7 +8705,6 @@ def main():
                 origin = "was not written by spindle" if unmanaged else "is being regenerated"
                 print(f"{service_file} {origin}; backed it up to {backup}")
             service_file.write_text(service_content)
-            _write_service_record(args.name, service_port, service_home, service_file)
             print(f"Wrote {service_file} (port {service_port}, spindle {__version__})")
             if service_home:
                 print(f"Spool store baked into the unit: {service_home}")
@@ -8660,6 +8723,11 @@ def main():
                 print(f"systemctl enable failed (exit {enabled.returncode}): {(enabled.stderr or '').strip()}")
                 sys.exit(1)
             print(f"Enabled {args.name} service")
+
+            # Record only once the service is actually installed and enabled. A
+            # record written earlier would outlive a failed activation and
+            # describe a service that was never put in place.
+            _write_service_record(args.name, service_port, service_home, service_file)
 
             print(f"\nTo start now: spindle start --name {args.name}")
             print(f"To check status: spindle status --port {service_port}")
@@ -8756,7 +8824,6 @@ def main():
             except OSError as exc:
                 _restore_previous(f"Could not write {plist_file}: {exc}")
                 sys.exit(1)
-            _write_service_record(args.name, service_port, service_home, plist_file)
             print(f"Wrote {plist_file} (port {service_port}, spindle {__version__})")
 
             # Ensure log directory exists
@@ -8778,6 +8845,12 @@ def main():
                 print(f"The plist that failed is the backup's replacement; check it with: plutil -lint {plist_file}")
                 sys.exit(1)
             print("Loaded launchd service")
+
+            # After the load, not before: a failed load restores the previous
+            # plist, and a record written earlier would then describe settings
+            # the machine is not running — so the next routine reinstall would
+            # "keep" them and move the service for real.
+            _write_service_record(args.name, service_port, service_home, plist_file)
 
             print("\nService is now running.")
             print(f"To check status: spindle status --port {service_port}")

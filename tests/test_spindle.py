@@ -9351,3 +9351,192 @@ class TestInstallServiceRefusesToGuess:
         assert (record["port"], record["home"]) == (8115, "/srv/mine")
         unit = (home / ".config" / "systemd" / "user" / "svc.service").read_text()
         assert "--port 8115" in unit and "/srv/mine" in unit
+
+
+class TestRecordIsBoundToTheFileItDescribes:
+    """A record is state that can drift; the digest is what makes it trustworthy."""
+
+    @pytest.fixture
+    def config(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
+        monkeypatch.delenv("SPINDLE_HOME", raising=False)
+        monkeypatch.delenv("SPINDLE_PORT", raising=False)
+        return tmp_path
+
+    def _installed(self, tmp_path, port=8075, home="/srv/store"):
+        unit = tmp_path / "svc.service"
+        unit.write_text(spindle._systemd_unit_text("/bin/spindle", port, home=home, name="svc"))
+        spindle._write_service_record("svc", port, home, unit)
+        return unit
+
+    def test_an_untouched_file_is_trusted(self, config, tmp_path):
+        unit = self._installed(tmp_path)
+        port, home, _, blocker = spindle._resolve_service_settings(unit, None, None, name="svc")
+        assert (port, home, blocker) == (8075, "/srv/store", None)
+
+    def test_a_hand_edited_file_makes_the_record_stale(self, config, tmp_path):
+        """Editing the unit's port by hand must not be silently rewritten back."""
+        unit = self._installed(tmp_path)
+        unit.write_text(unit.read_text().replace("--port 8075", "--port 9001"))
+        port, home, notes, blocker = spindle._resolve_service_settings(unit, None, None, name="svc")
+        assert (port, home) == (None, None)
+        assert blocker is not None
+        assert any("edited since" in n for n in notes)
+
+    def test_a_replaced_file_makes_the_record_stale(self, config, tmp_path):
+        unit = self._installed(tmp_path)
+        unit.write_text("[Unit]\nDescription=somebody else's\n")
+        _, _, _, blocker = spindle._resolve_service_settings(unit, None, None, name="svc")
+        assert blocker is not None
+
+    def test_explicit_arguments_still_work_on_a_stale_record(self, config, tmp_path):
+        unit = self._installed(tmp_path)
+        unit.write_text("[Unit]\nDescription=edited\n")
+        port, home, _, blocker = spindle._resolve_service_settings(unit, 9001, "/srv/new", name="svc")
+        assert (port, home, blocker) == (9001, "/srv/new", None)
+
+
+class TestMalformedRecordsRefuseRatherThanDefault:
+    """A record that cannot be trusted must take the ask-me path, not the defaults."""
+
+    @pytest.fixture
+    def config(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
+        monkeypatch.delenv("SPINDLE_HOME", raising=False)
+        monkeypatch.delenv("SPINDLE_PORT", raising=False)
+        return tmp_path
+
+    def _write_raw(self, record):
+        path = spindle._service_record_path("svc")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(record))
+
+    @pytest.mark.parametrize(
+        "record",
+        [
+            {"port": "8075", "home": "/srv/store"},  # port as a string
+            {"port": True, "home": "/srv/store"},  # bool is an int subclass
+            {"port": 8075, "home": []},  # home wrong type
+            {"port": 8075},  # home missing entirely
+            {"home": "/srv/store"},  # port missing
+            {"port": 8075, "home": "/srv/store", "service_sha256": 12},  # digest wrong type
+        ],
+    )
+    def test_unusable_records_read_as_absent(self, config, record):
+        self._write_raw(record)
+        assert spindle._read_service_record("svc") is None
+
+    def test_and_therefore_block_instead_of_defaulting(self, config, tmp_path):
+        unit = tmp_path / "svc.service"
+        unit.write_text(spindle._systemd_unit_text("/bin/spindle", 8115, home="/srv/mine", name="svc"))
+        self._write_raw({"port": "8115", "home": "/srv/mine"})
+        port, home, _, blocker = spindle._resolve_service_settings(unit, None, None, name="svc")
+        assert (port, home) == (None, None)
+        assert blocker is not None
+
+    def test_a_good_record_still_reads(self, config, tmp_path):
+        unit = tmp_path / "svc.service"
+        unit.write_text("x")
+        spindle._write_service_record("svc", 8075, None, unit)
+        record = spindle._read_service_record("svc")
+        assert record["port"] == 8075 and record["home"] is None
+
+
+class TestRefusalHintIsSafeToPaste:
+    @pytest.fixture
+    def config(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
+        return tmp_path
+
+    def test_a_systemd_specifier_is_not_offered_as_a_path(self, config, tmp_path):
+        """Pasting `--home %h/store` re-escapes the % and lands somewhere else."""
+        unit = tmp_path / "svc.service"
+        unit.write_text("[Service]\nEnvironment=SPINDLE_HOME=%h/store\nExecStart=/b serve --http --port 8115\n")
+        _, _, _, blocker = spindle._resolve_service_settings(unit, None, None, name="svc")
+        assert "--home %h/store" not in blocker
+        assert "systemd specifier" in blocker
+        assert "--port 8115" in blocker
+
+    def test_a_store_with_a_space_is_quoted(self, config, tmp_path):
+        unit = tmp_path / "svc.service"
+        unit.write_text('[Service]\nEnvironment="SPINDLE_HOME=/srv/my store"\nExecStart=/b serve --http --port 1\n')
+        _, _, _, blocker = spindle._resolve_service_settings(unit, None, None, name="svc")
+        assert "'/srv/my store'" in blocker
+
+    def test_the_hint_always_carries_both_flags(self, config, tmp_path):
+        """A remedy missing one flag refuses again when pasted."""
+        unit = tmp_path / "svc.service"
+        unit.write_text("[Unit]\nDescription=no store anywhere\n")
+        _, _, _, blocker = spindle._resolve_service_settings(unit, None, None, name="svc")
+        assert "--port" in blocker and "--home" in blocker
+
+    def test_pasting_the_hint_actually_unblocks(self, config, tmp_path):
+        """The remedy is executed, not just inspected."""
+        import shlex
+
+        unit = tmp_path / "svc.service"
+        unit.write_text('[Service]\nEnvironment="SPINDLE_HOME=/srv/store"\nExecStart=/b serve --http --port 8115\n')
+        _, _, _, blocker = spindle._resolve_service_settings(unit, None, None, name="svc")
+        argv = shlex.split([line for line in blocker.splitlines() if "install-service" in line][0])
+        port = int(argv[argv.index("--port") + 1])
+        home = argv[argv.index("--home") + 1]
+        p2, h2, _, blocker2 = spindle._resolve_service_settings(unit, port, home, name="svc")
+        assert blocker2 is None
+        assert (p2, h2) == (8115, "/srv/store")
+
+
+class TestRecordFollowsActivation:
+    @pytest.fixture
+    def home(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(spindle.Path, "home", staticmethod(lambda: tmp_path))
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
+        monkeypatch.delenv("SPINDLE_HOME", raising=False)
+        monkeypatch.delenv("SPINDLE_PORT", raising=False)
+        (tmp_path / "bin").mkdir()
+        (tmp_path / "bin" / "spindle").write_text("#!/bin/sh\n")
+        return tmp_path
+
+    def _run(self, argv, monkeypatch, system="Linux", runner=None):
+        import platform as platform_mod
+
+        monkeypatch.setattr(platform_mod, "system", lambda: system)
+        monkeypatch.setattr(
+            spindle.subprocess, "run", runner or (lambda *a, **k: MagicMock(returncode=0, stdout="", stderr=""))
+        )
+        with patch.object(spindle.sys, "argv", ["spindle", "install-service", *argv]):
+            with pytest.raises(SystemExit) as exc:
+                spindle.main()
+        return exc.value.code
+
+    def test_darwin_a_failed_load_leaves_the_record_describing_the_running_agent(self, home, monkeypatch):
+        """The record must not claim settings the restore just undid."""
+        assert self._run(["--name", "svc", "--port", "8115"], monkeypatch, "Darwin") == 0
+        assert spindle._read_service_record("svc")["port"] == 8115
+
+        state = {"loads": 0}
+
+        def runner(cmd, *a, **k):
+            if cmd[:2] == ["launchctl", "load"]:
+                state["loads"] += 1
+                if state["loads"] == 1:
+                    return MagicMock(returncode=1, stdout="", stderr="rejected")
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        assert self._run(["--name", "svc", "--port", "9001", "--force"], monkeypatch, "Darwin", runner) == 1
+        assert spindle._read_service_record("svc")["port"] == 8115
+        plist = home / "Library" / "LaunchAgents" / "com.svc.server.plist"
+        assert spindle._service_settings_from_file(plist)["port"] == 8115
+
+    def test_linux_a_failed_enable_writes_no_record(self, home, monkeypatch):
+        def runner(cmd, *a, **k):
+            if cmd[:3] == ["systemctl", "--user", "enable"]:
+                return MagicMock(returncode=1, stdout="", stderr="no such unit")
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        assert self._run(["--name", "svc", "--port", "8115"], monkeypatch, "Linux", runner) == 1
+        assert spindle._read_service_record("svc") is None
+
+    def test_a_successful_install_records_the_file_it_wrote(self, home, monkeypatch):
+        assert self._run(["--name", "svc", "--port", "8115"], monkeypatch) == 0
+        unit = home / ".config" / "systemd" / "user" / "svc.service"
+        assert spindle._read_service_record("svc")["service_sha256"] == spindle._service_file_digest(unit)
