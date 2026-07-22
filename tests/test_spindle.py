@@ -1614,7 +1614,7 @@ class TestCodexResultExtraction:
             except ProcessLookupError:
                 pass
 
-    def test_finalize_waits_and_preserves_failed_shard_while_process_group_lives(self, tmp_path):
+    def test_finalize_terminalizes_and_preserves_failed_shard_when_group_survives_kill(self, tmp_path):
         spool_id = "codex-live-group"
         stream = json.dumps({"type": "turn.failed", "error": {"message": "provider failed"}})
         with patch("spindle.SPINDLE_DIR", tmp_path):
@@ -1636,10 +1636,16 @@ class TestCodexResultExtraction:
             with patch("spindle._is_process_group_alive", return_value=True):
                 with patch("spindle._terminate_process_group", return_value=False) as terminate:
                     with patch("spindle._cleanup_shard") as cleanup:
-                        assert _check_and_finalize_spool(spool_id) is False
+                        assert _check_and_finalize_spool(spool_id) is True
             terminate.assert_called_once_with(999999999, 0.5)
             cleanup.assert_not_called()
-            assert _read_spool(spool_id)["status"] == "running"
+            saved = _read_spool(spool_id)
+            assert saved["status"] == "error"
+            assert saved["error"] == "provider failed"
+            assert saved["shard_cleanup_preserved"] is True
+            assert saved["process_group_cleanup_warning"] == (
+                "Process group survived TERM and KILL after agent completion"
+            )
             assert _get_output_path(spool_id).exists()
 
     @pytest.mark.parametrize(
@@ -2132,6 +2138,48 @@ class TestExitCodeCapture:
             assert _read_spool(sid)["status"] == "complete"
             assert not _get_output_path(sid).exists()
 
+    def test_complete_output_gives_live_cli_bounded_shutdown_grace(self, tmp_path):
+        sid = "claude-live-shutdown"
+        live_proc = MagicMock()
+        live_proc.poll.return_value = None
+        stream = json.dumps({"type": "result", "subtype": "success", "result": "done", "session_id": "session-live"})
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            spindle._PROC_HANDLES[sid] = live_proc
+            _write_spool(
+                sid,
+                {
+                    "id": sid,
+                    "status": "running",
+                    "harness": "claude-code",
+                    "prompt": "x",
+                    "pid": 565656,
+                    "created_at": datetime.now().isoformat(),
+                    "error": None,
+                },
+            )
+            _get_output_path(sid).write_text(stream)
+            with patch("spindle._is_process_group_alive", return_value=True):
+                with patch("spindle._terminate_process_group", return_value=True) as terminate:
+                    assert _check_and_finalize_spool(sid) is False
+                    first = _read_spool(sid)
+                    assert first["status"] == "running"
+                    assert first["output_complete_detected_at"]
+                    terminate.assert_not_called()
+
+                    first["output_complete_detected_at"] = (
+                        datetime.now() - timedelta(seconds=spindle.OUTPUT_COMPLETION_GRACE_SECONDS + 1)
+                    ).isoformat()
+                    _write_spool(sid, first)
+                    assert _check_and_finalize_spool(sid) is True
+
+            saved = _read_spool(sid)
+
+        terminate.assert_called_once_with(565656, 0.5)
+        assert saved["status"] == "complete"
+        assert saved["result"] == "done"
+        assert saved["session_id"] == "session-live"
+        assert "error" not in saved
+
     def test_finalize_really_kills_background_descendant_and_keeps_completed_result(self, tmp_path):
         sid = "codex-real-background-descendant"
         stream = json.dumps({"type": "turn.completed", "usage": {}})
@@ -2244,6 +2292,34 @@ class TestCancellationTermination:
         assert saved["status"] == "error"
         assert saved["error"] == "Cancelled by user"
         assert "result" not in saved
+
+    def test_drop_terminalizes_when_process_group_survives_kill(self, tmp_path):
+        spool_id = "cancel-stubborn-group"
+        shard = {"worktree_path": str(tmp_path / "worktree")}
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool(
+                spool_id,
+                {
+                    "id": spool_id,
+                    "status": "running",
+                    "pid": 575757,
+                    "created_at": datetime.now().isoformat(),
+                    "shard": shard,
+                    "shard_created_by_spool": True,
+                },
+            )
+            _get_output_path(spool_id).write_text("partial output")
+            with patch("spindle._terminate_process_group", return_value=False):
+                result = spindle._spin_drop_sync(spool_id)
+            saved = _read_spool(spool_id)
+            capture_preserved = _get_output_path(spool_id).exists()
+
+        assert result == f"Dropped spool {spool_id} (warning: process group may still be alive)"
+        assert saved["status"] == "error"
+        assert saved["error"] == "Cancelled by user"
+        assert saved["shard_cleanup_preserved"] is True
+        assert saved["process_group_cleanup_warning"] == ("Process group survived TERM and KILL after cancellation")
+        assert capture_preserved is True
 
     def test_expired_session_fallback_cannot_resurrect_cancelled_spool(self, tmp_path):
         spool_id = "fallback-cancel-race"
@@ -2829,6 +2905,32 @@ class TestOrphanedLockSweep:
             assert conc.exists()  # shared concurrency lock spared
             assert live.exists()  # spool json still present
 
+    def test_preserved_shard_spool_handle_does_not_expire(self, tmp_path):
+        old_created = (datetime.now() - timedelta(hours=25)).isoformat()
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool(
+                "preserved",
+                {
+                    "id": "preserved",
+                    "status": "error",
+                    "created_at": old_created,
+                    "shard_cleanup_preserved": True,
+                },
+            )
+            _write_spool(
+                "ordinary",
+                {
+                    "id": "ordinary",
+                    "status": "complete",
+                    "created_at": old_created,
+                },
+            )
+
+            spindle._cleanup_old_spools()
+
+            assert _read_spool("preserved") is not None
+            assert _read_spool("ordinary") is None
+
 
 class TestProcessUtils:
     """Test process utility functions."""
@@ -2842,6 +2944,10 @@ class TestProcessUtils:
         """Nonexistent PID should not be alive."""
         # Use a very high PID that's unlikely to exist
         assert _is_pid_alive(999999999) is False
+
+    def test_is_pid_alive_never_reaps_popen_exit_status(self):
+        with patch("spindle.os.waitpid", side_effect=AssertionError("must not reap")):
+            assert _is_pid_alive(os.getpid()) is True
 
 
 class TestSpoolDataStructure:
@@ -4581,6 +4687,56 @@ class TestSpawnFailureRecovery:
             assert spool["status"] == "error"
             assert "spawn failed" in spool["error"]
 
+    @pytest.mark.parametrize("harness", ["claude-code", "gemini", "kimi"])
+    def test_new_shard_spawn_failure_is_preserved_for_every_harness(self, tmp_path, harness):
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        shard = {
+            "worktree_path": str(worktree),
+            "branch_name": f"shard-{harness}",
+            "shard_id": f"spawn-{harness}",
+        }
+        common = {
+            "prompt": "test prompt",
+            "working_dir": str(tmp_path),
+            "model": None,
+            "system_prompt": None,
+            "timeout": None,
+            "tags": None,
+            "env": None,
+            "shard": True,
+            "skeinless": True,
+        }
+
+        with patch("spindle.SPINDLE_DIR", tmp_path / "spools"):
+            with patch("spindle._count_running", return_value=0):
+                with patch("spindle._detect_existing_shard", return_value=None):
+                    with patch("spindle._spawn_shard", return_value=(shard, None)):
+                        with patch("spindle._has_skein", return_value=False):
+                            with patch("spindle._spawn_detached", side_effect=OSError("boom")):
+                                with patch("spindle._cleanup_shard") as cleanup:
+                                    if harness == "claude-code":
+                                        result = _spin_sync(
+                                            permission=None,
+                                            allowed_tools=None,
+                                            **common,
+                                        )
+                                    elif harness == "gemini":
+                                        result = spindle._gemini_spin_sync(**common)
+                                    else:
+                                        with patch("spindle._kimi_validate_model", return_value=None):
+                                            result = spindle._kimi_spin_sync(**common)
+
+            cleanup.assert_not_called()
+            spool = _list_spools()[0]
+
+        assert result.startswith("Error: Failed to spawn process")
+        assert spool["status"] == "error"
+        assert spool["shard_created_by_spool"] is True
+        assert spool["shard_cleanup_preserved"] is True
+        assert spool["shard"]["startup_failure_preserved"] is True
+        assert worktree.exists()
+
     def test_codex_spawn_failure_preserves_pristine_shard_for_inspection(self, tmp_path):
         repo = tmp_path / "repo"
         worktree = tmp_path / "worktree"
@@ -5119,8 +5275,7 @@ class TestDetectExistingShard:
 
 
 class TestSpinSyncShardCleanupOnFailure:
-    """Verify that _spin_sync cleans up newly created shards on spawn failure
-    but leaves pre-existing shards untouched."""
+    """Verify that _spin_sync preserves every shard on spawn failure."""
 
     def _make_fake_shard_info(self, path):
         return {
@@ -5129,8 +5284,7 @@ class TestSpinSyncShardCleanupOnFailure:
             "shard_id": "test-20260426-001",
         }
 
-    def test_newly_created_shard_cleaned_up_on_spawn_failure(self, tmp_path):
-        """When _spin_sync creates a new shard and spawn fails, _cleanup_shard is called."""
+    def test_newly_created_shard_preserved_on_spawn_failure(self, tmp_path):
         fake_shard = self._make_fake_shard_info(tmp_path)
 
         with patch("spindle.SPINDLE_DIR", tmp_path):
@@ -5153,7 +5307,11 @@ class TestSpinSyncShardCleanupOnFailure:
                                         True,
                                         None,
                                     )
-                                    mock_cleanup.assert_called_once_with(fake_shard, str(tmp_path))
+                                    mock_cleanup.assert_not_called()
+            spool = _list_spools()[0]
+            assert spool["status"] == "error"
+            assert spool["shard_cleanup_preserved"] is True
+            assert spool["shard"]["startup_failure_preserved"] is True
 
     def test_preexisting_shard_not_cleaned_up_on_spawn_failure(self, tmp_path):
         """When _spin_sync reuses an existing shard and spawn fails, _cleanup_shard is NOT called."""
@@ -7046,7 +7204,7 @@ class TestReviewTagTimeout:
         terminate.assert_called_once_with(424242, 0.5)
         assert result["status"] == "timeout"
 
-    def test_monitor_spool_stays_running_while_timeout_group_survives(self, tmp_path):
+    def test_monitor_spool_terminalizes_timeout_when_group_survives_kill(self, tmp_path):
         spool_id = "test-timeout-stubborn-group"
         spool = {
             "id": spool_id,
@@ -7062,13 +7220,41 @@ class TestReviewTagTimeout:
             with patch("spindle._is_pid_alive", return_value=False):
                 with patch("spindle._is_process_group_alive", return_value=True):
                     with patch("spindle._terminate_process_group", return_value=False):
-                        with patch("spindle.time.sleep", side_effect=RuntimeError("stop monitor")):
-                            with pytest.raises(RuntimeError, match="stop monitor"):
-                                _monitor_spool(spool_id)
+                        _monitor_spool(spool_id)
             result = _read_spool(spool_id)
 
-        assert result["status"] == "running"
-        assert result["error"] == "Timeout reached; process-group termination still pending"
+        assert result["status"] == "timeout"
+        assert result["error"] == "Timeout after 1s"
+        assert result["process_group_cleanup_warning"] == ("Process group survived TERM and KILL after spool timeout")
+
+    def test_completed_output_at_timeout_is_not_discarded_during_cli_shutdown(self, tmp_path):
+        spool_id = "test-timeout-completed-output"
+        proc = MagicMock()
+        proc.poll.return_value = None
+        stream = json.dumps({"type": "result", "subtype": "success", "result": "done", "session_id": "session-timeout"})
+        spool = {
+            "id": spool_id,
+            "status": "running",
+            "harness": "claude-code",
+            "pid": 585858,
+            "timeout": 1,
+            "created_at": (datetime.now() - timedelta(seconds=5)).isoformat(),
+            "prompt": "test",
+        }
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            spindle._PROC_HANDLES[spool_id] = proc
+            _write_spool(spool_id, spool)
+            _get_output_path(spool_id).write_text(stream)
+            with patch("spindle.OUTPUT_COMPLETION_GRACE_SECONDS", 0):
+                with patch("spindle._is_process_group_alive", return_value=True):
+                    with patch("spindle._terminate_process_group", return_value=True):
+                        _monitor_spool(spool_id)
+            result = _read_spool(spool_id)
+
+        assert result["status"] == "complete"
+        assert result["result"] == "done"
+        assert result["session_id"] == "session-timeout"
 
     def test_monitor_spool_does_not_overwrite_terminal_spool_as_timeout(self, tmp_path):
         spool_id = "test-terminal-spool-past-timeout"

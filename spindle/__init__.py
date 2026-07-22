@@ -104,6 +104,7 @@ PENDING_SPAWN_TIMEOUT = 60
 # Poll interval for monitoring detached processes
 MONITOR_POLL_INTERVAL = 2  # seconds
 SPOOL_TERMINAL_LOCK_TIMEOUT = 5.0  # seconds
+OUTPUT_COMPLETION_GRACE_SECONDS = 5.0
 
 # Poll interval for draining the queue before a reload (spindle_reload)
 RELOAD_DRAIN_POLL_INTERVAL = 5  # seconds
@@ -1748,21 +1749,17 @@ def _is_pid_alive(pid: int) -> bool:
     except (OSError, ProcessLookupError):
         return False
 
-    # os.kill(pid, 0) succeeds for zombie processes too.
-    # Try to reap it — if it's our zombie child, waitpid will collect it.
+    # os.kill(pid, 0) succeeds for zombie processes too. Inspect /proc without
+    # waitpid: reaping here can steal the real return code from a Popen handle.
     try:
-        waited_pid, _ = os.waitpid(pid, os.WNOHANG)
-        if waited_pid == pid:
-            return False  # Was a zombie, now reaped
-    except ChildProcessError:
-        # Not our child process — check /proc status instead
-        try:
-            with open(f"/proc/{pid}/status") as f:
-                for line in f:
-                    if line.startswith("State:"):
-                        return "Z" not in line  # Z = zombie
-        except (FileNotFoundError, PermissionError):
-            pass  # Process disappeared or not accessible
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    fields = stat[stat.rfind(")") + 2 :].split()
+    if fields:
+        return fields[0] != "Z"
 
     return True
 
@@ -1824,11 +1821,22 @@ def _terminate_process_group(process_group_id: int, grace_seconds: float) -> boo
             os.kill(process_group_id, signal.SIGKILL)
         except (ProcessLookupError, OSError):
             pass
-    # Reap our leader if it became a zombie, then give adopted descendants a
-    # brief chance to disappear before reporting failure.
-    _is_pid_alive(process_group_id)
+    # Give adopted descendants a brief chance to disappear before reporting
+    # failure. Popen.poll()/wait() owns reaping the group leader.
     time.sleep(0.1)
     return not _is_process_group_alive(process_group_id)
+
+
+def _reap_process_handle_later(proc: "subprocess.Popen") -> None:
+    """Reap a still-live detached wrapper without blocking a terminal transition."""
+
+    def wait_for_exit() -> None:
+        try:
+            proc.wait()
+        except (ChildProcessError, OSError):
+            pass
+
+    threading.Thread(target=wait_for_exit, daemon=True).start()
 
 
 def _parse_duration(time_str: str) -> Optional[int]:
@@ -1917,6 +1925,10 @@ def _cleanup_old_spools() -> None:
                 data = json.load(f)
 
             spool_id = data.get("id", path.stem)
+            # A preserved shard is intentionally recoverable through its spool
+            # handle until an explicit merge/abandon operation resolves it.
+            if data.get("shard_cleanup_preserved"):
+                continue
             created = datetime.fromisoformat(data.get("created_at", ""))
             if created < cutoff:
                 # Use lock to prevent race with finalization
@@ -1957,6 +1969,30 @@ def _cleanup_old_spools() -> None:
             pass
 
 
+def _spool_has_complete_output(spool: dict, stdout_path: Path, stderr_path: Path) -> bool:
+    """Whether a non-Codex harness has published its terminal JSON object."""
+    if spool.get("harness") != "codex" and stdout_path.exists():
+        try:
+            content = stdout_path.read_text()
+            if content.strip():
+                data = json.loads(content)
+                result = _extract_cc_result(data)
+                if result and ("result" in result or "error" in result or "response" in result):
+                    return True
+        except (IOError, json.JSONDecodeError):
+            pass
+
+    if spool.get("harness") == "gemini" and stderr_path.exists():
+        try:
+            stderr_content = stderr_path.read_text()
+            if stderr_content.strip():
+                parsed = _extract_last_json_object(stderr_content)
+                return bool(parsed and ("error" in parsed or "session_id" in parsed))
+        except IOError:
+            pass
+    return False
+
+
 def _check_and_finalize_spool(spool_id: str) -> bool:
     """
     Check if a spool's process has finished and finalize it.
@@ -1990,33 +2026,10 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
         # linger after publishing its final object. Codex is intentionally not
         # finalized from stdout alone: its exit status is authoritative, and a
         # terminal event can precede a nonzero process exit.
-        output_complete = False
-        if stdout_path.exists():
-            try:
-                content = stdout_path.read_text()
-                if content.strip():
-                    if spool.get("harness") != "codex":
-                        # Claude Code / Gemini output
-                        data = json.loads(content)
-                        cc_result = _extract_cc_result(data)
-                        if cc_result and ("result" in cc_result or "error" in cc_result or "response" in cc_result):
-                            output_complete = True
-            except (IOError, json.JSONDecodeError):
-                pass
+        output_complete = _spool_has_complete_output(spool, stdout_path, stderr_path)
 
-        # Gemini CLI writes error JSON to stderr — check there too
-        if not output_complete and spool.get("harness") == "gemini" and stderr_path.exists():
-            try:
-                stderr_content = stderr_path.read_text()
-                if stderr_content.strip():
-                    parsed = _extract_last_json_object(stderr_content)
-                    if parsed and ("error" in parsed or "session_id" in parsed):
-                        output_complete = True
-            except IOError:
-                pass
-
-        # Poll our child handle before the generic PID probe. This preserves its
-        # real exit status; _is_pid_alive may reap a zombie via waitpid.
+        # Poll our child handle before the generic PID probe so its real exit
+        # status is cached before later process-group handling.
         proc = _PROC_HANDLES.get(spool_id)
         observed_exit_code = proc.poll() if proc is not None else None
         process_alive = observed_exit_code is None if proc is not None else _is_pid_alive(pid)
@@ -2025,20 +2038,35 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
         if process_alive and not output_complete:
             return False
 
-        # Once the leader exits (or a non-Codex harness emits its complete JSON
-        # object), descendants no longer own the spool. Drain the whole group
-        # before parsing and removing capture files so background children
-        # cannot pin a slot or keep mutating a shard forever.
-        if _is_process_group_alive(pid):
-            if not _terminate_process_group(pid, 0.5):
-                spool["error"] = "Process-group termination still pending after leader completion"
+        # Claude Code and Gemini may publish their final JSON before finishing
+        # session-store writes and normal shutdown. Give the live leader a
+        # bounded grace period; after that it is treated as wedged and drained.
+        if process_alive and output_complete:
+            now = datetime.now()
+            detected_at_raw = spool.get("output_complete_detected_at")
+            try:
+                detected_at = datetime.fromisoformat(detected_at_raw) if detected_at_raw else None
+            except (TypeError, ValueError):
+                detected_at = None
+            if detected_at is None:
+                spool["output_complete_detected_at"] = now.isoformat()
                 _write_spool(spool_id, spool)
                 return False
+            if (now - detected_at).total_seconds() < OUTPUT_COMPLETION_GRACE_SECONDS:
+                return False
+
+        # Once the leader exits, or its bounded post-result grace expires, drain
+        # the whole group. If an unsignalable process survives, terminalize the
+        # spool with a separate warning: retaining status=running would lose the
+        # usable result and pin a concurrency slot forever.
+        group_cleanup_succeeded = True
+        if _is_process_group_alive(pid):
+            if not _terminate_process_group(pid, 0.5):
+                group_cleanup_succeeded = False
+                spool["process_group_cleanup_warning"] = "Process group survived TERM and KILL after agent completion"
             if proc is not None:
                 observed_exit_code = proc.poll()
             process_alive = False
-        if spool.get("error") == "Process-group termination still pending after leader completion":
-            spool["error"] = None
 
         # Process finished or output complete - finalize
         # Re-read paths (they're the same but clearer for the finalization section)
@@ -2065,7 +2093,11 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
         # output is complete but the CLI lingers); that's fine - exit_code stays
         # unknown for that case. None when there's no handle (orphan recovery).
         proc = _PROC_HANDLES.pop(spool_id, None)
-        exit_code = observed_exit_code if proc is not None else _read_exit_code(spool_id)
+        exit_code = observed_exit_code
+        if exit_code is None:
+            exit_code = _read_exit_code(spool_id)
+        if proc is not None and proc.poll() is None:
+            _reap_process_handle_later(proc)
         if exit_code is not None:
             spool["exit_code"] = exit_code
         # Suffix for the "no output" fallbacks so a silent failure reports the
@@ -2240,6 +2272,8 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
                     spool["error"] = no_output
 
         spool["completed_at"] = datetime.now().isoformat()
+        if spool.get("status") == "complete":
+            spool.pop("error", None)
         _write_spool(spool_id, spool)
 
         # Save transcript for future respin if session_id exists
@@ -2252,20 +2286,22 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
             except IOError:
                 pass  # Non-critical, continue
 
-        # A provider can reject a Codex turn after work has already landed in
-        # ignored files. Preserve every newly created failed shard for explicit
-        # inspection; no automatic Git cleanup is race-free here.
+        # A provider can fail after work has already landed in ignored files.
+        # Preserve every newly created failed shard for explicit inspection; no
+        # automatic Git cleanup is race-free here.
         _preserve_failed_spool_shard(spool)
         _write_spool(spool_id, spool)
 
-        # Clean up output files
-        if stdout_path.exists():
-            stdout_path.unlink()
-        if stderr_path.exists():
-            stderr_path.unlink()
-        exit_path = _get_exit_path(spool_id)
-        if exit_path.exists():
-            exit_path.unlink()
+        # Do not unlink captures still held by an unsignalable process. They are
+        # useful diagnostics and may still be receiving writes.
+        if group_cleanup_succeeded:
+            if stdout_path.exists():
+                stdout_path.unlink()
+            if stderr_path.exists():
+                stderr_path.unlink()
+            exit_path = _get_exit_path(spool_id)
+            if exit_path.exists():
+                exit_path.unlink()
 
         return True
 
@@ -2413,16 +2449,27 @@ Continue from above. New message: {spool["prompt"].split(": ", 1)[-1]}"""
 def _monitor_spool(spool_id: str) -> None:
     """Background thread that monitors a spool until completion."""
     while True:
-        # Check for timeout
         spool = _read_spool(spool_id)
         if not spool or spool.get("status") != "running":
             break
-        if spool.get("timeout"):
+
+        # Detect a terminal result before applying the wall-clock timeout. A
+        # CLI's bounded post-result shutdown grace is not agent execution time.
+        if spool.get("timeout") and not spool.get("output_complete_detected_at"):
+            if _spool_has_complete_output(spool, _get_output_path(spool_id), _get_stderr_path(spool_id)):
+                if _check_and_finalize_spool(spool_id):
+                    break
+                spool = _read_spool(spool_id)
+                if not spool or spool.get("status") != "running":
+                    break
+
+        # Check for timeout unless a non-Codex harness already published its
+        # complete result and is only using its bounded shutdown grace.
+        if spool.get("timeout") and not spool.get("output_complete_detected_at"):
             created = datetime.fromisoformat(spool["created_at"])
             now = datetime.now(timezone.utc) if created.tzinfo else datetime.now()
             elapsed = (now - created).total_seconds()
             if elapsed > spool["timeout"]:
-                termination_pending = False
                 with _spool_lock(spool_id, blocking=False) as acquired:
                     if not acquired:
                         time.sleep(MONITOR_POLL_INTERVAL)
@@ -2439,19 +2486,18 @@ def _monitor_spool(spool_id: str) -> None:
                     pid = spool.get("pid")
                     group_alive = bool(pid) and (_is_pid_alive(pid) or _is_process_group_alive(pid))
                     if group_alive and not _terminate_process_group(pid, 0.5):
-                        spool["error"] = "Timeout reached; process-group termination still pending"
-                        _write_spool(spool_id, spool)
-                        termination_pending = True
-                    else:
-                        spool["status"] = "timeout"
-                        spool["error"] = f"Timeout after {spool['timeout']}s"
-                        spool["completed_at"] = datetime.now().isoformat()
-                        _write_spool(spool_id, spool)
-                        _PROC_HANDLES.pop(spool_id, None)
+                        spool["process_group_cleanup_warning"] = (
+                            "Process group survived TERM and KILL after spool timeout"
+                        )
+                    spool["status"] = "timeout"
+                    spool["error"] = f"Timeout after {spool['timeout']}s"
+                    spool["completed_at"] = datetime.now().isoformat()
+                    _write_spool(spool_id, spool)
+                    proc = _PROC_HANDLES.pop(spool_id, None)
+                    if proc is not None and proc.poll() is None:
+                        _reap_process_handle_later(proc)
+                    if "process_group_cleanup_warning" not in spool:
                         _get_exit_path(spool_id).unlink(missing_ok=True)
-                if termination_pending:
-                    time.sleep(MONITOR_POLL_INTERVAL)
-                    continue
                 break
 
         # For respin spools, check for "session not found" error early
@@ -2808,6 +2854,8 @@ Your task:
         "system_prompt": system_prompt,
         "tags": tag_list,
         "shard": shard_info,
+        "shard_created_by_spool": shard_newly_created,
+        "shard_source_dir": working_dir if shard_newly_created else None,
         "base_branch": base_branch,
         "model": model,
         "timeout": timeout,
@@ -2830,10 +2878,8 @@ Your task:
         spool["status"] = "error"
         spool["error"] = f"spawn failed: {e}"
         spool["completed_at"] = datetime.now().isoformat()
+        _preserve_failed_spool_shard(spool)
         _write_spool(spool_id, spool)
-        # Clean up shard worktree only if we created it; don't destroy pre-existing shards
-        if shard_newly_created:
-            _cleanup_shard(shard_info, working_dir)
         return f"Error: Failed to spawn process: {e}"
 
     # Update spool with PID and status
@@ -3270,24 +3316,32 @@ def _spin_drop_locked(spool_id: str) -> str:
     if not pid:
         return f"Spool {spool_id} has no PID recorded yet"
 
-    if not _terminate_process_group(pid, 0.5):
-        return f"Error: Could not terminate process group for spool {spool_id}"
+    group_cleanup_succeeded = _terminate_process_group(pid, 0.5)
 
     spool["status"] = "error"
     spool["error"] = "Cancelled by user"
+    if not group_cleanup_succeeded:
+        spool["process_group_cleanup_warning"] = "Process group survived TERM and KILL after cancellation"
     spool["completed_at"] = datetime.now().isoformat()
+    _preserve_failed_spool_shard(spool)
     _write_spool(spool_id, spool)
-    _PROC_HANDLES.pop(spool_id, None)
+    proc = _PROC_HANDLES.pop(spool_id, None)
+    if proc is not None and proc.poll() is None:
+        _reap_process_handle_later(proc)
 
     stdout_path = _get_output_path(spool_id)
     stderr_path = _get_stderr_path(spool_id)
-    if stdout_path.exists():
-        stdout_path.unlink()
-    if stderr_path.exists():
-        stderr_path.unlink()
-    _get_exit_path(spool_id).unlink(missing_ok=True)
+    if group_cleanup_succeeded:
+        if stdout_path.exists():
+            stdout_path.unlink()
+        if stderr_path.exists():
+            stderr_path.unlink()
+        _get_exit_path(spool_id).unlink(missing_ok=True)
 
-    return f"Dropped spool {spool_id}"
+    result = f"Dropped spool {spool_id}"
+    if not group_cleanup_succeeded:
+        result += " (warning: process group may still be alive)"
+    return result
 
 
 def _spool_peek_sync(spool_id: str, lines: int = 50) -> str:
@@ -6448,6 +6502,8 @@ Your task:
         "env": env,
         "research_target": research_target,
         "shard": shard_info,
+        "shard_created_by_spool": shard_newly_created,
+        "shard_source_dir": working_dir if shard_newly_created else None,
         "base_branch": base_branch,
         "created_at": datetime.now().isoformat(),
         "completed_at": None,
@@ -6466,10 +6522,8 @@ Your task:
         spool["status"] = "error"
         spool["error"] = f"spawn failed: {e}"
         spool["completed_at"] = datetime.now().isoformat()
+        _preserve_failed_spool_shard(spool)
         _write_spool(spool_id, spool)
-        # Clean up shard worktree only if we created it; don't destroy pre-existing shards
-        if shard_newly_created:
-            _cleanup_shard(shard_info, working_dir)
         return f"Error: Failed to spawn process: {e}"
 
     # Update spool with PID and status
@@ -6723,6 +6777,8 @@ Your task:
         "env": env,
         "research_target": research_target,
         "shard": shard_info,
+        "shard_created_by_spool": shard_newly_created,
+        "shard_source_dir": working_dir if shard_newly_created else None,
         "base_branch": base_branch,
         "created_at": datetime.now().isoformat(),
         "completed_at": None,
@@ -6742,10 +6798,8 @@ Your task:
         spool["status"] = "error"
         spool["error"] = f"spawn failed: {e}"
         spool["completed_at"] = datetime.now().isoformat()
+        _preserve_failed_spool_shard(spool)
         _write_spool(spool_id, spool)
-        # Clean up shard worktree only if we created it; don't destroy pre-existing shards
-        if shard_newly_created:
-            _cleanup_shard(shard_info, working_dir)
         return f"Error: Failed to spawn process: {e}"
 
     # Update spool with PID and status
