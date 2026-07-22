@@ -7700,28 +7700,51 @@ def _read_service_record(name: str) -> Optional[dict]:
     return record
 
 
+def _redact_foreign_assignments(line: str) -> Optional[str]:
+    """An `Environment=` line with non-spindle variables hidden.
+
+    Returns None if the line carries nothing of spindle's. The filter has to be
+    per assignment, not per line: systemd allows several on one line, so
+    `Environment=SPINDLE_HOME=/srv/store OPENAI_API_KEY=sk-...` matched a
+    line-level test for "SPINDLE_" and printed the key with it.
+    """
+    _, _, rhs = line.partition("=")
+    assignments = _parse_systemd_env_line(rhs.strip())
+    if assignments is None:
+        return line  # malformed; systemd ignores it, and there is nothing to hide
+    ours = [(k, v) for k, v in assignments if k.startswith("SPINDLE_")]
+    if not ours:
+        return None
+    hidden = len(assignments) - len(ours)
+    rendered = " ".join(f'"{k}={v}"' for k, v in ours)
+    suffix = f"   [{hidden} other assignment(s) hidden]" if hidden else ""
+    return f"Environment={rendered}{suffix}"
+
+
 def _service_file_excerpt(path: Path, max_lines: int = 12, max_chars: int = 200) -> Tuple[str, str]:
-    """The lines of a service file that state its port and store, quoted safely.
+    """What a service file says about its port and store, quoted safely.
 
-    Returns ``(excerpt, note)``. Quoted, never interpreted — but "verbatim" is
-    not the same as "raw", and the difference matters here because this text is
-    what the operator reads and retypes:
+    Returns ``(excerpt, note)``. This text is what the operator reads and
+    retypes, so "verbatim" is not sufficient and not even always safe:
 
-    - continuations are folded first, or a wrapped ExecStart shows its head and
-      hides the `--port` on the next line, and the operator concludes the file
-      states no port;
-    - only spindle's own settings are shown. Emitting every `Environment=` line
-      put unrelated secrets into an error message that lands in agent
-      transcripts and spool records;
-    - control characters are stripped and long lines truncated. A value carrying
-      an escape sequence could clear the terminal and hide the lines above it,
-      and a multi-megabyte line went out whole;
-    - a file that cannot be decoded as text (a binary plist, which launchd
-      accepts and `plutil -convert binary1` produces routinely) is named as such
-      and pointed at the tool that reads it, rather than dumped as mojibake.
+    - continuations are folded first, or a wrapped ExecStart hides the `--port`
+      on its next line and the file appears to state no port;
+    - only spindle's own variables are shown, per assignment. Unrelated ones
+      belong to the operator, and this text lands in agent transcripts;
+    - a bare `Environment=` is kept: it is a reset that clears every assignment
+      above it, so hiding it shows a store the service is not using;
+    - control characters are stripped and long lines truncated, so a value
+      cannot clear the terminal or run to megabytes;
+    - a file that is not decodable text is named, not dumped.
+
+    The store is additionally reported as the differential-tested reader
+    resolves it, because the raw line is written in systemd's escaping: a store
+    of `/srv/100%pure` appears as `100%%pure`, and retyping that produces a
+    two-percent directory.
     """
     try:
-        raw_bytes = path.read_bytes()[: 256 * 1024]
+        with open(path, "rb") as fh:
+            raw_bytes = fh.read(256 * 1024)
     except OSError as exc:
         return "", f"{path.name} could not be read ({exc}); nothing below is a reading of it."
     try:
@@ -7752,21 +7775,33 @@ def _service_file_excerpt(path: Path, max_lines: int = 12, max_chars: int = 200)
             stripped = line.strip()
             if re.match(r"^ExecStart\s*=", stripped) or re.match(r"^EnvironmentFile\s*=", stripped):
                 lines.append(clean(stripped))
-            elif re.match(r"^Environment\s*=", stripped) and "SPINDLE_" in stripped:
-                # Only spindle's own variables; other Environment= lines are none
-                # of spindle's business and may hold credentials.
-                lines.append(clean(stripped))
-        # A bare % is a systemd specifier resolved at run time. That is a
-        # syntactic fact about the text, not an interpretation of its value —
-        # and without saying so, "type what you read" turns %h/store into a
-        # literal directory called %h/store.
-        for line in lines:
-            if "SPINDLE_HOME" in line and re.search(r"(?<!%)%(?!%)", line):
-                note = (
-                    "The store above uses a systemd specifier (a bare %), which systemd resolves "
-                    "at run time. Type the real directory, not that string."
+            elif re.match(r"^Environment\s*=", stripped):
+                if not stripped.partition("=")[2].strip():
+                    lines.append(clean(stripped) + "   [clears every assignment above]")
+                    continue
+                redacted = _redact_foreign_assignments(stripped)
+                if redacted is not None:
+                    lines.append(clean(redacted))
+
+        # Report the store as systemd will actually resolve it. The reader used
+        # here is the one differential-tested against systemd, so it handles the
+        # escaping, the resets and the multi-assignment lines that make the raw
+        # text unsafe to copy character by character.
+        resolved = _env_from_unit_text(text, "SPINDLE_HOME")
+        if resolved is None:
+            note = "No store survives in this file, so it runs on the default store (~/.spindle)."
+        else:
+            # Same sanitising as the quoted lines: this value came out of the
+            # file too, and a note is no safer a place for an escape sequence.
+            note = f"The store resolves to: {clean(resolved)}"
+            # A bare % is a specifier systemd expands at run time; the sentinel
+            # swap is how %% (a literal percent) is told apart from it, and it
+            # handles odd runs like %%%h that a lookaround regex misses.
+            if "%" in _env_from_unit_text(text.replace("%%", "\x00PCT\x00"), "SPINDLE_HOME").replace("\x00PCT\x00", ""):
+                note += (
+                    "\nThat value contains a systemd specifier (a bare %), which systemd resolves at "
+                    "run time. Type the real directory, not that string."
                 )
-                break
 
     if not lines:
         return "", note
@@ -7882,10 +7917,14 @@ def _port_from_unit(name: str) -> Optional[int]:
     # fallback and can be fooled by shapes that are not argv (a `--port=` inside
     # a shell-wrapped command, a decoy in a comment). Wrong here only
     # mis-addresses a probe, but the record costs nothing and is exact.
+    unit = _unit_file_path(name)
     record = _read_service_record(name)
-    if record is not None:
+    # Same digest check regeneration makes. Trusting a record whose file has
+    # changed underneath it would make `reload` probe the port the service used
+    # to bind, so a store mismatch goes unseen and the drain protects nothing.
+    if record is not None and _service_file_digest(unit) == record["service_sha256"]:
         return record["port"]
-    return _service_settings_from_file(_unit_file_path(name))["port"]
+    return _service_settings_from_file(unit)["port"]
 
 
 def _reload_warn_on_store_mismatch(host: str, port: int) -> Optional[str]:

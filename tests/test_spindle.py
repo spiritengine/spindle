@@ -8525,6 +8525,9 @@ class TestReloadFindsTheRightPort:
         unit_dir.mkdir(parents=True)
         (unit_dir / "spindle-b.service").write_text(text)
         monkeypatch.setattr(spindle.Path, "home", staticmethod(lambda: tmp_path))
+        # Not the developer's: _systemd_user_dir prefers XDG_CONFIG_HOME, so an
+        # ambient one would send this lookup outside tmp_path.
+        monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
 
     def test_port_read_from_a_quoted_environment_line(self, tmp_path, monkeypatch):
         self._unit(tmp_path, monkeypatch, spindle._systemd_unit_text("/bin/spindle", 8042, name="spindle-b"))
@@ -9641,7 +9644,13 @@ class TestTheRefusalQuotesRatherThanInterprets:
             return
         assert "What the file says:" in blocker
         for line in self.UNITS[shape].strip().splitlines():
-            assert line in blocker
+            if line.startswith("Environment="):
+                # Environment lines are re-rendered per assignment so unrelated
+                # variables can be hidden; the setting itself must survive.
+                name, _, value = line.partition("=")[2].partition("=")
+                assert name in blocker and value.strip('"') in blocker
+            else:
+                assert line in blocker
 
     def test_a_plist_is_quoted_too(self, config, tmp_path):
         path = tmp_path / "com.svc.server.plist"
@@ -9860,3 +9869,96 @@ def test_service_files_are_written_utf8_under_a_c_locale(tmp_path):
     )
     assert proc.returncode == 0, proc.stderr
     assert proc.stdout.strip().endswith("True"), proc.stdout
+
+
+class TestExcerptPrecedenceAndLeaks:
+    """Round 12: two regressions from the previous commit's filter, and the leak."""
+
+    @pytest.fixture
+    def config(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
+        return tmp_path
+
+    def _blocker(self, unit):
+        return spindle._resolve_service_settings(unit, None, None, name="svc")[3]
+
+    def test_a_bare_environment_reset_is_shown(self, config, tmp_path):
+        """It clears everything above it; hiding it shows a store nothing uses."""
+        unit = tmp_path / "svc.service"
+        unit.write_text(
+            "[Service]\nEnvironment=SPINDLE_HOME=/data/store\nEnvironment=\nExecStart=/b serve --http --port 8115\n"
+        )
+        blocker = self._blocker(unit)
+        assert "clears every assignment above" in blocker
+        assert "default store" in blocker
+
+    def test_a_reset_store_is_reported_as_the_default(self, config, tmp_path):
+        unit = tmp_path / "svc.service"
+        unit.write_text("[Service]\nEnvironment=SPINDLE_HOME=/data/store\nEnvironment=\n")
+        assert "No store survives" in self._blocker(unit)
+
+    def test_a_secret_sharing_a_line_with_the_store_is_hidden(self, config, tmp_path):
+        """systemd allows several assignments per line; the filter must be per assignment."""
+        unit = tmp_path / "svc.service"
+        unit.write_text(
+            '[Service]\nEnvironment="SPINDLE_HOME=/srv/store" "OPENAI_API_KEY=sk-do-not-print"\n'
+            "ExecStart=/b serve --http --port 8115\n"
+        )
+        blocker = self._blocker(unit)
+        assert "sk-do-not-print" not in blocker
+        assert "OPENAI_API_KEY" not in blocker
+        assert "/srv/store" in blocker
+        assert "1 other assignment(s) hidden" in blocker
+
+    def test_a_secret_on_a_continuation_of_the_store_line_is_hidden(self, config, tmp_path):
+        unit = tmp_path / "svc.service"
+        unit.write_text('[Service]\nEnvironment="SPINDLE_HOME=/srv/store" \\\n    "OPENAI_API_KEY=sk-continued"\n')
+        assert "sk-continued" not in self._blocker(unit)
+
+    def test_the_resolved_store_is_what_to_type_not_the_escaped_text(self, config, tmp_path):
+        """The raw line is in systemd's escaping: /srv/100%pure appears as 100%%pure."""
+        unit = tmp_path / "svc.service"
+        unit.write_text(spindle._systemd_unit_text("/bin/spindle", 8115, home="/srv/100%pure", name="svc"))
+        blocker = self._blocker(unit)
+        assert "The store resolves to: /srv/100%pure" in blocker
+        assert "systemd specifier" not in blocker
+
+    @pytest.mark.parametrize("store", ["%h/store", "%%%h/store", "/srv/%t/x"])
+    def test_specifier_runs_of_any_length_are_flagged(self, config, tmp_path, store):
+        """`%%%h` is a literal % then a specifier; a lookaround regex missed it."""
+        unit = tmp_path / "svc.service"
+        unit.write_text(f"[Service]\nEnvironment=SPINDLE_HOME={store}\nExecStart=/b serve --http --port 1\n")
+        assert "systemd specifier" in self._blocker(unit)
+
+    @pytest.mark.parametrize("store", ["/srv/100%pure", "/srv/plain", "/srv/a b"])
+    def test_ordinary_stores_are_not_flagged(self, config, tmp_path, store):
+        unit = tmp_path / "svc.service"
+        unit.write_text(spindle._systemd_unit_text("/bin/spindle", 8115, home=store, name="svc"))
+        assert "systemd specifier" not in self._blocker(unit)
+
+
+class TestPortProbeVerifiesTheRecord:
+    @pytest.fixture
+    def config(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
+        return tmp_path
+
+    def _install(self, port):
+        unit = spindle._unit_file_path("svc")
+        unit.parent.mkdir(parents=True, exist_ok=True)
+        body = spindle._systemd_unit_text("/bin/spindle", port, name="svc")
+        unit.write_text(body)
+        spindle._write_service_record("svc", port, None, unit, body)
+        return unit
+
+    def test_an_intact_record_supplies_the_port(self, config):
+        self._install(8115)
+        assert spindle._port_from_unit("svc") == 8115
+
+    def test_a_stale_record_does_not(self, config):
+        """reload would otherwise probe the port the service used to bind."""
+        unit = self._install(8115)
+        unit.write_text(
+            unit.read_text().replace("--port 8115", "--port 9001").replace("SPINDLE_PORT=8115", "SPINDLE_PORT=9001")
+        )
+        assert spindle._port_from_unit("svc") == 9001
