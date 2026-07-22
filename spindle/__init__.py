@@ -7397,6 +7397,42 @@ _SYSTEMD_ESCAPES = {
 }
 
 
+def _decode_systemd_numeric_escape(line: str, i: int) -> Tuple[Optional[str], int]:
+    """Decode `\\xNN`, `\\NNN` (octal), `\\uXXXX`, `\\UXXXXXXXX` at ``line[i]``.
+
+    All four are real systemd escapes and all four were being dropped to their
+    letters — `/srv/a\\x20b` read as `/srv/ax20b` rather than `/srv/a b`, which
+    is a plausible hand-edit since `\\s` is the obscure spelling. Verified
+    against systemd on a live unit. A malformed escape makes systemd discard the
+    assignment, so this reports failure rather than guessing.
+
+    Returns ``(decoded, characters consumed)``; ``(None, 0)`` if malformed.
+    """
+    kind = line[i + 1]
+    specs = {"x": (16, 2), "u": (16, 4), "U": (16, 8)}
+    if kind in specs:
+        base, width = specs[kind]
+        digits = line[i + 2 : i + 2 + width]
+        if len(digits) < width:
+            return None, 0
+        try:
+            return chr(int(digits, base)), 2 + width
+        except ValueError:
+            return None, 0
+    # Octal: up to three digits after the backslash.
+    digits = ""
+    j = i + 1
+    while j < len(line) and len(digits) < 3 and line[j] in "01234567":
+        digits += line[j]
+        j += 1
+    if not digits:
+        return None, 0
+    try:
+        return chr(int(digits, 8)), 1 + len(digits)
+    except ValueError:
+        return None, 0
+
+
 def _parse_systemd_env_line(line: str) -> Optional[list]:
     """Split one `Environment=` value into its (name, value) assignments.
 
@@ -7426,6 +7462,15 @@ def _parse_systemd_env_line(line: str) -> Optional[list]:
             # systemd interprets escapes inside single quotes too, unlike a
             # shell — verified by differential-testing against systemctl show.
             nxt = line[i + 1]
+            if nxt in "xuU01234567":
+                decoded, consumed = _decode_systemd_numeric_escape(line, i)
+                if decoded is None:
+                    # systemd rejects the whole assignment on a malformed escape.
+                    return None
+                buf.append(decoded)
+                started = True
+                i += consumed
+                continue
             buf.append(_SYSTEMD_ESCAPES.get(nxt, nxt))
             started = True
             i += 2
@@ -7711,12 +7756,17 @@ def _redact_foreign_assignments(line: str) -> Optional[str]:
     _, _, rhs = line.partition("=")
     assignments = _parse_systemd_env_line(rhs.strip())
     if assignments is None:
-        return line  # malformed; systemd ignores it, and there is nothing to hide
+        # systemd discards a malformed line, and echoing it verbatim put a
+        # secret straight back into the excerpt the filter exists to keep out.
+        return "Environment=<malformed line; systemd ignores it>"
     ours = [(k, v) for k, v in assignments if k.startswith("SPINDLE_")]
     if not ours:
         return None
     hidden = len(assignments) - len(ours)
-    rendered = " ".join(f'"{k}={v}"' for k, v in ours)
+    # Re-escaped, so the displayed line is valid systemd meaning the same thing;
+    # rendering the decoded value turned `a\\\\b` (a literal backslash) into
+    # `a\\b`, which systemd reparses as a backspace.
+    rendered = " ".join(_systemd_quote(f"{k}={v}") for k, v in ours)
     suffix = f"   [{hidden} other assignment(s) hidden]" if hidden else ""
     return f"Environment={rendered}{suffix}"
 
@@ -7787,13 +7837,29 @@ def _service_file_excerpt(path: Path, max_lines: int = 12, max_chars: int = 200)
         # here is the one differential-tested against systemd, so it handles the
         # escaping, the resets and the multi-assignment lines that make the raw
         # text unsafe to copy character by character.
+        has_env_file = bool(re.search(r"^\s*EnvironmentFile\s*=", text, re.MULTILINE))
         resolved = _env_from_unit_text(text, "SPINDLE_HOME")
-        if resolved is None:
+        if has_env_file:
+            # systemd applies EnvironmentFile AFTER Environment=, so it wins.
+            # Whatever this file's own lines say, the store cannot be asserted.
+            seen = (
+                f"This file's own lines give: {clean(resolved)}"
+                if resolved is not None
+                else ("This file's own lines set no store")
+            )
+            note = (
+                f"{seen} — but it also reads an EnvironmentFile, which systemd applies afterwards "
+                f"and which may set the store. Check that file before deciding."
+            )
+        elif resolved is None:
             note = "No store survives in this file, so it runs on the default store (~/.spindle)."
         else:
             # Same sanitising as the quoted lines: this value came out of the
             # file too, and a note is no safer a place for an escape sequence.
-            note = f"The store resolves to: {clean(resolved)}"
+            # Not clean()'s 200-char cap: this is the value the operator has to
+            # type, and a truncated path is not one. Control characters still go.
+            printable = "".join(ch for ch in resolved if ch == "\t" or ch.isprintable())
+            note = f"The store resolves to: {printable}"
             # A bare % is a specifier systemd expands at run time; the sentinel
             # swap is how %% (a literal percent) is told apart from it, and it
             # handles odd runs like %%%h that a lookaround regex misses.
@@ -7919,11 +7985,14 @@ def _port_from_unit(name: str) -> Optional[int]:
     # mis-addresses a probe, but the record costs nothing and is exact.
     unit = _unit_file_path(name)
     record = _read_service_record(name)
-    # Same digest check regeneration makes. Trusting a record whose file has
-    # changed underneath it would make `reload` probe the port the service used
-    # to bind, so a store mismatch goes unseen and the drain protects nothing.
-    if record is not None and _service_file_digest(unit) == record["service_sha256"]:
-        return record["port"]
+    if record is not None:
+        # Digest the file the RECORD names. Assuming the systemd path meant a
+        # launchd install never matched, so `doctor --name X` on macOS fell back
+        # to the default port instead of the one it installed.
+        recorded_file = record.get("service_file")
+        described = Path(recorded_file) if isinstance(recorded_file, str) else unit
+        if _service_file_digest(described) == record["service_sha256"]:
+            return record["port"]
     return _service_settings_from_file(unit)["port"]
 
 
