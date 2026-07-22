@@ -2211,6 +2211,12 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
         if process_alive and not output_complete:
             return False
 
+        # The detached shell is the process-group leader, but a command can
+        # exit after starting descendants. Do not stop monitoring, remove
+        # output, or clean its shard until the entire group has exited.
+        if not process_alive and _is_process_group_alive(pid):
+            return False
+
         # Process finished or output complete - finalize
         # Re-read paths (they're the same but clearer for the finalization section)
         stdout_path = _get_output_path(spool_id)
@@ -2607,25 +2613,43 @@ def _monitor_spool(spool_id: str) -> None:
     while True:
         # Check for timeout
         spool = _read_spool(spool_id)
-        if spool and spool.get("timeout"):
+        if not spool or spool.get("status") != "running":
+            break
+        if spool.get("timeout"):
             created = datetime.fromisoformat(spool["created_at"])
             now = datetime.now(timezone.utc) if created.tzinfo else datetime.now()
             elapsed = (now - created).total_seconds()
             if elapsed > spool["timeout"]:
-                pid = spool.get("pid")
-                group_alive = bool(pid) and (_is_pid_alive(pid) or _is_process_group_alive(pid))
-                if group_alive and not _terminate_process_group(pid, 0.5):
-                    spool["error"] = "Timeout reached; process-group termination still pending"
-                    _write_spool(spool_id, spool)
+                termination_pending = False
+                with _spool_lock(spool_id) as acquired:
+                    if not acquired:
+                        time.sleep(MONITOR_POLL_INTERVAL)
+                        continue
+                    # Finalize/drop may have won while this monitor was waiting.
+                    spool = _read_spool(spool_id)
+                    if not spool or spool.get("status") != "running":
+                        break
+                    created = datetime.fromisoformat(spool["created_at"])
+                    now = datetime.now(timezone.utc) if created.tzinfo else datetime.now()
+                    elapsed = (now - created).total_seconds()
+                    if elapsed <= spool["timeout"]:
+                        continue
+                    pid = spool.get("pid")
+                    group_alive = bool(pid) and (_is_pid_alive(pid) or _is_process_group_alive(pid))
+                    if group_alive and not _terminate_process_group(pid, 0.5):
+                        spool["error"] = "Timeout reached; process-group termination still pending"
+                        _write_spool(spool_id, spool)
+                        termination_pending = True
+                    else:
+                        spool["status"] = "timeout"
+                        spool["error"] = f"Timeout after {spool['timeout']}s"
+                        spool["completed_at"] = datetime.now().isoformat()
+                        _write_spool(spool_id, spool)
+                        _PROC_HANDLES.pop(spool_id, None)
+                        _get_exit_path(spool_id).unlink(missing_ok=True)
+                if termination_pending:
                     time.sleep(MONITOR_POLL_INTERVAL)
                     continue
-                # Mark as timeout
-                spool["status"] = "timeout"
-                spool["error"] = f"Timeout after {spool['timeout']}s"
-                spool["completed_at"] = datetime.now().isoformat()
-                _write_spool(spool_id, spool)
-                _PROC_HANDLES.pop(spool_id, None)
-                _get_exit_path(spool_id).unlink(missing_ok=True)
                 break
 
         # For respin spools, check for "session not found" error early
@@ -3419,37 +3443,38 @@ def _spools_sync() -> str:
 
 def _spin_drop_sync(spool_id: str) -> str:
     """Synchronous implementation of spin_drop."""
-    spool = _read_spool(spool_id)
+    with _spool_lock(spool_id) as acquired:
+        if not acquired:
+            return f"Error: Could not lock spool {spool_id} for cancellation"
+        spool = _read_spool(spool_id)
 
-    if not spool:
-        return f"Error: Unknown spool_id '{spool_id}'"
+        if not spool:
+            return f"Error: Unknown spool_id '{spool_id}'"
 
-    if spool.get("status") != "running":
-        return f"Spool {spool_id} is not running (status: {spool.get('status')})"
+        if spool.get("status") != "running":
+            return f"Spool {spool_id} is not running (status: {spool.get('status')})"
 
-    pid = spool.get("pid")
+        pid = spool.get("pid")
 
-    if not pid:
-        return f"Spool {spool_id} has no PID recorded yet"
+        if not pid:
+            return f"Spool {spool_id} has no PID recorded yet"
 
-    if not _terminate_process_group(pid, 0.5):
-        return f"Error: Could not terminate process group for spool {spool_id}"
+        if not _terminate_process_group(pid, 0.5):
+            return f"Error: Could not terminate process group for spool {spool_id}"
 
-    # Update spool status
-    spool["status"] = "error"
-    spool["error"] = "Cancelled by user"
-    spool["completed_at"] = datetime.now().isoformat()
-    _write_spool(spool_id, spool)
-    _PROC_HANDLES.pop(spool_id, None)
+        spool["status"] = "error"
+        spool["error"] = "Cancelled by user"
+        spool["completed_at"] = datetime.now().isoformat()
+        _write_spool(spool_id, spool)
+        _PROC_HANDLES.pop(spool_id, None)
 
-    # Clean up output files
-    stdout_path = _get_output_path(spool_id)
-    stderr_path = _get_stderr_path(spool_id)
-    if stdout_path.exists():
-        stdout_path.unlink()
-    if stderr_path.exists():
-        stderr_path.unlink()
-    _get_exit_path(spool_id).unlink(missing_ok=True)
+        stdout_path = _get_output_path(spool_id)
+        stderr_path = _get_stderr_path(spool_id)
+        if stdout_path.exists():
+            stdout_path.unlink()
+        if stderr_path.exists():
+            stderr_path.unlink()
+        _get_exit_path(spool_id).unlink(missing_ok=True)
 
     return f"Dropped spool {spool_id}"
 
@@ -4078,39 +4103,7 @@ async def spin_drop(spool_id: str) -> str:
     Returns:
         Success or error message
     """
-    spool = _read_spool(spool_id)
-
-    if not spool:
-        return f"Error: Unknown spool_id '{spool_id}'"
-
-    if spool.get("status") != "running":
-        return f"Spool {spool_id} is not running (status: {spool.get('status')})"
-
-    pid = spool.get("pid")
-
-    if not pid:
-        return f"Spool {spool_id} has no PID recorded yet"
-
-    if not _terminate_process_group(pid, 0.5):
-        return f"Error: Could not terminate process group for spool {spool_id}"
-
-    # Update spool status
-    spool["status"] = "error"
-    spool["error"] = "Cancelled by user"
-    spool["completed_at"] = datetime.now().isoformat()
-    _write_spool(spool_id, spool)
-    _PROC_HANDLES.pop(spool_id, None)
-
-    # Clean up output files
-    stdout_path = _get_output_path(spool_id)
-    stderr_path = _get_stderr_path(spool_id)
-    if stdout_path.exists():
-        stdout_path.unlink()
-    if stderr_path.exists():
-        stderr_path.unlink()
-    _get_exit_path(spool_id).unlink(missing_ok=True)
-
-    return f"Dropped spool {spool_id}"
+    return await asyncio.to_thread(_spin_drop_sync, spool_id)
 
 
 @mcp.tool()
@@ -5557,6 +5550,11 @@ def _codex_auth_mode(binary: Optional[str], process_env: Optional[Dict[str, str]
     This intentionally runs for each fresh spin. Login state can change while
     the server remains alive, and CODEX_HOME/HOME may vary between callers.
     """
+    # CODEX_API_KEY is a per-invocation override supported by ``codex exec``.
+    # ``codex login status`` reports only the saved login, so consulting it
+    # first would misclassify an API-key child as ChatGPT.
+    if process_env and process_env.get("CODEX_API_KEY"):
+        return "api"
     if not binary:
         return "unknown"
     mode = "unknown"

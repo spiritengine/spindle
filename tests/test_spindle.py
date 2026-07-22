@@ -1623,7 +1623,7 @@ class TestCodexResultExtraction:
             except ProcessLookupError:
                 pass
 
-    def test_finalize_preserves_failed_shard_while_process_group_lives(self, tmp_path):
+    def test_finalize_waits_and_preserves_failed_shard_while_process_group_lives(self, tmp_path):
         spool_id = "codex-live-group"
         stream = json.dumps({"type": "turn.failed", "error": {"message": "provider failed"}})
         with patch("spindle.SPINDLE_DIR", tmp_path):
@@ -1644,9 +1644,10 @@ class TestCodexResultExtraction:
             _get_output_path(spool_id).write_text(stream)
             with patch("spindle._is_process_group_alive", return_value=True):
                 with patch("spindle._cleanup_shard") as cleanup:
-                    assert _check_and_finalize_spool(spool_id) is True
+                    assert _check_and_finalize_spool(spool_id) is False
             cleanup.assert_not_called()
-            assert _read_spool(spool_id)["status"] == "error"
+            assert _read_spool(spool_id)["status"] == "running"
+            assert _get_output_path(spool_id).exists()
 
     @pytest.mark.parametrize(
         "other_spool",
@@ -2341,6 +2342,35 @@ class TestExitCodeCapture:
             assert spool["error"] == "Process exited with no output"
             assert "exit_code" not in spool
 
+    def test_finalize_waits_for_descendants_after_group_leader_exits(self, tmp_path):
+        sid = "codex-descendant-still-running"
+        stream = json.dumps({"type": "turn.completed", "usage": {}})
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            spindle._PROC_HANDLES[sid] = self._FakeProc(0)
+            _write_spool(
+                sid,
+                {
+                    "id": sid,
+                    "status": "running",
+                    "harness": "codex",
+                    "prompt": "x",
+                    "pid": 454545,
+                    "created_at": datetime.now().isoformat(),
+                },
+            )
+            _get_output_path(sid).write_text(stream)
+
+            with patch("spindle._is_process_group_alive", return_value=True):
+                assert _check_and_finalize_spool(sid) is False
+            assert _read_spool(sid)["status"] == "running"
+            assert _get_output_path(sid).exists()
+            assert sid in spindle._PROC_HANDLES
+
+            with patch("spindle._is_process_group_alive", return_value=False):
+                assert _check_and_finalize_spool(sid) is True
+            assert _read_spool(sid)["status"] == "complete"
+            assert not _get_output_path(sid).exists()
+
 
 class TestCancellationTermination:
     @pytest.mark.parametrize("tool_path", ["sync", "async"])
@@ -2376,6 +2406,43 @@ class TestCancellationTermination:
                 os.killpg(proc.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
+
+    @pytest.mark.parametrize("tool_path", ["sync", "async"])
+    def test_drop_lock_prevents_finalizer_from_overwriting_terminal_state(self, tmp_path, tool_path):
+        spool_id = f"cancel-finalize-race-{tool_path}"
+        finalize_attempts = []
+
+        def terminate_while_finalizer_races(pid, grace):
+            finalize_attempts.append(_check_and_finalize_spool(spool_id))
+            return True
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool(
+                spool_id,
+                {
+                    "id": spool_id,
+                    "status": "running",
+                    "harness": "codex",
+                    "prompt": "x",
+                    "pid": 464646,
+                    "created_at": datetime.now().isoformat(),
+                },
+            )
+            _get_output_path(spool_id).write_text(json.dumps({"type": "turn.completed", "usage": {}}))
+            _get_exit_path(spool_id).write_text("0\n")
+            with patch("spindle._terminate_process_group", side_effect=terminate_while_finalizer_races):
+                if tool_path == "sync":
+                    result = spindle._spin_drop_sync(spool_id)
+                else:
+                    drop_tool = spindle.spin_drop.fn if hasattr(spindle.spin_drop, "fn") else spindle.spin_drop
+                    result = asyncio.run(drop_tool(spool_id))
+            saved = _read_spool(spool_id)
+
+        assert result == f"Dropped spool {spool_id}"
+        assert finalize_attempts == [False]
+        assert saved["status"] == "error"
+        assert saved["error"] == "Cancelled by user"
+        assert "result" not in saved
 
 
 class TestFableGateRefusal:
@@ -6322,6 +6389,16 @@ class TestCodexSandboxEnforcesProbe:
             env=process_env,
         )
 
+    def test_codex_auth_mode_prefers_per_run_api_key_over_saved_chatgpt_login(self):
+        process_env = {
+            "PATH": "/custom/bin",
+            "CODEX_HOME": "/custom/codex-home",
+            "CODEX_API_KEY": "per-run-key",
+        }
+        with patch("spindle.subprocess.run") as run:
+            assert spindle._codex_auth_mode("/fake/codex", process_env) == "api"
+        run.assert_not_called()
+
     def test_probe_true_when_write_blocked_and_command_ran(self, caplog):
         """Marker on stdout proves the command ran; a missing file means the write was blocked."""
         with patch("spindle.subprocess.run", return_value=self._proc(f"{spindle._CODEX_SANDBOX_PROBE_MARKER}\n")):
@@ -7116,6 +7193,29 @@ class TestReviewTagTimeout:
 
         assert result["status"] == "running"
         assert result["error"] == "Timeout reached; process-group termination still pending"
+
+    def test_monitor_spool_does_not_overwrite_terminal_spool_as_timeout(self, tmp_path):
+        spool_id = "test-terminal-spool-past-timeout"
+        completed_at = datetime.now().isoformat()
+        spool = {
+            "id": spool_id,
+            "status": "complete",
+            "result": "done",
+            "pid": 999999999,
+            "timeout": 1,
+            "created_at": (datetime.now() - timedelta(seconds=5)).isoformat(),
+            "completed_at": completed_at,
+        }
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool(spool_id, spool)
+            _monitor_spool(spool_id)
+            result = _read_spool(spool_id)
+
+        assert result["status"] == "complete"
+        assert result["result"] == "done"
+        assert result["completed_at"] == completed_at
+        assert "error" not in result
 
 
 class TestCCBgTasks:
