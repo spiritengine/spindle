@@ -9129,7 +9129,8 @@ class TestPlistReadingUsesPlistlib:
         }
         with open(path, "wb") as fh:
             plistlib.dump(data, fh, fmt=plistlib.FMT_BINARY)
-        assert spindle._service_settings_from_file(path) == {"port": 8075, "home": "/srv/store", "readable": True}
+        settings = spindle._service_settings_from_file(path)
+        assert (settings["port"], settings["home"], settings["readable"]) == (8075, "/srv/store", True)
 
     def test_the_last_port_argument_wins(self, tmp_path):
         """argparse takes the last; reading the first rewrites the agent's port."""
@@ -9143,7 +9144,8 @@ class TestPlistReadingUsesPlistlib:
     def test_generated_plists_round_trip(self, tmp_path):
         path = tmp_path / "com.svc.server.plist"
         path.write_text(spindle._launchd_plist_text("com.svc.server", "/bin/spindle", 8075, home="/srv/A&B store"))
-        assert spindle._service_settings_from_file(path) == {"port": 8075, "home": "/srv/A&B store", "readable": True}
+        settings = spindle._service_settings_from_file(path)
+        assert (settings["port"], settings["home"], settings["readable"]) == (8075, "/srv/A&B store", True)
 
     def test_unreadable_plist_is_marked_unreadable(self, tmp_path):
         path = tmp_path / "com.svc.server.plist"
@@ -9214,7 +9216,9 @@ class TestServiceRecord:
         return tmp_path
 
     def test_round_trips(self, config, tmp_path):
-        spindle._write_service_record("svc", 8075, "/srv/store", tmp_path / "svc.service")
+        unit = tmp_path / "svc.service"
+        unit.write_text("body")
+        spindle._write_service_record("svc", 8075, "/srv/store", unit, "body")
         record = spindle._read_service_record("svc")
         assert (record["port"], record["home"], record["name"]) == (8075, "/srv/store", "svc")
         assert record["spindle_version"] == spindle.__version__
@@ -9230,8 +9234,10 @@ class TestServiceRecord:
 
     def test_a_record_survives_values_no_parser_could_read(self, config, tmp_path):
         """%h, escapes, quotes: exactly the values that defeated the readers."""
+        unit = tmp_path / "svc.service"
+        unit.write_text("body")
         for home in ("%h/spindle-store", "/srv/a\\sb", "/srv/'q'", "/srv/tail\\", "", "/srv/A&B"):
-            spindle._write_service_record("svc", 8075, home, tmp_path / "svc.service")
+            spindle._write_service_record("svc", 8075, home, unit, "body")
             assert spindle._read_service_record("svc")["home"] == home, repr(home)
 
 
@@ -9540,3 +9546,115 @@ class TestRecordFollowsActivation:
         assert self._run(["--name", "svc", "--port", "8115"], monkeypatch) == 0
         unit = home / ".config" / "systemd" / "user" / "svc.service"
         assert spindle._read_service_record("svc")["service_sha256"] == spindle._service_file_digest(unit)
+
+
+class TestDigestIsRequiredNotOptional:
+    """ "No digest" must mean "cannot verify", not "skip the check"."""
+
+    @pytest.fixture
+    def config(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
+        monkeypatch.delenv("SPINDLE_HOME", raising=False)
+        monkeypatch.delenv("SPINDLE_PORT", raising=False)
+        return tmp_path
+
+    def _raw_record(self, record):
+        path = spindle._service_record_path("svc")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(record))
+
+    @pytest.mark.parametrize("digest", [None, "", "absent"])
+    def test_a_record_without_a_usable_digest_is_not_a_record(self, config, digest):
+        record = {"name": "svc", "port": 8075, "home": "/srv/store", "service_file": "/x"}
+        if digest != "absent":
+            record["service_sha256"] = digest
+        self._raw_record(record)
+        assert spindle._read_service_record("svc") is None
+
+    def test_a_pre_digest_record_no_longer_silently_regenerates(self, config, tmp_path):
+        """Every record written before digests existed looked like this."""
+        unit = tmp_path / "svc.service"
+        unit.write_text(spindle._systemd_unit_text("/bin/spindle", 9001, home="/srv/handedited", name="svc"))
+        self._raw_record({"name": "svc", "port": 8075, "home": "/srv/store", "service_file": str(unit)})
+        port, home, _, blocker = spindle._resolve_service_settings(unit, None, None, name="svc")
+        assert (port, home) == (None, None)
+        assert blocker is not None
+
+    def test_the_digest_covers_the_bytes_written_not_a_later_read(self, config, tmp_path):
+        """A write landing between activation and recording must not be blessed."""
+        unit = tmp_path / "svc.service"
+        unit.write_text("what spindle wrote")
+        spindle._write_service_record("svc", 8075, None, unit, "what spindle wrote")
+        good = spindle._read_service_record("svc")["service_sha256"]
+
+        unit.write_text("edited before the record landed")
+        spindle._write_service_record("svc", 8075, None, unit, "what spindle wrote")
+        assert spindle._read_service_record("svc")["service_sha256"] == good
+        # and that record is therefore stale against the file now on disk
+        _, _, _, blocker = spindle._resolve_service_settings(unit, None, None, name="svc")
+        assert blocker is not None
+
+    def test_out_of_range_ports_are_rejected(self, config):
+        for port in (0, -1, 70000):
+            self._raw_record({"name": "svc", "port": port, "home": None, "service_file": "/x", "service_sha256": "abc"})
+            assert spindle._read_service_record("svc") is None, port
+
+    def test_the_cli_rejects_an_impossible_port(self):
+        import argparse
+
+        for bad in ("0", "70000", "-1", "http"):
+            with pytest.raises(argparse.ArgumentTypeError):
+                spindle._service_port(bad)
+        assert spindle._service_port("8075") == 8075
+
+
+class TestTheHintIsNeverPasteableWhenItIsNotAReading:
+    @pytest.fixture
+    def config(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
+        return tmp_path
+
+    def _blocker(self, unit):
+        return spindle._resolve_service_settings(unit, None, None, name="svc")[3]
+
+    def _command(self, blocker):
+        return [line for line in blocker.splitlines() if "install-service" in line][0]
+
+    def test_a_specifier_store_yields_a_command_that_will_not_run(self, config, tmp_path):
+        """A runnable `--home ''` moved the store to the default when pasted."""
+        unit = tmp_path / "svc.service"
+        unit.write_text("[Service]\nEnvironment=SPINDLE_HOME=%h/store\nExecStart=/b serve --http --port 8115\n")
+        blocker = self._blocker(unit)
+        command = self._command(blocker)
+        assert "--home ''" not in command
+        assert "<the directory you actually mean>" in command
+        assert "systemd specifier" in blocker
+
+    def test_an_unreadable_file_yields_placeholders_not_defaults(self, config, tmp_path):
+        plist = tmp_path / "com.svc.server.plist"
+        plist.write_bytes(b"\x00\x01 not a plist")
+        command = self._command(self._blocker(plist))
+        assert "<port>" in command and "<store>" in command
+        assert "8002" not in command
+
+    def test_a_literal_percent_in_a_store_is_not_called_a_specifier(self, config, tmp_path):
+        """`%%` is a literal percent; only a bare `%` is a specifier."""
+        unit = tmp_path / "svc.service"
+        unit.write_text(spindle._systemd_unit_text("/bin/spindle", 8115, home="/srv/100%pure", name="svc"))
+        settings = spindle._service_settings_from_file(unit)
+        assert settings["home"] == "/srv/100%pure"
+        assert settings["home_specifier"] is False
+        blocker = self._blocker(unit)
+        assert "systemd specifier" not in blocker
+        assert "100%pure" in self._command(blocker)
+
+    def test_a_readable_ordinary_file_still_gives_a_pasteable_command(self, config, tmp_path):
+        import shlex
+
+        unit = tmp_path / "svc.service"
+        unit.write_text('[Service]\nEnvironment="SPINDLE_HOME=/srv/my store"\nExecStart=/b serve --http --port 8115\n')
+        argv = shlex.split(self._command(self._blocker(unit)))
+        port = int(argv[argv.index("--port") + 1])
+        home = argv[argv.index("--home") + 1]
+        p2, h2, _, blocker2 = spindle._resolve_service_settings(unit, port, home, name="svc")
+        assert (p2, h2, blocker2) == (8115, "/srv/my store", None)

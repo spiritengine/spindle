@@ -7311,6 +7311,19 @@ def _doctor_smoke_check(harness: str, timeout: int = 240, model: Optional[str] =
             shutil.rmtree(working_dir, ignore_errors=True)
 
 
+def _service_port(value: str) -> int:
+    """argparse type for a port a service can actually bind."""
+    import argparse as _argparse
+
+    try:
+        port = int(value)
+    except ValueError:
+        raise _argparse.ArgumentTypeError(f"{value!r} is not a port number")
+    if not (1 <= port <= 65535):
+        raise _argparse.ArgumentTypeError("must be between 1 and 65535")
+    return port
+
+
 def _positive_seconds(value: str) -> int:
     """argparse type for a timeout that must actually allow work to happen.
 
@@ -7505,7 +7518,7 @@ def _service_settings_from_file(path: Path) -> dict:
     from "nothing here could be parsed" — the caller must not claim to be
     keeping a value it never actually read.
     """
-    settings = {"port": None, "home": None, "readable": False}
+    settings = {"port": None, "home": None, "readable": False, "home_specifier": False}
 
     # launchd: plistlib is the canonical reader. Hand-walking the XML meant not
     # handling launchd's own binary format (plutil -convert binary1 is routine),
@@ -7559,6 +7572,12 @@ def _service_settings_from_file(path: Path) -> dict:
     # Anchored to the ExecStart line, so an ExecStartPre that happens to mention
     # `serve --http --port` cannot supply the port the unit is rewritten with.
     settings["home"] = _env_from_unit_text(text, "SPINDLE_HOME")
+    # A literal percent is written `%%` and a specifier is a bare `%`, but both
+    # come back as `%` once unescaped — so the raw text is the only place the
+    # two can be told apart. Without this, a store genuinely containing a `%`
+    # was reported as a specifier and its usable hint thrown away.
+    raw_home = _env_from_unit_text(text.replace("%%", "\x00PCT\x00"), "SPINDLE_HOME")
+    settings["home_specifier"] = bool(raw_home and "%" in raw_home.replace("\x00PCT\x00", ""))
     env_port = _env_from_unit_text(text, "SPINDLE_PORT")
     if env_port:
         try:
@@ -7596,6 +7615,13 @@ def _service_record_path(name: str) -> Path:
     return Path(base) / "spindle" / "services" / f"{name}.json"
 
 
+def _digest_text(text: str) -> str:
+    """SHA-256 of the exact content spindle is about to write."""
+    import hashlib
+
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
 def _service_file_digest(path: Path) -> Optional[str]:
     """SHA-256 of a service file, or None if it cannot be read."""
     import hashlib
@@ -7606,7 +7632,7 @@ def _service_file_digest(path: Path) -> Optional[str]:
         return None
 
 
-def _write_service_record(name: str, port: int, home: Optional[str], service_file: Path) -> None:
+def _write_service_record(name: str, port: int, home: Optional[str], service_file: Path, content: str = "") -> None:
     """Record what a service was installed with, and which exact file that was.
 
     The digest is what makes the record trustworthy later. A record on its own
@@ -7620,7 +7646,10 @@ def _write_service_record(name: str, port: int, home: Optional[str], service_fil
         "port": port,
         "home": home,
         "service_file": str(service_file),
-        "service_sha256": _service_file_digest(service_file),
+        # Hash of the bytes spindle wrote, not a re-read of the file: the record
+        # is written after activation, and re-reading would bless an edit that
+        # landed in between as spindle's own.
+        "service_sha256": _digest_text(content) if content else _service_file_digest(service_file),
         "spindle_version": __version__,
     }
     path = _service_record_path(name)
@@ -7658,7 +7687,13 @@ def _read_service_record(name: str) -> Optional[dict]:
         return None
     if "home" not in record or not isinstance(record["home"], (str, type(None))):
         return None
-    if not isinstance(record.get("service_sha256"), (str, type(None))):
+    # The digest is required, not optional. Treating a missing one as "skip the
+    # check" meant every record written before digests existed was trusted
+    # unconditionally — which is the staleness hole this was meant to close.
+    if not isinstance(record.get("service_sha256"), str) or not record["service_sha256"]:
+        return None
+    port_value = record["port"]
+    if not (1 <= port_value <= 65535):
         return None
     return record
 
@@ -7692,8 +7727,7 @@ def _resolve_service_settings(
     # and regenerating from it would rewrite the service back to settings it is
     # no longer running with, announcing that it "kept" them.
     if record is not None and exists:
-        recorded_digest = record.get("service_sha256")
-        if recorded_digest and _service_file_digest(existing) != recorded_digest:
+        if _service_file_digest(existing) != record["service_sha256"]:
             notes.append(f"{existing.name} has been edited since spindle installed it; its record is stale.")
             record = None
 
@@ -7707,23 +7741,38 @@ def _resolve_service_settings(
         # that omits one refuses again when pasted. --home '' asks for the
         # default store explicitly.
         caveat = ""
-        if hint_home and "%" in hint_home:
-            # A systemd specifier: its value depends on the service's runtime
-            # context, so it cannot be repeated back as a literal path. Pasting
-            # it would re-escape the % and land the store somewhere else — the
-            # exact defect this refusal exists to prevent, via the operator.
-            caveat = (
-                f"\n{existing.name} sets its store to {hint_home!r}, which is a systemd specifier "
-                f"resolved at runtime. Pass the actual directory you mean, not that string."
-            )
-            hint_home = None
-        hint = f"--port {hint_port} --home {shlex.quote(hint_home or '')}"
+        if not guess["readable"]:
+            # Nothing was read, so nothing may be suggested. A hint of
+            # "--port 8002 --home ''" here is not a reading of the file, it is
+            # the defaults wearing the file's name — and pasting it collides
+            # with the default install.
+            port_hint = "<port>"
+            home_hint = "<store>"
+            caveat = f"\n{existing.name} could not be read at all, so neither value below is a reading of it."
+        else:
+            port_hint = str(hint_port)
+            if guess.get("home_specifier"):
+                # A systemd specifier resolves against the service's runtime
+                # context, so it cannot be repeated back as a literal path.
+                # Deliberately NOT a runnable value: an operator pasting a
+                # working `--home ''` would move the store to the default, which
+                # is the defect this refusal exists to prevent.
+                home_hint = "<the directory you actually mean>"
+                caveat = (
+                    f"\n{existing.name} sets its store with a systemd specifier ({hint_home!r}), which is "
+                    f"resolved at run time. Substitute the real directory; do not paste that string."
+                )
+            elif hint_home:
+                home_hint = shlex.quote(hint_home)
+            else:
+                home_hint = "''"
+        hint = f"--port {port_hint} --home {home_hint}"
         blocker = (
             f"{existing} exists but spindle has no record of installing it (or the file changed "
             f"since), so what it currently runs with cannot be established from the file alone.\n"
             f"Say what it should be, and spindle will record it from then on:\n"
             f"  spindle install-service --name {name} {hint} --force\n"
-            f"(reading the file suggests {hint} — check it against the file before trusting it)"
+            f"(the values above are spindle's reading of the file — check them before trusting them)"
             f"{caveat}"
         )
         return None, None, notes, blocker
@@ -8190,7 +8239,7 @@ def main():
     )
     install_service_parser.add_argument(
         "--port",
-        type=int,
+        type=_service_port,
         default=None,
         help=f"Port the service binds (default: keep the existing service's port, else {DEFAULT_PORT})",
     )
@@ -8727,7 +8776,7 @@ def main():
             # Record only once the service is actually installed and enabled. A
             # record written earlier would outlive a failed activation and
             # describe a service that was never put in place.
-            _write_service_record(args.name, service_port, service_home, service_file)
+            _write_service_record(args.name, service_port, service_home, service_file, service_content)
 
             print(f"\nTo start now: spindle start --name {args.name}")
             print(f"To check status: spindle status --port {service_port}")
@@ -8850,7 +8899,7 @@ def main():
             # plist, and a record written earlier would then describe settings
             # the machine is not running — so the next routine reinstall would
             # "keep" them and move the service for real.
-            _write_service_record(args.name, service_port, service_home, plist_file)
+            _write_service_record(args.name, service_port, service_home, plist_file, plist_content)
 
             print("\nService is now running.")
             print(f"To check status: spindle status --port {service_port}")
