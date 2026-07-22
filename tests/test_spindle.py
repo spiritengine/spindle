@@ -5295,6 +5295,30 @@ class TestRecoverOrphansPending:
         assert saved["status"] == "error"
         assert "pid" not in saved
 
+    def test_late_spawn_cleanup_warning_records_new_process_birth(self, tmp_path):
+        spool_id = "recovered-live-process"
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool(
+                spool_id,
+                {
+                    "id": spool_id,
+                    "status": "error",
+                    "error": "spawn timeout - never started",
+                    "process_start_time": "stale-birth-token",
+                    "created_at": datetime.now().isoformat(),
+                },
+            )
+            with patch("spindle._process_start_time", return_value="new-birth-token"):
+                with patch("spindle._terminate_process_group", return_value=False):
+                    assert spindle._publish_spawned_process(spool_id, 747474) is False
+            saved = _read_spool(spool_id)
+
+        assert saved["pid"] == 747474
+        assert saved["process_start_time"] == "new-birth-token"
+        assert saved["process_group_cleanup_warning"] == (
+            "Process group survived cleanup after spool startup lost its terminal race"
+        )
+
     def test_setup_does_not_overwrite_recovered_shard_reservation(self, tmp_path):
         spool_id = "recovered-during-setup"
         worktree = tmp_path / "worktree"
@@ -6349,6 +6373,87 @@ class TestShardMergeCleanupFailure:
         assert lock_attempts == [False, False]
         terminate.assert_called_once_with(747474, 0.5)
         reap.assert_called_once_with(spool_id)
+        assert "process_group_cleanup_warning" not in saved
+
+    def test_merge_clears_warning_after_process_group_has_exited(self, tmp_path):
+        spool_id = "merge-dead-warned-group"
+        state_dir = tmp_path / "spools"
+        worktree = tmp_path / "worktrees" / "merge-dead-warned-group"
+        worktree.mkdir(parents=True)
+        spool = {
+            "id": spool_id,
+            "status": "complete",
+            "prompt": "merge me",
+            "base_branch": "main",
+            "pid": 757575,
+            "process_start_time": "departed-process-token",
+            "process_group_cleanup_warning": "group survived normal finalization",
+            "created_at": datetime.now().isoformat(),
+            "shard": {
+                "worktree_path": str(worktree),
+                "branch_name": "shard-merge-dead-warned-group",
+            },
+        }
+        git_ok = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+        merge = shard_merge.fn if hasattr(shard_merge, "fn") else shard_merge
+
+        with patch("spindle.SPINDLE_DIR", state_dir):
+            _write_spool(spool_id, spool)
+            with patch("spindle._is_pid_alive", return_value=False):
+                with patch("spindle._is_process_group_alive", return_value=False):
+                    with patch(
+                        "spindle._spool_process_identity_matches",
+                        side_effect=AssertionError("dead groups need no identity proof"),
+                    ):
+                        with patch(
+                            "spindle._terminate_process_group",
+                            side_effect=AssertionError("dead groups need no signal"),
+                        ):
+                            with patch("spindle.subprocess.run", side_effect=[git_ok, git_ok]):
+                                with patch("spindle._cleanup_shard", return_value=True):
+                                    with patch("spindle._close_tender_folios", return_value=None):
+                                        result = asyncio.run(merge(spool_id, caller_cwd=str(tmp_path / "outside")))
+            saved = _read_spool(spool_id)
+
+        assert result == f"Successfully merged shard {spool_id} to main"
+        assert "process_group_cleanup_warning" not in saved
+
+    def test_abandon_clears_warning_after_process_group_has_exited(self, tmp_path):
+        spool_id = "abandon-dead-warned-group"
+        state_dir = tmp_path / "spools"
+        worktree = tmp_path / "worktrees" / "abandon-dead-warned-group"
+        worktree.mkdir(parents=True)
+        spool = {
+            "id": spool_id,
+            "status": "error",
+            "pid": 767676,
+            "process_start_time": "departed-process-token",
+            "process_group_cleanup_warning": "group survived normal finalization",
+            "created_at": datetime.now().isoformat(),
+            "shard": {
+                "worktree_path": str(worktree),
+                "branch_name": "shard-abandon-dead-warned-group",
+            },
+        }
+        abandon = shard_abandon.fn if hasattr(shard_abandon, "fn") else shard_abandon
+
+        with patch("spindle.SPINDLE_DIR", state_dir):
+            _write_spool(spool_id, spool)
+            with patch("spindle._is_pid_alive", return_value=False):
+                with patch("spindle._is_process_group_alive", return_value=False):
+                    with patch(
+                        "spindle._spool_process_identity_matches",
+                        side_effect=AssertionError("dead groups need no identity proof"),
+                    ):
+                        with patch(
+                            "spindle._terminate_process_group",
+                            side_effect=AssertionError("dead groups need no signal"),
+                        ):
+                            with patch("spindle._cleanup_shard", return_value=True):
+                                result = asyncio.run(abandon(spool_id, caller_cwd=str(tmp_path / "outside")))
+            saved = _read_spool(spool_id)
+
+        assert result == f"Abandoned shard {spool_id}"
         assert "process_group_cleanup_warning" not in saved
 
     def test_successful_merge_preserves_handle_when_worktree_cleanup_fails(self, tmp_path):

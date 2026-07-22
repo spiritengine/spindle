@@ -1555,10 +1555,15 @@ def _publish_spawned_process(spool_id: str, pid: int) -> bool:
 
         # Recovery or cancellation finalized the reservation while Popen was
         # starting. Never leave that untracked process running in its shard.
+        process_start_time = _process_start_time(pid)
         cleanup_succeeded = _terminate_process_group(pid, 0.2)
         _pop_and_reap_process_handle(spool_id)
         if current is not None and not cleanup_succeeded:
             current["pid"] = pid
+            if process_start_time is not None:
+                current["process_start_time"] = process_start_time
+            else:
+                current.pop("process_start_time", None)
             current["process_group_cleanup_warning"] = (
                 "Process group survived cleanup after spool startup lost its terminal race"
             )
@@ -5309,9 +5314,10 @@ def _shard_merge_locked(spool_id: str, keep_branch: bool, caller_cwd: str | None
     # the shard. Resolve that explicit warning before any Git or cleanup work.
     if spool.get("process_group_cleanup_warning"):
         pid = spool.get("pid")
-        if not pid or not _spool_process_identity_matches(spool):
-            return f"Error: Spool {spool_id} has an unverifiable process-group warning; shard preserved"
-        if _is_pid_alive(pid) or _is_process_group_alive(pid):
+        process_alive = bool(pid) and (_is_pid_alive(pid) or _is_process_group_alive(pid))
+        if process_alive:
+            if not _spool_process_identity_matches(spool):
+                return f"Error: Spool {spool_id} has an unverifiable process-group warning; shard preserved"
             if not _terminate_process_group(pid, 0.5):
                 return f"Error: Could not terminate process group for spool {spool_id}; shard preserved"
         _pop_and_reap_process_handle(spool_id)
@@ -5464,12 +5470,20 @@ def _shard_abandon_locked(spool_id: str, keep_branch: bool, caller_cwd: str | No
     # Signal only a process whose birth identity still matches this spool. A
     # preserved terminal record can outlive its PID and must never kill the
     # unrelated process that later reused that number.
-    should_signal = spool.get("status") == "running" or bool(spool.get("process_group_cleanup_warning"))
+    is_running = spool.get("status") == "running"
+    has_cleanup_warning = bool(spool.get("process_group_cleanup_warning"))
     pid = spool.get("pid")
-    if should_signal:
+    if is_running:
         if not _spool_process_identity_matches(spool):
             return f"Error: Could not verify process identity for spool {spool_id}; shard preserved"
         if _is_pid_alive(pid) or _is_process_group_alive(pid):
+            if not _terminate_process_group(pid, 0.5):
+                return f"Error: Could not terminate process group for spool {spool_id}; shard preserved"
+    elif has_cleanup_warning:
+        process_alive = bool(pid) and (_is_pid_alive(pid) or _is_process_group_alive(pid))
+        if process_alive:
+            if not _spool_process_identity_matches(spool):
+                return f"Error: Could not verify process identity for spool {spool_id}; shard preserved"
             if not _terminate_process_group(pid, 0.5):
                 return f"Error: Could not terminate process group for spool {spool_id}; shard preserved"
     _pop_and_reap_process_handle(spool_id)
