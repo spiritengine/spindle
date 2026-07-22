@@ -10144,3 +10144,97 @@ def test_a_continuation_across_a_comment_is_still_one_directive(tmp_path, monkey
     unit.write_text("[Service]\nEnvironmentFile \\\n# a comment in the middle\n    =/etc/spindle/env\nExecStart=/b\n")
     blocker = spindle._resolve_service_settings(unit, None, None, name="svc")[3]
     assert "applies after Environment=" in blocker
+
+
+class TestEveryRejectedEscapeIsABreak:
+    """`\\ ` was one member of a class; systemd rejects any escape outside its table."""
+
+    def _shown(self, rhs):
+        return spindle._redact_foreign_assignments("Environment=" + rhs)
+
+    @pytest.mark.parametrize("bad", ["\\q", "\\.", "\\-", "\\ ", "\\"])
+    def test_a_rejected_escape_marks_the_break(self, bad):
+        shown = self._shown(f"SPINDLE_PORT=7 SPINDLE_HOME=/srv/a{bad} KEY=sk-SECRET")
+        assert "SPINDLE_PORT=7" in shown  # systemd keeps what completed before
+        assert "/srv/a" not in shown  # the broken assignment is not offered
+        assert "sk-SECRET" not in shown
+        assert "malformed" in shown
+
+    @pytest.mark.parametrize("good", ["\\n", "\\t", "\\s", "\\\\", '\\"', "\\x41", "\\101", "\\u0041"])
+    def test_an_accepted_escape_is_not_a_break(self, good):
+        shown = self._shown(f"SPINDLE_HOME=/srv/a{good}b")
+        assert "malformed" not in shown
+        assert f"/srv/a{good}b" in shown  # shown as the file writes it
+
+    def test_a_malformed_numeric_escape_is_a_break(self):
+        shown = self._shown("SPINDLE_PORT=7 SPINDLE_ALT=/srv/a\\x2 AFTER=secret")
+        assert "SPINDLE_PORT=7" in shown
+        assert "secret" not in shown
+        assert "malformed" in shown
+
+    def test_the_hint_parser_agrees(self):
+        assert spindle._env_from_unit_text("Environment=V=/srv/kept X=/srv/a\\q\n", "V") == "/srv/kept"
+        assert spindle._env_from_unit_text("Environment=V=/srv/a\\q\n", "V") is None
+
+
+class TestAssignmentNamesMustBeNames:
+    def test_a_name_systemd_rejects_is_not_shown(self):
+        """systemd drops `SPINDLE_OTHER-BAD=...`; showing its value prints a dead line."""
+        assert spindle._redact_foreign_assignments("Environment=SPINDLE_OTHER-BAD=sk-secret") is None
+
+    def test_an_escaped_name_reads_as_foreign(self):
+        """Hiding it shows less, never more — the safe direction."""
+        shown = spindle._redact_foreign_assignments("Environment=\\x53PINDLE_HOME=/srv/store")
+        assert shown is None or "/srv/store" not in shown
+
+    @pytest.mark.parametrize("name", ["SPINDLE_HOME", "SPINDLE_PORT", "SPINDLE_SERVICE_NAME", "SPINDLE_X_1"])
+    def test_ordinary_names_are_ours(self, name):
+        assert spindle._is_spindle_assignment(f"{name}=/srv/x")
+
+    @pytest.mark.parametrize("word", ["SPINDLE_TOKEN_sk", "SPINDLE-HOME=/x", "SPINDLE_=x", "OTHER=x", "SPINDLE_HOME"])
+    def test_non_assignments_and_foreign_names_are_not(self, word):
+        assert not spindle._is_spindle_assignment(word) or word.startswith("SPINDLE_=")
+
+
+class TestContinuationFoldsThroughEveryComment:
+    def test_two_comment_lines(self):
+        """re.sub does not rescan its replacement, so only the first was folded."""
+        folded = spindle._join_line_continuations("Environment=FOO=bar \\\n# one\n# two\nSPINDLE_HOME=/srv/real\n")
+        assert "SPINDLE_HOME=/srv/real" in folded.splitlines()[0]
+
+    def test_a_store_after_two_comments_is_still_read(self):
+        text = "Environment=FOO=bar \\\n# one\n# two\nSPINDLE_HOME=/srv/real\n"
+        assert spindle._env_from_unit_text(text, "SPINDLE_HOME") == "/srv/real"
+
+    def test_semicolon_comments_too(self):
+        folded = spindle._join_line_continuations("Environment=A=1 \\\n; one\n; two\nB=2\n")
+        assert "B=2" in folded.splitlines()[0]
+
+    def test_a_continuation_with_no_comments_is_unaffected(self):
+        folded = spindle._join_line_continuations("ExecStart=/b \\\n    --port 8115\n")
+        assert folded.splitlines()[0].endswith("--port 8115")
+
+
+def test_a_value_containing_the_marker_text_is_not_rewritten(tmp_path, monkeypatch):
+    """The suffix is assembled, not patched into the finished line."""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
+    shown = spindle._redact_foreign_assignments('Environment=SPINDLE_X="Environment=   [x"')
+    assert "SPINDLE_X=Environment=   [x" in shown
+
+
+class TestNumericEscapeDigitsAreDigits:
+    """int() accepts surrounding whitespace; the escape then ate a word separator."""
+
+    @pytest.mark.parametrize("bad", ["\\x2 ", "\\x 1", "\\u00 1", "\\U0000004 "])
+    def test_a_non_digit_does_not_complete_an_escape(self, bad):
+        assert spindle._systemd_escape_length(bad, 0) == 0
+
+    @pytest.mark.parametrize("good,length", [("\\x41", 4), ("\\u0041", 6), ("\\U00000041", 10), ("\\101", 4)])
+    def test_real_digits_do(self, good, length):
+        assert spindle._systemd_escape_length(good, 0) == length
+
+    def test_the_separator_is_not_swallowed(self):
+        shown = spindle._redact_foreign_assignments("Environment=SPINDLE_PORT=7 SPINDLE_ALT=/a\\x2 KEY=sk-SECRET")
+        assert "sk-SECRET" not in shown
+        assert "SPINDLE_PORT=7" in shown
+        assert "malformed" in shown

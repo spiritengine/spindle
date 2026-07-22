@@ -19,6 +19,7 @@ import os
 import re
 import shutil
 import signal
+import string
 import subprocess
 import sys
 import tempfile
@@ -7380,7 +7381,7 @@ def _join_line_continuations(text: str) -> str:
     Comment lines inside a continuation are skipped, as systemd skips them: a
     directive continued across a comment is still one directive.
     """
-    text = re.sub(r"\\\n[^\S\n]*[#;][^\n]*(?=\n)", "\\\\", text)
+    text = re.sub(r"\\\n(?:[^\S\n]*[#;][^\n]*\n)+", "\\\\\n", text)
     return re.sub(r"\\\n[^\S\n]*", " ", text)
 
 
@@ -7417,7 +7418,10 @@ def _decode_systemd_numeric_escape(line: str, i: int) -> Tuple[Optional[str], in
     if kind in specs:
         base, width = specs[kind]
         digits = line[i + 2 : i + 2 + width]
-        if len(digits) < width:
+        # int() accepts surrounding whitespace, so `\x2 ` parsed as 2 and the
+        # escape swallowed the space that separated the next assignment —
+        # merging a foreign one into spindle's word.
+        if len(digits) < width or not all(ch in string.hexdigits for ch in digits):
             return None, 0
         try:
             return chr(int(digits, base)), 2 + width
@@ -7477,7 +7481,11 @@ def _parse_systemd_env_line(line: str) -> Optional[list]:
                 started = True
                 i += consumed
                 continue
-            buf.append(_SYSTEMD_ESCAPES.get(nxt, nxt))
+            if nxt not in _SYSTEMD_ESCAPES:
+                # systemd rejects any escape outside its table and drops the
+                # assignment and everything after it.
+                return assignments
+            buf.append(_SYSTEMD_ESCAPES[nxt])
             started = True
             i += 2
             continue
@@ -7753,6 +7761,23 @@ def _read_service_record(name: str) -> Optional[dict]:
     return record
 
 
+def _systemd_escape_length(rhs: str, i: int) -> int:
+    """Characters consumed by the escape at ``rhs[i]``, or 0 if systemd rejects it.
+
+    systemd's unescaper fails on ANY escape outside its table — not just the
+    backslash-space that one round happened to report. `\\q`, `\\.`, `\\-` and a
+    trailing backslash all make it drop the assignment and everything after it,
+    so they are all breaks.
+    """
+    if i + 1 >= len(rhs):
+        return 0  # trailing backslash
+    nxt = rhs[i + 1]
+    if nxt in "xuU01234567":
+        _, consumed = _decode_systemd_numeric_escape(rhs, i)
+        return consumed
+    return 2 if nxt in _SYSTEMD_ESCAPES else 0
+
+
 def _split_systemd_words(rhs: str) -> Tuple[list, bool]:
     """Split an `Environment=` value into its raw, undecoded words.
 
@@ -7775,16 +7800,15 @@ def _split_systemd_words(rhs: str) -> Tuple[list, bool]:
     i = 0
     while i < len(rhs):
         char = rhs[i]
-        if char == "\\" and i + 1 < len(rhs):
-            if rhs[i + 1].isspace():
-                # systemd rejects a backslash-escaped space and drops the line
-                # from there. Treating it as an ordinary escape merged the next
-                # assignment into this word, printing a foreign one.
+        if char == "\\":
+            consumed = _systemd_escape_length(rhs, i)
+            if not consumed:
+                # An escape systemd rejects: it drops this assignment and
+                # everything after it, keeping what completed before.
                 return words, False
-            buf.append(char)
-            buf.append(rhs[i + 1])
+            buf.append(rhs[i : i + consumed])
             started = True
-            i += 2
+            i += consumed
             continue
         if quote is None and char in "\"'":
             quote = char
@@ -7815,12 +7839,19 @@ def _split_systemd_words(rhs: str) -> Tuple[list, bool]:
 def _is_spindle_assignment(word: str) -> bool:
     """True if this word assigns one of spindle's own variables.
 
-    The NAME has to be checked, not the word's prefix: `SPINDLE_TOKEN_sk-secret`
+    The NAME is what decides, not the word's prefix: `SPINDLE_TOKEN_sk-secret`
     is not an assignment at all, and printing it because it starts with the
-    right letters is the leak this filter exists to prevent.
+    right letters is the leak this filter exists to prevent. The name must also
+    be a name systemd accepts — `SPINDLE_OTHER-BAD=sk-secret` is rejected by
+    systemd, and showing it would print a value from a line systemd ignores.
+
+    A name written with escapes (`\\x53PINDLE_HOME`) reads as foreign and is
+    hidden. That is the safe direction: it shows less, never more.
     """
     name, sep, _ = word.partition("=")
-    return bool(sep) and name.startswith("SPINDLE_")
+    if not sep or not name.startswith("SPINDLE_"):
+        return False
+    return bool(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name))
 
 
 def _redact_foreign_assignments(line: str) -> Optional[str]:
@@ -7844,7 +7875,9 @@ def _redact_foreign_assignments(line: str) -> Optional[str]:
     if not ok:
         parts.append("rest of line malformed; systemd drops it from there")
     suffix = f"   [{'; '.join(parts)}]" if parts else ""
-    return f"Environment={rendered}{suffix}".replace("Environment=   [", "Environment=  [")
+    # Assembled from pieces; a str.replace over the finished line rewrote a
+    # spindle value that happened to contain the marker text.
+    return "Environment=" + rendered + suffix if rendered else "Environment=" + suffix.strip()
 
 
 def _service_file_excerpt(path: Path, max_lines: int = 12, max_chars: int = 200) -> Tuple[str, str]:
