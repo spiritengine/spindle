@@ -7357,64 +7357,122 @@ def _unit_file_path(name: str) -> Path:
 
 
 def _join_line_continuations(text: str) -> str:
-    """Fold systemd's backslash-newline continuations into single lines."""
-    return re.sub(r"\\\n\s*", " ", text)
+    """Fold systemd's backslash-newline continuations into single lines.
+
+    Only the horizontal whitespace after the newline is eaten. `\\s*` also
+    matches newlines, which folded a blank line and then the NEXT directive into
+    the continued line — so an `Environment=` following a wrapped `ExecStart`
+    disappeared from the parse entirely.
+    """
+    return re.sub(r"\\\n[^\S\n]*", " ", text)
 
 
-def _parse_systemd_env_line(line: str) -> list:
-    """Split one `Environment=` line into its (name, value) assignments.
+# systemd's C-style escapes, from systemd.syntax(7). `\s` for space is the one
+# that is easy to miss and the one most likely to appear in a path.
+_SYSTEMD_ESCAPES = {
+    "n": "\n",
+    "t": "\t",
+    "r": "\r",
+    "s": " ",
+    "a": "\a",
+    "b": "\b",
+    "f": "\f",
+    "v": "\v",
+    "\\": "\\",
+    '"': '"',
+    "'": "'",
+}
 
-    systemd allows SEVERAL space-separated assignments per line, each optionally
-    quoted, with backslash escapes inside the quotes. A regex that grabs from the
-    first `VAR=` to end-of-line reads `"SPINDLE_HOME=/srv/store" "FOO=bar"` as a
-    store literally named `/srv/store" "FOO=bar`, and that value gets written
-    back into the regenerated service — the service then starts on a directory
-    that does not exist and every spool in the real store is stranded.
+
+def _parse_systemd_env_line(line: str) -> Optional[list]:
+    """Split one `Environment=` value into its (name, value) assignments.
+
+    This implements systemd's syntax rather than the subset spindle happens to
+    emit, because the file being read is frequently NOT one spindle wrote — and
+    a value misread here is written straight back into the regenerated service,
+    pointing it at a store that does not exist.
+
+    What the previous hand-rolled versions missed, each verified against systemd
+    on this machine: several assignments per line, single quotes as well as
+    double, whitespace around the `=`, C-style escapes (`a\\sb` is `a b`, not
+    `asb`), `%%` for a literal percent, and an unterminated quote, which makes
+    systemd discard the whole line.
+
+    Returns None when the line is malformed (unterminated quote), which is
+    systemd's "ignore this line" — distinct from an empty list, which is a
+    deliberate reset.
     """
     assignments = []
     buf = []
-    quoted = False
+    quote = None  # None, '"' or "'"
+    started = False
     i = 0
-    while i <= len(line):
-        char = line[i] if i < len(line) else " "  # sentinel flushes the last token
+    while i < len(line):
+        char = line[i]
         if char == "\\" and i + 1 < len(line):
-            buf.append(line[i + 1])
+            # systemd interprets escapes inside single quotes too, unlike a
+            # shell — verified by differential-testing against systemctl show.
+            nxt = line[i + 1]
+            buf.append(_SYSTEMD_ESCAPES.get(nxt, nxt))
+            started = True
             i += 2
             continue
-        if char == '"':
-            quoted = not quoted
+        if quote is None and char in "\"'":
+            quote = char
+            started = True
             i += 1
             continue
-        if char.isspace() and not quoted:
-            token = "".join(buf)
-            buf = []
-            if "=" in token:
-                name, _, value = token.partition("=")
-                # %% is systemd's literal percent; undo it as systemd would.
-                assignments.append((name, value.replace("%%", "%")))
+        if quote is not None and char == quote:
+            quote = None
+            i += 1
+            continue
+        if char.isspace() and quote is None:
+            if started:
+                token = "".join(buf)
+                buf = []
+                started = False
+                if "=" in token:
+                    name, _, value = token.partition("=")
+                    assignments.append((name, value.replace("%%", "%")))
             i += 1
             continue
         buf.append(char)
+        started = True
         i += 1
+
+    if quote is not None:
+        return None  # unterminated quote: systemd drops the line
+    if started:
+        token = "".join(buf)
+        if "=" in token:
+            name, _, value = token.partition("=")
+            assignments.append((name, value.replace("%%", "%")))
     return assignments
 
 
 def _env_from_unit_text(text: str, var: str) -> Optional[str]:
-    """Read one Environment= value out of unit text.
+    """Read one Environment= value out of unit text, as systemd would resolve it.
 
-    Later assignments win, which is systemd's own rule: a unit that sets a
-    variable twice runs with the second value, so regenerating from the first
-    would move the service off what it is actually running.
+    A later assignment wins, and a bare `Environment=` clears everything set so
+    far — both verified against `systemctl show`. Regenerating from the first
+    value, or from one that a reset discarded, moves the service off what it is
+    actually running.
     """
-    found = None
+    resolved = {}
     for line in _join_line_continuations(text).splitlines():
-        stripped = line.strip()
-        if not stripped.startswith("Environment="):
+        match = re.match(r"^\s*Environment\s*=(.*)$", line)
+        if not match:
             continue
-        for name, value in _parse_systemd_env_line(stripped[len("Environment=") :]):
-            if name == var:
-                found = value
-    return found
+        rhs = match.group(1).strip()
+        if not rhs:
+            resolved.clear()  # bare Environment= resets the list
+            continue
+        assignments = _parse_systemd_env_line(rhs)
+        if assignments is None:
+            continue  # malformed line, ignored entirely
+        for name, value in assignments:
+            resolved[name] = value
+    return resolved.get(var)
 
 
 def _env_from_unit(name: str, var: str) -> Optional[str]:
@@ -7442,63 +7500,60 @@ def _service_settings_from_file(path: Path) -> dict:
     spool store onto ~/.spindle, stranding every spool in the old one.
 
     Handles both formats so the rule cannot hold on one platform and not the
-    other. Returns {"port": int|None, "home": str|None}; unreadable or
-    unrecognized files yield Nones, which fall through to the defaults.
+    other. Returns {"port": int|None, "home": str|None, "readable": bool}.
+    ``readable`` distinguishes "this service is configured with the defaults"
+    from "nothing here could be parsed" — the caller must not claim to be
+    keeping a value it never actually read.
     """
-    settings = {"port": None, "home": None}
+    settings = {"port": None, "home": None, "readable": False}
+
+    # launchd: plistlib is the canonical reader. Hand-walking the XML meant not
+    # handling launchd's own binary format (plutil -convert binary1 is routine),
+    # where a hand walk sees mojibake and reports "nothing configured" for an
+    # agent that is configured.
+    if path.suffix == ".plist":
+        import plistlib
+
+        try:
+            with open(path, "rb") as fh:
+                data = plistlib.load(fh)
+        except Exception:
+            return settings
+        if not isinstance(data, dict):
+            return settings
+        settings["readable"] = True
+
+        env = data.get("EnvironmentVariables")
+        if isinstance(env, dict):
+            home = env.get("SPINDLE_HOME")
+            if isinstance(home, str):
+                settings["home"] = home
+            port = env.get("SPINDLE_PORT")
+            try:
+                settings["port"] = int(port)
+            except (TypeError, ValueError):
+                pass
+
+        # ProgramArguments is what launchd actually runs, so it wins on port.
+        # The LAST --port wins, matching argparse: an agent whose arguments say
+        # `--port 8075 --port 9001` binds 9001.
+        argv = data.get("ProgramArguments")
+        if isinstance(argv, list):
+            argv = [a for a in argv if isinstance(a, str)]
+            for i in range(len(argv) - 2, -1, -1):
+                if argv[i] == "--port":
+                    try:
+                        settings["port"] = int(argv[i + 1])
+                    except ValueError:
+                        pass
+                    break
+        return settings
+
     try:
         text = path.read_text(errors="replace")
     except OSError:
         return settings
-
-    if path.suffix == ".plist" or text.lstrip().startswith("<?xml"):
-        try:
-            import xml.etree.ElementTree as ET
-
-            root = ET.fromstring(text)
-        except Exception:
-            return settings
-
-        # Read only the top-level dict's own keys. Walking every <dict>/<array>
-        # in the document let a nested dict or an unrelated array override the
-        # real ProgramArguments/EnvironmentVariables on a hand-edited plist, and
-        # a wrong value here gets written back into the regenerated agent —
-        # whereas no value at all safely falls through to the default.
-        top = root.find("dict")
-        if top is None:
-            return settings
-
-        def _value_for(container, key_name):
-            children = list(container)
-            for i, child in enumerate(children):
-                if child.tag == "key" and child.text == key_name and i + 1 < len(children):
-                    return children[i + 1]
-            return None
-
-        env = _value_for(top, "EnvironmentVariables")
-        if env is not None and env.tag == "dict":
-            home_node = _value_for(env, "SPINDLE_HOME")
-            if home_node is not None and home_node.text:
-                settings["home"] = home_node.text
-            port_node = _value_for(env, "SPINDLE_PORT")
-            if port_node is not None and port_node.text:
-                try:
-                    settings["port"] = int(port_node.text)
-                except ValueError:
-                    pass
-
-        # ProgramArguments is what launchd actually runs, so it wins on port.
-        program = _value_for(top, "ProgramArguments")
-        if program is not None and program.tag == "array":
-            argv = [node.text or "" for node in program if node.tag == "string"]
-            if "--port" in argv:
-                idx = argv.index("--port")
-                if idx + 1 < len(argv):
-                    try:
-                        settings["port"] = int(argv[idx + 1])
-                    except ValueError:
-                        pass
-        return settings
+    settings["readable"] = True
 
     # systemd unit. ExecStart wins on port: it is what the service binds.
     # Anchored to the ExecStart line, so an ExecStartPre that happens to mention
@@ -7548,6 +7603,10 @@ def _resolve_service_settings(
     """
     persisted = _service_settings_from_file(existing)
     exists = existing.exists()
+    # Parsed successfully, so an absent setting really is "configured with the
+    # default". A file that exists but could not be read tells us nothing, and
+    # claiming to keep a value we never saw is worse than falling back quietly.
+    readable = persisted["readable"]
     notes = []
 
     if arg_port is not None:
@@ -7557,7 +7616,9 @@ def _resolve_service_settings(
         notes.append(f"Keeping the port {existing.name} already binds: {port} (pass --port to change it)")
     elif exists:
         port = _BASE_DEFAULT_PORT
-        if os.environ.get("SPINDLE_PORT"):
+        if not readable:
+            notes.append(f"Could not read {existing.name}; falling back to port {port}")
+        elif os.environ.get("SPINDLE_PORT"):
             notes.append(
                 f"Keeping the default port {existing.name} already binds: {port} "
                 "(ignoring SPINDLE_PORT in this shell; pass --port to change it)"
@@ -7567,12 +7628,16 @@ def _resolve_service_settings(
 
     if arg_home is not None:
         home = arg_home or None
-    elif persisted["home"]:
+    elif persisted["home"] is not None:
+        # `is not None`, not truthiness: a persisted empty SPINDLE_HOME is a
+        # setting the running service behaves by, and dropping it would move the
+        # store just as surely as replacing it.
         home = persisted["home"]
-        notes.append(f"Keeping the spool store {existing.name} already uses: {home} (pass --home to change it)")
+        shown = home or "(empty)"
+        notes.append(f"Keeping the spool store {existing.name} already uses: {shown} (pass --home to change it)")
     elif exists:
         home = None
-        if os.environ.get("SPINDLE_HOME"):
+        if readable and os.environ.get("SPINDLE_HOME"):
             notes.append(
                 f"Keeping the default spool store {existing.name} already uses "
                 "(ignoring SPINDLE_HOME in this shell; pass --home to change it)"
@@ -7835,7 +7900,9 @@ def _systemd_unit_text(
 
     env_lines = [f"Environment=SPINDLE_PORT={port}"]
     env_lines.append(f"Environment={_systemd_quote('SPINDLE_SERVICE_NAME=' + str(name))}")
-    if home:
+    # `is not None`: an empty store is a setting the service behaves by, and
+    # dropping it here would undo the resolver's decision to keep it.
+    if home is not None:
         env_lines.append(f"Environment={_systemd_quote('SPINDLE_HOME=' + str(home))}")
     env_lines.append(f"Environment={_systemd_quote('PATH=' + _service_path_env(path_env))}")
     env_block = "\n".join(env_lines)
@@ -7880,7 +7947,7 @@ def _launchd_plist_text(
     from xml.sax.saxutils import escape
 
     env_entries = [("SPINDLE_PORT", str(port)), ("PYTHONUNBUFFERED", "1")]
-    if home:
+    if home is not None:
         env_entries.append(("SPINDLE_HOME", str(home)))
     env_entries.append(("PATH", _service_path_env(path_env)))
     env_xml = "\n".join(f"        <key>{escape(k)}</key>\n        <string>{escape(v)}</string>" for k, v in env_entries)
@@ -8589,11 +8656,22 @@ def main():
             # Unload if already loaded. Its exit code decides what a later
             # failure means: if the unload failed, the OLD agent is still running,
             # so "no agent is loaded" would be exactly wrong.
+            def _launchctl(action: str):
+                """Run launchctl, turning an exec failure into a nonzero result.
+
+                An OSError escaping here (launchctl missing, fork failure) after
+                the unload would leave the machine with no agent and skip every
+                restore below, so it is reported like any other failure.
+                """
+                try:
+                    return subprocess.run(["launchctl", action, str(plist_file)], capture_output=True, text=True)
+                except OSError as exc:
+                    return subprocess.CompletedProcess([], 1, "", str(exc))
+
             was_loaded = plist_file.exists()
             unload_failed = False
             if was_loaded:
-                unloaded = subprocess.run(["launchctl", "unload", str(plist_file)], capture_output=True, text=True)
-                unload_failed = unloaded.returncode != 0
+                unload_failed = _launchctl("unload").returncode != 0
 
             def _restore_previous(reason: str) -> None:
                 """Put the old agent back after any failure past the unload."""
@@ -8608,7 +8686,7 @@ def main():
                 if unload_failed:
                     print(f"Restored the previous plist from {backup}; it was never unloaded, so it is still running.")
                     return
-                reloaded = subprocess.run(["launchctl", "load", str(plist_file)], capture_output=True, text=True)
+                reloaded = _launchctl("load")
                 if reloaded.returncode == 0:
                     print(f"Restored the previous plist from {backup} and reloaded it.")
                 else:
@@ -8639,10 +8717,13 @@ def main():
             # Load the service. launchctl's exit code is the only signal that the
             # plist was accepted; announcing success without it means a plist that
             # never loads reads as a successful install.
-            loaded = subprocess.run(["launchctl", "load", str(plist_file)], capture_output=True, text=True)
+            loaded = _launchctl("load")
             if loaded.returncode != 0:
-                print(f"Check the plist with: plutil -lint {plist_file}")
+                # Report and restore BEFORE suggesting plutil: the previous
+                # ordering told the operator to lint a file that the next line
+                # then reverted, so they linted the wrong plist.
                 _restore_previous(f"launchctl load failed (exit {loaded.returncode}): {(loaded.stderr or '').strip()}")
+                print(f"The plist that failed is the backup's replacement; check it with: plutil -lint {plist_file}")
                 sys.exit(1)
             print("Loaded launchd service")
 
