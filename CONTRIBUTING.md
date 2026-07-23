@@ -13,17 +13,22 @@ pip install -e ".[dev]"
 
 ## Code Style
 
-We use black for formatting and ruff for linting:
+We use ruff for both formatting and linting - the same commands CI runs, so a
+clean local run is a clean CI run. (Do not format with black: its output differs
+from `ruff format` and CI will reject it.)
 
 ```bash
 # Format code
-black spindle/ tests/
+ruff format .
+
+# Check formatting without writing (what CI does)
+ruff format --check .
 
 # Lint
-ruff check spindle/ tests/
+ruff check .
 
 # Fix auto-fixable lint issues
-ruff check --fix spindle/ tests/
+ruff check --fix .
 ```
 
 ## Running Tests
@@ -36,7 +41,7 @@ pytest
 
 1. Create a branch for your changes
 2. Make your changes
-3. Run `black` and `ruff check`
+3. Run `ruff format` and `ruff check`
 4. Run `pytest`
 5. Submit a PR
 

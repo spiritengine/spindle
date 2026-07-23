@@ -4,10 +4,13 @@ import asyncio
 import contextlib
 import inspect
 import json
+import logging
 import multiprocessing
 import os
+import shutil
 import signal
 import subprocess
+import sys
 import threading
 import time
 from contextlib import contextmanager
@@ -10251,3 +10254,2743 @@ class TestProfiles:
         _make_profile(profiles_root, "p3", {"model": 42})
         with pytest.raises(ValueError):
             _resolve_profile_overrides(_load_profile("p3"))
+
+
+# ---------------------------------------------------------------------------
+# Release identity: version single-sourcing, /health identity, spindle doctor,
+# and the service files install-service writes.
+#
+# These tests reference symbols through the `spindle` module rather than the
+# top-of-file import list, so they stay independent of it.
+# ---------------------------------------------------------------------------
+
+
+class TestVersionSingleSource:
+    """The version must have exactly one source, or CLI and service can skew."""
+
+    def test_version_exposed(self):
+        assert isinstance(spindle.__version__, str)
+        assert spindle.__version__.strip() == spindle.__version__
+        # PEP 440-ish: at least major.minor
+        assert spindle.__version__.count(".") >= 1
+        from spindle import _version
+
+        assert _version.__version__ == spindle.__version__
+
+    def test_version_module_has_no_imports(self):
+        """_version.py must stay import-free so setuptools can read it statically.
+
+        The build reads the version with `attr:`, which only avoids importing the
+        package while the value is a plain literal in a module it can parse.
+        """
+        source = Path(spindle.__file__).parent / "_version.py"
+        text = source.read_text()
+        assert "\nimport " not in text
+        assert "\nfrom " not in text
+
+    def test_pyproject_reads_the_version_from_the_package(self):
+        """A static version in pyproject would let the wheel disagree with the code."""
+        pyproject = Path(spindle.__file__).parent.parent / "pyproject.toml"
+        if not pyproject.exists():  # installed wheel, not a checkout
+            pytest.skip("no pyproject.toml (running against an installed wheel)")
+        tomllib = pytest.importorskip("tomllib")  # 3.11+; the check is skipped on 3.10
+        data = tomllib.loads(pyproject.read_text())
+        assert "version" in data["project"]["dynamic"]
+        assert "version" not in data["project"]  # no static version to drift
+        assert data["tool"]["setuptools"]["dynamic"]["version"]["attr"] == "spindle._version.__version__"
+
+
+class TestHealthIdentity:
+    """/health must carry enough identity for a client to recognize the install."""
+
+    def _health(self):
+        return asyncio.run(spindle.health_check(MagicMock()))
+
+    def test_health_reports_identity(self):
+        payload = json.loads(self._health().body)
+        assert payload["status"] == "healthy"
+        assert payload["version"] == spindle.__version__
+        assert payload["package"] == str(Path(spindle.__file__).resolve())
+        assert payload["pid"] == os.getpid()
+        assert payload["spool_dir"] == str(spindle.SPINDLE_DIR)
+
+    def test_health_keeps_legacy_fields(self):
+        """Existing monitors read these; adding identity must not drop them."""
+        payload = json.loads(self._health().body)
+        for key in ("status", "uptime_seconds", "running_spools", "max_concurrent"):
+            assert key in payload
+
+
+class TestDoctorServiceIdentity:
+    """The check that stops a fresh install reporting another one's service as its own."""
+
+    def _check(self, monkeypatch, payload, error=None):
+        monkeypatch.setattr(spindle, "_fetch_health", lambda host, port, timeout=2.0: (payload, error))
+        return spindle._doctor_service_check("127.0.0.1", 8002)
+
+    def _healthy(self, **overrides):
+        payload = {
+            "status": "healthy",
+            "uptime_seconds": 10,
+            "running_spools": 0,
+            "max_concurrent": 15,
+            "version": spindle.__version__,
+            "package": str(Path(spindle.__file__).resolve()),
+            "pid": 4242,
+            "spool_dir": str(spindle.SPINDLE_DIR),
+        }
+        payload.update(overrides)
+        return payload
+
+    def test_no_service_is_a_warning_not_a_failure(self, monkeypatch):
+        result = self._check(monkeypatch, None, error="connection refused")
+        assert result["status"] == "warn"
+        assert result["data"]["running"] is False
+
+    def test_same_install_is_ok(self, monkeypatch):
+        result = self._check(monkeypatch, self._healthy())
+        assert result["status"] == "ok"
+        assert "same install" in result["detail"]
+
+    def test_foreign_install_on_the_port_fails(self, monkeypatch):
+        """The dev-service confusion: another spindle answering our port."""
+        result = self._check(monkeypatch, self._healthy(package="/opt/other/spindle/__init__.py"))
+        assert result["status"] == "fail"
+        assert "DIFFERENT" in result["detail"]
+        assert any("/opt/other/spindle/__init__.py" in line for line in result["lines"])
+
+    def test_version_skew_fails(self, monkeypatch):
+        result = self._check(monkeypatch, self._healthy(version="0.0.1"))
+        assert result["status"] == "fail"
+        assert "skew" in result["detail"]
+        assert "0.0.1" in result["detail"]
+
+    def test_unversioned_service_is_never_claimed_as_ours(self, monkeypatch):
+        """A pre-1.2.0 service reports no version; that is 'unknown', not 'match'."""
+        payload = self._healthy()
+        del payload["version"]
+        del payload["package"]
+        result = self._check(monkeypatch, payload)
+        assert result["status"] == "warn"
+        assert "does not report its version" in result["detail"]
+
+    def test_divergent_spool_store_warns(self, monkeypatch):
+        result = self._check(monkeypatch, self._healthy(spool_dir="/somewhere/else/spools"))
+        assert result["status"] == "warn"
+        assert any("not be visible to this CLI" in line for line in result["lines"])
+
+    def test_unhealthy_spindle_fails(self, monkeypatch):
+        """A spindle in a bad state is this install's problem."""
+        result = self._check(monkeypatch, {"status": "starting", "version": "1.2.0", "running_spools": 0})
+        assert result["status"] == "fail"
+
+    def test_another_application_on_the_port_only_warns(self, monkeypatch):
+        """A stdio-only user with something else on 8002 has a healthy install."""
+        result = self._check(monkeypatch, {"status": "ok", "service": "grafana"})
+        assert result["status"] == "warn"
+        assert any("some other application" in line for line in result["lines"])
+
+    def test_fetch_health_on_a_closed_port_reports_an_error(self):
+        import socket
+
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        sock.close()
+        payload, err = spindle._fetch_health("127.0.0.1", port, timeout=0.5)
+        assert payload is None
+        assert err
+
+
+class TestDoctorStorage:
+    def test_writable_store_is_ok(self, tmp_path, monkeypatch):
+        store = tmp_path / "spools"
+        monkeypatch.setattr(spindle, "SPINDLE_DIR", store)
+        spindle._write_spool("abc12345", {"id": "abc12345", "status": "complete"})
+        result = spindle._doctor_storage_check()
+        assert result["status"] == "ok"
+        assert result["data"]["spools"] == 1
+        assert not list(store.glob(".doctor-probe-*"))  # probe cleaned up
+
+    def test_uncreatable_store_fails(self, tmp_path, monkeypatch):
+        blocker = tmp_path / "not-a-dir"
+        blocker.write_text("")
+        monkeypatch.setattr(spindle, "SPINDLE_DIR", blocker / "spools")
+        result = spindle._doctor_storage_check()
+        assert result["status"] == "fail"
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+    def test_unwritable_store_fails(self, tmp_path, monkeypatch):
+        store = tmp_path / "spools"
+        store.mkdir()
+        store.chmod(0o500)
+        monkeypatch.setattr(spindle, "SPINDLE_DIR", store)
+        try:
+            result = spindle._doctor_storage_check()
+        finally:
+            store.chmod(0o700)
+        assert result["status"] == "fail"
+        assert "not writable" in result["detail"]
+
+
+class TestDoctorHarnesses:
+    def test_no_harness_is_a_failure(self, monkeypatch):
+        monkeypatch.setattr(spindle, "_probe_command", lambda cmd, timeout=5.0: (None, None))
+        monkeypatch.setattr(spindle, "_discover_profiles", lambda: {})
+        result = spindle._doctor_harness_check()
+        assert result["status"] == "fail"
+        assert result["data"]["detected"] == {}
+
+    def test_detected_harnesses_are_reported_with_paths(self, monkeypatch):
+        def fake_probe(cmd, timeout=5.0):
+            table = {"claude": ("/bin/claude", "2.1.216"), "codex": ("/bin/codex", "codex-cli 0.144.5")}
+            return table.get(cmd, (None, None))
+
+        monkeypatch.setattr(spindle, "_probe_command", fake_probe)
+        monkeypatch.setattr(spindle, "_discover_profiles", lambda: {"mimo": {}})
+        result = spindle._doctor_harness_check()
+        assert result["status"] == "ok"
+        assert set(result["data"]["detected"]) == {"claude-code", "codex"}
+        assert result["data"]["profiles"] == ["mimo"]
+        assert any("gemini: not found" in line for line in result["lines"])
+        assert any("mimo" in line for line in result["lines"])
+
+    def test_single_harness_warns(self, monkeypatch):
+        monkeypatch.setattr(
+            spindle,
+            "_probe_command",
+            lambda cmd, timeout=5.0: ("/bin/claude", "2.1") if cmd == "claude" else (None, None),
+        )
+        monkeypatch.setattr(spindle, "_discover_profiles", lambda: {})
+        assert spindle._doctor_harness_check()["status"] == "warn"
+
+    def test_harness_commands_cover_every_builtin(self):
+        assert set(spindle.HARNESS_COMMANDS) == spindle.BUILTIN_HARNESSES
+
+
+class TestDoctorSmoke:
+    """The smoke runs real agents, so these tests stub the spawn and drive the states."""
+
+    def _seed(self, spool_id, status, result):
+        spindle._write_spool(spool_id, {"id": spool_id, "status": status, "result": result, "prompt": "x"})
+
+    def _no_finalize(self, monkeypatch):
+        monkeypatch.setattr(spindle, "_check_and_finalize_spool", lambda spool_id: True)
+
+    def test_token_match_is_ok(self, monkeypatch):
+        self._no_finalize(monkeypatch)
+        self._seed("smoke001", "complete", spindle.DOCTOR_SMOKE_TOKEN)
+        monkeypatch.setattr(spindle, "_doctor_smoke_spin", lambda *a, **k: "smoke001")
+        result = spindle._doctor_smoke_check("codex", timeout=5)
+        assert result["status"] == "ok"
+        assert result["data"]["spool_id"] == "smoke001"
+
+    def test_missing_token_fails(self, monkeypatch):
+        self._no_finalize(monkeypatch)
+        self._seed("smoke002", "complete", "I cannot comply")
+        monkeypatch.setattr(spindle, "_doctor_smoke_spin", lambda *a, **k: "smoke002")
+        result = spindle._doctor_smoke_check("codex", timeout=5)
+        assert result["status"] == "fail"
+        assert "smoke token" in result["detail"]
+
+    def test_errored_spool_fails(self, monkeypatch):
+        self._no_finalize(monkeypatch)
+        self._seed("smoke003", "error", "")
+        monkeypatch.setattr(spindle, "_doctor_smoke_spin", lambda *a, **k: "smoke003")
+        assert spindle._doctor_smoke_check("codex", timeout=5)["status"] == "fail"
+
+    def test_spawn_error_fails(self, monkeypatch):
+        monkeypatch.setattr(spindle, "_doctor_smoke_spin", lambda *a, **k: "Error: codex CLI not found")
+        result = spindle._doctor_smoke_check("codex", timeout=5)
+        assert result["status"] == "fail"
+        assert "codex CLI not found" in result["detail"]
+
+    def test_hung_spool_is_dropped_and_failed(self, monkeypatch):
+        self._no_finalize(monkeypatch)
+        self._seed("smoke004", "running", "")
+        monkeypatch.setattr(spindle, "_doctor_smoke_spin", lambda *a, **k: "smoke004")
+        dropped = []
+        monkeypatch.setattr(spindle, "_spin_drop_sync", lambda spool_id: dropped.append(spool_id) or "dropped")
+        monkeypatch.setattr(spindle.time, "sleep", lambda seconds: None)
+        result = spindle._doctor_smoke_check("codex", timeout=0)
+        assert result["status"] == "fail"
+        assert dropped == ["smoke004"]
+
+    def test_smoke_is_limited_to_harnesses_with_a_read_only_tier(self):
+        """kimi runs --yolo and gemini has no enforced read-only tier: no 'harmless' smoke."""
+        assert spindle.DOCTOR_SMOKE_HARNESSES == ("claude-code", "codex")
+        for harness in ("kimi", "gemini"):
+            assert spindle._doctor_smoke_check(harness)["status"] == "skip"
+
+    def test_smoke_working_dir_is_temporary(self, monkeypatch):
+        """A smoke must not run inside the user's repo."""
+        self._no_finalize(monkeypatch)
+        self._seed("smoke005", "complete", spindle.DOCTOR_SMOKE_TOKEN)
+        seen = {}
+
+        def fake_spin(harness, working_dir, model, timeout):
+            seen["working_dir"] = working_dir
+            return "smoke005"
+
+        monkeypatch.setattr(spindle, "_doctor_smoke_spin", fake_spin)
+        spindle._doctor_smoke_check("codex", timeout=5)
+        assert "spindle-doctor-" in seen["working_dir"]
+        assert not Path(seen["working_dir"]).exists()  # cleaned up
+
+
+class TestDoctorRun:
+    def _stub_all(self, monkeypatch, service_status="ok"):
+        monkeypatch.setattr(spindle, "_doctor_cli_check", lambda: spindle._doctor_result("cli", "ok", "cli"))
+        monkeypatch.setattr(
+            spindle,
+            "_doctor_service_check",
+            lambda host, port, timeout=2.0: spindle._doctor_result("service", service_status, "service"),
+        )
+        monkeypatch.setattr(spindle, "_doctor_storage_check", lambda: spindle._doctor_result("storage", "ok", "store"))
+        monkeypatch.setattr(
+            spindle,
+            "_doctor_harness_check",
+            lambda service_path=None, service_name=None, service_port=None: spindle._doctor_result(
+                "harnesses", "ok", "harnesses"
+            ),
+        )
+        monkeypatch.setattr(spindle, "_doctor_shard_check", lambda: spindle._doctor_result("shards", "ok", "shards"))
+
+    def test_clean_run_is_ok_and_offers_the_smoke(self, monkeypatch):
+        self._stub_all(monkeypatch)
+        report = spindle._doctor_run()
+        assert report["ok"] is True
+        assert report["version"] == spindle.__version__
+        smoke = [c for c in report["checks"] if c["name"] == "smoke"][0]
+        assert smoke["status"] == "skip"
+        assert "--smoke" in smoke["detail"]
+
+    def test_a_failing_check_fails_the_report(self, monkeypatch):
+        self._stub_all(monkeypatch, service_status="fail")
+        report = spindle._doctor_run()
+        assert report["ok"] is False
+        assert report["failed"] == ["service"]
+
+    def test_warnings_do_not_fail_the_report(self, monkeypatch):
+        self._stub_all(monkeypatch, service_status="warn")
+        assert spindle._doctor_run()["ok"] is True
+
+    def test_smoke_runs_per_requested_harness(self, monkeypatch):
+        self._stub_all(monkeypatch)
+        ran = []
+
+        def fake_smoke(harness, timeout=240, model=None):
+            ran.append(harness)
+            return spindle._doctor_result(f"smoke:{harness}", "ok", "smoked")
+
+        monkeypatch.setattr(spindle, "_doctor_smoke_check", fake_smoke)
+        report = spindle._doctor_run(smoke=True, smoke_harnesses=["codex"])
+        assert ran == ["codex"]
+        assert [c["name"] for c in report["checks"] if c["name"].startswith("smoke")] == ["smoke:codex"]
+
+    def test_render_is_one_line_per_status(self, monkeypatch):
+        self._stub_all(monkeypatch, service_status="fail")
+        text = spindle._doctor_render(spindle._doctor_run())
+        lines = text.splitlines()
+        assert lines[0].startswith("spindle doctor")
+        assert any(line.startswith("fail: service") for line in lines)
+        assert lines[-1].startswith("FAILED: service")
+        assert "|" not in text  # plain text, no table columns
+
+
+class TestServiceFileGeneration:
+    def test_unit_carries_marker_port_and_home(self):
+        unit = spindle._systemd_unit_text("/opt/venv/bin/spindle", 8042, home="/tmp/store", name="spindle-release")
+        assert spindle.SERVICE_MARKER in unit
+        assert 'ExecStart="/opt/venv/bin/spindle" serve --http --port 8042' in unit
+        assert "Environment=SPINDLE_PORT=8042" in unit
+        assert 'Environment="SPINDLE_HOME=/tmp/store"' in unit
+        assert "spindle-release" in unit
+
+    def test_unit_omits_home_when_not_set(self):
+        unit = spindle._systemd_unit_text("/opt/venv/bin/spindle", 8002)
+        assert "SPINDLE_HOME" not in unit
+
+    def test_plist_carries_marker_and_port(self):
+        plist = spindle._launchd_plist_text("com.spindle.server", "/usr/local/bin/spindle", 8042, home="/tmp/store")
+        assert spindle.SERVICE_MARKER in plist
+        assert "<string>8042</string>" in plist
+        assert "SPINDLE_HOME" in plist
+
+    def test_marked_service_file_is_recognized(self, tmp_path):
+        missing = tmp_path / "none.service"
+        assert spindle._service_file_is_marked(missing) is False
+
+        ours = tmp_path / "ours.service"
+        ours.write_text(spindle._systemd_unit_text("/bin/spindle", 8002))
+        assert spindle._service_file_is_marked(ours) is True
+
+        theirs = tmp_path / "theirs.service"
+        theirs.write_text("[Unit]\nDescription=Hand-written spindle\n")
+        assert spindle._service_file_is_marked(theirs) is False
+
+    def test_marker_must_lead_a_header_line(self, tmp_path):
+        """Substring matching let a file disclaim ownership and be claimed anyway."""
+        disclaimed = tmp_path / "disclaimed.service"
+        disclaimed.write_text(f"# NOT {spindle.SERVICE_MARKER} - hand-written, do not touch\n[Unit]\n")
+        assert spindle._service_file_is_marked(disclaimed) is False
+
+        buried = tmp_path / "buried.service"
+        buried.write_text("[Unit]\n" + "\n" * 40 + f"# {spindle.SERVICE_MARKER}\n")
+        assert spindle._service_file_is_marked(buried) is False
+
+    def test_plist_marker_inside_its_xml_comment_counts(self, tmp_path):
+        plist = tmp_path / "com.spindle.server.plist"
+        plist.write_text(spindle._launchd_plist_text("com.spindle.server", "/bin/spindle", 8002))
+        assert spindle._service_file_is_marked(plist) is True
+
+    def test_service_path_env_dedupes_and_prunes(self, tmp_path):
+        real = tmp_path / "bin"
+        real.mkdir()
+        gone = tmp_path / "vanished"
+        raw = os.pathsep.join([str(real), str(gone), str(real), ""])
+        resolved = spindle._service_path_env(raw)
+        assert resolved.split(os.pathsep) == [str(real)]
+
+    def test_service_path_env_never_empty(self, tmp_path):
+        assert spindle._service_path_env(str(tmp_path / "nope"))
+
+
+class TestPortResolution:
+    def test_default_port(self, monkeypatch):
+        monkeypatch.delenv("SPINDLE_PORT", raising=False)
+        assert spindle._default_port() == 8002
+
+    def test_port_from_env(self, monkeypatch):
+        monkeypatch.setenv("SPINDLE_PORT", "8042")
+        assert spindle._default_port() == 8042
+
+    def test_bad_port_falls_back(self, monkeypatch):
+        monkeypatch.setenv("SPINDLE_PORT", "not-a-port")
+        assert spindle._default_port() == 8002
+
+
+class TestHarnessSelectionSharedByCliAndTool:
+    """`spindle spin --harness X` must accept exactly what the spin tool accepts."""
+
+    @pytest.fixture
+    def profiles_root(self, tmp_path, monkeypatch):
+        root = tmp_path / "profiles"
+        root.mkdir()
+        monkeypatch.setattr(spindle, "SPINDLE_PROFILES_DIR", root)
+        monkeypatch.chdir(tmp_path)
+        return root
+
+    def test_builtin_passes_through(self):
+        harness, model, env, extra, name = spindle._resolve_harness_selection("CODEX", "gpt-5.6-sol", None)
+        assert harness == "codex"
+        assert model == "gpt-5.6-sol"
+        assert (extra, name) == (None, None)
+
+    def test_no_harness_is_none(self):
+        assert spindle._resolve_harness_selection(None, None, None)[0] is None
+
+    def test_unknown_harness_raises(self, profiles_root):
+        with pytest.raises(ValueError) as exc:
+            spindle._resolve_harness_selection("nope", None, None)
+        assert "Unknown harness or profile" in str(exc.value)
+
+    def test_profile_resolves_to_claude_code_with_its_env(self, profiles_root):
+        _make_profile(
+            profiles_root,
+            "alt",
+            {"base_url": "https://alt.example/v1", "api_key": "k", "model": "alt-default", "extra_args": ["--flag"]},
+        )
+        harness, model, env, extra, name = spindle._resolve_harness_selection("alt", None, None)
+        assert harness == "claude-code"
+        assert name == "alt"
+        assert model == "alt-default"
+        assert extra == ["--flag"]
+        assert env["ANTHROPIC_BASE_URL"] == "https://alt.example/v1"
+
+    def test_cli_spin_rejects_unknown_harness(self, profiles_root, capsys):
+        """Regression: the CLI used to run plain Claude Code for any unknown --harness."""
+        argv = ["spindle", "spin", "hello", "--harness", "nope", "--working-dir", str(profiles_root)]
+        with patch.object(spindle.sys, "argv", argv):
+            with pytest.raises(SystemExit) as exc:
+                spindle.main()
+        assert exc.value.code == 1
+        assert "Unknown harness or profile" in json.loads(capsys.readouterr().out)["error"]
+
+    def test_cli_spin_routes_a_profile_through_the_profile_path(self, profiles_root, capsys):
+        """Regression: a lodged profile name used to fall through to plain Claude Code."""
+        _make_profile(profiles_root, "alt", {"base_url": "https://alt.example/v1", "model": "alt-default"})
+        captured = {}
+
+        def fake_spin_sync(**kwargs):
+            captured.update(kwargs)
+            return "abc12345"
+
+        with patch.object(spindle, "_spin_sync", fake_spin_sync):
+            argv = ["spindle", "spin", "hello", "--harness", "alt", "--working-dir", str(profiles_root)]
+            with patch.object(spindle.sys, "argv", argv):
+                with pytest.raises(SystemExit) as exc:
+                    spindle.main()
+        assert exc.value.code == 0
+        assert captured["profile"] == "alt"
+        assert captured["model"] == "alt-default"
+        assert captured["spawn_env"]["ANTHROPIC_BASE_URL"] == "https://alt.example/v1"
+        assert json.loads(capsys.readouterr().out)["spool_id"] == "abc12345"
+
+
+class TestCliDoctorCommand:
+    def test_doctor_exit_code_and_json(self, monkeypatch, capsys):
+        report = {"ok": False, "version": spindle.__version__, "failed": ["service"], "checks": [], "endpoint": "x"}
+        monkeypatch.setattr(spindle, "_doctor_run", lambda **kwargs: report)
+        with patch.object(spindle.sys, "argv", ["spindle", "doctor", "--json"]):
+            with pytest.raises(SystemExit) as exc:
+                spindle.main()
+        assert exc.value.code == 1
+        assert json.loads(capsys.readouterr().out)["failed"] == ["service"]
+
+    def test_doctor_passes_flags_through(self, monkeypatch, capsys):
+        seen = {}
+
+        def fake_run(**kwargs):
+            seen.update(kwargs)
+            return {"ok": True, "version": spindle.__version__, "failed": [], "checks": [], "endpoint": "x"}
+
+        monkeypatch.setattr(spindle, "_doctor_run", fake_run)
+        argv = ["spindle", "doctor", "--smoke", "--harness", "codex,claude-code", "--port", "8042"]
+        with patch.object(spindle.sys, "argv", argv):
+            with pytest.raises(SystemExit) as exc:
+                spindle.main()
+        assert exc.value.code == 0
+        assert seen["smoke"] is True
+        assert seen["smoke_harnesses"] == ["codex", "claude-code"]
+        assert seen["port"] == 8042
+        capsys.readouterr()
+
+    def test_status_flags_a_foreign_service(self, monkeypatch, capsys):
+        """`spindle status` must not present another install's health as its own."""
+        payload = {"status": "healthy", "version": "9.9.9", "package": "/opt/other/spindle/__init__.py"}
+        monkeypatch.setattr(spindle, "_fetch_health", lambda host, port, timeout=2.0: (payload, None))
+        with patch.object(spindle.sys, "argv", ["spindle", "status"]):
+            with pytest.raises(SystemExit):
+                spindle.main()
+        captured = capsys.readouterr()
+        assert json.loads(captured.out)["version"] == "9.9.9"
+        assert "different install" in captured.err
+
+    def test_status_reports_not_running(self, monkeypatch, capsys):
+        monkeypatch.setattr(spindle, "_fetch_health", lambda host, port, timeout=2.0: (None, "refused"))
+        with patch.object(spindle.sys, "argv", ["spindle", "status"]):
+            with pytest.raises(SystemExit):
+                spindle.main()
+        assert "Not running" in capsys.readouterr().out
+
+
+class TestDoctorCliIdentity:
+    """ "Is the `spindle` on PATH the one I'm running?" - the two-installs question."""
+
+    def test_console_script_mismatch_warns(self, tmp_path, monkeypatch):
+        theirs = tmp_path / "theirs" / "spindle"
+        theirs.parent.mkdir()
+        theirs.write_text("#!/usr/bin/python3\n")
+        ours = tmp_path / "ours" / "spindle"
+        ours.parent.mkdir()
+        ours.write_text("#!/usr/bin/python3\n")
+        monkeypatch.setattr(spindle.shutil, "which", lambda cmd: str(theirs))
+        result = spindle._doctor_cli_check(argv0=str(ours))
+        assert result["status"] == "warn"
+        assert any("DIFFERENT install" in line for line in result["lines"])
+
+    def test_same_console_script_is_ok(self, tmp_path, monkeypatch):
+        script = tmp_path / "spindle"
+        script.write_text("#!/usr/bin/python3\n")
+        monkeypatch.setattr(spindle.shutil, "which", lambda cmd: str(script))
+        assert spindle._doctor_cli_check(argv0=str(script))["status"] == "ok"
+
+    def test_module_invocation_compares_interpreter_dirs(self, tmp_path, monkeypatch):
+        """A venv python resolves to its base interpreter, so compare bin dirs."""
+        script = tmp_path / "spindle"
+        script.write_text("#!/opt/other-venv/bin/python3\n")
+        monkeypatch.setattr(spindle.shutil, "which", lambda cmd: str(script))
+        result = spindle._doctor_cli_check(argv0=str(tmp_path / "spindle" / "__main__.py"))
+        assert result["status"] == "warn"
+
+        script.write_text(f"#!{Path(sys.executable).parent / 'python3'}\n")
+        assert spindle._doctor_cli_check(argv0="/some/pkg/__main__.py")["status"] == "ok"
+
+    def test_missing_console_script_warns(self, monkeypatch):
+        monkeypatch.setattr(spindle.shutil, "which", lambda cmd: None)
+        result = spindle._doctor_cli_check()
+        assert result["status"] == "warn"
+        assert result["data"]["console_script"] is None
+        assert result["data"]["version"] == spindle.__version__
+
+
+def test_cli_import_emits_no_third_party_deprecation_noise():
+    """Every CLI command used to print an authlib deprecation warning first.
+
+    Import spindle in a clean subprocess with warnings enabled and assert stderr
+    stays quiet: the filter has to be registered before fastmcp is imported, so a
+    reordering of the imports would silently bring the noise back.
+    """
+    proc = subprocess.run(
+        [sys.executable, "-W", "default", "-c", "import spindle"],
+        capture_output=True,
+        text=True,
+        cwd=str(Path(spindle.__file__).parent.parent),
+        timeout=120,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "authlib" not in proc.stderr
+
+
+class TestImportNoiseSuppression:
+    """authlib's import-time deprecation used to precede every command's output."""
+
+    def test_authlib_message_is_dropped(self, monkeypatch):
+        seen = []
+        monkeypatch.setattr(spindle, "_real_showwarning", lambda *args: seen.append(args))
+        spindle._showwarning_without_authlib_noise(
+            "authlib.jose module is deprecated, please use joserfc instead.",
+            DeprecationWarning,
+            "authlib/jose.py",
+            10,
+        )
+        assert seen == []
+
+    def test_other_warnings_still_surface(self, monkeypatch):
+        seen = []
+        monkeypatch.setattr(spindle, "_real_showwarning", lambda *args: seen.append(args))
+        spindle._showwarning_without_authlib_noise("something you should know", UserWarning, "x.py", 1)
+        assert len(seen) == 1
+
+    def test_warnings_machinery_is_handed_back(self):
+        """The shim must only be installed for the duration of the fastmcp import."""
+        import warnings as warnings_module
+
+        assert warnings_module.showwarning is not spindle._showwarning_without_authlib_noise
+
+
+class TestCodexProbeLogging:
+    """The blocked-write outcome is the probe PASSING; it must not look like a failure."""
+
+    def _proc(self, stdout, returncode=0):
+        proc = MagicMock()
+        proc.stdout = stdout
+        proc.returncode = returncode
+        return proc
+
+    def test_blocked_write_does_not_warn(self, caplog):
+        """A missing target means the sandbox held. Warning about it alarmed every first run."""
+        with patch("spindle.subprocess.run", return_value=self._proc(f"{spindle._CODEX_SANDBOX_PROBE_MARKER}\n")):
+            with caplog.at_level(logging.WARNING, logger="spindle"):
+                assert spindle._codex_sandbox_probe("/fake/codex") is True
+        assert caplog.records == []
+
+    def test_a_real_stat_error_still_warns(self, caplog):
+        """Anything other than "the file isn't there" still warns — and fails closed.
+
+        An unreadable probe target cannot prove the sandbox held, so the probe
+        must not report an enforcing sandbox (master's fail-closed semantics).
+        """
+
+        def boom(path):
+            raise PermissionError("denied")
+
+        with patch("spindle.subprocess.run", return_value=self._proc(f"{spindle._CODEX_SANDBOX_PROBE_MARKER}\n")):
+            with patch("spindle.os.stat", side_effect=boom):
+                with caplog.at_level(logging.WARNING, logger="spindle"):
+                    assert spindle._codex_sandbox_probe("/fake/codex") is False
+        assert any("could not stat target" in r.message for r in caplog.records)
+
+
+def test_harness_check_says_presence_is_not_authentication(monkeypatch):
+    """Installed-but-not-logged-in is the likeliest fresh-machine failure."""
+    monkeypatch.setattr(
+        spindle,
+        "_probe_command",
+        lambda cmd, timeout=5.0: (f"/bin/{cmd}", "1.0") if cmd != "kimi-cli" else (None, None),
+    )
+    monkeypatch.setattr(spindle, "_discover_profiles", lambda: {})
+    result = spindle._doctor_harness_check()
+    assert any("not the same as logged in" in line for line in result["lines"])
+    assert any("--smoke" in line for line in result["lines"])
+
+
+# --- 1.1.0 unit that install-service must still recognize as its own ---------
+_LEGACY_UNIT = """\
+[Unit]
+Description=Spindle MCP Server
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/home/u/.local/bin/spindle serve --http
+Restart=on-failure
+RestartSec=5
+Environment=PATH=%h/.local/bin:/usr/bin
+
+[Install]
+WantedBy=default.target
+"""
+
+# A unit a person wrote for the same service. Superficially similar, and must
+# never be overwritten - it carries settings spindle knows nothing about.
+_HAND_WRITTEN_UNIT = """\
+[Unit]
+Description=Spindle MCP Server (HTTP)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/u/projects/spindle
+ExecStart=/home/u/.pyenv/versions/3.12.0/bin/spindle serve --http --port 8002
+Restart=on-failure
+Environment=PATH=/home/u/.nvm/versions/node/v20.20.2/bin:/usr/bin
+EnvironmentFile=-/home/u/.spindle/env
+
+[Install]
+WantedBy=default.target
+"""
+
+_LEGACY_PLIST = """\
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.spindle.server</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/spindle</string>
+        <string>serve</string>
+        <string>--http</string>
+    </array>
+</dict>
+</plist>
+"""
+
+
+class TestUnmarkedServiceFilesAreBackedUpNotGuessedAt:
+    """Ownership of an unmarked file cannot be inferred, so it is never destroyed.
+
+    Fingerprinting the shape a previous spindle generated was tried and is wrong
+    in both directions: that shape is also what users copy out of examples/ and
+    then edit (so their customized unit reads as ours and gets clobbered), and a
+    1.1.0 user who edited the fingerprinted PATH line - the single most likely
+    edit - reads as foreign with no way forward. Backing the file up instead is
+    correct for every case without having to tell them apart.
+    """
+
+    def test_legacy_and_hand_written_are_both_unmarked(self, tmp_path):
+        for name, text in (("legacy", _LEGACY_UNIT), ("hand", _HAND_WRITTEN_UNIT), ("plist", _LEGACY_PLIST)):
+            path = tmp_path / f"{name}.service"
+            path.write_text(text)
+            assert spindle._service_file_is_marked(path) is False, name
+
+    def test_backup_preserves_the_original(self, tmp_path):
+        unit = tmp_path / "spindle.service"
+        unit.write_text(_HAND_WRITTEN_UNIT)
+        backup = spindle._backup_service_file(unit)
+        assert backup is not None
+        assert backup.read_text() == _HAND_WRITTEN_UNIT
+        assert backup.name.startswith("spindle.service.bak-")
+
+    def test_backups_do_not_overwrite_each_other(self, tmp_path):
+        unit = tmp_path / "spindle.service"
+        unit.write_text("first")
+        first = spindle._backup_service_file(unit)
+        unit.write_text("second")
+        second = spindle._backup_service_file(unit)
+        assert first != second
+        assert first.read_text() == "first"
+        assert second.read_text() == "second"
+
+    def test_current_unit_round_trips(self, tmp_path):
+        unit = tmp_path / "spindle.service"
+        unit.write_text(spindle._systemd_unit_text("/bin/spindle", 8002))
+        assert spindle._service_file_is_marked(unit) is True
+
+    def test_service_name_cannot_escape_the_unit_directory(self):
+        assert spindle._valid_service_name("spindle") is True
+        assert spindle._valid_service_name("spindle-release_2.1") is True
+        assert spindle._valid_service_name("../../evil") is False
+        assert spindle._valid_service_name("a/b") is False
+        assert spindle._valid_service_name("") is False
+        assert spindle._valid_service_name("-leading") is False
+
+
+class TestSystemdQuoting:
+    """systemd splits unquoted Environment= on whitespace and expands %."""
+
+    def test_path_with_a_space_survives(self):
+        unit = spindle._systemd_unit_text("/bin/spindle", 8002, path_env="/usr/bin")
+        path_line = [ln for ln in unit.splitlines() if ln.startswith("Environment=") and "PATH=" in ln][0]
+        assert path_line.startswith('Environment="PATH=')
+        assert path_line.endswith('"')
+
+    def test_percent_is_escaped_everywhere(self, tmp_path):
+        """An unescaped % makes systemd drop the whole assignment, not just the value."""
+        weird = tmp_path / "100%dir"
+        weird.mkdir()
+        unit = spindle._systemd_unit_text("/opt/100%bin/spindle", 8002, home="/srv/100%home", path_env=str(weird))
+        for line in unit.splitlines():
+            if line.startswith(("Environment=", "ExecStart=")):
+                # every literal % must be doubled
+                assert "%%" in line or "%" not in line, line
+
+    def test_home_with_a_space_is_quoted(self):
+        unit = spindle._systemd_unit_text("/bin/spindle", 8002, home="/mnt/c/Users/My Name/.spindle")
+        home_line = [ln for ln in unit.splitlines() if "SPINDLE_HOME" in ln][0]
+        assert home_line == 'Environment="SPINDLE_HOME=/mnt/c/Users/My Name/.spindle"'
+
+    def test_execstart_path_with_a_space_is_quoted(self):
+        unit = spindle._systemd_unit_text("/opt/my apps/bin/spindle", 8002)
+        exec_line = [ln for ln in unit.splitlines() if ln.startswith("ExecStart=")][0]
+        assert exec_line == 'ExecStart="/opt/my apps/bin/spindle" serve --http --port 8002'
+
+    def test_relative_path_entries_are_dropped(self, tmp_path, monkeypatch):
+        """They resolve for whoever ran install-service and for nobody else."""
+        real = tmp_path / "bin"
+        real.mkdir()
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "node_modules").mkdir()
+        resolved = spindle._service_path_env(os.pathsep.join(["./node_modules", str(real)]))
+        assert resolved.split(os.pathsep) == [str(real)]
+
+
+class TestLaunchdEscaping:
+    """A plist that does not parse is a service that silently never starts."""
+
+    def test_ampersand_in_a_path_still_parses(self):
+        import xml.etree.ElementTree as ET
+
+        plist = spindle._launchd_plist_text(
+            "com.spindle.server",
+            "/Users/A&B/bin/spindle",
+            8002,
+            home="/Users/A&B/.spindle",
+            path_env="/usr/bin",
+        )
+        ET.fromstring(plist)  # raises if malformed
+        assert "A&amp;B" in plist
+
+    def test_angle_brackets_are_escaped(self):
+        import xml.etree.ElementTree as ET
+
+        plist = spindle._launchd_plist_text("com.spindle.server", "/opt/<odd>/spindle", 8002, path_env="/usr/bin")
+        ET.fromstring(plist)
+
+
+class TestServiceStalePath:
+    """A unit's PATH is baked at install time and rots; the failure lands much later."""
+
+    def _detected(self, monkeypatch):
+        monkeypatch.setattr(
+            spindle,
+            "_probe_command",
+            lambda cmd, timeout=5.0: (f"/new/bin/{cmd}", "1.0") if cmd in ("claude", "codex") else (None, None),
+        )
+        monkeypatch.setattr(spindle, "_discover_profiles", lambda: {})
+
+    def test_harness_unreachable_from_the_service_warns(self, monkeypatch, tmp_path):
+        """Found from this shell, unfindable from the service that has to spawn it."""
+        self._detected(monkeypatch)
+        result = spindle._doctor_harness_check(service_path=str(tmp_path))
+        assert result["status"] == "warn"
+        assert set(result["data"]["unreachable_from_service"]) == {"claude-code", "codex"}
+        assert any("cannot find" in line for line in result["lines"])
+
+    def test_no_warning_when_the_service_can_see_them(self, monkeypatch, tmp_path):
+        self._detected(monkeypatch)
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        for cmd in ("claude", "codex"):
+            exe = bin_dir / cmd
+            exe.write_text("#!/bin/sh\n")
+            exe.chmod(0o755)
+        result = spindle._doctor_harness_check(service_path=str(bin_dir))
+        assert result["data"]["unreachable_from_service"] == []
+        assert result["status"] == "ok"
+
+    def test_no_service_means_no_path_claim(self, monkeypatch):
+        self._detected(monkeypatch)
+        result = spindle._doctor_harness_check(service_path=None)
+        assert result["data"]["unreachable_from_service"] == []
+
+    def test_health_reports_the_path_the_service_will_search(self):
+        payload = json.loads(asyncio.run(spindle.health_check(MagicMock())).body)
+        assert payload["path"] == os.environ.get("PATH", "")
+
+    def test_doctor_only_trusts_the_path_of_a_matching_install(self, monkeypatch):
+        """A foreign service's PATH says nothing about whether ours can spawn."""
+        seen = {}
+
+        def fake_harness_check(service_path=None, service_name=None, service_port=None):
+            seen["service_path"] = service_path
+            return spindle._doctor_result("harnesses", "ok", "harnesses")
+
+        monkeypatch.setattr(spindle, "_doctor_cli_check", lambda: spindle._doctor_result("cli", "ok", "cli"))
+        monkeypatch.setattr(spindle, "_doctor_storage_check", lambda: spindle._doctor_result("storage", "ok", "s"))
+        monkeypatch.setattr(spindle, "_doctor_shard_check", lambda: spindle._doctor_result("shards", "ok", "s"))
+        monkeypatch.setattr(spindle, "_doctor_harness_check", fake_harness_check)
+
+        foreign = spindle._doctor_result(
+            "service", "fail", "different install", health={"path": "/foreign/bin"}, same_install=False
+        )
+        monkeypatch.setattr(spindle, "_doctor_service_check", lambda host, port, timeout=2.0: foreign)
+        spindle._doctor_run()
+        assert seen["service_path"] is None
+
+        ours = spindle._doctor_result("service", "ok", "same install", health={"path": "/our/bin"}, same_install=True)
+        monkeypatch.setattr(spindle, "_doctor_service_check", lambda host, port, timeout=2.0: ours)
+        spindle._doctor_run()
+        assert seen["service_path"] == "/our/bin"
+
+
+class TestReloadStoreMismatch:
+    """`reload` drains this process's store; that can be the wrong one."""
+
+    def test_divergent_store_warns(self, monkeypatch, capsys):
+        monkeypatch.setattr(
+            spindle,
+            "_fetch_health",
+            lambda host, port, timeout=2.0: ({"spool_dir": "/elsewhere/spools"}, None),
+        )
+        warning = spindle._reload_warn_on_store_mismatch("127.0.0.1", 8042)
+        assert warning and "cannot see that service's" in warning
+        assert "/elsewhere/spools" in capsys.readouterr().err
+
+    def test_matching_store_is_silent(self, monkeypatch, capsys):
+        monkeypatch.setattr(
+            spindle,
+            "_fetch_health",
+            lambda host, port, timeout=2.0: ({"spool_dir": str(spindle.SPINDLE_DIR)}, None),
+        )
+        assert spindle._reload_warn_on_store_mismatch("127.0.0.1", 8042) is None
+        assert capsys.readouterr().err == ""
+
+    def test_no_service_is_silent(self, monkeypatch):
+        monkeypatch.setattr(spindle, "_fetch_health", lambda host, port, timeout=2.0: (None, "refused"))
+        assert spindle._reload_warn_on_store_mismatch("127.0.0.1", 8042) is None
+
+
+def test_launchd_log_is_named_for_the_service():
+    """Two installs must not interleave output in one ~/.spindle/spindle.log."""
+    plist = spindle._launchd_plist_text("com.spindle-release.server", "/bin/spindle", 8042, name="spindle-release")
+    assert "spindle-release.log" in plist
+
+
+class TestShippedExamplesMatchTheGenerator:
+    """The examples are a manual-install path, so they must not drift from the tool."""
+
+    def _examples(self):
+        root = Path(spindle.__file__).parent.parent / "examples"
+        if not root.exists():
+            pytest.skip("no examples/ (running against an installed wheel)")
+        return root
+
+    def test_example_unit_is_recognized_as_ours(self):
+        """Copied in unedited, it stays replaceable; the header says to drop the
+        marker if you customize it, which is what makes ownership knowable."""
+        unit = self._examples() / "spindle.service"
+        assert spindle._service_file_is_marked(unit) is True
+
+    def test_example_plist_is_recognized_as_ours(self):
+        plist = self._examples() / "com.spindle.server.plist"
+        assert spindle._service_file_is_marked(plist) is True
+
+    def test_example_unit_quotes_its_environment_values(self):
+        """The example is copied verbatim; an unquoted PATH would truncate at a space."""
+        text = (self._examples() / "spindle.service").read_text()
+        for line in text.splitlines():
+            if line.startswith("Environment=") and ("PATH=" in line or "SPINDLE_HOME=" in line):
+                assert line.startswith(('Environment="', "#")), line
+
+    def test_example_unit_carries_what_the_generator_emits(self):
+        text = (self._examples() / "spindle.service").read_text()
+        assert spindle.SERVICE_MARKER in text
+        assert "serve --http --port" in text  # not the portless 1.1.0 ExecStart
+        assert "Environment=SPINDLE_PORT=" in text
+        assert "SPINDLE_HOME" in text
+
+    def test_example_plist_carries_what_the_generator_emits(self):
+        text = (self._examples() / "com.spindle.server.plist").read_text()
+        assert spindle.SERVICE_MARKER in text
+        assert "<key>SPINDLE_PORT</key>" in text
+        assert "<key>PATH</key>" in text
+
+    def test_example_plist_is_valid_xml(self):
+        import xml.etree.ElementTree as ET
+
+        ET.parse(self._examples() / "com.spindle.server.plist")
+
+
+class TestStalePathSurvivesADivergentStore:
+    """The two-install recipe in the README is exactly where this used to switch itself off."""
+
+    def _service(self, monkeypatch, spool_dir):
+        payload = {
+            "status": "healthy",
+            "uptime_seconds": 5,
+            "running_spools": 0,
+            "max_concurrent": 15,
+            "version": spindle.__version__,
+            "package": str(Path(spindle.__file__).resolve()),
+            "spool_dir": spool_dir,
+            "path": "/nonexistent/bin",
+        }
+        monkeypatch.setattr(spindle, "_fetch_health", lambda host, port, timeout=2.0: (payload, None))
+        return spindle._doctor_service_check("127.0.0.1", 8042)
+
+    def test_divergent_store_warns_but_identity_still_holds(self, monkeypatch):
+        result = self._service(monkeypatch, "/elsewhere/spools")
+        assert result["status"] == "warn"
+        assert result["data"]["same_install"] is True
+
+    def test_matching_store_is_ok_and_identified(self, monkeypatch):
+        result = self._service(monkeypatch, str(spindle.SPINDLE_DIR))
+        assert result["status"] == "ok"
+        assert result["data"]["same_install"] is True
+
+    def test_stale_path_is_still_reported_when_the_store_differs(self, monkeypatch):
+        """`doctor --port 8042` without that service's SPINDLE_HOME is the documented flow."""
+        self._service(monkeypatch, "/elsewhere/spools")
+        monkeypatch.setattr(
+            spindle,
+            "_probe_command",
+            lambda cmd, timeout=5.0: (f"/real/bin/{cmd}", "1.0") if cmd == "claude" else (None, None),
+        )
+        monkeypatch.setattr(spindle, "_discover_profiles", lambda: {})
+        monkeypatch.setattr(spindle, "_doctor_cli_check", lambda: spindle._doctor_result("cli", "ok", "cli"))
+        monkeypatch.setattr(spindle, "_doctor_storage_check", lambda: spindle._doctor_result("storage", "ok", "s"))
+        monkeypatch.setattr(spindle, "_doctor_shard_check", lambda: spindle._doctor_result("shards", "ok", "s"))
+        report = spindle._doctor_run(port=8042)
+        harnesses = [c for c in report["checks"] if c["name"] == "harnesses"][0]
+        assert harnesses["data"]["unreachable_from_service"] == ["claude-code"]
+
+    def test_remedy_names_the_service_it_is_about(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(
+            spindle,
+            "_probe_command",
+            lambda cmd, timeout=5.0: (f"/real/bin/{cmd}", "1.0") if cmd == "claude" else (None, None),
+        )
+        monkeypatch.setattr(spindle, "_discover_profiles", lambda: {})
+        result = spindle._doctor_harness_check(service_path=str(tmp_path), service_name="spindle-b")
+        remedy = [line for line in result["lines"] if "install-service" in line][0]
+        assert "--name spindle-b" in remedy
+        assert "reload --name spindle-b" in remedy
+
+
+class TestReloadFindsTheRightPort:
+    """`reload --name X` used to probe the default port, i.e. a different service."""
+
+    def _unit(self, tmp_path, monkeypatch, text):
+        unit_dir = tmp_path / ".config" / "systemd" / "user"
+        unit_dir.mkdir(parents=True)
+        (unit_dir / "spindle-b.service").write_text(text)
+        monkeypatch.setattr(spindle.Path, "home", staticmethod(lambda: tmp_path))
+        # Not the developer's: _systemd_user_dir prefers XDG_CONFIG_HOME, so an
+        # ambient one would send this lookup outside tmp_path.
+        monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+
+    def test_port_read_from_a_quoted_environment_line(self, tmp_path, monkeypatch):
+        self._unit(tmp_path, monkeypatch, spindle._systemd_unit_text("/bin/spindle", 8042, name="spindle-b"))
+        assert spindle._port_from_unit("spindle-b") == 8042
+
+    def test_port_read_from_execstart_when_env_is_absent(self, tmp_path, monkeypatch):
+        self._unit(tmp_path, monkeypatch, "[Service]\nExecStart=/bin/spindle serve --http --port 8055\n")
+        assert spindle._port_from_unit("spindle-b") == 8055
+
+    def test_missing_unit_is_none(self, tmp_path, monkeypatch):
+        self._unit(tmp_path, monkeypatch, "[Service]\n")
+        assert spindle._port_from_unit("nope") is None
+
+
+class TestSmokeHarnessSelection:
+    def test_unknown_harness_fails_rather_than_skipping(self, monkeypatch):
+        """`--harness codxe` used to exit 0 having smoked nothing."""
+        monkeypatch.setattr(spindle, "_discover_profiles", lambda: {})
+        result = spindle._doctor_smoke_check("codxe")
+        assert result["status"] == "fail"
+        assert "unknown harness" in result["detail"]
+
+    def test_harness_names_are_case_insensitive(self, monkeypatch):
+        seeded = {"id": "smokeX", "status": "complete", "result": spindle.DOCTOR_SMOKE_TOKEN, "prompt": "x"}
+        spindle._write_spool("smokeX", seeded)
+        monkeypatch.setattr(spindle, "_check_and_finalize_spool", lambda spool_id: True)
+        monkeypatch.setattr(spindle, "_doctor_smoke_spin", lambda *a, **k: "smokeX")
+        assert spindle._doctor_smoke_check("CODEX", timeout=5)["status"] == "ok"
+
+    def test_known_harness_without_a_readonly_tier_still_skips(self, monkeypatch):
+        monkeypatch.setattr(spindle, "_discover_profiles", lambda: {})
+        assert spindle._doctor_smoke_check("kimi")["status"] == "skip"
+
+    def test_a_full_queue_is_a_skip_not_a_failure(self, monkeypatch):
+        monkeypatch.setattr(
+            spindle, "_doctor_smoke_spin", lambda *a, **k: "Error: Max 15 concurrent spools reached, try later"
+        )
+        assert spindle._doctor_smoke_check("codex")["status"] == "skip"
+
+    def test_zero_timeout_does_not_spawn_and_abandon(self, monkeypatch):
+        """timeout=0 means 'no timeout' to spin, while the poll loop exits at once."""
+        spindle._write_spool("smokeY", {"id": "smokeY", "status": "complete", "result": spindle.DOCTOR_SMOKE_TOKEN})
+        seen = {}
+
+        def fake_spin(harness, working_dir, model, timeout):
+            seen["timeout"] = timeout
+            return "smokeY"
+
+        monkeypatch.setattr(spindle, "_check_and_finalize_spool", lambda spool_id: True)
+        monkeypatch.setattr(spindle, "_doctor_smoke_spin", fake_spin)
+        result = spindle._doctor_smoke_check("codex", timeout=0)
+        assert seen["timeout"] >= 1
+        assert result["status"] == "ok"
+
+    def test_a_hung_smoke_keeps_its_working_dir(self, monkeypatch):
+        """rmtree under a process that may still be alive is worse than leaving it."""
+        spindle._write_spool("smokeZ", {"id": "smokeZ", "status": "running", "result": ""})
+        monkeypatch.setattr(spindle, "_check_and_finalize_spool", lambda spool_id: True)
+        monkeypatch.setattr(spindle, "_doctor_smoke_spin", lambda *a, **k: "smokeZ")
+        monkeypatch.setattr(spindle, "_spin_drop_sync", lambda spool_id: "dropped")
+        monkeypatch.setattr(spindle.time, "sleep", lambda seconds: None)
+        result = spindle._doctor_smoke_check("codex", timeout=1)
+        assert result["status"] == "fail"
+        assert "kill signal" in result["detail"]
+        import shutil as _shutil
+
+        kept = [line for line in result["lines"] if "working dir" in line][0]
+        working_dir = kept.split(": ", 1)[1]
+        assert Path(working_dir).exists()
+        _shutil.rmtree(working_dir, ignore_errors=True)
+
+
+class TestScriptInterpreterParsing:
+    def test_env_shebang_resolves_the_interpreter_through_path(self, tmp_path):
+        """A bare name compares as a path with parent ".", which matches nothing."""
+        script = tmp_path / "spindle"
+        script.write_text("#!/usr/bin/env python3\n")
+        resolved = spindle._script_interpreter(str(script))
+        assert resolved == (shutil.which("python3") or "python3")
+        assert Path(resolved).is_absolute()
+
+    def test_env_shebang_skips_options_and_assignments(self, tmp_path):
+        script = tmp_path / "spindle"
+        script.write_text("#!/usr/bin/env -u PYTHONPATH FOO=bar python3\n")
+        assert spindle._script_interpreter(str(script)) == (shutil.which("python3") or "python3")
+
+    def test_plain_shebang(self, tmp_path):
+        script = tmp_path / "spindle"
+        script.write_text("#!/opt/venv/bin/python\n")
+        assert spindle._script_interpreter(str(script)) == "/opt/venv/bin/python"
+
+    def test_no_shebang(self, tmp_path):
+        script = tmp_path / "spindle"
+        script.write_text("not a script\n")
+        assert spindle._script_interpreter(str(script)) is None
+
+
+class TestRegeneratingAUnitDoesNotLoseSettings:
+    """--force rebuilds a unit from argv; what it doesn't know, it must not drop."""
+
+    @pytest.fixture
+    def unit_dir(self, tmp_path, monkeypatch):
+        d = tmp_path / ".config" / "systemd" / "user"
+        d.mkdir(parents=True)
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
+        return d
+
+    def test_spool_store_is_read_back_out_of_the_unit(self, unit_dir):
+        """The store is the setting whose silent loss merges two installs' spools."""
+        unit_dir.joinpath("svc.service").write_text(
+            spindle._systemd_unit_text("/bin/spindle", 8065, home="/srv/store", name="svc")
+        )
+        assert spindle._env_from_unit("svc", "SPINDLE_HOME") == "/srv/store"
+
+    def test_store_with_a_space_round_trips(self, unit_dir):
+        home = "/mnt/c/Users/My Name/.spindle"
+        unit_dir.joinpath("svc.service").write_text(
+            spindle._systemd_unit_text("/bin/spindle", 8065, home=home, name="svc")
+        )
+        assert spindle._env_from_unit("svc", "SPINDLE_HOME") == home
+
+    def test_store_with_a_percent_round_trips(self, unit_dir):
+        home = "/srv/100%store"
+        unit_dir.joinpath("svc.service").write_text(
+            spindle._systemd_unit_text("/bin/spindle", 8065, home=home, name="svc")
+        )
+        assert spindle._env_from_unit("svc", "SPINDLE_HOME") == home
+
+    def test_absent_store_reads_as_none(self, unit_dir):
+        unit_dir.joinpath("svc.service").write_text(spindle._systemd_unit_text("/bin/spindle", 8065, name="svc"))
+        assert spindle._env_from_unit("svc", "SPINDLE_HOME") is None
+
+    def test_execstart_port_wins_over_a_stale_environment_line(self, unit_dir):
+        """Whichever the service actually binds is the truthful one."""
+        unit_dir.joinpath("svc.service").write_text(
+            '[Service]\nEnvironment="SPINDLE_PORT=8002"\nExecStart=/bin/spindle serve --http --port 9000\n'
+        )
+        assert spindle._port_from_unit("svc") == 9000
+
+    def test_unit_records_its_own_service_name(self, unit_dir):
+        unit_dir.joinpath("svc.service").write_text(
+            spindle._systemd_unit_text("/bin/spindle", 8065, name="spindle-release")
+        )
+        assert spindle._env_from_unit("svc", "SPINDLE_SERVICE_NAME") == "spindle-release"
+
+
+class TestSystemdBackslashQuoting:
+    """A value ending in a backslash escapes the closing quote and unterminates it."""
+
+    def test_trailing_backslash_is_doubled(self):
+        unit = spindle._systemd_unit_text("/bin/spindle", 8002, home="/srv/tail\\")
+        home_line = [ln for ln in unit.splitlines() if "SPINDLE_HOME" in ln][0]
+        assert home_line == 'Environment="SPINDLE_HOME=/srv/tail\\\\"'
+        # the closing quote is a real terminator, not an escaped one
+        assert home_line.count('"') == 2
+
+    def test_backslash_is_escaped_before_the_quote_it_inserts(self):
+        """Wrong order double-escapes the backslash this function adds itself."""
+        assert spindle._systemd_quote('a"b') == '"a\\"b"'
+        assert spindle._systemd_quote("a\\b") == '"a\\\\b"'
+        assert spindle._systemd_quote('a\\"b') == '"a\\\\\\"b"'
+
+    def test_percent_still_doubled(self):
+        assert spindle._systemd_quote("100%") == '"100%%"'
+
+
+class TestOwnServiceName:
+    def test_reads_the_name_baked_into_the_unit(self, monkeypatch):
+        monkeypatch.setenv("SPINDLE_SERVICE_NAME", "spindle-release")
+        assert spindle._own_service_name() == "spindle-release"
+
+    def test_defaults_when_unset(self, monkeypatch):
+        monkeypatch.delenv("SPINDLE_SERVICE_NAME", raising=False)
+        assert spindle._own_service_name() == "spindle"
+
+    def test_rejects_a_name_that_is_not_a_valid_unit(self, monkeypatch):
+        monkeypatch.setenv("SPINDLE_SERVICE_NAME", "../../evil")
+        assert spindle._own_service_name() == "spindle"
+
+
+class TestSystemdUserDirHonorsXdg:
+    def test_xdg_config_home_is_used(self, tmp_path, monkeypatch):
+        """A unit written where systemd does not look never starts."""
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+        assert spindle._systemd_user_dir() == tmp_path / "cfg" / "systemd" / "user"
+
+    def test_falls_back_to_home_config(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+        monkeypatch.setattr(spindle.Path, "home", staticmethod(lambda: tmp_path))
+        assert spindle._systemd_user_dir() == tmp_path / ".config" / "systemd" / "user"
+
+
+class TestEmptyServicePathIsStillChecked:
+    def test_empty_path_reports_every_harness_unreachable(self, monkeypatch):
+        """An empty PATH resolves nothing; truthiness skipped exactly that case."""
+        monkeypatch.setattr(
+            spindle,
+            "_probe_command",
+            lambda cmd, timeout=5.0: (f"/bin/{cmd}", "1.0") if cmd == "claude" else (None, None),
+        )
+        monkeypatch.setattr(spindle, "_discover_profiles", lambda: {})
+        result = spindle._doctor_harness_check(service_path="")
+        assert result["data"]["unreachable_from_service"] == ["claude-code"]
+
+    def test_no_service_still_means_no_claim(self, monkeypatch):
+        monkeypatch.setattr(spindle, "_probe_command", lambda cmd, timeout=5.0: (f"/bin/{cmd}", "1.0"))
+        monkeypatch.setattr(spindle, "_discover_profiles", lambda: {})
+        assert spindle._doctor_harness_check(service_path=None)["data"]["unreachable_from_service"] == []
+
+    def test_remedy_names_the_port_that_was_probed(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(
+            spindle,
+            "_probe_command",
+            lambda cmd, timeout=5.0: (f"/bin/{cmd}", "1.0") if cmd == "claude" else (None, None),
+        )
+        monkeypatch.setattr(spindle, "_discover_profiles", lambda: {})
+        result = spindle._doctor_harness_check(service_path=str(tmp_path), service_name="svc", service_port=8042)
+        remedy = [line for line in result["lines"] if "install-service" in line][0]
+        assert "--port 8042" in remedy
+        assert "<its port>" not in remedy
+
+
+class TestReloadRefusesRatherThanDrainingTheWrongStore:
+    def test_mismatch_returns_the_warning_for_the_caller_to_act_on(self, monkeypatch, capsys):
+        monkeypatch.setattr(
+            spindle, "_fetch_health", lambda host, port, timeout=2.0: ({"spool_dir": "/elsewhere/spools"}, None)
+        )
+        assert spindle._reload_warn_on_store_mismatch("127.0.0.1", 8042) is not None
+        capsys.readouterr()
+
+    def test_no_mismatch_returns_none(self, monkeypatch):
+        monkeypatch.setattr(
+            spindle, "_fetch_health", lambda host, port, timeout=2.0: ({"spool_dir": str(spindle.SPINDLE_DIR)}, None)
+        )
+        assert spindle._reload_warn_on_store_mismatch("127.0.0.1", 8042) is None
+
+
+class TestSmokeTimeoutIsRejectedNotClamped:
+    def test_zero_is_rejected(self):
+        import argparse
+
+        with pytest.raises(argparse.ArgumentTypeError):
+            spindle._positive_seconds("0")
+
+    def test_negative_is_rejected(self):
+        import argparse
+
+        with pytest.raises(argparse.ArgumentTypeError):
+            spindle._positive_seconds("-5")
+
+    def test_non_numeric_is_rejected(self):
+        import argparse
+
+        with pytest.raises(argparse.ArgumentTypeError):
+            spindle._positive_seconds("soon")
+
+    def test_positive_passes(self):
+        assert spindle._positive_seconds("240") == 240
+
+
+class TestInstallServiceEndToEnd:
+    """Drive `install-service` through main(), on both platforms.
+
+    The resolver could be perfectly correct and simply not wired into a branch —
+    which is exactly the defect this replaced, and it passed every test because
+    the tests called the resolver directly. These call the command.
+    """
+
+    @pytest.fixture
+    def home(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(spindle.Path, "home", staticmethod(lambda: tmp_path))
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
+        monkeypatch.delenv("SPINDLE_HOME", raising=False)
+        (tmp_path / "bin").mkdir()
+        (tmp_path / "bin" / "spindle").write_text("#!/bin/sh\n")
+        return tmp_path
+
+    def _run(self, argv, monkeypatch, system="Linux", env=None):
+        """Run install-service with the OS and every subprocess call stubbed."""
+        import platform as platform_mod
+
+        monkeypatch.setattr(platform_mod, "system", lambda: system)
+        monkeypatch.setattr(spindle.subprocess, "run", lambda *a, **k: MagicMock(returncode=0, stdout="", stderr=""))
+        for key, value in (env or {}).items():
+            monkeypatch.setenv(key, value)
+        with patch.object(spindle.sys, "argv", ["spindle", "install-service", *argv]):
+            with pytest.raises(SystemExit) as exc:
+                spindle.main()
+        return exc.value.code
+
+    def _unit(self, home):
+        return home / ".config" / "systemd" / "user" / "svc.service"
+
+    def _plist(self, home):
+        return home / "Library" / "LaunchAgents" / "com.svc.server.plist"
+
+    # --- systemd -------------------------------------------------------------
+
+    def test_reinstall_without_arguments_keeps_port_and_store(self, home, monkeypatch, capsys):
+        assert self._run(["--name", "svc", "--port", "8075", "--home", "/srv/store"], monkeypatch) == 0
+        capsys.readouterr()
+        assert self._run(["--name", "svc", "--force"], monkeypatch) == 0
+        settings = spindle._service_settings_from_file(self._unit(home))
+        assert (settings["port"], settings["home"]) == (8075, "/srv/store")
+        assert "Keeping the port" in capsys.readouterr().out
+
+    def test_ambient_spindle_home_does_not_move_an_existing_service(self, home, monkeypatch, capsys):
+        """Installed on the default store; a later shell exporting one must not move it."""
+        assert self._run(["--name", "svc", "--port", "8075"], monkeypatch) == 0
+        capsys.readouterr()
+        assert self._run(["--name", "svc", "--force"], monkeypatch, env={"SPINDLE_HOME": "/srv/other"}) == 0
+        assert spindle._service_settings_from_file(self._unit(home))["home"] is None
+        assert "SPINDLE_HOME" not in self._unit(home).read_text()
+
+    def test_ambient_spindle_home_still_applies_on_a_first_install(self, home, monkeypatch):
+        assert self._run(["--name", "svc", "--port", "8075"], monkeypatch, env={"SPINDLE_HOME": "/srv/env"}) == 0
+        assert spindle._service_settings_from_file(self._unit(home))["home"] == "/srv/env"
+
+    def test_explicit_arguments_still_win_on_reinstall(self, home, monkeypatch):
+        assert self._run(["--name", "svc", "--port", "8075", "--home", "/srv/store"], monkeypatch) == 0
+        assert self._run(["--name", "svc", "--port", "9001", "--home", "/srv/new", "--force"], monkeypatch) == 0
+        settings = spindle._service_settings_from_file(self._unit(home))
+        assert (settings["port"], settings["home"]) == (9001, "/srv/new")
+
+    def test_reinstall_backs_the_previous_unit_up(self, home, monkeypatch):
+        assert self._run(["--name", "svc", "--port", "8075"], monkeypatch) == 0
+        assert self._run(["--name", "svc", "--force"], monkeypatch) == 0
+        backups = list(self._unit(home).parent.glob("svc.service.bak-*"))
+        assert len(backups) == 1
+        assert "8075" in backups[0].read_text()
+
+    def test_existing_unit_without_force_is_refused(self, home, monkeypatch):
+        assert self._run(["--name", "svc", "--port", "8075"], monkeypatch) == 0
+        assert self._run(["--name", "svc"], monkeypatch) == 1
+
+    # --- launchd -------------------------------------------------------------
+
+    def test_darwin_reinstall_without_arguments_keeps_port_and_store(self, home, monkeypatch, capsys):
+        assert self._run(["--name", "svc", "--port", "8075", "--home", "/srv/store"], monkeypatch, "Darwin") == 0
+        capsys.readouterr()
+        assert self._run(["--name", "svc", "--force"], monkeypatch, "Darwin") == 0
+        settings = spindle._service_settings_from_file(self._plist(home))
+        assert (settings["port"], settings["home"]) == (8075, "/srv/store")
+        assert "Keeping the port" in capsys.readouterr().out
+
+    def test_darwin_reinstall_backs_up_a_marked_plist(self, home, monkeypatch):
+        """macOS backed up only unmarked files, so its own agents were replaced blind."""
+        assert self._run(["--name", "svc", "--port", "8075"], monkeypatch, "Darwin") == 0
+        assert self._run(["--name", "svc", "--force"], monkeypatch, "Darwin") == 0
+        backups = list(self._plist(home).parent.glob("com.svc.server.plist.bak-*"))
+        assert len(backups) == 1
+        assert "8075" in backups[0].read_text()
+
+    def test_darwin_ambient_home_does_not_move_an_existing_agent(self, home, monkeypatch):
+        assert self._run(["--name", "svc", "--port", "8075"], monkeypatch, "Darwin") == 0
+        assert self._run(["--name", "svc", "--force"], monkeypatch, "Darwin", env={"SPINDLE_HOME": "/srv/other"}) == 0
+        assert spindle._service_settings_from_file(self._plist(home))["home"] is None
+
+    def test_darwin_plist_stays_valid_xml_through_a_reinstall(self, home, monkeypatch):
+        import xml.etree.ElementTree as ET
+
+        assert self._run(["--name", "svc", "--port", "8075", "--home", "/srv/A&B"], monkeypatch, "Darwin") == 0
+        assert self._run(["--name", "svc", "--force"], monkeypatch, "Darwin") == 0
+        ET.parse(self._plist(home))
+        assert spindle._service_settings_from_file(self._plist(home))["home"] == "/srv/A&B"
+
+
+class TestServiceFileScanRobustness:
+    """A wrong read gets written back into the service; a missing read is safe."""
+
+    def test_execstartpre_cannot_supply_the_port(self, tmp_path):
+        unit = tmp_path / "svc.service"
+        unit.write_text(
+            "[Service]\n"
+            "ExecStartPre=/bin/echo serve --http --port 9999\n"
+            "ExecStart=/bin/spindle serve --http --port 8075\n"
+        )
+        assert spindle._service_settings_from_file(unit)["port"] == 8075
+
+    def test_a_nested_dict_cannot_override_the_real_environment(self, tmp_path):
+        plist = tmp_path / "com.svc.server.plist"
+        plist.write_text(
+            '<?xml version="1.0"?>\n<plist version="1.0"><dict>\n'
+            "<key>EnvironmentVariables</key><dict>"
+            "<key>SPINDLE_HOME</key><string>/real/store</string></dict>\n"
+            "<key>SomethingElse</key><dict>"
+            "<key>SPINDLE_HOME</key><string>/decoy</string></dict>\n"
+            "</dict></plist>\n"
+        )
+        assert spindle._service_settings_from_file(plist)["home"] == "/real/store"
+
+    def test_an_unrelated_array_cannot_supply_the_port(self, tmp_path):
+        plist = tmp_path / "com.svc.server.plist"
+        plist.write_text(
+            '<?xml version="1.0"?>\n<plist version="1.0"><dict>\n'
+            "<key>ProgramArguments</key><array>"
+            "<string>/bin/spindle</string><string>--port</string><string>8075</string></array>\n"
+            "<key>WatchPaths</key><array><string>--port</string><string>9999</string></array>\n"
+            "</dict></plist>\n"
+        )
+        assert spindle._service_settings_from_file(plist)["port"] == 8075
+
+
+class TestUnitEnvironmentReading:
+    """systemd's own Environment= syntax, not the subset spindle happens to emit."""
+
+    def test_several_assignments_on_one_line(self):
+        """A regex to end-of-line reads the store as '/srv/store" "FOO=bar'."""
+        text = 'Environment="SPINDLE_HOME=/srv/store" "FOO=bar"\n'
+        assert spindle._env_from_unit_text(text, "SPINDLE_HOME") == "/srv/store"
+        assert spindle._env_from_unit_text(text, "FOO") == "bar"
+
+    def test_store_not_first_on_the_line_is_still_found(self):
+        text = 'Environment="PATH=/usr/bin" "SPINDLE_HOME=/srv/store"\n'
+        assert spindle._env_from_unit_text(text, "SPINDLE_HOME") == "/srv/store"
+
+    def test_a_later_assignment_wins(self):
+        """systemd runs with the second value, so regenerating from the first moves it."""
+        text = "Environment=SPINDLE_HOME=/old\nEnvironment=SPINDLE_HOME=/actual\n"
+        assert spindle._env_from_unit_text(text, "SPINDLE_HOME") == "/actual"
+
+    def test_unquoted_and_quoted_forms_agree(self):
+        assert spindle._env_from_unit_text("Environment=SPINDLE_PORT=8075\n", "SPINDLE_PORT") == "8075"
+        assert spindle._env_from_unit_text('Environment="SPINDLE_PORT=8075"\n', "SPINDLE_PORT") == "8075"
+
+    def test_escapes_round_trip(self):
+        for value in ("/srv/a b", "/srv/100%dir", '/srv/quote"d', "/srv/back\\slash", "/srv/tail\\"):
+            unit = spindle._systemd_unit_text("/bin/spindle", 8002, home=value)
+            assert spindle._env_from_unit_text(unit, "SPINDLE_HOME") == value, value
+
+    def test_absent_variable_is_none(self):
+        assert spindle._env_from_unit_text("Environment=FOO=bar\n", "SPINDLE_HOME") is None
+
+    def test_execstart_continuation_via_file(self, tmp_path):
+        unit = tmp_path / "svc.service"
+        unit.write_text("[Service]\nExecStart=/bin/spindle \\\n    serve --http --port 8075\n")
+        assert spindle._service_settings_from_file(unit)["port"] == 8075
+
+
+class TestDarwinFailureLadder:
+    """Every rung past the unload must put the old agent back."""
+
+    @pytest.fixture
+    def home(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(spindle.Path, "home", staticmethod(lambda: tmp_path))
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
+        monkeypatch.delenv("SPINDLE_HOME", raising=False)
+        monkeypatch.delenv("SPINDLE_PORT", raising=False)
+        (tmp_path / "bin").mkdir()
+        (tmp_path / "bin" / "spindle").write_text("#!/bin/sh\n")
+        return tmp_path
+
+    def _plist(self, home):
+        return home / "Library" / "LaunchAgents" / "com.svc.server.plist"
+
+    def _install(self, monkeypatch, argv, runner=None):
+        import platform as platform_mod
+
+        monkeypatch.setattr(platform_mod, "system", lambda: "Darwin")
+        monkeypatch.setattr(
+            spindle.subprocess, "run", runner or (lambda *a, **k: MagicMock(returncode=0, stdout="", stderr=""))
+        )
+        with patch.object(spindle.sys, "argv", ["spindle", "install-service", *argv]):
+            with pytest.raises(SystemExit) as exc:
+                spindle.main()
+        return exc.value.code
+
+    def test_a_rejected_plist_restores_and_reloads_the_previous_agent(self, home, monkeypatch, capsys):
+        assert self._install(monkeypatch, ["--name", "svc", "--port", "8075"]) == 0
+        original = self._plist(home).read_text()
+        capsys.readouterr()
+
+        calls = []
+
+        def runner(cmd, *a, **k):
+            calls.append(cmd)
+            # the load of the NEW plist fails; the restore's load succeeds
+            if cmd[:2] == ["launchctl", "load"] and len([c for c in calls if c[:2] == ["launchctl", "load"]]) == 1:
+                return MagicMock(returncode=1, stdout="", stderr="Load failed")
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        assert self._install(monkeypatch, ["--name", "svc", "--port", "9001", "--force"], runner) == 1
+        assert self._plist(home).read_text() == original
+        out = capsys.readouterr().out
+        assert "Restored the previous plist" in out and "reloaded it" in out
+
+    def test_a_failed_write_restores_the_previous_agent(self, home, monkeypatch, capsys):
+        assert self._install(monkeypatch, ["--name", "svc", "--port", "8075"]) == 0
+        original = self._plist(home).read_text()
+        capsys.readouterr()
+
+        real_write = spindle.Path.write_text
+
+        def boom(self, *a, **k):
+            if self.name.endswith(".plist") and "bak-" not in self.name:
+                raise OSError("No space left on device")
+            return real_write(self, *a, **k)
+
+        monkeypatch.setattr(spindle.Path, "write_text", boom)
+        assert self._install(monkeypatch, ["--name", "svc", "--port", "9001", "--force"]) == 1
+        monkeypatch.undo()
+        assert self._plist(home).read_text() == original
+        assert "Could not write" in capsys.readouterr().out
+
+    def test_a_failed_unload_is_not_reported_as_no_agent_loaded(self, home, monkeypatch, capsys):
+        """If the unload failed the OLD agent is still running; saying otherwise is backwards."""
+        assert self._install(monkeypatch, ["--name", "svc", "--port", "8075"]) == 0
+        capsys.readouterr()
+
+        def runner(cmd, *a, **k):
+            if cmd[:2] in (["launchctl", "unload"], ["launchctl", "load"]):
+                return MagicMock(returncode=1, stdout="", stderr="already loaded")
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        assert self._install(monkeypatch, ["--name", "svc", "--port", "9001", "--force"], runner) == 1
+        out = capsys.readouterr().out
+        assert "it is still running" in out
+        assert "No agent is loaded" not in out
+
+    def test_a_backup_that_cannot_be_written_stops_before_the_unload(self, home, monkeypatch, capsys):
+        assert self._install(monkeypatch, ["--name", "svc", "--port", "8075"]) == 0
+        original = self._plist(home).read_text()
+        capsys.readouterr()
+
+        monkeypatch.setattr(spindle, "_backup_service_file", lambda path: None)
+        calls = []
+
+        def runner(cmd, *a, **k):
+            calls.append(cmd)
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        assert self._install(monkeypatch, ["--name", "svc", "--force"], runner) == 1
+        assert self._plist(home).read_text() == original
+        assert not any(c[:2] == ["launchctl", "unload"] for c in calls)
+
+
+class TestSystemdEnvironmentSyntax:
+    """Every expectation here was read off systemd itself, not off the man page.
+
+    The values were produced by installing a unit carrying each line, starting
+    it, and having it `printenv` the variable into a file — so these assert what
+    systemd on a real machine does, which is the standard a reader of somebody
+    else's unit file has to meet. Three hand-rolled readers in a row got this
+    wrong in a way that silently rewrites a running service's spool store.
+    """
+
+    # (Environment= line(s), what systemd resolves V to)
+    CASES = [
+        ("Environment=V=/srv/plain", "/srv/plain"),
+        ('Environment="V=/srv/with space"', "/srv/with space"),
+        ("Environment='V=/srv/single quote'", "/srv/single quote"),
+        ('Environment = "V=/srv/spaced-eq"', "/srv/spaced-eq"),
+        ("Environment=V=a\\sb", "a b"),
+        ("Environment=V=a\\\\b", "a\\b"),
+        ("Environment=V=100%%pct", "100%pct"),
+        ('Environment="A=/x" "V=/srv/second-on-line"', "/srv/second-on-line"),
+        ("Environment=V=first\nEnvironment=V=second", "second"),
+        ("Environment=V=first\nEnvironment=\nEnvironment=V=after-reset", "after-reset"),
+        ("Environment=V=", ""),
+        ("Environment=V=a=b", "a=b"),
+        ("Environment=V=tail\\\\", "tail\\"),
+        ("Environment=V=/srv/a\\tb", "/srv/a\tb"),
+        ('Environment="V=quote\\"inside"', 'quote"inside'),
+        ("Environment=V=%%h", "%h"),
+        ("Environment=V=x \\\n    W=y", "x"),
+    ]
+
+    @pytest.mark.parametrize("line,expected", CASES)
+    def test_matches_systemd(self, line, expected):
+        assert spindle._env_from_unit_text(line + "\n", "V") == expected
+
+    def test_an_unterminated_quote_drops_that_word_and_the_rest(self):
+        """systemd keeps what parsed before the bad word; only the tail is lost."""
+        assert spindle._env_from_unit_text('Environment="V=/srv/open\n', "V") is None
+        assert spindle._parse_systemd_env_line('"V=/srv/open') == []
+        # an assignment before the break survives, as it does in systemd
+        assert spindle._env_from_unit_text('Environment=V=/srv/kept "X=/srv/open\n', "V") == "/srv/kept"
+
+    def test_a_bare_environment_line_resets_everything_before_it(self):
+        assert spindle._env_from_unit_text("Environment=V=gone\nEnvironment=\n", "V") is None
+
+    def test_continuation_does_not_swallow_the_next_directive(self):
+        """`\\s*` after the newline ate blank lines and then the following line."""
+        text = 'ExecStart=/bin/spindle \\\n    serve --http --port 8075\n\nEnvironment="SPINDLE_HOME=/srv/store"\n'
+        assert spindle._env_from_unit_text(text, "SPINDLE_HOME") == "/srv/store"
+
+    def test_round_trip_through_the_generator_is_exact(self):
+        for value in ("/srv/a b", "/srv/100%dir", '/srv/q"d', "/srv/back\\slash", "/srv/tail\\", "", "/srv/a=b"):
+            unit = spindle._systemd_unit_text("/bin/spindle", 8002, home=value)
+            assert spindle._env_from_unit_text(unit, "SPINDLE_HOME") == value, repr(value)
+
+
+class TestPlistReadingUsesPlistlib:
+    def test_binary_plists_are_read(self, tmp_path):
+        """launchd's own preferred format; a hand XML walk sees mojibake."""
+        import plistlib
+
+        path = tmp_path / "com.svc.server.plist"
+        data = {
+            "Label": "com.svc.server",
+            "ProgramArguments": ["/bin/spindle", "serve", "--http", "--port", "8075"],
+            "EnvironmentVariables": {"SPINDLE_HOME": "/srv/store", "SPINDLE_PORT": "8075"},
+        }
+        with open(path, "wb") as fh:
+            plistlib.dump(data, fh, fmt=plistlib.FMT_BINARY)
+        settings = spindle._service_settings_from_file(path)
+        assert (settings["port"], settings["home"], settings["readable"]) == (8075, "/srv/store", True)
+
+    def test_the_last_port_argument_wins(self, tmp_path):
+        """argparse takes the last; reading the first rewrites the agent's port."""
+        import plistlib
+
+        path = tmp_path / "com.svc.server.plist"
+        with open(path, "wb") as fh:
+            plistlib.dump({"ProgramArguments": ["/bin/spindle", "--port", "8075", "--port", "9001"]}, fh)
+        assert spindle._service_settings_from_file(path)["port"] == 9001
+
+    def test_generated_plists_round_trip(self, tmp_path):
+        path = tmp_path / "com.svc.server.plist"
+        path.write_text(spindle._launchd_plist_text("com.svc.server", "/bin/spindle", 8075, home="/srv/A&B store"))
+        settings = spindle._service_settings_from_file(path)
+        assert (settings["port"], settings["home"], settings["readable"]) == (8075, "/srv/A&B store", True)
+
+    def test_unreadable_plist_is_marked_unreadable(self, tmp_path):
+        path = tmp_path / "com.svc.server.plist"
+        path.write_bytes(b"\x00\x01 not a plist")
+        settings = spindle._service_settings_from_file(path)
+        assert settings["readable"] is False
+        assert settings["port"] is None
+
+
+class TestLaunchctlExceptionsRestore:
+    @pytest.fixture
+    def home(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(spindle.Path, "home", staticmethod(lambda: tmp_path))
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
+        monkeypatch.delenv("SPINDLE_HOME", raising=False)
+        monkeypatch.delenv("SPINDLE_PORT", raising=False)
+        (tmp_path / "bin").mkdir()
+        (tmp_path / "bin" / "spindle").write_text("#!/bin/sh\n")
+        return tmp_path
+
+    def _install(self, monkeypatch, argv, runner=None):
+        import platform as platform_mod
+
+        monkeypatch.setattr(platform_mod, "system", lambda: "Darwin")
+        monkeypatch.setattr(
+            spindle.subprocess, "run", runner or (lambda *a, **k: MagicMock(returncode=0, stdout="", stderr=""))
+        )
+        with patch.object(spindle.sys, "argv", ["spindle", "install-service", *argv]):
+            with pytest.raises(SystemExit) as exc:
+                spindle.main()
+        return exc.value.code
+
+    def test_launchctl_raising_still_restores_the_previous_agent(self, home, monkeypatch, capsys):
+        """An OSError past the unload used to escape, leaving no agent at all."""
+        assert self._install(monkeypatch, ["--name", "svc", "--port", "8075"]) == 0
+        original = (home / "Library" / "LaunchAgents" / "com.svc.server.plist").read_text()
+        capsys.readouterr()
+
+        state = {"loads": 0}
+
+        def runner(cmd, *a, **k):
+            if cmd[:2] == ["launchctl", "load"]:
+                state["loads"] += 1
+                if state["loads"] == 1:
+                    raise OSError("launchctl: not found")
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        assert self._install(monkeypatch, ["--name", "svc", "--port", "9001", "--force"], runner) == 1
+        assert (home / "Library" / "LaunchAgents" / "com.svc.server.plist").read_text() == original
+        assert "Restored the previous plist" in capsys.readouterr().out
+
+
+class TestServiceRecord:
+    """Spindle's own record of what it installed, in a format spindle owns.
+
+    Six rounds of review went into reading these settings back out of a systemd
+    unit, and each round found another divergence between the reader and
+    systemd — ending at `%h`, whose value depends on the runtime context of the
+    service and cannot be known from the file at all. A value read slightly
+    wrong is worse than one not read, because it is written straight back.
+    """
+
+    @pytest.fixture
+    def config(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
+        monkeypatch.delenv("SPINDLE_HOME", raising=False)
+        monkeypatch.delenv("SPINDLE_PORT", raising=False)
+        return tmp_path
+
+    def test_round_trips(self, config, tmp_path):
+        unit = tmp_path / "svc.service"
+        unit.write_text("body")
+        spindle._write_service_record("svc", 8075, "/srv/store", unit, "body")
+        record = spindle._read_service_record("svc")
+        assert (record["port"], record["home"], record["name"]) == (8075, "/srv/store", "svc")
+        assert record["spindle_version"] == spindle.__version__
+
+    def test_absent_record_is_none(self, config):
+        assert spindle._read_service_record("never-installed") is None
+
+    def test_corrupt_record_is_none(self, config):
+        path = spindle._service_record_path("svc")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{not json")
+        assert spindle._read_service_record("svc") is None
+
+    def test_a_record_survives_values_no_parser_could_read(self, config, tmp_path):
+        """%h, escapes, quotes: exactly the values that defeated the readers."""
+        unit = tmp_path / "svc.service"
+        unit.write_text("body")
+        for home in ("%h/spindle-store", "/srv/a\\sb", "/srv/'q'", "/srv/tail\\", "", "/srv/A&B"):
+            spindle._write_service_record("svc", 8075, home, unit, "body")
+            assert spindle._read_service_record("svc")["home"] == home, repr(home)
+
+
+class TestRegenerationUsesTheRecord:
+    @pytest.fixture
+    def config(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
+        monkeypatch.delenv("SPINDLE_HOME", raising=False)
+        monkeypatch.delenv("SPINDLE_PORT", raising=False)
+        return tmp_path
+
+    def _existing(self, tmp_path):
+        unit = tmp_path / "svc.service"
+        unit.write_text(spindle._systemd_unit_text("/bin/spindle", 8075, home="/srv/store", name="svc"))
+        return unit
+
+    def test_record_supplies_omitted_arguments(self, config, tmp_path):
+        unit = self._existing(tmp_path)
+        spindle._write_service_record("svc", 8075, "/srv/store", unit)
+        port, home, notes, blocker = spindle._resolve_service_settings(unit, None, None, name="svc")
+        assert (port, home, blocker) == (8075, "/srv/store", None)
+        assert any("Keeping the port" in n for n in notes)
+
+    def test_explicit_arguments_beat_the_record(self, config, tmp_path):
+        unit = self._existing(tmp_path)
+        spindle._write_service_record("svc", 8075, "/srv/store", unit)
+        port, home, _, blocker = spindle._resolve_service_settings(unit, 9001, "/srv/new", name="svc")
+        assert (port, home, blocker) == (9001, "/srv/new", None)
+
+    def test_ambient_environment_cannot_move_a_recorded_service(self, config, tmp_path, monkeypatch):
+        unit = self._existing(tmp_path)
+        spindle._write_service_record("svc", 8075, None, unit)
+        monkeypatch.setenv("SPINDLE_HOME", "/srv/decoy")
+        monkeypatch.setenv("SPINDLE_PORT", "9999")
+        port, home, _, blocker = spindle._resolve_service_settings(unit, None, None, name="svc")
+        assert (port, home, blocker) == (8075, None, None)
+
+    def test_a_recorded_value_no_parser_could_read_survives(self, config, tmp_path):
+        """%h defeated the file reader; the record carries it exactly."""
+        unit = self._existing(tmp_path)
+        spindle._write_service_record("svc", 8075, "%h/spindle-store", unit)
+        _, home, _, blocker = spindle._resolve_service_settings(unit, None, None, name="svc")
+        assert (home, blocker) == ("%h/spindle-store", None)
+
+    def test_first_install_has_no_file_and_no_record(self, config, tmp_path, monkeypatch):
+        monkeypatch.setenv("SPINDLE_HOME", "/srv/env")
+        monkeypatch.setattr(spindle, "DEFAULT_PORT", 8002)
+        port, home, notes, blocker = spindle._resolve_service_settings(tmp_path / "new.service", None, None, name="new")
+        assert (port, home, blocker, notes) == (8002, "/srv/env", None, [])
+
+    def test_an_unrecorded_service_is_not_guessed_at(self, config, tmp_path):
+        """The change of approach: refuse to invent settings rather than move a service."""
+        unit = self._existing(tmp_path)  # exists, no record
+        port, home, _, blocker = spindle._resolve_service_settings(unit, None, None, name="svc")
+        assert (port, home) == (None, None)
+        assert blocker is not None
+        assert "--port <port>" in blocker
+        assert "--home <store>" in blocker
+
+    def test_explicit_arguments_unblock_an_unrecorded_service(self, config, tmp_path):
+        unit = self._existing(tmp_path)
+        port, home, _, blocker = spindle._resolve_service_settings(unit, 9001, "/srv/new", name="svc")
+        assert (port, home, blocker) == (9001, "/srv/new", None)
+
+    def test_a_file_stating_no_port_gets_a_placeholder_not_the_default(self, config, tmp_path):
+        """8002 is not a reading of the file; it is the default install's port."""
+        unit = tmp_path / "svc.service"
+        unit.write_text("[Unit]\nDescription=hand written, no port anywhere\n")
+        _, _, _, blocker = spindle._resolve_service_settings(unit, None, None, name="svc")
+        assert blocker is not None
+        assert "--port <port>" in blocker
+        assert str(spindle._BASE_DEFAULT_PORT) not in blocker
+
+
+class TestInstallServiceRefusesToGuess:
+    @pytest.fixture
+    def home(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(spindle.Path, "home", staticmethod(lambda: tmp_path))
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
+        monkeypatch.delenv("SPINDLE_HOME", raising=False)
+        monkeypatch.delenv("SPINDLE_PORT", raising=False)
+        (tmp_path / "bin").mkdir()
+        (tmp_path / "bin" / "spindle").write_text("#!/bin/sh\n")
+        return tmp_path
+
+    def _run(self, argv, monkeypatch, system="Linux"):
+        import platform as platform_mod
+
+        monkeypatch.setattr(platform_mod, "system", lambda: system)
+        monkeypatch.setattr(spindle.subprocess, "run", lambda *a, **k: MagicMock(returncode=0, stdout="", stderr=""))
+        with patch.object(spindle.sys, "argv", ["spindle", "install-service", *argv]):
+            with pytest.raises(SystemExit) as exc:
+                spindle.main()
+        return exc.value.code
+
+    def test_a_hand_written_unit_is_not_regenerated_from_a_guess(self, home, monkeypatch, capsys):
+        unit_dir = home / ".config" / "systemd" / "user"
+        unit_dir.mkdir(parents=True)
+        original = "[Unit]\nDescription=mine\n[Service]\nEnvironment=SPINDLE_HOME=%h/mystore\nExecStart=/bin/true\n"
+        (unit_dir / "svc.service").write_text(original)
+        assert self._run(["--name", "svc", "--force"], monkeypatch) == 1
+        assert (unit_dir / "svc.service").read_text() == original  # untouched
+        error = capsys.readouterr().err
+        assert "--port <port>" in error
+        assert "--home <store>" in error
+
+    def test_stating_the_settings_installs_and_records_them(self, home, monkeypatch):
+        unit_dir = home / ".config" / "systemd" / "user"
+        unit_dir.mkdir(parents=True)
+        (unit_dir / "svc.service").write_text("[Unit]\nDescription=mine\n")
+        assert self._run(["--name", "svc", "--port", "8115", "--home", "/srv/mine", "--force"], monkeypatch) == 0
+        record = spindle._read_service_record("svc")
+        assert (record["port"], record["home"]) == (8115, "/srv/mine")
+
+    def test_after_that_a_bare_reinstall_works(self, home, monkeypatch):
+        assert self._run(["--name", "svc", "--port", "8115", "--home", "/srv/mine"], monkeypatch) == 0
+        assert self._run(["--name", "svc", "--force"], monkeypatch) == 0
+        record = spindle._read_service_record("svc")
+        assert (record["port"], record["home"]) == (8115, "/srv/mine")
+        unit = (home / ".config" / "systemd" / "user" / "svc.service").read_text()
+        assert "--port 8115" in unit and "/srv/mine" in unit
+
+
+class TestRecordIsBoundToTheFileItDescribes:
+    """A record is state that can drift; the digest is what makes it trustworthy."""
+
+    @pytest.fixture
+    def config(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
+        monkeypatch.delenv("SPINDLE_HOME", raising=False)
+        monkeypatch.delenv("SPINDLE_PORT", raising=False)
+        return tmp_path
+
+    def _installed(self, tmp_path, port=8075, home="/srv/store"):
+        unit = tmp_path / "svc.service"
+        unit.write_text(spindle._systemd_unit_text("/bin/spindle", port, home=home, name="svc"))
+        spindle._write_service_record("svc", port, home, unit)
+        return unit
+
+    def test_an_untouched_file_is_trusted(self, config, tmp_path):
+        unit = self._installed(tmp_path)
+        port, home, _, blocker = spindle._resolve_service_settings(unit, None, None, name="svc")
+        assert (port, home, blocker) == (8075, "/srv/store", None)
+
+    def test_a_hand_edited_file_makes_the_record_stale(self, config, tmp_path):
+        """Editing the unit's port by hand must not be silently rewritten back."""
+        unit = self._installed(tmp_path)
+        unit.write_text(unit.read_text().replace("--port 8075", "--port 9001"))
+        port, home, notes, blocker = spindle._resolve_service_settings(unit, None, None, name="svc")
+        assert (port, home) == (None, None)
+        assert blocker is not None
+        assert any("edited since" in n for n in notes)
+
+    def test_a_replaced_file_makes_the_record_stale(self, config, tmp_path):
+        unit = self._installed(tmp_path)
+        unit.write_text("[Unit]\nDescription=somebody else's\n")
+        _, _, _, blocker = spindle._resolve_service_settings(unit, None, None, name="svc")
+        assert blocker is not None
+
+    def test_explicit_arguments_still_work_on_a_stale_record(self, config, tmp_path):
+        unit = self._installed(tmp_path)
+        unit.write_text("[Unit]\nDescription=edited\n")
+        port, home, _, blocker = spindle._resolve_service_settings(unit, 9001, "/srv/new", name="svc")
+        assert (port, home, blocker) == (9001, "/srv/new", None)
+
+
+class TestMalformedRecordsRefuseRatherThanDefault:
+    """A record that cannot be trusted must take the ask-me path, not the defaults."""
+
+    @pytest.fixture
+    def config(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
+        monkeypatch.delenv("SPINDLE_HOME", raising=False)
+        monkeypatch.delenv("SPINDLE_PORT", raising=False)
+        return tmp_path
+
+    def _write_raw(self, record):
+        path = spindle._service_record_path("svc")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(record))
+
+    @pytest.mark.parametrize(
+        "record",
+        [
+            {"port": "8075", "home": "/srv/store"},  # port as a string
+            {"port": True, "home": "/srv/store"},  # bool is an int subclass
+            {"port": 8075, "home": []},  # home wrong type
+            {"port": 8075},  # home missing entirely
+            {"home": "/srv/store"},  # port missing
+            {"port": 8075, "home": "/srv/store", "service_sha256": 12},  # digest wrong type
+        ],
+    )
+    def test_unusable_records_read_as_absent(self, config, record):
+        self._write_raw(record)
+        assert spindle._read_service_record("svc") is None
+
+    def test_and_therefore_block_instead_of_defaulting(self, config, tmp_path):
+        unit = tmp_path / "svc.service"
+        unit.write_text(spindle._systemd_unit_text("/bin/spindle", 8115, home="/srv/mine", name="svc"))
+        self._write_raw({"port": "8115", "home": "/srv/mine"})
+        port, home, _, blocker = spindle._resolve_service_settings(unit, None, None, name="svc")
+        assert (port, home) == (None, None)
+        assert blocker is not None
+
+    def test_a_good_record_still_reads(self, config, tmp_path):
+        unit = tmp_path / "svc.service"
+        unit.write_text("x")
+        spindle._write_service_record("svc", 8075, None, unit)
+        record = spindle._read_service_record("svc")
+        assert record["port"] == 8075 and record["home"] is None
+
+
+class TestRecordFollowsActivation:
+    @pytest.fixture
+    def home(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(spindle.Path, "home", staticmethod(lambda: tmp_path))
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
+        monkeypatch.delenv("SPINDLE_HOME", raising=False)
+        monkeypatch.delenv("SPINDLE_PORT", raising=False)
+        (tmp_path / "bin").mkdir()
+        (tmp_path / "bin" / "spindle").write_text("#!/bin/sh\n")
+        return tmp_path
+
+    def _run(self, argv, monkeypatch, system="Linux", runner=None):
+        import platform as platform_mod
+
+        monkeypatch.setattr(platform_mod, "system", lambda: system)
+        monkeypatch.setattr(
+            spindle.subprocess, "run", runner or (lambda *a, **k: MagicMock(returncode=0, stdout="", stderr=""))
+        )
+        with patch.object(spindle.sys, "argv", ["spindle", "install-service", *argv]):
+            with pytest.raises(SystemExit) as exc:
+                spindle.main()
+        return exc.value.code
+
+    def test_darwin_a_failed_load_leaves_the_record_describing_the_running_agent(self, home, monkeypatch):
+        """The record must not claim settings the restore just undid."""
+        assert self._run(["--name", "svc", "--port", "8115"], monkeypatch, "Darwin") == 0
+        assert spindle._read_service_record("svc")["port"] == 8115
+
+        state = {"loads": 0}
+
+        def runner(cmd, *a, **k):
+            if cmd[:2] == ["launchctl", "load"]:
+                state["loads"] += 1
+                if state["loads"] == 1:
+                    return MagicMock(returncode=1, stdout="", stderr="rejected")
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        assert self._run(["--name", "svc", "--port", "9001", "--force"], monkeypatch, "Darwin", runner) == 1
+        assert spindle._read_service_record("svc")["port"] == 8115
+        plist = home / "Library" / "LaunchAgents" / "com.svc.server.plist"
+        assert spindle._service_settings_from_file(plist)["port"] == 8115
+
+    def test_linux_a_failed_enable_writes_no_record(self, home, monkeypatch):
+        def runner(cmd, *a, **k):
+            if cmd[:3] == ["systemctl", "--user", "enable"]:
+                return MagicMock(returncode=1, stdout="", stderr="no such unit")
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        assert self._run(["--name", "svc", "--port", "8115"], monkeypatch, "Linux", runner) == 1
+        assert spindle._read_service_record("svc") is None
+
+    def test_a_successful_install_records_the_file_it_wrote(self, home, monkeypatch):
+        assert self._run(["--name", "svc", "--port", "8115"], monkeypatch) == 0
+        unit = home / ".config" / "systemd" / "user" / "svc.service"
+        assert spindle._read_service_record("svc")["service_sha256"] == spindle._service_file_digest(unit)
+
+
+class TestDigestIsRequiredNotOptional:
+    """ "No digest" must mean "cannot verify", not "skip the check"."""
+
+    @pytest.fixture
+    def config(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
+        monkeypatch.delenv("SPINDLE_HOME", raising=False)
+        monkeypatch.delenv("SPINDLE_PORT", raising=False)
+        return tmp_path
+
+    def _raw_record(self, record):
+        path = spindle._service_record_path("svc")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(record))
+
+    @pytest.mark.parametrize("digest", [None, "", "absent"])
+    def test_a_record_without_a_usable_digest_is_not_a_record(self, config, digest):
+        record = {"name": "svc", "port": 8075, "home": "/srv/store", "service_file": "/x"}
+        if digest != "absent":
+            record["service_sha256"] = digest
+        self._raw_record(record)
+        assert spindle._read_service_record("svc") is None
+
+    def test_a_pre_digest_record_no_longer_silently_regenerates(self, config, tmp_path):
+        """Every record written before digests existed looked like this."""
+        unit = tmp_path / "svc.service"
+        unit.write_text(spindle._systemd_unit_text("/bin/spindle", 9001, home="/srv/handedited", name="svc"))
+        self._raw_record({"name": "svc", "port": 8075, "home": "/srv/store", "service_file": str(unit)})
+        port, home, _, blocker = spindle._resolve_service_settings(unit, None, None, name="svc")
+        assert (port, home) == (None, None)
+        assert blocker is not None
+
+    def test_the_digest_covers_the_bytes_written_not_a_later_read(self, config, tmp_path):
+        """A write landing between activation and recording must not be blessed."""
+        unit = tmp_path / "svc.service"
+        unit.write_text("what spindle wrote")
+        spindle._write_service_record("svc", 8075, None, unit, "what spindle wrote")
+        good = spindle._read_service_record("svc")["service_sha256"]
+
+        unit.write_text("edited before the record landed")
+        spindle._write_service_record("svc", 8075, None, unit, "what spindle wrote")
+        assert spindle._read_service_record("svc")["service_sha256"] == good
+        # and that record is therefore stale against the file now on disk
+        _, _, _, blocker = spindle._resolve_service_settings(unit, None, None, name="svc")
+        assert blocker is not None
+
+    def test_out_of_range_ports_are_rejected(self, config):
+        for port in (0, -1, 70000):
+            self._raw_record({"name": "svc", "port": port, "home": None, "service_file": "/x", "service_sha256": "abc"})
+            assert spindle._read_service_record("svc") is None, port
+
+    def test_the_cli_rejects_an_impossible_port(self):
+        import argparse
+
+        for bad in ("0", "70000", "-1", "http"):
+            with pytest.raises(argparse.ArgumentTypeError):
+                spindle._service_port(bad)
+        assert spindle._service_port("8075") == 8075
+
+
+class TestOrphanedRecordIsAnnounced:
+    @pytest.fixture
+    def config(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
+        monkeypatch.delenv("SPINDLE_HOME", raising=False)
+        return tmp_path
+
+    def test_recreating_a_deleted_service_says_where_the_values_came_from(self, config, tmp_path):
+        unit = tmp_path / "svc.service"
+        unit.write_text("body")
+        spindle._write_service_record("svc", 8115, "/srv/store", unit, "body")
+        unit.unlink()
+        port, home, notes, blocker = spindle._resolve_service_settings(unit, None, None, name="svc")
+        assert (port, home, blocker) == (8115, "/srv/store", None)
+        assert any(f"{unit.name} is gone" in note and "recreating it from spindle's record" in note for note in notes)
+
+
+class TestTheRefusalQuotesRatherThanInterprets:
+    """The suggestion must never be runnable.
+
+    Four consecutive review rounds found the suggestion printing a pasteable
+    command that would move the service: 8002 offered as the file's port; an
+    empty store offered for a `%h` specifier; an Environment=SPINDLE_PORT
+    fallback standing in for an unparsed ExecStart port; a repeated --port read
+    first-wins where systemd binds last-wins; a value an EnvironmentFile
+    overrides. All the same shape — the reader interprets with less authority
+    than systemd applies, then offers its interpretation as something to run.
+    So it offers nothing to run.
+    """
+
+    @pytest.fixture
+    def config(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
+        return tmp_path
+
+    def _blocker(self, unit):
+        return spindle._resolve_service_settings(unit, None, None, name="svc")[3]
+
+    def _command(self, blocker):
+        return [line for line in blocker.splitlines() if "install-service" in line][0]
+
+    def test_the_suggested_command_is_never_runnable(self, config, tmp_path):
+        """One mixed unit covers the invariant; its spellings cannot affect the fixed template."""
+        unit = tmp_path / "svc.service"
+        unit.write_text(
+            "[Service]\n"
+            "ExecStart=/b spindle serve --http --port 8115 --port 9000\n"
+            "Environment=SPINDLE_HOME=%h/store SPINDLE_PORT=8115\n"
+            "EnvironmentFile=/etc/spindle.env\n"
+        )
+        command = self._command(self._blocker(unit))
+        assert "--port <port>" in command
+        assert "--home <store>" in command
+        # no value read out of the file may appear as an argument
+        for value in ("8115", "9000", "8002", "%h/store"):
+            assert f"--port {value}" not in command
+            assert f"--home {value}" not in command
+
+    def test_relevant_unit_lines_are_quoted_for_the_operator(self, config, tmp_path):
+        unit = tmp_path / "svc.service"
+        unit.write_text(
+            "[Service]\n"
+            "ExecStart=/b spindle serve --http --port 8115\n"
+            "Environment=SPINDLE_HOME=%h/store\n"
+            "EnvironmentFile=/etc/spindle.env\n"
+        )
+        blocker = self._blocker(unit)
+        assert "ExecStart=/b spindle serve --http --port 8115" in blocker
+        assert "SPINDLE_HOME=%h/store" in blocker
+        assert "EnvironmentFile=/etc/spindle.env" in blocker
+
+    def test_a_plist_is_quoted_too(self, config, tmp_path):
+        path = tmp_path / "com.svc.server.plist"
+        path.write_text(spindle._launchd_plist_text("com.svc.server", "/b/spindle", 8115, home="/srv/store"))
+        blocker = self._blocker(path)
+        assert "--port <port>" in self._command(blocker)
+        assert "SPINDLE_HOME" in blocker and "/srv/store" in blocker
+
+    def test_the_excerpt_is_bounded(self, config, tmp_path):
+        unit = tmp_path / "svc.service"
+        unit.write_text("[Service]\n" + "Environment=SPINDLE_EXTRA=x\n" * 50)
+        excerpt, _ = spindle._service_file_excerpt(unit)
+        assert len(excerpt.splitlines()) == 13  # twelve entries and one truncation marker
+
+    def test_an_unreadable_file_still_refuses_without_inventing(self, config, tmp_path):
+        path = tmp_path / "com.svc.server.plist"
+        path.write_bytes(b"\x00\x01 not a plist")
+        command = self._command(self._blocker(path))
+        assert "--port <port>" in command and "8002" not in command
+
+
+class TestExecStartPortReadingMatchesArgparse:
+    """The reader is probe-only now, but reload/doctor still ask it for a port."""
+
+    def _port(self, tmp_path, execstart):
+        unit = tmp_path / "svc.service"
+        unit.write_text(f"[Service]\n{execstart}\n")
+        return spindle._service_settings_from_file(unit)["port"]
+
+    def test_last_repeated_port_wins(self, tmp_path):
+        assert self._port(tmp_path, "ExecStart=/b spindle serve --http --port 8115 --port 9000") == 9000
+
+    def test_equals_form_is_read(self, tmp_path):
+        assert self._port(tmp_path, "ExecStart=/b spindle serve --http --port=8115") == 8115
+
+    def test_whitespace_around_the_directive(self, tmp_path):
+        assert self._port(tmp_path, "ExecStart = /b spindle serve --http --port 8115") == 8115
+
+    def test_a_port_after_another_flag_is_read(self, tmp_path):
+        assert self._port(tmp_path, "ExecStart=/b spindle serve --http --host 1.2.3.4 --port 8115") == 8115
+
+
+def test_service_files_are_written_as_utf8(tmp_path, monkeypatch):
+    """The digest is UTF-8; a locale-encoded write could never match it."""
+    monkeypatch.setattr(spindle.Path, "home", staticmethod(lambda: tmp_path))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
+    monkeypatch.delenv("SPINDLE_HOME", raising=False)
+    monkeypatch.delenv("SPINDLE_PORT", raising=False)
+    (tmp_path / "bin").mkdir()
+    (tmp_path / "bin" / "spindle").write_text("#!/bin/sh\n")
+
+    import platform as platform_mod
+
+    monkeypatch.setattr(platform_mod, "system", lambda: "Linux")
+    monkeypatch.setattr(spindle.subprocess, "run", lambda *a, **k: MagicMock(returncode=0, stdout="", stderr=""))
+    argv = ["spindle", "install-service", "--name", "svc", "--port", "8115", "--home", "/srv/café"]
+    with patch.object(spindle.sys, "argv", argv):
+        with pytest.raises(SystemExit) as exc:
+            spindle.main()
+    assert exc.value.code == 0
+
+    unit = tmp_path / ".config" / "systemd" / "user" / "svc.service"
+    assert unit.read_bytes().decode("utf-8")  # written as UTF-8, whatever the locale
+    # and therefore the record's digest matches the file on disk
+    assert spindle._read_service_record("svc")["service_sha256"] == spindle._service_file_digest(unit)
+    assert spindle._resolve_service_settings(unit, None, None, name="svc")[3] is None
+
+
+class TestTheExcerptIsSafeToRead:
+    """Quoting is what the operator now retypes, so "verbatim" is not enough."""
+
+    @pytest.fixture
+    def config(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
+        return tmp_path
+
+    def _blocker(self, unit):
+        return spindle._resolve_service_settings(unit, None, None, name="svc")[3]
+
+    def test_a_wrapped_execstart_still_shows_its_port(self, config, tmp_path):
+        """Unfolded, the port sat on a continuation line and vanished from view."""
+        unit = tmp_path / "svc.service"
+        unit.write_text(
+            "[Service]\nExecStart=/usr/bin/spindle serve --http \\\n    --port 8115 \\\n    --host 127.0.0.1\n"
+        )
+        blocker = self._blocker(unit)
+        assert "--port 8115" in blocker
+
+    def test_an_execstart_with_space_before_equals_is_shown(self, config, tmp_path):
+        unit = tmp_path / "svc.service"
+        unit.write_text("[Service]\nExecStart = /b spindle serve --http --port 8115\n")
+        excerpt, _ = spindle._service_file_excerpt(unit)
+        assert "--port 8115" in excerpt
+
+    def test_no_resolution_is_claimed_for_a_specifier_store(self, config, tmp_path):
+        """Spindle shows the line and sends the operator to systemd for its value."""
+        unit = tmp_path / "svc.service"
+        unit.write_text("[Service]\nEnvironment=SPINDLE_HOME=%h/store\nExecStart=/b serve --http --port 8115\n")
+        blocker = self._blocker(unit)
+        assert "%h/store" in blocker
+        assert "systemctl --user show -p Environment" in blocker
+
+    def test_no_effective_store_value_is_claimed(self, config, tmp_path):
+        """The excerpt quotes ambiguous input but never presents an interpretation as fact."""
+        unit = tmp_path / "svc.service"
+        unit.write_text("[Service]\nEnvironment=SPINDLE_HOME=/srv/a\\x20b\nEnvironment=\n")
+        blocker = self._blocker(unit)
+        for false_claim in ("The store resolves to", "No store survives", "runs on the default store"):
+            assert false_claim not in blocker
+
+    def test_unrelated_environment_lines_are_not_printed(self, config, tmp_path):
+        """This text lands in agent transcripts and spool records."""
+        unit = tmp_path / "svc.service"
+        unit.write_text(
+            "[Service]\nEnvironment=OPENAI_API_KEY=sk-do-not-print-me\n"
+            'Environment="SPINDLE_HOME=/srv/store"\nExecStart=/b serve --http --port 8115\n'
+        )
+        blocker = self._blocker(unit)
+        assert "sk-do-not-print-me" not in blocker
+        assert "/srv/store" in blocker
+
+    def test_an_environmentfile_path_is_still_shown(self, config, tmp_path):
+        """The path matters (it may hold the store); its contents are not read."""
+        unit = tmp_path / "svc.service"
+        unit.write_text("[Service]\nEnvironmentFile=/etc/spindle.env\nExecStart=/b serve --http --port 8115\n")
+        assert "/etc/spindle.env" in self._blocker(unit)
+
+    def test_control_characters_are_stripped(self, config, tmp_path):
+        """An escape sequence in a value could clear the screen and hide the rest."""
+        unit = tmp_path / "svc.service"
+        unit.write_text('[Service]\nEnvironment="SPINDLE_HOME=/srv/\x1b[2Jstore"\nExecStart=/b --port 1\n')
+        blocker = self._blocker(unit)
+        assert "\x1b" not in blocker
+
+    def test_a_very_long_quoted_line_is_truncated(self, config, tmp_path):
+        """The quoted line is bounded, so a value cannot run to megabytes."""
+        unit = tmp_path / "svc.service"
+        unit.write_text('[Service]\nEnvironment="SPINDLE_HOME=/srv/' + "x" * 5000 + '"\n')
+        blocker = self._blocker(unit)
+        quoted = [ln for ln in blocker.splitlines() if ln.startswith("    Environment=")][0]
+        assert len(quoted) < 300
+        assert quoted.endswith("...")
+
+    def test_a_binary_plist_is_named_not_dumped(self, config, tmp_path):
+        import plistlib
+
+        path = tmp_path / "com.svc.server.plist"
+        with open(path, "wb") as fh:
+            plistlib.dump({"EnvironmentVariables": {"SPINDLE_HOME": "/srv/store"}}, fh, fmt=plistlib.FMT_BINARY)
+        excerpt, note = spindle._service_file_excerpt(path)
+        assert excerpt == ""
+        assert path.name in note
+        assert "bplist" not in note
+
+    def test_an_unreadable_file_says_so(self, config, tmp_path):
+        unit = tmp_path / "svc.service"
+        unit.write_text("[Service]\nExecStart=/b serve --http --port 1\n")
+        unit.chmod(0o000)
+        try:
+            excerpt, note = spindle._service_file_excerpt(unit)
+        finally:
+            unit.chmod(0o600)
+        assert excerpt == ""
+        assert note
+
+    def test_a_file_with_nothing_to_say_is_not_confused_with_one_that_could_not_be_read(self, config, tmp_path):
+        unit = tmp_path / "svc.service"
+        unit.write_text("[Unit]\nDescription=nothing here\n")
+        excerpt, _ = spindle._service_file_excerpt(unit)
+        assert excerpt == ""
+
+    def test_a_unit_without_environmentfile_gets_no_caveat(self, config, tmp_path):
+        unit = tmp_path / "svc.service"
+        unit.write_text('[Service]\nEnvironment="SPINDLE_HOME=/srv/store"\n')
+        _, note = spindle._service_file_excerpt(unit)
+        assert "This unit also reads an EnvironmentFile" not in note
+
+
+class TestPortProbePrefersTheRecord:
+    @pytest.fixture
+    def config(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
+        return tmp_path
+
+    def test_a_recorded_port_beats_a_decoy_in_the_unit(self, config):
+        """`sh -c '... --port 8115 # --port=9001'` binds 8115; the text says otherwise."""
+        unit = spindle._unit_file_path("svc")
+        unit.parent.mkdir(parents=True, exist_ok=True)
+        body = "[Service]\nExecStart=/bin/sh -c '/b/spindle serve --http --port 8115 # --port=9001'\n"
+        unit.write_text(body)
+        spindle._write_service_record("svc", 8115, None, unit, body)
+        assert spindle._port_from_unit("svc") == 8115
+
+    def test_without_a_record_it_falls_back_to_the_file(self, config):
+        unit = spindle._unit_file_path("svc")
+        unit.parent.mkdir(parents=True, exist_ok=True)
+        unit.write_text("[Service]\nExecStart=/b/spindle serve --http --port 8115\n")
+        assert spindle._port_from_unit("svc") == 8115
+
+
+def test_the_recreate_note_is_silent_when_both_values_came_from_argv(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
+    unit = tmp_path / "svc.service"
+    unit.write_text("body")
+    spindle._write_service_record("svc", 8115, "/srv/store", unit, "body")
+    unit.unlink()
+    _, _, notes_argv, _ = spindle._resolve_service_settings(unit, 9001, "/srv/new", name="svc")
+    assert notes_argv == []
+    _, _, notes_bare, _ = spindle._resolve_service_settings(unit, None, None, name="svc")
+    assert notes_bare
+
+
+def test_service_files_are_written_utf8_under_a_c_locale(tmp_path):
+    """The suite's own locale hides this; PEP 540 turns UTF-8 mode on for C."""
+    script = tmp_path / "probe.py"
+    script.write_text(
+        "import sys, pathlib\n"
+        f"sys.path.insert(0, {str(Path(spindle.__file__).parent.parent)!r})\n"
+        "import spindle\n"
+        "p = pathlib.Path(sys.argv[1])\n"
+        "content = spindle._systemd_unit_text('/bin/spindle', 8115, home='/srv/caf\\u00e9')\n"
+        "p.write_text(content, encoding='utf-8')\n"
+        "print(spindle._digest_text(content) == spindle._service_file_digest(p))\n"
+    )
+    env = dict(os.environ, LC_ALL="C", LANG="C", PYTHONUTF8="0", PYTHONCOERCECLOCALE="0")
+    proc = subprocess.run(
+        [sys.executable, str(script), str(tmp_path / "svc.service")],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=120,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip().endswith("True"), proc.stdout
+
+
+class TestExcerptPrecedenceAndLeaks:
+    """Round 12: two regressions from the previous commit's filter, and the leak."""
+
+    @pytest.fixture
+    def config(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
+        return tmp_path
+
+    def _blocker(self, unit):
+        return spindle._resolve_service_settings(unit, None, None, name="svc")[3]
+
+    def test_a_bare_environment_reset_is_shown(self, config, tmp_path):
+        """It clears everything above it; hiding it shows a store nothing uses."""
+        unit = tmp_path / "svc.service"
+        unit.write_text(
+            "[Service]\nEnvironment=SPINDLE_HOME=/data/store\nEnvironment=\nExecStart=/b serve --http --port 8115\n"
+        )
+        blocker = self._blocker(unit)
+        assert blocker.count("Environment=") >= 2
+        assert "/data/store" in blocker
+        assert "clears every assignment above" in blocker
+
+    def test_a_secret_sharing_a_line_with_the_store_is_hidden(self, config, tmp_path):
+        """systemd allows several assignments per line; the filter must be per assignment."""
+        unit = tmp_path / "svc.service"
+        unit.write_text(
+            '[Service]\nEnvironment="SPINDLE_HOME=/srv/store" "OPENAI_API_KEY=sk-do-not-print"\n'
+            "ExecStart=/b serve --http --port 8115\n"
+        )
+        blocker = self._blocker(unit)
+        assert "sk-do-not-print" not in blocker
+        assert "OPENAI_API_KEY" not in blocker
+        assert "/srv/store" in blocker
+
+    def test_a_secret_on_a_continuation_of_the_store_line_is_hidden(self, config, tmp_path):
+        unit = tmp_path / "svc.service"
+        unit.write_text('[Service]\nEnvironment="SPINDLE_HOME=/srv/store" \\\n    "OPENAI_API_KEY=sk-continued"\n')
+        assert "sk-continued" not in self._blocker(unit)
+
+
+class TestPortProbeVerifiesTheRecord:
+    @pytest.fixture
+    def config(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
+        return tmp_path
+
+    def _install(self, port):
+        unit = spindle._unit_file_path("svc")
+        unit.parent.mkdir(parents=True, exist_ok=True)
+        body = spindle._systemd_unit_text("/bin/spindle", port, name="svc")
+        unit.write_text(body)
+        spindle._write_service_record("svc", port, None, unit, body)
+        return unit
+
+    def test_an_intact_record_supplies_the_port(self, config):
+        self._install(8115)
+        assert spindle._port_from_unit("svc") == 8115
+
+    def test_a_stale_record_does_not(self, config):
+        """reload would otherwise probe the port the service used to bind."""
+        unit = self._install(8115)
+        unit.write_text(
+            unit.read_text().replace("--port 8115", "--port 9001").replace("SPINDLE_PORT=8115", "SPINDLE_PORT=9001")
+        )
+        assert spindle._port_from_unit("svc") == 9001
+
+
+class TestNumericEscapesMatchSystemd:
+    """Verified on live units: the value each line gives a service's environment."""
+
+    CASES = [
+        ("V=/srv/a\\x20b", "/srv/a b"),
+        ("V=/srv/a\\101b", "/srv/aAb"),
+        ("V=/srv/a\\u0041b", "/srv/aAb"),
+        ("V=/srv/a\\U00000041b", "/srv/aAb"),
+        ("V=/srv/a\\sb", "/srv/a b"),
+    ]
+
+    @pytest.mark.parametrize("line,expected", CASES)
+    def test_decoded_like_systemd(self, line, expected):
+        assert dict(spindle._parse_systemd_env_line(line))["V"] == expected
+
+
+class TestMalformedLinesAreNotEchoed:
+    @pytest.fixture
+    def config(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
+        return tmp_path
+
+    def _blocker(self, unit):
+        return spindle._resolve_service_settings(unit, None, None, name="svc")[3]
+
+    def test_an_unterminated_quote_does_not_leak(self, config, tmp_path):
+        """Returning the raw line re-opened the leak the redactor exists to close."""
+        unit = tmp_path / "svc.service"
+        unit.write_text('[Service]\nEnvironment=OPENAI_API_KEY="sk-proj-LEAKME\nExecStart=/b --port 1\n')
+        blocker = self._blocker(unit)
+        assert "sk-proj-LEAKME" not in blocker
+        assert "systemd drops it" in blocker
+
+    def test_the_shown_assignment_keeps_the_files_own_text(self, config, tmp_path):
+        """Not decoded and re-encoded — that changed what the assignment meant."""
+        unit = tmp_path / "svc.service"
+        unit.write_text('[Service]\nEnvironment="SPINDLE_HOME=/srv/a\\\\b"\n')
+        blocker = self._blocker(unit)
+        assert "SPINDLE_HOME=/srv/a\\\\b" in blocker
+
+
+def test_port_probe_digests_the_file_the_record_names(tmp_path, monkeypatch):
+    """A launchd record names a plist; digesting an assumed unit path never matched."""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
+    plist = tmp_path / "com.svc.server.plist"
+    body = spindle._launchd_plist_text("com.svc.server", "/bin/spindle", 8115, name="svc")
+    plist.write_text(body)
+    spindle._write_service_record("svc", 8115, None, plist, body)
+    assert spindle._port_from_unit("svc") == 8115
+
+
+class TestContinuedEnvironmentFile:
+    def test_it_is_still_shown(self, tmp_path):
+        """`EnvironmentFile\\` + newline + `=/path` is one directive to systemd."""
+        unit = tmp_path / "svc.service"
+        unit.write_text("[Service]\nEnvironmentFile \\\n    =/etc/spindle/env\nExecStart=/b --port 1\n")
+        excerpt, _ = spindle._service_file_excerpt(unit)
+        assert "/etc/spindle/env" in excerpt
+
+
+class TestPartialLinesFollowSystemd:
+    """systemd drops the bad word and everything after it, keeping what parsed."""
+
+    def test_an_assignment_before_a_bad_quote_survives(self):
+        assert spindle._env_from_unit_text('Environment=V=/srv/kept "X=open\n', "V") == "/srv/kept"
+
+    def test_an_assignment_before_a_bad_escape_survives(self):
+        assert spindle._env_from_unit_text("Environment=V=/srv/kept X=/x\\x2\n", "V") == "/srv/kept"
+
+    def test_the_bad_word_itself_is_dropped(self):
+        assert spindle._env_from_unit_text('Environment=V=/srv/kept "X=open\n', "X") is None
+
+    def test_the_store_is_still_shown_when_its_line_breaks_later(self, tmp_path, monkeypatch):
+        """Hiding it made the refusal claim the service was on the default store."""
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
+        unit = tmp_path / "svc.service"
+        unit.write_text('[Service]\nEnvironment=SPINDLE_HOME=/srv/s OTHER="sk-LEAK\n')
+        blocker = spindle._resolve_service_settings(unit, None, None, name="svc")[3]
+        assert "/srv/s" in blocker
+        assert "sk-LEAK" not in blocker
+
+
+def test_shown_assignments_are_not_decoded(tmp_path, monkeypatch):
+    """Values are shown as the file writes them; decoding was where every round went wrong."""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
+    unit = tmp_path / "svc.service"
+    unit.write_text('[Service]\nEnvironment="SPINDLE_HOME=/srv/a\\x20b" "SPINDLE_ALT=%h/x"\n')
+    blocker = spindle._resolve_service_settings(unit, None, None, name="svc")[3]
+    assert "/srv/a\\x20b" in blocker  # not "/srv/a b"
+    assert "%h/x" in blocker  # not "%%h/x", and not expanded
+
+
+class TestMalformedTailKeepsWhatSystemdKeeps:
+    """The fallback used to re-split naively and falsify spindle's own values."""
+
+    def _shown(self, rhs):
+        return spindle._redact_foreign_assignments("Environment=" + rhs)
+
+    def test_a_quoted_store_before_the_break_survives(self):
+        """Cutting at the first quote showed an empty store for a real one."""
+        shown = self._shown('SPINDLE_HOME="/srv/spindle store" SPINDLE_PORT=7 KEY="sk-LEAK')
+        assert "/srv/spindle store" in shown
+        assert "SPINDLE_PORT=7" in shown
+        assert "sk-LEAK" not in shown
+
+    def test_an_escaped_quote_does_not_truncate(self):
+        shown = self._shown('SPINDLE_HOME=/srv/a\\"b SPINDLE_PORT=1 KEY="sk-LEAK')
+        assert '/srv/a\\"b' in shown
+        assert "SPINDLE_PORT=1" in shown
+        assert "sk-LEAK" not in shown
+
+    def test_a_quoted_foreign_assignment_ahead_of_the_break_is_counted_not_shown(self):
+        shown = self._shown("TZ='UTC' SPINDLE_HOME=/srv/store KEY=\"sk-LEAK")
+        assert "/srv/store" in shown
+        assert "UTC" not in shown
+        assert "1 other assignment(s) hidden" in shown
+
+    def test_an_escaped_space_voids_the_line(self):
+        """systemd rejects `\\ ` and drops the line; merging the words leaked the next one."""
+        shown = self._shown("SPINDLE_HOME=/srv/a\\ OPENAI_API_KEY=sk-SECRET1")
+        assert "sk-SECRET1" not in shown
+
+    def test_a_balanced_line_has_no_truncation_warning(self):
+        shown = self._shown('SPINDLE_HOME="/srv/a b" OTHER=x')
+        assert "/srv/a b" in shown
+        assert "systemd drops it" not in shown
+
+
+class TestRedactionMatchesOnTheVariableName:
+    def test_a_spindle_prefixed_non_assignment_is_not_shown(self):
+        """`SPINDLE_TOKEN_sk-secret` is not an assignment; printing it is the leak."""
+        assert spindle._redact_foreign_assignments("Environment=SPINDLE_TOKEN_sk-secret") is None
+
+    def test_a_real_assignment_is_shown(self):
+        shown = spindle._redact_foreign_assignments("Environment=SPINDLE_HOME=/srv/store")
+        assert "/srv/store" in shown
+
+    def test_a_word_without_an_equals_does_not_count_as_ours(self):
+        shown = spindle._redact_foreign_assignments("Environment=SPINDLE_HOME=/srv/store SPINDLE_BARE")
+        assert "/srv/store" in shown
+        assert "SPINDLE_BARE" not in shown
+
+
+def test_a_continuation_across_a_comment_is_still_one_directive(tmp_path, monkeypatch):
+    """systemd skips comment lines inside a continuation; the caveat must too."""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
+    unit = tmp_path / "svc.service"
+    unit.write_text("[Service]\nEnvironmentFile \\\n# a comment in the middle\n    =/etc/spindle/env\nExecStart=/b\n")
+    blocker = spindle._resolve_service_settings(unit, None, None, name="svc")[3]
+    assert "applies after Environment=" in blocker
+
+
+class TestEveryRejectedEscapeIsABreak:
+    """`\\ ` was one member of a class; systemd rejects any escape outside its table."""
+
+    def _shown(self, rhs):
+        return spindle._redact_foreign_assignments("Environment=" + rhs)
+
+    @pytest.mark.parametrize("bad", ["\\q", "\\"])
+    def test_a_rejected_escape_marks_the_break(self, bad):
+        shown = self._shown(f"SPINDLE_PORT=7 SPINDLE_HOME=/srv/a{bad} KEY=sk-SECRET")
+        assert "SPINDLE_PORT=7" in shown  # systemd keeps what completed before
+        assert "/srv/a" not in shown  # the broken assignment is not offered
+        assert "sk-SECRET" not in shown
+
+    @pytest.mark.parametrize("good", ["\\s", "\\\\", "\\x41", "\\u0041"])
+    def test_an_accepted_escape_is_not_a_break(self, good):
+        shown = self._shown(f"SPINDLE_HOME=/srv/a{good}b")
+        assert f"/srv/a{good}b" in shown  # shown as the file writes it
+
+    def test_a_malformed_numeric_escape_is_a_break(self):
+        shown = self._shown("SPINDLE_PORT=7 SPINDLE_ALT=/srv/a\\x2 AFTER=secret")
+        assert "SPINDLE_PORT=7" in shown
+        assert "secret" not in shown
+
+    def test_the_hint_parser_agrees(self):
+        assert spindle._env_from_unit_text("Environment=V=/srv/kept X=/srv/a\\q\n", "V") == "/srv/kept"
+        assert spindle._env_from_unit_text("Environment=V=/srv/a\\q\n", "V") is None
+
+
+class TestAssignmentNamesMustBeNames:
+    def test_a_name_systemd_rejects_is_not_shown(self):
+        """systemd drops `SPINDLE_OTHER-BAD=...`; showing its value prints a dead line."""
+        assert spindle._redact_foreign_assignments("Environment=SPINDLE_OTHER-BAD=sk-secret") is None
+
+    def test_an_escaped_name_reads_as_foreign(self):
+        """Hiding it shows less, never more — the safe direction."""
+        shown = spindle._redact_foreign_assignments("Environment=\\x53PINDLE_HOME=/srv/store")
+        assert shown is None or "/srv/store" not in shown
+
+    @pytest.mark.parametrize("name", ["SPINDLE_HOME", "SPINDLE_X_1"])
+    def test_ordinary_names_are_ours(self, name):
+        assert spindle._is_spindle_assignment(f"{name}=/srv/x")
+
+    @pytest.mark.parametrize("word", ["SPINDLE_TOKEN_sk", "SPINDLE-HOME=/x", "OTHER=x"])
+    def test_non_assignments_and_foreign_names_are_not(self, word):
+        assert not spindle._is_spindle_assignment(word)
+
+
+class TestContinuationFoldsThroughEveryComment:
+    def test_two_comment_lines(self):
+        """re.sub does not rescan its replacement, so only the first was folded."""
+        folded = spindle._join_line_continuations("Environment=FOO=bar \\\n# one\n# two\nSPINDLE_HOME=/srv/real\n")
+        assert "SPINDLE_HOME=/srv/real" in folded.splitlines()[0]
+
+    def test_a_store_after_two_comments_is_still_read(self):
+        text = "Environment=FOO=bar \\\n# one\n# two\nSPINDLE_HOME=/srv/real\n"
+        assert spindle._env_from_unit_text(text, "SPINDLE_HOME") == "/srv/real"
+
+    def test_semicolon_comments_too(self):
+        folded = spindle._join_line_continuations("Environment=A=1 \\\n; one\n; two\nB=2\n")
+        assert "B=2" in folded.splitlines()[0]
+
+    def test_a_continuation_with_no_comments_is_unaffected(self):
+        folded = spindle._join_line_continuations("ExecStart=/b \\\n    --port 8115\n")
+        assert folded.splitlines()[0].endswith("--port 8115")
+
+
+def test_a_value_containing_the_marker_text_is_not_rewritten(tmp_path, monkeypatch):
+    """The suffix is assembled, not patched into the finished line."""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
+    shown = spindle._redact_foreign_assignments('Environment=SPINDLE_X="Environment=   [x"')
+    assert "SPINDLE_X=Environment=   [x" in shown
+
+
+class TestNumericEscapeDigitsAreDigits:
+    """int() accepts surrounding whitespace; the escape then ate a word separator."""
+
+    @pytest.mark.parametrize("bad", ["\\x2 ", "\\U0000004 "])
+    def test_a_non_digit_does_not_complete_an_escape(self, bad):
+        assert spindle._systemd_escape_length(bad, 0) == 0
+
+    @pytest.mark.parametrize("good,length", [("\\x41", 4), ("\\U00000041", 10)])
+    def test_real_digits_do(self, good, length):
+        assert spindle._systemd_escape_length(good, 0) == length
+
+    def test_the_separator_is_not_swallowed(self):
+        shown = spindle._redact_foreign_assignments("Environment=SPINDLE_PORT=7 SPINDLE_ALT=/a\\x2 KEY=sk-SECRET")
+        assert "sk-SECRET" not in shown
+        assert "SPINDLE_PORT=7" in shown
+
+
+class TestResolverHasNoUnreachableFallback:
+    """After the refusal, only three states remain — nothing else needs a branch.
+
+    Two review rounds were spent adding fallbacks for a fourth state that the
+    record redesign had already made impossible. A mutation study proved the
+    suite could not tell they were gone, which is the only reason they survived.
+    """
+
+    @pytest.fixture
+    def config(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
+        monkeypatch.delenv("SPINDLE_HOME", raising=False)
+        monkeypatch.delenv("SPINDLE_PORT", raising=False)
+        return tmp_path
+
+    def test_an_existing_file_without_a_record_always_refuses(self, config, tmp_path):
+        """This is what makes the fourth state impossible; pin it directly."""
+        unit = tmp_path / "svc.service"
+        unit.write_text(spindle._systemd_unit_text("/bin/spindle", 8115, name="svc"))
+        for arg_port, arg_home in [(None, None), (None, "/srv/x"), (9001, None)]:
+            _, _, _, blocker = spindle._resolve_service_settings(unit, arg_port, arg_home, name="svc")
+            assert blocker is not None, (arg_port, arg_home)
+
+    def test_both_arguments_together_are_the_only_way_past_it(self, config, tmp_path):
+        unit = tmp_path / "svc.service"
+        unit.write_text(spindle._systemd_unit_text("/bin/spindle", 8115, name="svc"))
+        port, home, _, blocker = spindle._resolve_service_settings(unit, 9001, "/srv/x", name="svc")
+        assert (port, home, blocker) == (9001, "/srv/x", None)
+
+    def test_every_reachable_state_is_covered(self, config, tmp_path):
+        """Explicit argument, usable record, or no file — exhaustively."""
+        unit = tmp_path / "svc.service"
+        body = spindle._systemd_unit_text("/bin/spindle", 8115, home="/srv/rec", name="svc")
+
+        # no file at all
+        assert spindle._resolve_service_settings(unit, None, None, name="svc")[0] == spindle.DEFAULT_PORT
+
+        # usable record
+        unit.write_text(body)
+        spindle._write_service_record("svc", 8115, "/srv/rec", unit, body)
+        port, home, _, blocker = spindle._resolve_service_settings(unit, None, None, name="svc")
+        assert (port, home, blocker) == (8115, "/srv/rec", None)
+
+        # explicit arguments win over it
+        assert spindle._resolve_service_settings(unit, 9001, "/srv/x", name="svc")[:2] == (9001, "/srv/x")
