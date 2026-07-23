@@ -10887,15 +10887,19 @@ class TestCodexProbeLogging:
         assert caplog.records == []
 
     def test_a_real_stat_error_still_warns(self, caplog):
-        """Anything other than "the file isn't there" is still worth surfacing."""
+        """Anything other than "the file isn't there" still warns — and fails closed.
+
+        An unreadable probe target cannot prove the sandbox held, so the probe
+        must not report an enforcing sandbox (master's fail-closed semantics).
+        """
 
         def boom(path):
             raise PermissionError("denied")
 
         with patch("spindle.subprocess.run", return_value=self._proc(f"{spindle._CODEX_SANDBOX_PROBE_MARKER}\n")):
-            with patch("spindle.os.path.getsize", side_effect=boom):
+            with patch("spindle.os.stat", side_effect=boom):
                 with caplog.at_level(logging.WARNING, logger="spindle"):
-                    assert spindle._codex_sandbox_probe("/fake/codex") is True
+                    assert spindle._codex_sandbox_probe("/fake/codex") is False
         assert any("could not stat target" in r.message for r in caplog.records)
 
 
