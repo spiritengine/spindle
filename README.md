@@ -265,7 +265,7 @@ Spindle supports multiple AI agent harnesses, allowing you to choose the best to
 **Kimi CLI** - Moonshot AI's Kimi models via `kimi-cli`
 - Fast startup (~5-10 seconds to first response)
 - Thinking mode for complex reasoning
-- Models: `"thinking"` (kimi-k2.6 in thinking mode), `"k2.6"`, `"k2.5"`, `"latest"`, or any full model name
+- Models: `"k3"`/`"latest"`/`"thinking"` (K3, always thinking; default), `"k2.7-code"`, `"k2.6"`, `"k2.5"`, or any full model name
 - Use `harness="kimi"`
 
 ### Basic Usage
@@ -415,7 +415,7 @@ for a worked example and the full schema reference.
 - `harness` (optional): "claude-code" (default), "codex", "gemini", or "kimi"
 - `working_dir` (optional for Claude, required for Codex/Gemini/Kimi): Project directory
 - `permission` (optional): "readonly" (alias "manual"), "careful" (default, = auto), "full", "shard", "careful+shard", "research", "research+shard", "auto", "auto+shard" (readonly/manual cannot be combined with a shard — the pairing is rejected however the shard intent arrives: `readonly+shard`/`manual+shard`, or `readonly`/`manual` with `shard=True`)
-- `model` (optional): Model to use ("sonnet", "opus", "haiku" for Claude; "flash", "pro" for Gemini; "thinking", "k2.6", "k2.5" for Kimi)
+- `model` (optional): Model to use ("sonnet", "opus", "haiku" for Claude; "flash", "pro" for Gemini; "k3", "latest", "thinking", "k2.7-code", "k2.6", "k2.5" for Kimi)
 - `timeout` (optional): Auto-kill after N seconds
 - `tags` (optional): Comma-separated tags for organization
 - `shard` (optional): Create isolated git worktree (can also use `permission="shard"`)

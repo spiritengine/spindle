@@ -4396,15 +4396,16 @@ class TestKimiHarness:
 
     def test_kimi_model_aliases(self):
         """Aliases should resolve only to models the managed provider actually serves."""
-        assert KIMI_MODEL_ALIASES["thinking"] == "moonshot-ai/kimi-k2.6"
+        assert KIMI_MODEL_ALIASES["thinking"] == "moonshot-ai/kimi-k3"
+        assert KIMI_MODEL_ALIASES["k3"] == "moonshot-ai/kimi-k3"
         assert KIMI_MODEL_ALIASES["k2.6"] == "moonshot-ai/kimi-k2.6"
         assert KIMI_MODEL_ALIASES["k2.5"] == "moonshot-ai/kimi-k2.5"
-        assert KIMI_MODEL_ALIASES["latest"] == "moonshot-ai/kimi-k2.6"
+        assert KIMI_MODEL_ALIASES["latest"] == "moonshot-ai/kimi-k3"
         # The retired standalone thinking/turbo models must not reappear as alias targets.
         assert "moonshot-ai/kimi-k2-thinking" not in KIMI_MODEL_ALIASES.values()
         assert "moonshot-ai/kimi-k2-turbo-preview" not in KIMI_MODEL_ALIASES.values()
         # Default model must be a real, registerable model (regression: was kimi-k2-thinking).
-        assert KIMI_DEFAULT_MODEL == "moonshot-ai/kimi-k2.6"
+        assert KIMI_DEFAULT_MODEL == "moonshot-ai/kimi-k3"
         # k2.7-code (2026-06-12): coding-specialized aliases resolve to the served model.
         assert KIMI_MODEL_ALIASES["k2.7-code"] == "moonshot-ai/kimi-k2.7-code"
         assert KIMI_MODEL_ALIASES["k2.7"] == "moonshot-ai/kimi-k2.7-code"
@@ -4461,7 +4462,7 @@ class TestKimiHarness:
         assert "--thinking" in captured_cmd
 
     def test_kimi_spin_resolves_alias(self, tmp_path):
-        """The 'thinking' alias resolves to kimi-k2.6 and enables thinking mode."""
+        """The 'thinking' alias resolves to K3 and enables thinking mode."""
         captured_cmd = []
 
         def fake_spawn(spool_id, cmd, cwd, env=None):
@@ -4481,7 +4482,7 @@ class TestKimiHarness:
                         env=None,
                     )
 
-        assert "moonshot-ai/kimi-k2.6" in captured_cmd
+        assert "moonshot-ai/kimi-k3" in captured_cmd
         assert "--thinking" in captured_cmd
 
     def test_kimi_spin_full_model_no_thinking_flag(self, tmp_path):
@@ -4509,8 +4510,7 @@ class TestKimiHarness:
         assert "--thinking" not in captured_cmd
 
     def test_kimi_spin_default_model(self, tmp_path):
-        """No model specified defaults to kimi-k2.6 (regression: was the unregistered
-        kimi-k2-thinking, which made kimi-cli report 'LLM not set')."""
+        """No model specified defaults to K3 with its required thinking mode."""
         captured_cmd = []
 
         def fake_spawn(spool_id, cmd, cwd, env=None):
@@ -4531,8 +4531,33 @@ class TestKimiHarness:
                     )
 
         m_idx = captured_cmd.index("-m")
-        assert captured_cmd[m_idx + 1] == "moonshot-ai/kimi-k2.6"
-        assert "--thinking" not in captured_cmd
+        assert captured_cmd[m_idx + 1] == "moonshot-ai/kimi-k3"
+        assert "--thinking" in captured_cmd
+
+    @pytest.mark.parametrize("model", ["k3", "latest", "moonshot-ai/kimi-k3"])
+    def test_kimi_k3_forces_thinking_for_every_selection_path(self, tmp_path, model):
+        """K3 is always-thinking whether selected by alias or full model name."""
+        captured_cmd = []
+
+        def fake_spawn(spool_id, cmd, cwd, env=None):
+            captured_cmd.extend(cmd)
+            return 12345
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle._spawn_detached", side_effect=fake_spawn):
+                with patch("spindle._count_running", return_value=0):
+                    _kimi_spin_sync(
+                        prompt="Test",
+                        working_dir=str(tmp_path),
+                        model=model,
+                        system_prompt=None,
+                        timeout=None,
+                        tags=None,
+                        env=None,
+                    )
+
+        assert "moonshot-ai/kimi-k3" in captured_cmd
+        assert "--thinking" in captured_cmd
 
     def test_kimi_spin_rejects_unregistered_model(self, tmp_path):
         """An unregistered model is rejected up front with a clear error instead of
@@ -4564,6 +4589,8 @@ class TestKimiHarness:
         assert result.startswith("Error:")
         assert "moonshot-ai/kimi-k2-thinking" in result
         assert "LLM not set" in result
+        assert "interactive `/model`" in result
+        assert "/setup" not in result
         # No process spawned and no spool slot left behind.
         assert spawned == []
         assert list(tmp_path.glob("kimi-*.json")) == []

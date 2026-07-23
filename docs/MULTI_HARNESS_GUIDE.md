@@ -110,9 +110,9 @@ spin(
 ### Kimi CLI
 
 **CLI:** `kimi-cli` (Moonshot AI's Kimi Code CLI)
-**Models:** Kimi K2.5, K2-Thinking, K2-Thinking-Turbo
+**Models:** Kimi K3, K2.7 Code, K2.6, K2.5
 **Startup time:** ~5-10 seconds to first response
-**Strengths:** Fast startup, thinking mode for complex reasoning, multimodal support
+**Strengths:** Fast startup, reasoning, multimodal support
 
 The Kimi harness uses Moonshot AI's Kimi Code CLI in headless mode. Full agent with tool use, file access, and multi-step reasoning. Auth via Kimi/Moonshot API credentials configured in `~/.kimi/config.toml`.
 
@@ -126,16 +126,17 @@ spin(
 ```
 
 **Model aliases:**
-- `"thinking"` → `moonshot-ai/kimi-k2.6` run in thinking mode (best for complex reasoning)
+- `"k3"` → `moonshot-ai/kimi-k3` with required thinking mode
+- `"thinking"` → `moonshot-ai/kimi-k3` with required thinking mode
 - `"k2.6"` → `moonshot-ai/kimi-k2.6`
 - `"k2.5"` → `moonshot-ai/kimi-k2.5`
-- `"latest"` → `moonshot-ai/kimi-k2.6` (latest stable)
-- No model specified → `moonshot-ai/kimi-k2.6` (default)
+- `"latest"` → `moonshot-ai/kimi-k3` with required thinking mode (latest stable)
+- No model specified → `moonshot-ai/kimi-k3` with required thinking mode (default)
 - Any other string passes through to the CLI as-is
 
-The standalone `kimi-k2-thinking` / `kimi-k2-thinking-turbo` / `kimi-k2-turbo-preview` models the managed provider used to ship are gone; thinking is now a capability of kimi-k2.5/kimi-k2.6 enabled with kimi-cli's `--thinking` flag, which the `"thinking"` alias sets automatically.
+The standalone `kimi-k2-thinking` / `kimi-k2-thinking-turbo` / `kimi-k2-turbo-preview` models the managed provider used to ship are gone. Thinking is now a model capability enabled with kimi-cli's `--thinking` flag. Spindle enables it automatically for always-thinking K3 and K2.7 Code models, regardless of whether they are selected by alias or full model name.
 
-Every alias target must be registered under `[models.…]` in `~/.kimi/config.toml`. A model that isn't registered makes kimi-cli silently fall back to an empty LLM and emit only `LLM not set`; spindle now validates the resolved model up front and returns a clear error (with the list of available models) instead. Run `kimi /setup` to refresh managed models if a newer one is missing.
+Every alias target must be registered under `[models.…]` in `~/.kimi/config.toml`. A model that isn't registered makes kimi-cli silently fall back to an empty LLM and emit only `LLM not set`; spindle validates the resolved model up front and returns a clear error (with the list of available models) instead. Upgrade kimi-cli and use interactive `/model` to refresh managed models if a newer one is missing.
 
 **Important:** Kimi requires `working_dir` to be specified. Session continuity uses explicit UUID session IDs generated upfront. Auth via `kimi-cli login` or direct API key configuration in `~/.kimi/config.toml`.
 
