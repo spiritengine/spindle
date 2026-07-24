@@ -250,9 +250,7 @@ def _stream_driver_script_path() -> Optional[Path]:
     return path if path.exists() else None
 
 
-def _claude_headless_cmd(
-    prompt: str, flags: list, prompt_path: Optional[Path] = None
-) -> Tuple[list, Optional[str]]:
+def _claude_headless_cmd(prompt: str, flags: list, prompt_path: Optional[Path] = None) -> Tuple[list, Optional[str]]:
     """Build the argv for a headless Claude launch, honoring the driver flag.
 
     Returns ``(cmd, claude_protocol)`` — protocol is CLAUDE_PROTOCOL_STREAM_V1
@@ -276,9 +274,7 @@ def _claude_headless_cmd(
     if _claude_stream_driver_enabled():
         driver = _stream_driver_script_path()
         if driver is not None:
-            prompt_args = (
-                ["--prompt-file", str(prompt_path)] if prompt_path is not None else ["--prompt", prompt]
-            )
+            prompt_args = ["--prompt-file", str(prompt_path)] if prompt_path is not None else ["--prompt", prompt]
             cmd = [
                 sys.executable,
                 str(driver),
@@ -2908,11 +2904,7 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
                     elif sentinel_subtype == "parked" and parked_eligible:
                         pending = [
                             {"id": t.get("id"), "source": t.get("source")}
-                            for t in (
-                                sentinel.get("unresolved_tasks")
-                                or sentinel.get("stale_resolved_tasks")
-                                or []
-                            )
+                            for t in (sentinel.get("unresolved_tasks") or sentinel.get("stale_resolved_tasks") or [])
                             if isinstance(t, dict)
                         ] or [{"id": "unknown", "source": "unknown"}]
                         ids = ", ".join(str(t["id"]) for t in pending)
@@ -2959,9 +2951,7 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
                     task_state = _claude_driver.background_task_state(data)
                     pending_src = task_state["unresolved"] or task_state["stale_resolved"]
                     if pending_src:
-                        pending = [
-                            {"id": t.get("id"), "source": t.get("source")} for t in pending_src
-                        ]
+                        pending = [{"id": t.get("id"), "source": t.get("source")} for t in pending_src]
                         ids = ", ".join(str(t["id"]) for t in pending)
                         prior_error = spool.get("error")
                         spool["status"] = "error"
@@ -2973,8 +2963,7 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
                             f"stream driver terminated without a verdict. The stored "
                             f"result is not a completed answer. Use respin() to "
                             f"continue — it will rebuild a clean session from the "
-                            f"transcript."
-                            + (f" Original error: {prior_error[:300]}" if prior_error else "")
+                            f"transcript." + (f" Original error: {prior_error[:300]}" if prior_error else "")
                         )
             except json.JSONDecodeError:
                 if stdout.strip():
@@ -2998,9 +2987,7 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
         # that parked before any result has no session, and its transcript is
         # the only material the rebuild-based respin recovery can work from
         # (fell round 2, finding-20260724-xvo0).
-        if stdout and (
-            spool.get("session_id") or spool.get("claude_protocol") == CLAUDE_PROTOCOL_STREAM_V1
-        ):
+        if stdout and (spool.get("session_id") or spool.get("claude_protocol") == CLAUDE_PROTOCOL_STREAM_V1):
             transcript_path = _get_transcript_path(spool_id)
             transcript_path.parent.mkdir(parents=True, exist_ok=True)
             try:
@@ -3146,8 +3133,7 @@ def _sanitize_claude_transcript(transcript_text: str) -> str:
                     except (TypeError, ValueError):
                         rendered_input = str(block.get("input"))
                     lines.append(
-                        f"[tool call] {name}: "
-                        f"{_truncate_for_transcript(rendered_input, SANITIZED_TOOL_CALL_MAX_CHARS)}"
+                        f"[tool call] {name}: {_truncate_for_transcript(rendered_input, SANITIZED_TOOL_CALL_MAX_CHARS)}"
                     )
         elif etype == "user":
             for channel, text in _claude_driver.iter_user_texts(ev):
@@ -3155,10 +3141,7 @@ def _sanitize_claude_transcript(transcript_text: str) -> str:
                 if not cleaned:
                     continue
                 if channel == "tool_result":
-                    lines.append(
-                        f"[tool result] "
-                        f"{_truncate_for_transcript(cleaned, SANITIZED_TOOL_RESULT_MAX_CHARS)}"
-                    )
+                    lines.append(f"[tool result] {_truncate_for_transcript(cleaned, SANITIZED_TOOL_RESULT_MAX_CHARS)}")
                 else:
                     lines.append(f"[user] {cleaned}")
     if not lines:
@@ -4405,9 +4388,7 @@ async def spools() -> str:
     return await asyncio.to_thread(_spools_sync)
 
 
-def _respin_parked_state(
-    original_spool: dict, force_rebuild: bool = False
-) -> Tuple[list, Optional[str]]:
+def _respin_parked_state(original_spool: dict, force_rebuild: bool = False) -> Tuple[list, Optional[str]]:
     """Whether a Claude spool must respin via transcript rebuild, and its transcript.
 
     Returns ``(parked_tasks, transcript_text)``. A non-empty task list means
@@ -4447,9 +4428,7 @@ def _respin_parked_state(
     if force_rebuild:
         tasks = []
         if transcript_text:
-            state = _claude_driver.background_task_state(
-                _parse_claude_transcript_events(transcript_text)
-            )
+            state = _claude_driver.background_task_state(_parse_claude_transcript_events(transcript_text))
             tasks = state["unresolved"] or state["stale_resolved"]
         return (
             [{"id": t.get("id"), "source": t.get("source")} for t in tasks]

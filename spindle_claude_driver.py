@@ -144,9 +144,7 @@ class BackgroundTaskTracker:
         self.ever_armed = True
         if task_id in self._resolved:
             return
-        entry = self._armed.setdefault(
-            task_id, {"id": task_id, "source": source, "armed_at": time.time()}
-        )
+        entry = self._armed.setdefault(task_id, {"id": task_id, "source": source, "armed_at": time.time()})
         if timeout_ms is not None:
             entry["timeout_ms"] = timeout_ms
 
@@ -442,9 +440,7 @@ def main(argv=None):
     signal.signal(signal.SIGTERM, _handle_term)
 
     try:
-        proc.stdin.write(
-            json.dumps({"type": "user", "message": {"role": "user", "content": prompt}}) + "\n"
-        )
+        proc.stdin.write(json.dumps({"type": "user", "message": {"role": "user", "content": prompt}}) + "\n")
         proc.stdin.flush()
     except (BrokenPipeError, OSError):
         pass  # claude died at startup; the read loop below drains and reports
@@ -494,9 +490,7 @@ def main(argv=None):
             now = time.time()
             unresolved = tracker.unresolved
             if unresolved:
-                if now > _park_deadline(
-                    unresolved, args.default_task_timeout_seconds, args.park_grace_seconds
-                ):
+                if now > _park_deadline(unresolved, args.default_task_timeout_seconds, args.park_grace_seconds):
                     _emit(
                         build_sentinel(
                             "parked",
@@ -506,11 +500,7 @@ def main(argv=None):
                     )
                     return _finish(proc) or 0
             elif grace_started is not None:
-                idle_grace = (
-                    args.requery_start_window_seconds
-                    if user_after_result
-                    else args.complete_grace_seconds
-                )
+                idle_grace = args.requery_start_window_seconds if user_after_result else args.complete_grace_seconds
                 if now - grace_started >= idle_grace:
                     return _linger_terminal()
 

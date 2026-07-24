@@ -11,7 +11,6 @@ Event fixtures mirror the real shapes captured from the 2026-07-24 incident
 """
 
 import json
-import os
 import subprocess
 import sys
 import textwrap
@@ -53,8 +52,7 @@ def monitor_arm_event(task_id="bhbhqvqfz", timeout_ms=600000, persistent=False):
                     "tool_use_id": "toolu_arm",
                     "type": "tool_result",
                     "content": (
-                        f"Monitor started (task {task_id}, timeout {timeout_ms}ms). "
-                        "You will be notified on each event."
+                        f"Monitor started (task {task_id}, timeout {timeout_ms}ms). You will be notified on each event."
                     ),
                 }
             ],
@@ -120,7 +118,7 @@ def system_task_notification_event(task_id, status="completed"):
         "task_id": task_id,
         "tool_use_id": "toolu_arm",
         "status": status,
-        "summary": f'Monitor "watch" stream ended',
+        "summary": 'Monitor "watch" stream ended',
     }
 
 
@@ -548,9 +546,7 @@ class TestStreamDriverFinalization:
     def test_sentinel_marks_output_complete(self, tmp_path):
         spool = running_claude_spool("drv2", claude_protocol=CLAUDE_PROTOCOL_STREAM_V1)
         out = tmp_path / "out.txt"
-        out.write_text(
-            ndjson([result_event("done"), driver.build_sentinel("complete", [])])
-        )
+        out.write_text(ndjson([result_event("done"), driver.build_sentinel("complete", [])]))
         assert _spool_has_complete_output(spool, out, tmp_path / "err.txt") is True
 
     def test_one_shot_result_still_complete_without_sentinel(self, tmp_path):
@@ -670,9 +666,7 @@ class TestStreamDriverFinalization:
         """A safety-refusal classification outranks parked metadata — the
         actionable response is re-routing, and error_kind must say so."""
         spool_id = "drv-refusal"
-        refusal_result = dict(
-            result_event("I can't help with that."), stop_reason="refusal"
-        )
+        refusal_result = dict(result_event("I can't help with that."), stop_reason="refusal")
         events = [
             monitor_arm_event("t6"),
             refusal_result,
@@ -819,9 +813,7 @@ class TestRespinParkedRecovery:
             if transcript_events is not None or transcript_text is not None:
                 tpath = _get_transcript_path(spool["id"])
                 tpath.parent.mkdir(parents=True, exist_ok=True)
-                tpath.write_text(
-                    transcript_text if transcript_text is not None else json.dumps(transcript_events)
-                )
+                tpath.write_text(transcript_text if transcript_text is not None else json.dumps(transcript_events))
             with patch("spindle._spawn_detached", side_effect=fake_detached):
                 with patch("spindle._count_running", return_value=0):
                     with patch("spindle._monitor_spool"):
@@ -967,9 +959,7 @@ class TestRespinParkedRecovery:
             monitor_arm_event("bigtask"),
             result_event(PARKED_STUB),
         ]
-        result, cmd, new_spool, stdin_path = self._respin(
-            tmp_path, self._parked_spool("bigrb01"), events
-        )
+        result, cmd, new_spool, stdin_path = self._respin(tmp_path, self._parked_spool("bigrb01"), events)
         assert not result.startswith(("Error", "Spool")), result
         assert "--resume" not in cmd
         for arg in cmd:
