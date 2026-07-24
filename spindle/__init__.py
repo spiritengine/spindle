@@ -2812,6 +2812,51 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
                     spool["result"] = stdout
                     spool["status"] = "complete"
 
+                # Driver sentinel subtype authority (fell round 1,
+                # finding-20260724-5evm): for stream-driver spools the sentinel
+                # is the driver's verdict on how the stream ended — presence
+                # alone only means "the stream is over". A no_result sentinel
+                # (claude died before any result) must not finalize as success,
+                # and a parked sentinel must park even when its unresolved list
+                # is empty (tasks that resolved only after the final result:
+                # the stored answer provably never accounted for them).
+                if (
+                    spool.get("claude_protocol") == CLAUDE_PROTOCOL_STREAM_V1
+                    and spool.get("status") == "complete"
+                ):
+                    sentinel = _claude_driver.find_sentinel(data)
+                    sentinel_subtype = sentinel.get("subtype") if sentinel else None
+                    if sentinel_subtype == "no_result":
+                        spool["status"] = "error"
+                        detail = sentinel.get("reason") or "claude exited without emitting a result event"
+                        exit_note = sentinel.get("claude_exit_code")
+                        spool["error"] = (
+                            f"Stream driver reported no result: {detail}"
+                            + (f" (claude exit code {exit_note})" if exit_note is not None else "")
+                            + (f"; stderr: {stderr.strip()[:300]}" if stderr.strip() else "")
+                        )
+                    elif sentinel_subtype == "parked":
+                        pending = [
+                            {"id": t.get("id"), "source": t.get("source")}
+                            for t in (
+                                sentinel.get("unresolved_tasks")
+                                or sentinel.get("stale_resolved_tasks")
+                                or []
+                            )
+                            if isinstance(t, dict)
+                        ] or [{"id": "unknown", "source": "unknown"}]
+                        ids = ", ".join(str(t["id"]) for t in pending)
+                        spool["status"] = "error"
+                        spool["error_kind"] = "headless_background_wait"
+                        spool["pending_background_tasks"] = pending
+                        spool["error"] = (
+                            f"Claude's headless turn ended without a result that accounts "
+                            f"for its background task(s) [{ids}] "
+                            f"({sentinel.get('reason') or 'driver reported the turn parked'}). "
+                            f"The stored result is not a completed answer. Use respin() to "
+                            f"continue — it will rebuild a clean session from the transcript."
+                        )
+
                 # Parked-turn detection (finding-20260724-2niy): a turn that
                 # ended while nonpersistent background tasks (Monitor,
                 # background Bash, scheduled wakeup) were still unresolved is

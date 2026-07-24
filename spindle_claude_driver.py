@@ -272,7 +272,7 @@ def ndjson_has_sentinel(text):
     return False
 
 
-def build_sentinel(subtype, unresolved, claude_exit_code=None, reason=None):
+def build_sentinel(subtype, unresolved, claude_exit_code=None, reason=None, stale_resolved=None):
     sentinel = {
         "type": SENTINEL_TYPE,
         "subtype": subtype,
@@ -283,6 +283,10 @@ def build_sentinel(subtype, unresolved, claude_exit_code=None, reason=None):
         sentinel["claude_exit_code"] = claude_exit_code
     if reason:
         sentinel["reason"] = reason
+    if stale_resolved:
+        # Tasks whose completion arrived only AFTER the final result event:
+        # the recorded answer provably never accounted for them.
+        sentinel["stale_resolved_tasks"] = stale_resolved
     return sentinel
 
 
@@ -400,36 +404,55 @@ def main(argv=None):
 
     tracker = BackgroundTaskTracker()
     saw_result = False
-    awaiting_tasks_since_result = False
-    completing_since = None  # clean result seen; lingering for a queued requery turn
-    resolved_wait_since = None  # tasks resolved after a parked result; awaiting the requery
-    first_clean_result_at = None
+    stale_resolved = []  # tasks resolved AFTER the most recent result event
+    completing_since = None  # start of the current requery-linger grace window
+    first_clean_result_at = None  # anchor for the hard linger cap, per clean phase
+
+    def _linger_terminal():
+        """Terminal sentinel once the post-clean-result linger is exhausted.
+
+        Resolutions that arrived after the final result mean that result
+        provably never accounted for them — report parked (spindle marks
+        headless_background_wait; respin rebuilds) instead of blessing a
+        stale answer as complete: the original false-completion otherwise
+        returns through this exit.
+        """
+        if stale_resolved:
+            _emit(
+                build_sentinel(
+                    "parked",
+                    [],
+                    reason="background tasks resolved after the final result; no requery turn ran",
+                    stale_resolved=stale_resolved,
+                )
+            )
+        else:
+            _emit(build_sentinel("complete", []))
+        return _finish(proc) or 0
 
     while True:
+        clean = saw_result and not tracker.unresolved
         try:
-            line = lines.get(timeout=0.25 if completing_since is not None else 1.0)
+            line = lines.get(timeout=0.25 if clean else 1.0)
         except queue.Empty:
             now = time.time()
-            if completing_since is not None:
+            unresolved = tracker.unresolved
+            if saw_result and not unresolved:
+                # Invariant: once a result exists and nothing is unresolved,
+                # the driver is ALWAYS on a bounded path to a sentinel — the
+                # linger (re)enters here no matter what noise events cleared
+                # it, and the hard cap is anchored at the clean result itself.
+                if first_clean_result_at is None:
+                    first_clean_result_at = now
+                if completing_since is None:
+                    completing_since = now
                 if (
                     now - completing_since >= args.complete_grace_seconds
                     or now - first_clean_result_at >= args.complete_linger_max_seconds
                 ):
-                    _emit(build_sentinel("complete", []))
-                    return _finish(proc) or 0
-            elif awaiting_tasks_since_result:
-                unresolved = tracker.unresolved
-                if not unresolved:
-                    # Every task resolved after the parked result, but the
-                    # requery turn hasn't produced a new result. Give it a
-                    # bounded window, then accept the last result as final so
-                    # a CLI that never requeries can't hang the driver.
-                    if resolved_wait_since is None:
-                        resolved_wait_since = now
-                    elif now - resolved_wait_since >= args.complete_linger_max_seconds:
-                        _emit(build_sentinel("complete", []))
-                        return _finish(proc) or 0
-                elif now > _park_deadline(
+                    return _linger_terminal()
+            elif saw_result and unresolved:
+                if now > _park_deadline(
                     unresolved, args.default_task_timeout_seconds, args.park_grace_seconds
                 ):
                     _emit(
@@ -455,6 +478,16 @@ def main(argv=None):
                         reason="claude exited with unresolved background tasks",
                     )
                 )
+            elif saw_result and stale_resolved:
+                _emit(
+                    build_sentinel(
+                        "parked",
+                        [],
+                        claude_exit_code=exit_code,
+                        reason="claude exited after tasks resolved past the final result; no requery turn ran",
+                        stale_resolved=stale_resolved,
+                    )
+                )
             elif saw_result:
                 _emit(build_sentinel("complete", [], claude_exit_code=exit_code))
             else:
@@ -478,16 +511,28 @@ def main(argv=None):
         if not isinstance(event, dict):
             continue
 
-        # Any event ends the current linger phases: a queued requery turn has
-        # started (or lifecycle noise arrived); the next result decides.
+        # Activity restarts the grace window (a queued requery turn may be
+        # starting); the hard cap anchored at first_clean_result_at still
+        # bounds the total linger even under continuous noise.
         completing_since = None
-        resolved_wait_since = None
 
+        before = {t["id"]: t for t in tracker.unresolved} if saw_result else {}
         tracker.observe(event)
+        if before:
+            after_ids = {t["id"] for t in tracker.unresolved}
+            for tid, entry in before.items():
+                if tid not in after_ids:
+                    stale_resolved.append({"id": tid, "source": entry.get("source")})
+
+        if tracker.unresolved:
+            # New arms re-enter the waiting phase; the next clean result gets
+            # a fresh linger-cap anchor.
+            first_clean_result_at = None
 
         if event.get("type") == "result":
             saw_result = True
-            awaiting_tasks_since_result = bool(tracker.unresolved)
+            # This result post-dates every resolution seen so far.
+            stale_resolved = []
             if not tracker.unresolved:
                 if not tracker.ever_armed:
                     # No background tasks ever existed, so no notification can
@@ -502,6 +547,17 @@ def main(argv=None):
                 completing_since = now
                 if first_clean_result_at is None:
                     first_clean_result_at = now
+
+        # Backstop for a stream that never goes quiet: enforce the hard cap at
+        # event time too, so continuous noise cannot outrun the Empty-branch
+        # checks and hold the driver open past the linger cap.
+        if (
+            saw_result
+            and not tracker.unresolved
+            and first_clean_result_at is not None
+            and time.time() - first_clean_result_at >= args.complete_linger_max_seconds
+        ):
+            return _linger_terminal()
 
 
 if __name__ == "__main__":

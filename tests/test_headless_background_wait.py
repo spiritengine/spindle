@@ -473,6 +473,62 @@ class TestStreamDriverFinalization:
         assert spool["error_kind"] == "headless_background_wait"
         assert spool["result"] == PARKED_STUB
 
+    def test_driver_no_result_sentinel_finalizes_as_error(self, tmp_path):
+        """Fell r1 finding 3: a no_result sentinel (claude died before any
+        result) used to finalize as status=complete with raw NDJSON as the
+        result."""
+        spool_id = "drv-nores"
+        events = [
+            {"type": "system", "subtype": "init", "session_id": "s"},
+            driver.build_sentinel(
+                "no_result",
+                [],
+                claude_exit_code=1,
+                reason="claude exited without emitting a result event",
+            ),
+        ]
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool(
+                spool_id,
+                running_claude_spool(spool_id, claude_protocol=CLAUDE_PROTOCOL_STREAM_V1),
+            )
+            _get_output_path(spool_id).write_text(ndjson(events))
+            assert _check_and_finalize_spool(spool_id) is True
+            spool = _read_spool(spool_id)
+        assert spool["status"] == "error"
+        assert "no result" in spool["error"].lower()
+        assert "claude exit code 1" in spool["error"]
+
+    def test_driver_stale_parked_sentinel_finalizes_as_error(self, tmp_path):
+        """Fell r1 findings 2+3: a parked sentinel with an EMPTY unresolved
+        list (tasks resolved after the final result) must still park the
+        spool, sourcing pending ids from the stale list."""
+        spool_id = "drv-stale"
+        events = [
+            monitor_arm_event("t8"),
+            result_event(PARKED_STUB),
+            system_task_notification_event("t8", "completed"),
+            driver.build_sentinel(
+                "parked",
+                [],
+                claude_exit_code=0,
+                reason="claude exited after tasks resolved past the final result; no requery turn ran",
+                stale_resolved=[{"id": "t8", "source": "monitor"}],
+            ),
+        ]
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool(
+                spool_id,
+                running_claude_spool(spool_id, claude_protocol=CLAUDE_PROTOCOL_STREAM_V1),
+            )
+            _get_output_path(spool_id).write_text(ndjson(events))
+            assert _check_and_finalize_spool(spool_id) is True
+            spool = _read_spool(spool_id)
+        assert spool["status"] == "error"
+        assert spool["error_kind"] == "headless_background_wait"
+        assert spool["pending_background_tasks"] == [{"id": "t8", "source": "monitor"}]
+        assert spool["result"] == PARKED_STUB
+
     def test_driver_notified_stream_finalizes_as_complete(self, tmp_path):
         spool_id = "drv-ok"
         events = [
@@ -815,6 +871,30 @@ FAKE_CLAUDE_TEMPLATE = textwrap.dedent(
               "result": "Final answer after wakeup."})
         # Stay alive (like a real CLI with open stdin) until stdin closes.
         sys.stdin.read()
+    elif MODE == "noise_after_result":
+        # Fell r1 finding 1: lifecycle noise after the task resolved and the
+        # result arrived must not cancel the bounded path to a sentinel.
+        emit({"type": "system", "subtype": "task_notification", "task_id": "faketask",
+              "status": "completed", "summary": "done"})
+        emit({"type": "assistant", "message": {"role": "assistant",
+              "content": [{"type": "text", "text": "Informed answer."}]}})
+        emit({"type": "result", "subtype": "success", "is_error": False,
+              "stop_reason": "end_turn", "session_id": "fake-sess",
+              "result": "Informed answer."})
+        time.sleep(0.1)
+        emit({"type": "system", "subtype": "background_tasks_changed", "tasks": []})
+        sys.stdin.read()
+    elif MODE == "resolve_exit":
+        # Fell r1 finding 2 (EOF variant): the task resolves only AFTER the
+        # stub result, then claude exits without a requery turn.
+        emit({"type": "system", "subtype": "task_notification", "task_id": "faketask",
+              "status": "completed", "summary": "done"})
+    elif MODE == "resolve_silent":
+        # Fell r1 finding 2 (linger variant): resolution after the stub
+        # result, then silence — no requery ever arrives.
+        emit({"type": "system", "subtype": "task_notification", "task_id": "faketask",
+              "status": "completed", "summary": "done"})
+        sys.stdin.read()
     elif MODE == "silent":
         # Never notify; keep running until killed or stdin closes.
         sys.stdin.read()
@@ -893,6 +973,39 @@ class TestDriverEndToEnd:
         results = [ev for ev in events if ev.get("type") == "result"]
         assert len(results) == 2
         assert results[-1]["result"] == "Requery answer."
+
+    def test_driver_bounded_exit_despite_noise_after_clean_result(self, tmp_path):
+        """Fell r1 finding 1: a lifecycle event after the clean result used to
+        clear the linger timer with nothing to restart it — unbounded hang."""
+        proc, events = run_driver(tmp_path, "noise_after_result")
+        assert proc.returncode == 0, proc.stderr
+        sentinel = driver.find_sentinel(events)
+        assert sentinel is not None
+        assert sentinel["subtype"] == "complete"
+        assert [ev for ev in events if ev.get("type") == "result"][-1]["result"] == "Informed answer."
+
+    def test_driver_marks_stale_result_parked_on_exit(self, tmp_path):
+        """Fell r1 finding 2 (EOF): resolution after the stub result with no
+        requery used to finalize as complete, reviving the false completion."""
+        proc, events = run_driver(tmp_path, "resolve_exit")
+        sentinel = driver.find_sentinel(events)
+        assert sentinel is not None
+        assert sentinel["subtype"] == "parked"
+        assert sentinel["unresolved_tasks"] == []
+        assert [t["id"] for t in sentinel["stale_resolved_tasks"]] == ["faketask"]
+
+    def test_driver_marks_stale_result_parked_after_linger(self, tmp_path):
+        """Fell r1 finding 2 (linger): same stale-result case when claude
+        stays alive silently instead of exiting."""
+        proc, events = run_driver(
+            tmp_path,
+            "resolve_silent",
+            extra_args=("--complete-linger-max-seconds", "1.2"),
+        )
+        sentinel = driver.find_sentinel(events)
+        assert sentinel is not None, proc.stdout
+        assert sentinel["subtype"] == "parked"
+        assert [t["id"] for t in sentinel["stale_resolved_tasks"]] == ["faketask"]
 
     def test_driver_parks_after_task_deadline(self, tmp_path):
         proc, events = run_driver(
