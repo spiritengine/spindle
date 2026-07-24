@@ -2873,9 +2873,30 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
                 # the stored answer provably never accounted for them).
                 driver_stream = spool.get("claude_protocol") == CLAUDE_PROTOCOL_STREAM_V1
                 sentinel = _claude_driver.find_sentinel(data) if driver_stream else None
-                if driver_stream and sentinel is not None and spool.get("status") == "complete":
+                # A parked verdict must land even when Claude's last result was
+                # error-shaped (fell round 3, finding-20260724-sgoz): without
+                # error_kind=headless_background_wait, respin would --resume the
+                # parked session and replay the stale notification. Refusal
+                # classifications (fable_gate/safety_refusal) keep precedence —
+                # only kind-less states are eligible.
+                parked_eligible = spool.get("status") == "complete" or (
+                    spool.get("status") == "error" and not spool.get("error_kind")
+                )
+                if driver_stream and sentinel is None and cc_result is None:
+                    # The driver died before producing either a result or a
+                    # verdict (crash, SIGKILL). Raw stream stays as the result
+                    # for diagnostics, but this is never a completed spool.
+                    spool["status"] = "error"
+                    spool["error"] = (
+                        "Stream driver terminated without a result or a verdict "
+                        "(claude or the driver crashed mid-stream"
+                        + (f", exit code {exit_code}" if exit_code is not None else "")
+                        + ")"
+                        + (f"; stderr: {stderr.strip()[:300]}" if stderr.strip() else "")
+                    )
+                elif driver_stream and sentinel is not None:
                     sentinel_subtype = sentinel.get("subtype")
-                    if sentinel_subtype == "no_result":
+                    if sentinel_subtype == "no_result" and spool.get("status") == "complete":
                         spool["status"] = "error"
                         detail = sentinel.get("reason") or "claude exited without emitting a result event"
                         exit_note = sentinel.get("claude_exit_code")
@@ -2884,7 +2905,7 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
                             + (f" (claude exit code {exit_note})" if exit_note is not None else "")
                             + (f"; stderr: {stderr.strip()[:300]}" if stderr.strip() else "")
                         )
-                    elif sentinel_subtype == "parked":
+                    elif sentinel_subtype == "parked" and parked_eligible:
                         pending = [
                             {"id": t.get("id"), "source": t.get("source")}
                             for t in (
@@ -2895,6 +2916,7 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
                             if isinstance(t, dict)
                         ] or [{"id": "unknown", "source": "unknown"}]
                         ids = ", ".join(str(t["id"]) for t in pending)
+                        prior_error = spool.get("error")
                         spool["status"] = "error"
                         spool["error_kind"] = "headless_background_wait"
                         spool["pending_background_tasks"] = pending
@@ -2904,6 +2926,7 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
                             f"({sentinel.get('reason') or 'driver reported the turn parked'}). "
                             f"The stored result is not a completed answer. Use respin() to "
                             f"continue — it will rebuild a clean session from the transcript."
+                            + (f" Original error: {prior_error[:300]}" if prior_error else "")
                         )
 
                 # Parked-turn detection backstop, DRIVER STREAMS ONLY, for a

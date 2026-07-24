@@ -26,6 +26,7 @@ from spindle import (
     _check_and_finalize_spool,
     _claude_headless_cmd,
     _format_spool_failure,
+    _get_exit_path,
     _get_output_path,
     _get_transcript_path,
     _handle_expired_session,
@@ -614,6 +615,98 @@ class TestStreamDriverFinalization:
         assert spool["error_kind"] == "headless_background_wait"
         assert spool["pending_background_tasks"] == [{"id": "t8", "source": "monitor"}]
         assert spool["result"] == PARKED_STUB
+
+    def test_parked_sentinel_lands_on_error_shaped_result(self, tmp_path):
+        """Fell r3 finding 1: arm -> is_error result -> parked sentinel must
+        still record error_kind/pending so respin rebuilds instead of
+        --resume replaying the stale notification."""
+        spool_id = "drv-err-park"
+        error_result = dict(result_event("API error: stream interrupted"), is_error=True)
+        events = [
+            monitor_arm_event("t6"),
+            error_result,
+            driver.build_sentinel(
+                "parked",
+                [{"id": "t6", "source": "monitor"}],
+                reason="claude exited with unresolved background tasks",
+            ),
+        ]
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool(
+                spool_id,
+                running_claude_spool(spool_id, claude_protocol=CLAUDE_PROTOCOL_STREAM_V1),
+            )
+            _get_output_path(spool_id).write_text(ndjson(events))
+            assert _check_and_finalize_spool(spool_id) is True
+            spool = _read_spool(spool_id)
+        assert spool["status"] == "error"
+        assert spool["error_kind"] == "headless_background_wait"
+        assert spool["pending_background_tasks"] == [{"id": "t6", "source": "monitor"}]
+        assert "API error: stream interrupted" in spool["error"]
+
+    def test_parked_sentinel_does_not_override_refusal_kind(self, tmp_path):
+        """A safety-refusal classification outranks parked metadata — the
+        actionable response is re-routing, and error_kind must say so."""
+        spool_id = "drv-refusal"
+        refusal_result = dict(
+            result_event("I can't help with that."), stop_reason="refusal"
+        )
+        events = [
+            monitor_arm_event("t6"),
+            refusal_result,
+            driver.build_sentinel("parked", [{"id": "t6", "source": "monitor"}]),
+        ]
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool(
+                spool_id,
+                running_claude_spool(spool_id, claude_protocol=CLAUDE_PROTOCOL_STREAM_V1),
+            )
+            _get_output_path(spool_id).write_text(ndjson(events))
+            assert _check_and_finalize_spool(spool_id) is True
+            spool = _read_spool(spool_id)
+        assert spool["status"] == "error"
+        assert spool["error_kind"] == "safety_refusal"
+
+    def test_sentinel_less_crash_before_result_is_error(self, tmp_path):
+        """Fell r3 finding 2: a parseable driver stream with neither a result
+        nor a sentinel (driver SIGKILLed pre-result) must not finalize
+        complete."""
+        spool_id = "drv-crash"
+        events = [
+            {"type": "system", "subtype": "init", "session_id": "s"},
+            assistant_text_event("Starting work..."),
+        ]
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool(
+                spool_id,
+                running_claude_spool(spool_id, claude_protocol=CLAUDE_PROTOCOL_STREAM_V1),
+            )
+            _get_output_path(spool_id).write_text(ndjson(events))
+            _get_exit_path(spool_id).write_text("137\n")
+            assert _check_and_finalize_spool(spool_id) is True
+            spool = _read_spool(spool_id)
+        assert spool["status"] == "error"
+        assert "without a result or a verdict" in spool["error"]
+        assert "137" in spool["error"]
+
+    def test_sentinel_less_stream_with_result_and_no_tasks_stays_complete(self, tmp_path):
+        """SIGTERM after a clean no-task result: the result exists and no
+        task evidence contradicts it — complete."""
+        spool_id = "drv-sigterm-ok"
+        events = [
+            assistant_text_event("Answer."),
+            result_event("Answer."),
+        ]
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool(
+                spool_id,
+                running_claude_spool(spool_id, claude_protocol=CLAUDE_PROTOCOL_STREAM_V1),
+            )
+            _get_output_path(spool_id).write_text(ndjson(events))
+            assert _check_and_finalize_spool(spool_id) is True
+            spool = _read_spool(spool_id)
+        assert spool["status"] == "complete"
+        assert spool["result"] == "Answer."
 
     def test_driver_notified_stream_finalizes_as_complete(self, tmp_path):
         spool_id = "drv-ok"
