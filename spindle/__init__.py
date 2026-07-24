@@ -250,7 +250,9 @@ def _stream_driver_script_path() -> Optional[Path]:
     return path if path.exists() else None
 
 
-def _claude_headless_cmd(prompt: str, flags: list) -> Tuple[list, Optional[str]]:
+def _claude_headless_cmd(
+    prompt: str, flags: list, prompt_path: Optional[Path] = None
+) -> Tuple[list, Optional[str]]:
     """Build the argv for a headless Claude launch, honoring the driver flag.
 
     Returns ``(cmd, claude_protocol)`` — protocol is CLAUDE_PROTOCOL_STREAM_V1
@@ -262,16 +264,25 @@ def _claude_headless_cmd(prompt: str, flags: list) -> Tuple[list, Optional[str]]
     outright. Under the driver, Monitor notifications are deliverable, but
     ScheduleWakeup's fire-while-headless semantics are unverified, so it stays
     disallowed there too. A backgrounded Bash command cannot be blocked by
-    tool name; the parked-turn detector remains the backstop for it.
+    tool name; the driver-stream parked detection remains the backstop for it.
+
+    ``prompt_path``: deliver the prompt from this file instead of argv — a
+    single argv element is capped at 128KiB on Linux, which rebuilt transcript
+    continuations routinely exceed. The caller must have written ``prompt`` to
+    that path already. Driver launches read it via --prompt-file; one-shot
+    launches take no positional prompt, and the caller MUST spawn them with
+    stdin redirected from the file (``claude -p`` reads the prompt from stdin).
     """
     if _claude_stream_driver_enabled():
         driver = _stream_driver_script_path()
         if driver is not None:
+            prompt_args = (
+                ["--prompt-file", str(prompt_path)] if prompt_path is not None else ["--prompt", prompt]
+            )
             cmd = [
                 sys.executable,
                 str(driver),
-                "--prompt",
-                prompt,
+                *prompt_args,
                 "--",
                 "claude",
                 "-p",
@@ -293,7 +304,7 @@ def _claude_headless_cmd(prompt: str, flags: list) -> Tuple[list, Optional[str]]
     cmd = [
         "claude",
         "-p",
-        prompt,
+        *([] if prompt_path is not None else [prompt]),
         "--output-format",
         "json",
         "--disallowedTools",
@@ -1125,6 +1136,35 @@ def _get_exit_path(spool_id: str) -> Path:
     return SPINDLE_DIR / f"{spool_id}.exit"
 
 
+def _get_prompt_path(spool_id: str) -> Path:
+    """Get path to a spool's file-delivered prompt.
+
+    Rebuilt transcript continuations routinely exceed Linux's 128KiB per-argv
+    limit (MAX_ARG_STRLEN), so they are written here and delivered via stdin
+    (one-shot claude) or --prompt-file (stream driver) instead of argv.
+    """
+    return SPINDLE_DIR / f"{spool_id}.prompt"
+
+
+# Prompts above this byte size are delivered by file instead of argv — margin
+# under Linux's MAX_ARG_STRLEN (131072 bytes per argv element), which 1,100+
+# real transcript-continuation prompts exceed (fell round 2 measurement).
+PROMPT_ARGV_LIMIT = 100_000
+
+
+def _prompt_file_if_oversized(spool_id: str, prompt: str) -> Optional[Path]:
+    """Write an over-limit prompt to the spool's prompt file; None if argv fits.
+
+    Raises IOError if the file cannot be written.
+    """
+    if len(prompt.encode("utf-8", errors="ignore")) <= PROMPT_ARGV_LIMIT:
+        return None
+    path = _get_prompt_path(spool_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(prompt)
+    return path
+
+
 def _read_exit_code(spool_id: str) -> Optional[int]:
     """Read a detached child's persisted exit status, or None if unavailable."""
     try:
@@ -1835,7 +1875,13 @@ def _publish_spawned_process(spool_id: str, pid: int) -> bool:
         return False
 
 
-def _start_spool_process(spool: dict, cmd: list, cwd: str, env: Optional[Dict[str, str]]) -> Optional[str]:
+def _start_spool_process(
+    spool: dict,
+    cmd: list,
+    cwd: str,
+    env: Optional[Dict[str, str]],
+    stdin_path: Optional[Path] = None,
+) -> Optional[str]:
     """Prepare, spawn, and publish a process while its shard worktree is locked."""
     spool_id = spool["id"]
     worktree_path = _spool_worktree_path(spool)
@@ -1845,7 +1891,12 @@ def _start_spool_process(spool: dict, cmd: list, cwd: str, env: Optional[Dict[st
         if not _prepare_pending_spool_for_spawn(spool):
             return f"Error: Spool {spool_id} was finalized before process startup completed"
         try:
-            pid = _spawn_detached(spool_id, cmd, cwd, env)
+            # Pass stdin_path only when set so tests that fake _spawn_detached
+            # with the historical 4-arg signature keep working.
+            if stdin_path is not None:
+                pid = _spawn_detached(spool_id, cmd, cwd, env, stdin_path=stdin_path)
+            else:
+                pid = _spawn_detached(spool_id, cmd, cwd, env)
         except Exception as exc:
             with _spool_lock(spool_id) as spool_acquired:
                 current = _read_spool(spool_id) if spool_acquired else None
@@ -2820,12 +2871,10 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
                 # and a parked sentinel must park even when its unresolved list
                 # is empty (tasks that resolved only after the final result:
                 # the stored answer provably never accounted for them).
-                if (
-                    spool.get("claude_protocol") == CLAUDE_PROTOCOL_STREAM_V1
-                    and spool.get("status") == "complete"
-                ):
-                    sentinel = _claude_driver.find_sentinel(data)
-                    sentinel_subtype = sentinel.get("subtype") if sentinel else None
+                driver_stream = spool.get("claude_protocol") == CLAUDE_PROTOCOL_STREAM_V1
+                sentinel = _claude_driver.find_sentinel(data) if driver_stream else None
+                if driver_stream and sentinel is not None and spool.get("status") == "complete":
+                    sentinel_subtype = sentinel.get("subtype")
                     if sentinel_subtype == "no_result":
                         spool["status"] = "error"
                         detail = sentinel.get("reason") or "claude exited without emitting a result event"
@@ -2857,33 +2906,42 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
                             f"continue — it will rebuild a clean session from the transcript."
                         )
 
-                # Parked-turn detection (finding-20260724-2niy): a turn that
-                # ended while nonpersistent background tasks (Monitor,
-                # background Bash, scheduled wakeup) were still unresolved is
-                # NOT a completed task — the process that would have delivered
-                # their notifications has exited, so the recorded result is the
-                # agent's waiting stub. Reuse status=error (no new status) so
-                # every existing unspool/spin_wait error path surfaces it.
-                # A genuine final report with an unresolved task is still
-                # flagged: the termination is invalid either way, and the
-                # report stays preserved in spool["result"].
-                if spool.get("status") == "complete" and isinstance(data, list):
-                    unresolved = _claude_driver.background_task_state(data)["unresolved"]
-                    if unresolved:
+                # Parked-turn detection backstop, DRIVER STREAMS ONLY, for a
+                # driver that died without a sentinel (SIGTERM, crash). It is
+                # deliberately NOT applied to one-shot output (fell round 2,
+                # finding-20260724-xvo0): resolution events are structurally
+                # invisible there — measured against the live store, ~9% of
+                # all historical transcripts carry an armed-without-resolution
+                # signature while holding genuine final answers, so on that
+                # channel the signature is evidence of a normal backgrounded
+                # command, not a park. Driver streams carry both resolution
+                # channels, making the fold sound. A turn that ended with
+                # unresolved tasks — or whose tasks resolved only after its
+                # final result — did not finish; reuse status=error (no new
+                # status) and preserve the result text.
+                if (
+                    driver_stream
+                    and sentinel is None
+                    and spool.get("status") == "complete"
+                    and isinstance(data, list)
+                ):
+                    task_state = _claude_driver.background_task_state(data)
+                    pending_src = task_state["unresolved"] or task_state["stale_resolved"]
+                    if pending_src:
                         pending = [
-                            {"id": t.get("id"), "source": t.get("source")} for t in unresolved
+                            {"id": t.get("id"), "source": t.get("source")} for t in pending_src
                         ]
                         ids = ", ".join(str(t["id"]) for t in pending)
                         spool["status"] = "error"
                         spool["error_kind"] = "headless_background_wait"
                         spool["pending_background_tasks"] = pending
                         spool["error"] = (
-                            f"Claude ended its headless turn while still waiting on "
-                            f"unresolved background task(s) [{ids}]. Their completion "
-                            f"notifications cannot reach an exited process, so this "
-                            f"spool did not finish its task; the stored result is the "
-                            f"agent's parked stub. Use respin() to continue — it will "
-                            f"rebuild a clean session from the transcript."
+                            f"Claude's headless turn ended without a result that "
+                            f"accounts for its background task(s) [{ids}], and the "
+                            f"stream driver terminated without a verdict. The stored "
+                            f"result is not a completed answer. Use respin() to "
+                            f"continue — it will rebuild a clean session from the "
+                            f"transcript."
                         )
             except json.JSONDecodeError:
                 if stdout.strip():
@@ -2902,8 +2960,14 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
         _write_spool(spool_id, spool)
 
         # Save transcript for future respin if session_id exists
-        # This preserves conversation context even after CC cleans up sessions
-        if spool.get("session_id") and stdout:
+        # This preserves conversation context even after CC cleans up sessions.
+        # Driver-protocol streams are saved even without a session_id: a spool
+        # that parked before any result has no session, and its transcript is
+        # the only material the rebuild-based respin recovery can work from
+        # (fell round 2, finding-20260724-xvo0).
+        if stdout and (
+            spool.get("session_id") or spool.get("claude_protocol") == CLAUDE_PROTOCOL_STREAM_V1
+        ):
             transcript_path = _get_transcript_path(spool_id)
             transcript_path.parent.mkdir(parents=True, exist_ok=True)
             try:
@@ -2927,6 +2991,7 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
             exit_path = _get_exit_path(spool_id)
             if exit_path.exists():
                 exit_path.unlink()
+            _get_prompt_path(spool_id).unlink(missing_ok=True)
 
         return True
 
@@ -3218,7 +3283,16 @@ def _handle_expired_session_locked(spool_id: str, spool: dict) -> bool:
         if profile_extra_args:
             cmd_flags.extend(profile_extra_args)
 
-    cmd, claude_protocol = _claude_headless_cmd(context_prompt, cmd_flags)
+    # Transcript-context prompts can exceed the 128KiB per-argv limit — an
+    # oversized prompt is delivered by file (stdin for one-shot claude,
+    # --prompt-file for the driver) instead of argv.
+    try:
+        prompt_path = _prompt_file_if_oversized(spool_id, context_prompt)
+    except IOError:
+        return False
+
+    cmd, claude_protocol = _claude_headless_cmd(context_prompt, cmd_flags, prompt_path=prompt_path)
+    spawn_stdin = prompt_path if (prompt_path is not None and claude_protocol is None) else None
 
     shard_info = spool.get("shard") or original_spool.get("shard")
     fallback_cwd = spool.get("working_dir") or (shard_info or {}).get("worktree_path")
@@ -3231,7 +3305,10 @@ def _handle_expired_session_locked(spool_id: str, spool: dict) -> bool:
         )
 
     try:
-        new_pid = _spawn_detached(spool_id, cmd, fallback_cwd, spawn_env)
+        if spawn_stdin is not None:
+            new_pid = _spawn_detached(spool_id, cmd, fallback_cwd, spawn_env, stdin_path=spawn_stdin)
+        else:
+            new_pid = _spawn_detached(spool_id, cmd, fallback_cwd, spawn_env)
 
         # Update spool with new PID and mark as using transcript fallback
         spool["pid"] = new_pid
@@ -3359,7 +3436,13 @@ def _start_spool_monitor(spool_id: str) -> None:
     threading.Thread(target=_run_spool_monitor, args=(spool_id,), daemon=True).start()
 
 
-def _spawn_detached(spool_id: str, cmd: list, cwd: str, env: Optional[Dict[str, str]] = None) -> int:
+def _spawn_detached(
+    spool_id: str,
+    cmd: list,
+    cwd: str,
+    env: Optional[Dict[str, str]] = None,
+    stdin_path: Optional[Path] = None,
+) -> int:
     """
     Spawn a detached process that survives parent death.
     Returns the PID.
@@ -3369,6 +3452,8 @@ def _spawn_detached(spool_id: str, cmd: list, cwd: str, env: Optional[Dict[str, 
         cmd: Command and arguments to execute
         cwd: Working directory
         env: Optional dict of environment variables to merge with current environment
+        stdin_path: Optional file to connect as the child's stdin (file-delivered
+            prompts that exceed the per-argv size limit). None inherits, as before.
     """
     stdout_path = _get_output_path(spool_id)
     stderr_path = _get_stderr_path(spool_id)
@@ -3392,15 +3477,21 @@ def _spawn_detached(spool_id: str, cmd: list, cwd: str, env: Optional[Dict[str, 
     wrapper_script = 'status_file="$1"; shift; "$@"; rc=$?; printf "%s\\n" "$rc" > "$status_file"; exit "$rc"'
     wrapped_cmd = ["/bin/sh", "-c", wrapper_script, "spindle-exit-status", str(exit_path), *cmd]
 
-    with open(stdout_path, "w") as stdout_file, open(stderr_path, "w") as stderr_file:
-        proc = subprocess.Popen(
-            wrapped_cmd,
-            stdout=stdout_file,
-            stderr=stderr_file,
-            cwd=cwd,
-            env=process_env,
-            start_new_session=True,  # Detach from parent
-        )
+    stdin_file = open(stdin_path, "r") if stdin_path is not None else None
+    try:
+        with open(stdout_path, "w") as stdout_file, open(stderr_path, "w") as stderr_file:
+            proc = subprocess.Popen(
+                wrapped_cmd,
+                stdin=stdin_file,
+                stdout=stdout_file,
+                stderr=stderr_file,
+                cwd=cwd,
+                env=process_env,
+                start_new_session=True,  # Detach from parent
+            )
+    finally:
+        if stdin_file is not None:
+            stdin_file.close()
 
     # Keep the handle for fast-path polling and reaping. The exit-status file is
     # authoritative after a restart when this in-memory handle no longer exists.
@@ -4281,17 +4372,29 @@ async def spools() -> str:
     return await asyncio.to_thread(_spools_sync)
 
 
-def _respin_parked_state(original_spool: dict) -> Tuple[list, Optional[str]]:
-    """Whether a Claude spool parked on background tasks, and its transcript.
+def _respin_parked_state(
+    original_spool: dict, force_rebuild: bool = False
+) -> Tuple[list, Optional[str]]:
+    """Whether a Claude spool must respin via transcript rebuild, and its transcript.
 
     Returns ``(parked_tasks, transcript_text)``. A non-empty task list means
-    the spool's last turn ended still waiting on background tasks that died
-    with its process, so respin must rebuild a fresh session instead of
-    ``--resume`` (whose orphan scan injects a stale stopped notification ahead
-    of the continuation — issue-20260724-tqs3). Detector-marked spools
-    (error_kind=headless_background_wait) carry their task list; legacy spools
-    finalized as complete before the detector existed are recognized by
-    scanning the saved transcript, so no migration is needed.
+    respin must rebuild a fresh session instead of ``--resume`` (whose orphan
+    scan injects a stale stopped notification ahead of the continuation —
+    issue-20260724-tqs3). Two triggers:
+
+    - Detector-marked spools (error_kind=headless_background_wait) carry
+      their recorded task list.
+    - ``force_rebuild`` (the caller's explicit respin(rebuild=True)) forces
+      the rebuild for a legacy stub the caller has judged parked.
+
+    Legacy transcripts are deliberately NOT auto-scanned (fell round 2,
+    finding-20260724-xvo0): on one-shot output, resolution events are
+    structurally invisible, so armed-without-resolution is the signature of a
+    NORMAL backgrounded command — measured against the live store it matches
+    healthy completed spools and the genuinely parked incident stub alike, at
+    roughly 40:1 against genuine parks. No structural rule separates them;
+    the human (or orchestrator) holding the stub result decides via
+    rebuild=True.
     """
     if original_spool.get("harness", "claude-code") != "claude-code":
         return [], None
@@ -4308,13 +4411,22 @@ def _respin_parked_state(original_spool: dict) -> Tuple[list, Optional[str]]:
         tasks = [t for t in original_spool.get("pending_background_tasks") or [] if isinstance(t, dict)]
         return tasks or [{"id": "unknown", "source": "unknown"}], transcript_text
 
-    if original_spool.get("status") == "complete" and transcript_text:
-        return _transcript_unresolved_tasks(transcript_text), transcript_text
+    if force_rebuild:
+        tasks = []
+        if transcript_text:
+            state = _claude_driver.background_task_state(
+                _parse_claude_transcript_events(transcript_text)
+            )
+            tasks = state["unresolved"] or state["stale_resolved"]
+        return (
+            [{"id": t.get("id"), "source": t.get("source")} for t in tasks]
+            or [{"id": "unknown", "source": "forced_rebuild"}]
+        ), transcript_text
 
     return [], transcript_text
 
 
-def _respin_sync(handle: str, prompt: str) -> str:
+def _respin_sync(handle: str, prompt: str, rebuild: bool = False) -> str:
     """Synchronous implementation of respin - auto-detects harness.
 
     `handle` may be either the spool_id returned by spin() (preferred, and
@@ -4322,6 +4434,11 @@ def _respin_sync(handle: str, prompt: str) -> str:
     (legacy contract). It is resolved to the original spool, and the spool's
     real session_id is what flows down to the harness resume path - never
     the raw caller handle, which may be a spool_id.
+
+    ``rebuild`` (claude-code only) forces the sanitized-transcript rebuild
+    instead of ``--resume`` — for legacy parked stubs the caller has judged
+    from their result text, since one-shot transcripts carry no sound
+    structural park signal.
     """
     # Resolve the original spool to detect harness (accepts spool_id or session_id)
     original_spool = _resolve_spool_for_respin(handle)
@@ -4355,10 +4472,30 @@ def _respin_sync(handle: str, prompt: str) -> str:
     # handle (which may be a spool_id). For codex/gemini/kimi this is the
     # opaque harness thread-id; for claude-code it's the claude session id.
     session_id = original_spool.get("session_id")
-    if not session_id:
-        return f"Spool '{original_spool.get('id', handle)}' completed without a resumable session (status={status})"
-
     harness = original_spool.get("harness", "claude-code")
+
+    # A claude spool that parked on background tasks must not --resume: the
+    # CLI's resume-time orphan scan inserts a stale "stopped"
+    # task-notification as a user message directly ahead of the continuation,
+    # and the model correctly reads that contradictory blob as injected input
+    # and parks again. The rebuild path needs only the saved transcript — not
+    # a session — so this is decided BEFORE the session gate: a spool that
+    # parked before any result has no session_id at all, and its transcript
+    # is still recoverable (fell round 2, finding-20260724-xvo0).
+    parked_tasks: list = []
+    parked_transcript = None
+    if harness == "claude-code":
+        parked_tasks, parked_transcript = _respin_parked_state(original_spool, force_rebuild=rebuild)
+        if parked_tasks and not parked_transcript:
+            return (
+                f"Spool '{original_spool.get('id', handle)}' parked waiting on background "
+                f"task(s) [{', '.join(str(t.get('id', '?')) for t in parked_tasks)}] and has no "
+                f"saved transcript to rebuild from. Resuming it would replay a stale task "
+                f"notification and park again — start a fresh spin() with the task context instead."
+            )
+
+    if not parked_tasks and not session_id:
+        return f"Spool '{original_spool.get('id', handle)}' completed without a resumable session (status={status})"
 
     # Route to appropriate harness implementation
     if harness == "codex":
@@ -4381,21 +4518,6 @@ def _respin_sync(handle: str, prompt: str) -> str:
         if conflict:
             return f"Error: {conflict}"
 
-        # A spool that parked on background tasks must not --resume: the CLI's
-        # resume-time orphan scan inserts a stale "stopped" task-notification
-        # as a user message directly ahead of the continuation, and the model
-        # correctly reads that contradictory blob as injected input and parks
-        # again. Rebuild a fresh session from the sanitized transcript instead,
-        # with the dead tasks explicitly abandoned.
-        parked_tasks, parked_transcript = _respin_parked_state(original_spool)
-        if parked_tasks and not parked_transcript:
-            return (
-                f"Spool '{original_spool.get('id', handle)}' parked waiting on background "
-                f"task(s) [{', '.join(str(t.get('id', '?')) for t in parked_tasks)}] and has no "
-                f"saved transcript to rebuild from. Resuming it would replay a stale task "
-                f"notification and park again — start a fresh spin() with the task context instead."
-            )
-
         # Generate spool ID first
         spool_id = str(uuid.uuid4())[:8]
 
@@ -4406,13 +4528,22 @@ def _respin_sync(handle: str, prompt: str) -> str:
 
         # Slot reserved via spool creation - continue with setup
 
+        prompt_path = None
         if parked_tasks:
             # Fresh session continuing the sanitized transcript; old background
-            # tasks are stated dead so the model doesn't wait on them.
+            # tasks are stated dead so the model doesn't wait on them. The
+            # rebuilt prompt embeds the whole sanitized transcript and can
+            # exceed the 128KiB per-argv limit, in which case it is delivered
+            # by file instead of argv (fell round 2, finding-20260724-xvo0).
             effective_prompt = _build_transcript_continuation_prompt(
                 parked_transcript, prompt, abandoned_tasks=parked_tasks
             )
             cmd_flags = []
+            try:
+                prompt_path = _prompt_file_if_oversized(spool_id, effective_prompt)
+            except IOError as exc:
+                _record_pre_spawn_failure(spool_id, f"could not write rebuild prompt: {exc}")
+                return f"Error: could not write rebuild prompt: {exc}"
         else:
             # Try to resume with session_id first
             # If that fails (session expired), fall back to transcript injection
@@ -4482,7 +4613,10 @@ def _respin_sync(handle: str, prompt: str) -> str:
             orig_model = original_spool["model"]
             cmd_flags.extend(["--model", CLAUDE_MODEL_ALIASES.get(orig_model, orig_model)])
 
-        cmd, claude_protocol = _claude_headless_cmd(effective_prompt, cmd_flags)
+        cmd, claude_protocol = _claude_headless_cmd(effective_prompt, cmd_flags, prompt_path=prompt_path)
+        # One-shot launches read a file-delivered prompt from stdin; the
+        # driver reads its --prompt-file itself.
+        spawn_stdin = prompt_path if (prompt_path is not None and claude_protocol is None) else None
 
         if shard_info:
             cmd = _codex_bwrap_wrap(
@@ -4524,7 +4658,7 @@ def _respin_sync(handle: str, prompt: str) -> str:
             spool["parked_recovery_of"] = original_spool["id"]
             spool["abandoned_background_tasks"] = parked_tasks
 
-        startup_error = _start_spool_process(spool, cmd, cwd, spawn_env)
+        startup_error = _start_spool_process(spool, cmd, cwd, spawn_env, stdin_path=spawn_stdin)
         if startup_error:
             return startup_error
 
@@ -4538,6 +4672,7 @@ def _respin_sync(handle: str, prompt: str) -> str:
 async def respin(
     session_id: str,
     prompt: str,
+    rebuild: bool = False,
 ) -> str:
     """
     Continue an existing session with a new message.
@@ -4546,11 +4681,10 @@ async def respin(
     Auto-detects the harness (claude-code, codex, gemini, kimi) from the
     original spool. For Claude Code sessions, falls back to transcript
     injection if the session has expired. A Claude spool that parked waiting
-    on background tasks (error_kind=headless_background_wait, or a legacy
-    stub whose transcript shows unresolved tasks) is not resumed — resume
-    would replay a stale task notification into the model's context; instead
-    a fresh session is rebuilt from the sanitized transcript with those
-    tasks explicitly abandoned.
+    on background tasks (error_kind=headless_background_wait) is not resumed —
+    resume would replay a stale task notification into the model's context;
+    instead a fresh session is rebuilt from the sanitized transcript with
+    those tasks explicitly abandoned.
 
     Args:
         session_id: The handle of the session to continue. Accepts the
@@ -4558,11 +4692,18 @@ async def respin(
             other spindle entrypoint) or a raw session_id (legacy). The
             spool's real session_id is resolved internally before resuming.
         prompt: The follow-up message/task
+        rebuild: Claude-code only. Force the sanitized-transcript rebuild
+            instead of --resume. Use for a LEGACY spool whose stored result
+            is a background-wait stub ("Waiting for the ... notification"):
+            its one-shot transcript carries no sound structural park signal
+            (healthy backgrounded-command spools look identical), so the
+            judgment is the caller's. Resuming such a spool replays a stale
+            stopped task-notification that reads as prompt injection.
 
     Returns:
         spool_id to check result later
     """
-    return await asyncio.to_thread(_respin_sync, session_id, prompt)
+    return await asyncio.to_thread(_respin_sync, session_id, prompt, rebuild)
 
 
 @mcp.tool()

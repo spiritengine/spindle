@@ -128,6 +128,10 @@ class BackgroundTaskTracker:
         self._armed = {}  # task_id -> {"id", "source", "timeout_ms", "armed_at"}
         self._resolved = set()
         self.ever_armed = False
+        self.saw_result = False
+        # Tasks resolved AFTER the most recent result event: that result
+        # provably never accounted for them. Cleared by each new result.
+        self.stale_resolved = []
 
     def _arm(self, task_id, source, timeout_ms=None):
         if not task_id:
@@ -144,11 +148,19 @@ class BackgroundTaskTracker:
     def _resolve(self, task_id, status):
         if status not in TERMINAL_TASK_STATUSES:
             return
+        entry = self._armed.pop(task_id, None)
         self._resolved.add(task_id)
-        self._armed.pop(task_id, None)
+        if entry is not None and self.saw_result:
+            self.stale_resolved.append({"id": task_id, "source": entry.get("source")})
 
     def observe(self, event):
         if not isinstance(event, dict):
+            return
+
+        if event.get("type") == "result":
+            self.saw_result = True
+            # This result post-dates every resolution seen so far.
+            self.stale_resolved = []
             return
 
         # Structured lifecycle events (observed live on Claude Code 2.1.219):
@@ -175,7 +187,13 @@ class BackgroundTaskTracker:
         has_structured = isinstance(tur, dict)
         if has_structured:
             task_id = tur.get("taskId")
-            if isinstance(task_id, str) and not tur.get("persistent"):
+            # Genuine Monitor arms carry an EXPLICIT persistent key (observed
+            # live: {"taskId", "timeoutMs", "persistent": false}). Requiring
+            # the key excludes the todo-list tools (TaskUpdate/TaskCreate),
+            # whose results also carry a taskId but never a persistent field —
+            # without this, every todo status change armed a phantom monitor
+            # that nothing could ever resolve (fell r2 finding 1).
+            if isinstance(task_id, str) and "persistent" in tur and not tur.get("persistent"):
                 self._arm(task_id, "monitor", timeout_ms=tur.get("timeoutMs"))
             bg_id = tur.get("backgroundTaskId")
             if isinstance(bg_id, str):
@@ -221,14 +239,17 @@ class BackgroundTaskTracker:
 def background_task_state(events):
     """Pure fold of ``BackgroundTaskTracker`` over a full event list.
 
-    Returns ``{"unresolved": [...]}`` where each entry carries id/source (and
-    timeout_ms when the arm published one). Used by spindle's finalizer to
-    detect a parked turn after the fact, and shared with the live driver loop.
+    Returns ``{"unresolved": [...], "stale_resolved": [...]}``. ``unresolved``
+    entries carry id/source (and timeout_ms when the arm published one);
+    ``stale_resolved`` lists tasks whose resolution arrived only after the
+    final result event, meaning that result never accounted for them. Used by
+    spindle's finalizer on driver streams (the only channel where resolution
+    events are reliably present) and shared with the live driver loop.
     """
     tracker = BackgroundTaskTracker()
     for event in events if isinstance(events, list) else []:
         tracker.observe(event)
-    return {"unresolved": tracker.unresolved}
+    return {"unresolved": tracker.unresolved, "stale_resolved": tracker.stale_resolved}
 
 
 def parse_ndjson_events(text):
@@ -336,7 +357,16 @@ def _park_deadline(unresolved, default_task_timeout, grace):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Spindle persistent stream-json driver for Claude Code")
-    parser.add_argument("--prompt", required=True, help="Initial user message to send on stdin")
+    prompt_group = parser.add_mutually_exclusive_group(required=True)
+    prompt_group.add_argument("--prompt", help="Initial user message to send on stdin")
+    prompt_group.add_argument(
+        "--prompt-file",
+        help=(
+            "Read the initial user message from this file. Required for large "
+            "prompts (rebuilt transcript continuations): a single argv element "
+            "is capped at 128KiB on Linux (MAX_ARG_STRLEN)."
+        ),
+    )
     parser.add_argument(
         "--park-grace-seconds",
         type=float,
@@ -352,19 +382,24 @@ def main(argv=None):
     parser.add_argument(
         "--complete-grace-seconds",
         type=float,
-        default=float(os.environ.get("SPINDLE_DRIVER_COMPLETE_GRACE_SECONDS", "3")),
+        default=float(os.environ.get("SPINDLE_DRIVER_COMPLETE_GRACE_SECONDS", "5")),
         help=(
-            "After a clean result in a stream that armed background tasks, wait this "
-            "long for a CLI-queued follow-up turn before finishing. Notifications can "
-            "land mid-turn without the model consuming them; the CLI then auto-runs a "
-            "requery turn that would be cut off by an immediate stdin close."
+            "How long an IDLE stream (result seen, nothing unresolved, no turn in "
+            "progress) waits for a CLI-queued follow-up turn to start before the "
+            "driver finishes. Notifications can land mid-turn without the model "
+            "consuming them; the CLI then auto-runs a requery turn that an immediate "
+            "stdin close would cut off. Never applied while a turn is active."
         ),
     )
     parser.add_argument(
-        "--complete-linger-max-seconds",
+        "--requery-start-window-seconds",
         type=float,
-        default=float(os.environ.get("SPINDLE_DRIVER_COMPLETE_LINGER_MAX_SECONDS", "30")),
-        help="Hard cap on total post-clean-result linger across requery turns",
+        default=float(os.environ.get("SPINDLE_DRIVER_REQUERY_WINDOW_SECONDS", "30")),
+        help=(
+            "Idle wait used instead of the plain grace when a post-result user "
+            "message (a delivered notification) suggests a requery is coming — "
+            "dispatch of that inference can exceed the plain grace."
+        ),
     )
     parser.add_argument("claude_cmd", nargs=argparse.REMAINDER, help="-- followed by the claude invocation")
     args = parser.parse_args(argv)
@@ -375,6 +410,16 @@ def main(argv=None):
     if not claude_cmd:
         print("spindle_claude_driver: no claude command given after --", file=sys.stderr)
         return 2
+
+    if args.prompt is not None:
+        prompt = args.prompt
+    else:
+        try:
+            with open(args.prompt_file, "r") as handle:
+                prompt = handle.read()
+        except OSError as exc:
+            print(f"spindle_claude_driver: cannot read --prompt-file: {exc}", file=sys.stderr)
+            return 2
 
     proc = subprocess.Popen(
         claude_cmd,
@@ -393,7 +438,7 @@ def main(argv=None):
 
     try:
         proc.stdin.write(
-            json.dumps({"type": "user", "message": {"role": "user", "content": args.prompt}}) + "\n"
+            json.dumps({"type": "user", "message": {"role": "user", "content": prompt}}) + "\n"
         )
         proc.stdin.flush()
     except (BrokenPipeError, OSError):
@@ -402,14 +447,20 @@ def main(argv=None):
     lines = queue.Queue()
     threading.Thread(target=_reader, args=(proc.stdout, lines), daemon=True).start()
 
+    # State machine (fell r2 finding 2): the driver must never terminate an
+    # ACTIVE turn — silence during inference or a long tool execution is
+    # routine, so timers apply only while the stream is idle (result seen, no
+    # turn in progress). turn_active is True from process start (our stdin
+    # message begins the first turn) until a result, and again from any
+    # init/assistant event (a requery turn starting). The external spool
+    # timeout bounds active turns, exactly as it bounds the first one.
     tracker = BackgroundTaskTracker()
-    saw_result = False
-    stale_resolved = []  # tasks resolved AFTER the most recent result event
-    completing_since = None  # start of the current requery-linger grace window
-    first_clean_result_at = None  # anchor for the hard linger cap, per clean phase
+    turn_active = True
+    user_after_result = False  # a delivered notification suggests a requery is coming
+    grace_started = None  # entered the idle-clean phase at this time
 
     def _linger_terminal():
-        """Terminal sentinel once the post-clean-result linger is exhausted.
+        """Terminal sentinel once the idle grace is exhausted.
 
         Resolutions that arrived after the final result mean that result
         provably never accounted for them — report parked (spindle marks
@@ -417,13 +468,13 @@ def main(argv=None):
         stale answer as complete: the original false-completion otherwise
         returns through this exit.
         """
-        if stale_resolved:
+        if tracker.stale_resolved:
             _emit(
                 build_sentinel(
                     "parked",
                     [],
                     reason="background tasks resolved after the final result; no requery turn ran",
-                    stale_resolved=stale_resolved,
+                    stale_resolved=tracker.stale_resolved,
                 )
             )
         else:
@@ -431,27 +482,13 @@ def main(argv=None):
         return _finish(proc) or 0
 
     while True:
-        clean = saw_result and not tracker.unresolved
-        try:
-            line = lines.get(timeout=0.25 if clean else 1.0)
-        except queue.Empty:
+        # Idle-deadline checks run every iteration — with or without events —
+        # so a noisy stream cannot outrun them and a quiet one cannot dodge
+        # them. Nothing here ever fires while a turn is active.
+        if not turn_active and tracker.saw_result:
             now = time.time()
             unresolved = tracker.unresolved
-            if saw_result and not unresolved:
-                # Invariant: once a result exists and nothing is unresolved,
-                # the driver is ALWAYS on a bounded path to a sentinel — the
-                # linger (re)enters here no matter what noise events cleared
-                # it, and the hard cap is anchored at the clean result itself.
-                if first_clean_result_at is None:
-                    first_clean_result_at = now
-                if completing_since is None:
-                    completing_since = now
-                if (
-                    now - completing_since >= args.complete_grace_seconds
-                    or now - first_clean_result_at >= args.complete_linger_max_seconds
-                ):
-                    return _linger_terminal()
-            elif saw_result and unresolved:
+            if unresolved:
                 if now > _park_deadline(
                     unresolved, args.default_task_timeout_seconds, args.park_grace_seconds
                 ):
@@ -463,6 +500,18 @@ def main(argv=None):
                         )
                     )
                     return _finish(proc) or 0
+            elif grace_started is not None:
+                idle_grace = (
+                    args.requery_start_window_seconds
+                    if user_after_result
+                    else args.complete_grace_seconds
+                )
+                if now - grace_started >= idle_grace:
+                    return _linger_terminal()
+
+        try:
+            line = lines.get(timeout=0.25 if (not turn_active and tracker.saw_result) else 1.0)
+        except queue.Empty:
             continue
 
         if line is None:
@@ -478,17 +527,17 @@ def main(argv=None):
                         reason="claude exited with unresolved background tasks",
                     )
                 )
-            elif saw_result and stale_resolved:
+            elif tracker.saw_result and tracker.stale_resolved:
                 _emit(
                     build_sentinel(
                         "parked",
                         [],
                         claude_exit_code=exit_code,
                         reason="claude exited after tasks resolved past the final result; no requery turn ran",
-                        stale_resolved=stale_resolved,
+                        stale_resolved=tracker.stale_resolved,
                     )
                 )
-            elif saw_result:
+            elif tracker.saw_result:
                 _emit(build_sentinel("complete", [], claude_exit_code=exit_code))
             else:
                 _emit(
@@ -511,53 +560,36 @@ def main(argv=None):
         if not isinstance(event, dict):
             continue
 
-        # Activity restarts the grace window (a queued requery turn may be
-        # starting); the hard cap anchored at first_clean_result_at still
-        # bounds the total linger even under continuous noise.
-        completing_since = None
-
-        before = {t["id"]: t for t in tracker.unresolved} if saw_result else {}
         tracker.observe(event)
-        if before:
-            after_ids = {t["id"] for t in tracker.unresolved}
-            for tid, entry in before.items():
-                if tid not in after_ids:
-                    stale_resolved.append({"id": tid, "source": entry.get("source")})
 
-        if tracker.unresolved:
-            # New arms re-enter the waiting phase; the next clean result gets
-            # a fresh linger-cap anchor.
-            first_clean_result_at = None
+        etype = event.get("type")
+        if etype == "result":
+            turn_active = False
+            user_after_result = False
+            if not tracker.unresolved and not tracker.ever_armed:
+                # No background tasks ever existed, so no notification can be
+                # queued — finish immediately (the common fast path).
+                _emit(build_sentinel("complete", []))
+                return _finish(proc) or 0
+        elif etype == "assistant" or (etype == "system" and event.get("subtype") == "init"):
+            # Inference is in progress; all idle timers are off until its
+            # result arrives.
+            turn_active = True
+        elif etype == "user" and not turn_active and tracker.saw_result:
+            # A post-result user message (a replayed/delivered notification):
+            # dispatch of the requery inference may take a while, so restart
+            # the idle window at its longer setting.
+            user_after_result = True
+            grace_started = None
 
-        if event.get("type") == "result":
-            saw_result = True
-            # This result post-dates every resolution seen so far.
-            stale_resolved = []
-            if not tracker.unresolved:
-                if not tracker.ever_armed:
-                    # No background tasks ever existed, so no notification can
-                    # be queued — finish immediately (the common fast path).
-                    _emit(build_sentinel("complete", []))
-                    return _finish(proc) or 0
-                # Tasks existed: notifications may have landed mid-turn without
-                # the model consuming them, in which case the CLI auto-runs a
-                # follow-up turn (observed live on 2.1.219). Linger briefly so
-                # that turn's result replaces this one instead of being cut off.
-                now = time.time()
-                completing_since = now
-                if first_clean_result_at is None:
-                    first_clean_result_at = now
-
-        # Backstop for a stream that never goes quiet: enforce the hard cap at
-        # event time too, so continuous noise cannot outrun the Empty-branch
-        # checks and hold the driver open past the linger cap.
-        if (
-            saw_result
-            and not tracker.unresolved
-            and first_clean_result_at is not None
-            and time.time() - first_clean_result_at >= args.complete_linger_max_seconds
-        ):
-            return _linger_terminal()
+        # Recompute the idle-clean anchor: it exists exactly while idle with a
+        # result and nothing unresolved, and starts when that phase is entered
+        # (a resolution event can enter it long after the result). Noise never
+        # resets an existing anchor.
+        if turn_active or not tracker.saw_result or tracker.unresolved:
+            grace_started = None
+        elif grace_started is None:
+            grace_started = time.time()
 
 
 if __name__ == "__main__":

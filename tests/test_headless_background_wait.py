@@ -299,16 +299,74 @@ class TestBackgroundTaskDetector:
         ]
         assert [t["id"] for t in driver.background_task_state(events)["unresolved"]] == ["t1"]
 
+    def test_todo_tool_task_ids_do_not_arm(self):
+        """Fell r2 finding 1: TaskUpdate/TaskCreate results carry a taskId but
+        no persistent key — they must not arm phantom monitors."""
+        todo = {
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [
+                    {
+                        "tool_use_id": "toolu_todo",
+                        "type": "tool_result",
+                        "content": "Updated task #1 status",
+                    }
+                ],
+            },
+            "tool_use_result": {
+                "success": True,
+                "taskId": "1",
+                "updatedFields": ["status"],
+                "statusChange": {"from": "pending", "to": "in_progress"},
+            },
+        }
+        state = driver.background_task_state([todo, result_event("done")])
+        assert state["unresolved"] == []
+        assert state["stale_resolved"] == []
+
+    def test_resolution_after_final_result_is_stale(self):
+        """Ordering awareness: a resolution arriving after the last result
+        means that result never accounted for it."""
+        events = [
+            monitor_arm_event("t7"),
+            result_event(PARKED_STUB),
+            system_task_notification_event("t7", "completed"),
+        ]
+        state = driver.background_task_state(events)
+        assert state["unresolved"] == []
+        assert [t["id"] for t in state["stale_resolved"]] == ["t7"]
+
+    def test_new_result_clears_stale(self):
+        events = [
+            monitor_arm_event("t7"),
+            result_event(PARKED_STUB),
+            system_task_notification_event("t7", "completed"),
+            result_event("Informed answer."),
+        ]
+        state = driver.background_task_state(events)
+        assert state["unresolved"] == []
+        assert state["stale_resolved"] == []
+
 
 # --- finalize wiring (one-shot protocol) ------------------------------------
 
 
 class TestFinalizeParkedDetection:
+    """Backstop detection for DRIVER streams whose driver died sentinel-less.
+
+    One-shot output is deliberately exempt (fell r2 finding 3): resolution
+    events are structurally invisible there, so armed-without-resolution
+    matches healthy backgrounded-command spools and genuine parks alike.
+    """
+
     def _finalize(self, tmp_path, events, spool_extra=None):
         spool_id = "parked-fin"
+        extra = {"claude_protocol": CLAUDE_PROTOCOL_STREAM_V1}
+        extra.update(spool_extra or {})
         with patch("spindle.SPINDLE_DIR", tmp_path):
-            _write_spool(spool_id, running_claude_spool(spool_id, **(spool_extra or {})))
-            _get_output_path(spool_id).write_text(json.dumps(events))
+            _write_spool(spool_id, running_claude_spool(spool_id, **extra))
+            _get_output_path(spool_id).write_text(ndjson(events))
             assert _check_and_finalize_spool(spool_id) is True
             return _read_spool(spool_id)
 
@@ -324,6 +382,19 @@ class TestFinalizeParkedDetection:
         spool = self._finalize(tmp_path, [background_bash_event("bg7"), result_event("stub")])
         assert spool["status"] == "error"
         assert spool["pending_background_tasks"] == [{"id": "bg7", "source": "background_shell"}]
+
+    def test_stale_resolution_without_sentinel_is_error(self, tmp_path):
+        """SIGTERM-killed driver: resolution after the last result, no
+        sentinel — the ordering-aware fold must not bless the stub."""
+        events = [
+            monitor_arm_event("t2"),
+            result_event(PARKED_STUB),
+            system_task_notification_event("t2", "completed"),
+        ]
+        spool = self._finalize(tmp_path, events)
+        assert spool["status"] == "error"
+        assert spool["error_kind"] == "headless_background_wait"
+        assert spool["pending_background_tasks"] == [{"id": "t2", "source": "monitor"}]
 
     def test_completed_notification_permits_completion(self, tmp_path):
         events = [
@@ -351,6 +422,21 @@ class TestFinalizeParkedDetection:
         ]
         spool = self._finalize(tmp_path, events)
         assert spool["status"] == "complete"
+
+    def test_one_shot_stream_is_never_park_flagged(self, tmp_path):
+        """Fell r2 finding 3: one-shot output must not be park-detected —
+        armed-without-resolution there matches healthy spools (measured ~9%
+        of the live store, incl. genuine CLEAN verdicts)."""
+        spool_id = "oneshot-ok"
+        events = [monitor_arm_event("t5"), result_event("Verdict: CLEAN")]
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool(spool_id, running_claude_spool(spool_id))
+            _get_output_path(spool_id).write_text(json.dumps(events))
+            assert _check_and_finalize_spool(spool_id) is True
+            spool = _read_spool(spool_id)
+        assert spool["status"] == "complete"
+        assert spool["result"] == "Verdict: CLEAN"
+        assert "pending_background_tasks" not in spool
 
     def test_format_spool_failure_explains_parked(self, tmp_path):
         spool = self._finalize(tmp_path, [monitor_arm_event(), result_event(PARKED_STUB)])
@@ -597,25 +683,36 @@ class TestSanitizedTranscript:
 
 
 class TestRespinParkedRecovery:
-    def _respin(self, tmp_path, spool, transcript_events=None, prompt="continue now"):
+    def _respin(
+        self,
+        tmp_path,
+        spool,
+        transcript_events=None,
+        prompt="continue now",
+        rebuild=False,
+        transcript_text=None,
+    ):
         captured = {}
 
-        def fake_detached(sid, cmd, cwd, env=None):
+        def fake_detached(sid, cmd, cwd, env=None, **kwargs):
             captured["cmd"] = list(cmd)
+            captured["stdin_path"] = kwargs.get("stdin_path")
             return 4242
 
         with patch("spindle.SPINDLE_DIR", tmp_path):
             _write_spool(spool["id"], spool)
-            if transcript_events is not None:
+            if transcript_events is not None or transcript_text is not None:
                 tpath = _get_transcript_path(spool["id"])
                 tpath.parent.mkdir(parents=True, exist_ok=True)
-                tpath.write_text(json.dumps(transcript_events))
+                tpath.write_text(
+                    transcript_text if transcript_text is not None else json.dumps(transcript_events)
+                )
             with patch("spindle._spawn_detached", side_effect=fake_detached):
                 with patch("spindle._count_running", return_value=0):
                     with patch("spindle._monitor_spool"):
-                        result = _respin_sync(spool["id"], prompt)
+                        result = _respin_sync(spool["id"], prompt, rebuild)
             new_spool = _read_spool(result) if not result.startswith(("Error", "Spool")) else None
-        return result, captured.get("cmd"), new_spool
+        return result, captured.get("cmd"), new_spool, captured.get("stdin_path")
 
     def _parked_spool(self, spool_id="parked01"):
         return {
@@ -635,7 +732,7 @@ class TestRespinParkedRecovery:
 
     def test_parked_spool_rebuilds_without_resume(self, tmp_path):
         events = [assistant_text_event("Prior work."), monitor_arm_event(), result_event(PARKED_STUB)]
-        result, cmd, new_spool = self._respin(tmp_path, self._parked_spool(), events)
+        result, cmd, new_spool, _ = self._respin(tmp_path, self._parked_spool(), events)
         assert not result.startswith("Error"), result
         assert "--resume" not in cmd
         prompt_arg = cmd[cmd.index("-p") + 1]
@@ -650,7 +747,10 @@ class TestRespinParkedRecovery:
         assert new_spool["session_id"] is None
         assert new_spool["abandoned_background_tasks"] == [{"id": "bhbhqvqfz", "source": "monitor"}]
 
-    def test_legacy_complete_stub_selects_rebuild_not_resume(self, tmp_path):
+    def test_legacy_complete_stub_resumes_by_default(self, tmp_path):
+        """Fell r2 finding 3: no auto transcript scan — one-shot transcripts
+        carry no sound structural park signal, so a legacy complete spool
+        keeps --resume unless the caller explicitly asks for a rebuild."""
         legacy = {
             "id": "legacy01",
             "status": "complete",
@@ -662,11 +762,32 @@ class TestRespinParkedRecovery:
             "result": PARKED_STUB,
         }
         events = [monitor_arm_event("oldtask"), result_event(PARKED_STUB)]
-        result, cmd, new_spool = self._respin(tmp_path, legacy, events)
+        result, cmd, new_spool, _ = self._respin(tmp_path, legacy, events)
+        assert not result.startswith("Error"), result
+        assert cmd[cmd.index("--resume") + 1] == "sess-legacy"
+        assert "parked_recovery_of" not in new_spool
+
+    def test_rebuild_flag_forces_transcript_rebuild(self, tmp_path):
+        """respin(rebuild=True): the caller judged the stub parked — rebuild
+        the sanitized fresh session, no --resume."""
+        legacy = {
+            "id": "legacy02",
+            "status": "complete",
+            "session_id": "sess-legacy2",
+            "harness": "claude-code",
+            "permission": "careful",
+            "allowed_tools": None,
+            "working_dir": "/tmp",
+            "result": PARKED_STUB,
+        }
+        events = [monitor_arm_event("oldtask"), result_event(PARKED_STUB)]
+        result, cmd, new_spool, _ = self._respin(tmp_path, legacy, events, rebuild=True)
         assert not result.startswith("Error"), result
         assert "--resume" not in cmd
-        assert "oldtask" in cmd[cmd.index("-p") + 1]
-        assert new_spool["parked_recovery_of"] == "legacy01"
+        prompt_arg = cmd[cmd.index("-p") + 1]
+        assert "oldtask" in prompt_arg
+        assert "task-notification" not in prompt_arg
+        assert new_spool["parked_recovery_of"] == "legacy02"
 
     def test_ordinary_complete_spool_still_resumes(self, tmp_path):
         clean = {
@@ -684,7 +805,7 @@ class TestRespinParkedRecovery:
             notification_event("t1", "completed"),
             result_event("All done."),
         ]
-        result, cmd, new_spool = self._respin(tmp_path, clean, events)
+        result, cmd, new_spool, _ = self._respin(tmp_path, clean, events)
         assert not result.startswith("Error"), result
         assert cmd[cmd.index("--resume") + 1] == "sess-clean"
         assert new_spool["session_id"] == "sess-clean"
@@ -700,19 +821,52 @@ class TestRespinParkedRecovery:
             "allowed_tools": None,
             "working_dir": "/tmp",
         }
-        result, cmd, _ = self._respin(tmp_path, bare, transcript_events=None)
+        result, cmd, _, _ = self._respin(tmp_path, bare, transcript_events=None)
         assert not result.startswith("Error"), result
         assert cmd[cmd.index("--resume") + 1] == "sess-bare"
 
     def test_parked_without_transcript_refuses_resume(self, tmp_path):
-        result, cmd, _ = self._respin(tmp_path, self._parked_spool("noTrans1"), transcript_events=None)
+        result, cmd, _, _ = self._respin(tmp_path, self._parked_spool("noTrans1"), transcript_events=None)
         assert cmd is None  # nothing spawned
         assert "parked" in result
         assert "fresh spin()" in result
 
+    def test_parked_spool_without_session_still_rebuilds(self, tmp_path):
+        """Fell r2 finding 5: a spool that parked before any result has no
+        session_id; the rebuild needs only the transcript, so the session
+        gate must not block it."""
+        spool = self._parked_spool("nosess01")
+        spool["session_id"] = None
+        events = [assistant_text_event("Partial work before the crash."), monitor_arm_event()]
+        result, cmd, new_spool, _ = self._respin(tmp_path, spool, events)
+        assert not result.startswith(("Error", "Spool")), result
+        assert "--resume" not in cmd
+        assert new_spool["parked_recovery_of"] == "nosess01"
+
+    def test_oversized_rebuild_prompt_is_file_delivered(self, tmp_path):
+        """Fell r2 finding 4: a rebuilt prompt beyond the per-argv limit must
+        go via prompt file + stdin, not argv (execve E2BIG)."""
+        big_text = "x" * 200_000
+        events = [
+            {"type": "user", "message": {"role": "user", "content": big_text}},
+            monitor_arm_event("bigtask"),
+            result_event(PARKED_STUB),
+        ]
+        result, cmd, new_spool, stdin_path = self._respin(
+            tmp_path, self._parked_spool("bigrb01"), events
+        )
+        assert not result.startswith(("Error", "Spool")), result
+        assert "--resume" not in cmd
+        for arg in cmd:
+            assert len(arg.encode()) < 131072
+        assert stdin_path is not None
+        content = Path(stdin_path).read_text()
+        assert big_text in content
+        assert content.rstrip().endswith("continue now")
+
     def test_parked_recovery_disallows_background_tools(self, tmp_path):
         events = [monitor_arm_event(), result_event(PARKED_STUB)]
-        _, cmd, _ = self._respin(tmp_path, self._parked_spool("guard01"), events)
+        _, cmd, _, _ = self._respin(tmp_path, self._parked_spool("guard01"), events)
         assert cmd[cmd.index("--disallowedTools") + 1] == "Monitor,ScheduleWakeup"
 
     def test_ordinary_resume_disallows_background_tools(self, tmp_path):
@@ -725,7 +879,7 @@ class TestRespinParkedRecovery:
             "allowed_tools": None,
             "working_dir": "/tmp",
         }
-        _, cmd, _ = self._respin(tmp_path, clean, transcript_events=None)
+        _, cmd, _, _ = self._respin(tmp_path, clean, transcript_events=None)
         assert cmd[cmd.index("--disallowedTools") + 1] == "Monitor,ScheduleWakeup"
 
 
@@ -871,6 +1025,21 @@ FAKE_CLAUDE_TEMPLATE = textwrap.dedent(
               "result": "Final answer after wakeup."})
         # Stay alive (like a real CLI with open stdin) until stdin closes.
         sys.stdin.read()
+    elif MODE == "slow_requery":
+        # Fell r2 finding 2: the requery turn contains a silent gap far longer
+        # than the idle grace (inference/tool time). The driver must wait for
+        # its result instead of killing the turn.
+        emit({"type": "system", "subtype": "task_notification", "task_id": "faketask",
+              "status": "completed", "summary": "done"})
+        time.sleep(0.2)
+        emit({"type": "system", "subtype": "init", "session_id": "fake-sess"})
+        time.sleep(1.5)  # >> grace (0.4) and window (0.8): mid-turn silence
+        emit({"type": "assistant", "message": {"role": "assistant",
+              "content": [{"type": "text", "text": "Slow requery answer."}]}})
+        emit({"type": "result", "subtype": "success", "is_error": False,
+              "stop_reason": "end_turn", "session_id": "fake-sess",
+              "result": "Slow requery answer."})
+        sys.stdin.read()
     elif MODE == "noise_after_result":
         # Fell r1 finding 1: lifecycle noise after the task resolved and the
         # result arrived must not cancel the bounded path to a sentinel.
@@ -919,8 +1088,8 @@ def run_driver(tmp_path, mode, timeout_ms=600000, extra_args=()):
         "do the fake work",
         "--complete-grace-seconds",
         "0.4",
-        "--complete-linger-max-seconds",
-        "5",
+        "--requery-start-window-seconds",
+        "0.8",
         *extra_args,
         "--",
         sys.executable,
@@ -997,15 +1166,23 @@ class TestDriverEndToEnd:
     def test_driver_marks_stale_result_parked_after_linger(self, tmp_path):
         """Fell r1 finding 2 (linger): same stale-result case when claude
         stays alive silently instead of exiting."""
-        proc, events = run_driver(
-            tmp_path,
-            "resolve_silent",
-            extra_args=("--complete-linger-max-seconds", "1.2"),
-        )
+        proc, events = run_driver(tmp_path, "resolve_silent")
         sentinel = driver.find_sentinel(events)
         assert sentinel is not None, proc.stdout
         assert sentinel["subtype"] == "parked"
         assert [t["id"] for t in sentinel["stale_resolved_tasks"]] == ["faketask"]
+
+    def test_driver_never_kills_an_active_requery_turn(self, tmp_path):
+        """Fell r2 finding 2: silence INSIDE an active requery turn (inference
+        or a long tool run) must not trigger the idle grace — the requery's
+        answer must land, however slow the turn is."""
+        proc, events = run_driver(tmp_path, "slow_requery")
+        assert proc.returncode == 0, proc.stderr
+        sentinel = driver.find_sentinel(events)
+        assert sentinel is not None
+        assert sentinel["subtype"] == "complete"
+        results = [ev for ev in events if ev.get("type") == "result"]
+        assert results[-1]["result"] == "Slow requery answer."
 
     def test_driver_parks_after_task_deadline(self, tmp_path):
         proc, events = run_driver(
