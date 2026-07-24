@@ -127,9 +127,13 @@ class BackgroundTaskTracker:
     def __init__(self):
         self._armed = {}  # task_id -> {"id", "source", "timeout_ms", "armed_at"}
         self._resolved = set()
+        self.ever_armed = False
 
     def _arm(self, task_id, source, timeout_ms=None):
-        if not task_id or task_id in self._resolved:
+        if not task_id:
+            return
+        self.ever_armed = True
+        if task_id in self._resolved:
             return
         entry = self._armed.setdefault(
             task_id, {"id": task_id, "source": source, "armed_at": time.time()}
@@ -144,7 +148,27 @@ class BackgroundTaskTracker:
         self._armed.pop(task_id, None)
 
     def observe(self, event):
-        if not isinstance(event, dict) or event.get("type") != "user":
+        if not isinstance(event, dict):
+            return
+
+        # Structured lifecycle events (observed live on Claude Code 2.1.219):
+        # the CLI reports task completion as top-level system events — a
+        # Monitor's completion arrives ONLY on this channel, with no user-level
+        # XML notification. Top-level event types cannot be forged by tool
+        # output (which is confined to text inside tool_result blocks), so
+        # this is also the most trustworthy resolution source.
+        if event.get("type") == "system":
+            subtype = event.get("subtype")
+            task_id = event.get("task_id")
+            if subtype == "task_notification" and isinstance(task_id, str):
+                self._resolve(task_id, event.get("status"))
+            elif subtype == "task_updated" and isinstance(task_id, str):
+                patch = event.get("patch")
+                if isinstance(patch, dict):
+                    self._resolve(task_id, patch.get("status"))
+            return
+
+        if event.get("type") != "user":
             return
 
         tur = event.get("tool_use_result")
@@ -321,6 +345,23 @@ def main(argv=None):
         default=float(os.environ.get("SPINDLE_DRIVER_DEFAULT_TASK_TIMEOUT_SECONDS", "600")),
         help="Assumed lifetime for an unresolved task that published no timeoutMs",
     )
+    parser.add_argument(
+        "--complete-grace-seconds",
+        type=float,
+        default=float(os.environ.get("SPINDLE_DRIVER_COMPLETE_GRACE_SECONDS", "3")),
+        help=(
+            "After a clean result in a stream that armed background tasks, wait this "
+            "long for a CLI-queued follow-up turn before finishing. Notifications can "
+            "land mid-turn without the model consuming them; the CLI then auto-runs a "
+            "requery turn that would be cut off by an immediate stdin close."
+        ),
+    )
+    parser.add_argument(
+        "--complete-linger-max-seconds",
+        type=float,
+        default=float(os.environ.get("SPINDLE_DRIVER_COMPLETE_LINGER_MAX_SECONDS", "30")),
+        help="Hard cap on total post-clean-result linger across requery turns",
+    )
     parser.add_argument("claude_cmd", nargs=argparse.REMAINDER, help="-- followed by the claude invocation")
     args = parser.parse_args(argv)
 
@@ -360,16 +401,35 @@ def main(argv=None):
     tracker = BackgroundTaskTracker()
     saw_result = False
     awaiting_tasks_since_result = False
+    completing_since = None  # clean result seen; lingering for a queued requery turn
+    resolved_wait_since = None  # tasks resolved after a parked result; awaiting the requery
+    first_clean_result_at = None
 
     while True:
         try:
-            line = lines.get(timeout=1.0)
+            line = lines.get(timeout=0.25 if completing_since is not None else 1.0)
         except queue.Empty:
-            if awaiting_tasks_since_result:
+            now = time.time()
+            if completing_since is not None:
+                if (
+                    now - completing_since >= args.complete_grace_seconds
+                    or now - first_clean_result_at >= args.complete_linger_max_seconds
+                ):
+                    _emit(build_sentinel("complete", []))
+                    return _finish(proc) or 0
+            elif awaiting_tasks_since_result:
                 unresolved = tracker.unresolved
                 if not unresolved:
-                    awaiting_tasks_since_result = False
-                elif time.time() > _park_deadline(
+                    # Every task resolved after the parked result, but the
+                    # requery turn hasn't produced a new result. Give it a
+                    # bounded window, then accept the last result as final so
+                    # a CLI that never requeries can't hang the driver.
+                    if resolved_wait_since is None:
+                        resolved_wait_since = now
+                    elif now - resolved_wait_since >= args.complete_linger_max_seconds:
+                        _emit(build_sentinel("complete", []))
+                        return _finish(proc) or 0
+                elif now > _park_deadline(
                     unresolved, args.default_task_timeout_seconds, args.park_grace_seconds
                 ):
                     _emit(
@@ -418,24 +478,30 @@ def main(argv=None):
         if not isinstance(event, dict):
             continue
 
+        # Any event ends the current linger phases: a queued requery turn has
+        # started (or lifecycle noise arrived); the next result decides.
+        completing_since = None
+        resolved_wait_since = None
+
         tracker.observe(event)
 
         if event.get("type") == "result":
             saw_result = True
-            unresolved = tracker.unresolved
-            if not unresolved:
-                _emit(build_sentinel("complete", []))
-                exit_code = _finish(proc)
-                return exit_code or 0
-            # Turn ended but tasks are pending: hold the process and stdin
-            # open so the CLI can deliver the notification and run the
-            # follow-up turn. The park deadline bounds the wait.
-            awaiting_tasks_since_result = True
-        elif event.get("type") == "user":
-            # Notification (or any new user-visible activity) restarts the
-            # turn; deadline checks resume at the next result.
+            awaiting_tasks_since_result = bool(tracker.unresolved)
             if not tracker.unresolved:
-                awaiting_tasks_since_result = False
+                if not tracker.ever_armed:
+                    # No background tasks ever existed, so no notification can
+                    # be queued — finish immediately (the common fast path).
+                    _emit(build_sentinel("complete", []))
+                    return _finish(proc) or 0
+                # Tasks existed: notifications may have landed mid-turn without
+                # the model consuming them, in which case the CLI auto-runs a
+                # follow-up turn (observed live on 2.1.219). Linger briefly so
+                # that turn's result replaces this one instead of being cut off.
+                now = time.time()
+                completing_since = now
+                if first_clean_result_at is None:
+                    first_clean_result_at = now
 
 
 if __name__ == "__main__":

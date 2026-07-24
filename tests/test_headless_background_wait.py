@@ -110,6 +110,28 @@ def notification_event(task_id, status, summary="Task finished."):
     }
 
 
+def system_task_notification_event(task_id, status="completed"):
+    """Top-level lifecycle event — the ONLY channel a Monitor completion
+    arrives on (observed live, Claude Code 2.1.219 smoke 2026-07-24)."""
+    return {
+        "type": "system",
+        "subtype": "task_notification",
+        "task_id": task_id,
+        "tool_use_id": "toolu_arm",
+        "status": status,
+        "summary": f'Monitor "watch" stream ended',
+    }
+
+
+def system_task_updated_event(task_id, status="completed"):
+    return {
+        "type": "system",
+        "subtype": "task_updated",
+        "task_id": task_id,
+        "patch": {"status": status, "end_time": 1784920194947},
+    }
+
+
 def assistant_text_event(text):
     return {
         "type": "assistant",
@@ -250,6 +272,32 @@ class TestBackgroundTaskDetector:
         events = [wakeup_arm_event(1000), wakeup_arm_event(2000), result_event("stub")]
         state = driver.background_task_state(events)
         assert [t["source"] for t in state["unresolved"]] == ["scheduled_wakeup"]
+
+    def test_system_task_notification_resolves_monitor(self):
+        """A Monitor's completion arrives only as a system event, never as
+        user-level XML — the live smoke's false park without this."""
+        events = [
+            monitor_arm_event("b7yyr65dc", timeout_ms=30000),
+            system_task_notification_event("b7yyr65dc", "completed"),
+            result_event("NOTIFIED SMOKE_MARKER_DONE"),
+        ]
+        assert driver.background_task_state(events)["unresolved"] == []
+
+    def test_system_task_updated_resolves(self):
+        events = [
+            background_bash_event("bv8qp3uax"),
+            system_task_updated_event("bv8qp3uax", "completed"),
+            result_event("done"),
+        ]
+        assert driver.background_task_state(events)["unresolved"] == []
+
+    def test_system_event_with_nonterminal_status_does_not_resolve(self):
+        events = [
+            monitor_arm_event("t1"),
+            system_task_notification_event("t1", "running"),
+            result_event("stub"),
+        ]
+        assert [t["id"] for t in driver.background_task_state(events)["unresolved"]] == ["t1"]
 
 
 # --- finalize wiring (one-shot protocol) ------------------------------------
@@ -697,6 +745,8 @@ FAKE_CLAUDE_TEMPLATE = textwrap.dedent(
     assert msg["type"] == "user", msg
 
     emit({"type": "system", "subtype": "init", "session_id": "fake-sess"})
+    MODE = {mode!r}
+
     emit({
         "type": "user",
         "message": {"role": "user", "content": [
@@ -704,12 +754,57 @@ FAKE_CLAUDE_TEMPLATE = textwrap.dedent(
              "content": "Monitor started (task faketask, timeout {timeout_ms}ms)."}]},
         "tool_use_result": {"taskId": "faketask", "timeoutMs": {timeout_ms}, "persistent": False},
     })
+    if MODE == "requery_preresult":
+        # Run-2 ordering: notifications land mid-turn, BEFORE the model ends
+        # its turn with a stale stub.
+        emit({"type": "system", "subtype": "task_updated", "task_id": "faketask",
+              "patch": {"status": "completed", "end_time": 1}})
+        emit({"type": "system", "subtype": "task_notification", "task_id": "faketask",
+              "status": "completed", "summary": "done"})
     emit({"type": "result", "subtype": "success", "is_error": False,
           "stop_reason": "end_turn", "session_id": "fake-sess",
           "result": "Waiting for the background task."})
 
-    MODE = {mode!r}
-    if MODE == "notify":
+    if MODE == "requery_preresult":
+        # The CLI-queued requery turn with the real answer.
+        time.sleep(0.15)
+        emit({"type": "system", "subtype": "init", "session_id": "fake-sess"})
+        emit({"type": "assistant", "message": {"role": "assistant",
+              "content": [{"type": "text", "text": "Requery answer."}]}})
+        emit({"type": "result", "subtype": "success", "is_error": False,
+              "stop_reason": "end_turn", "session_id": "fake-sess",
+              "result": "Requery answer."})
+        sys.stdin.read()
+    elif MODE == "requery":
+        # Run-1 ordering: the turn ends parked, notifications arrive after the
+        # stub result, and the CLI auto-runs a requery turn with the answer.
+        emit({"type": "system", "subtype": "task_updated", "task_id": "faketask",
+              "patch": {"status": "completed", "end_time": 1}})
+        emit({"type": "system", "subtype": "task_notification", "task_id": "faketask",
+              "status": "completed", "summary": "done"})
+        time.sleep(0.15)
+        emit({"type": "system", "subtype": "init", "session_id": "fake-sess"})
+        emit({"type": "assistant", "message": {"role": "assistant",
+              "content": [{"type": "text", "text": "Requery answer."}]}})
+        emit({"type": "result", "subtype": "success", "is_error": False,
+              "stop_reason": "end_turn", "session_id": "fake-sess",
+              "result": "Requery answer."})
+        sys.stdin.read()
+    elif MODE == "notify_system":
+        # Resolution via the system lifecycle channel only (the real Monitor
+        # completion path observed live) — no user-level XML notification.
+        time.sleep(0.3)
+        emit({"type": "system", "subtype": "task_updated", "task_id": "faketask",
+              "patch": {"status": "completed", "end_time": 1}})
+        emit({"type": "system", "subtype": "task_notification", "task_id": "faketask",
+              "status": "completed", "summary": "done"})
+        emit({"type": "assistant", "message": {"role": "assistant",
+              "content": [{"type": "text", "text": "Final answer after wakeup."}]}})
+        emit({"type": "result", "subtype": "success", "is_error": False,
+              "stop_reason": "end_turn", "session_id": "fake-sess",
+              "result": "Final answer after wakeup."})
+        sys.stdin.read()
+    elif MODE == "notify":
         time.sleep(0.3)
         emit({"type": "user", "message": {"role": "user", "content":
              "<task-notification>\\n<task-id>faketask</task-id>\\n<status>completed</status>\\n<summary>done</summary>\\n</task-notification>"}})
@@ -742,6 +837,10 @@ def run_driver(tmp_path, mode, timeout_ms=600000, extra_args=()):
         str(DRIVER_SCRIPT),
         "--prompt",
         "do the fake work",
+        "--complete-grace-seconds",
+        "0.4",
+        "--complete-linger-max-seconds",
+        "5",
         *extra_args,
         "--",
         sys.executable,
@@ -763,6 +862,37 @@ class TestDriverEndToEnd:
         results = [ev for ev in events if ev.get("type") == "result"]
         assert len(results) == 2  # stub + real: the driver did not stop at the stub
         assert results[-1]["result"] == "Final answer after wakeup."
+
+    def test_driver_completes_on_system_channel_notification(self, tmp_path):
+        proc, events = run_driver(tmp_path, "notify_system")
+        assert proc.returncode == 0, proc.stderr
+        sentinel = driver.find_sentinel(events)
+        assert sentinel is not None
+        assert sentinel["subtype"] == "complete"
+        results = [ev for ev in events if ev.get("type") == "result"]
+        assert results[-1]["result"] == "Final answer after wakeup."
+
+    def test_driver_waits_for_requery_after_postresult_notifications(self, tmp_path):
+        """Run-1 ordering: stub result, then notifications, then a requery
+        turn — the requery's answer must replace the stub."""
+        proc, events = run_driver(tmp_path, "requery")
+        assert proc.returncode == 0, proc.stderr
+        sentinel = driver.find_sentinel(events)
+        assert sentinel["subtype"] == "complete"
+        results = [ev for ev in events if ev.get("type") == "result"]
+        assert results[-1]["result"] == "Requery answer."
+
+    def test_driver_lingers_past_clean_result_for_queued_requery(self, tmp_path):
+        """Run-2 ordering: notifications landed mid-turn (result arrives with
+        nothing unresolved), but a queued requery follows — an immediate
+        stdin close would cut it off and keep the stale stub."""
+        proc, events = run_driver(tmp_path, "requery_preresult")
+        assert proc.returncode == 0, proc.stderr
+        sentinel = driver.find_sentinel(events)
+        assert sentinel["subtype"] == "complete"
+        results = [ev for ev in events if ev.get("type") == "result"]
+        assert len(results) == 2
+        assert results[-1]["result"] == "Requery answer."
 
     def test_driver_parks_after_task_deadline(self, tmp_path):
         proc, events = run_driver(
