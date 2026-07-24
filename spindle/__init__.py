@@ -33,6 +33,18 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Dict, Generator, Optional, Tuple
 
+# The stream driver is a standalone top-level module (not part of this
+# package) so the driver child process can import the shared background-task
+# tracking without triggering this module's server startup side effects. In an
+# installed wheel it sits next to the package in site-packages; in a checkout
+# it sits at the repo root, which may not be on sys.path when the package is
+# imported by path (some test runners), hence the fallback.
+try:
+    import spindle_claude_driver as _claude_driver
+except ImportError:  # checkout where the repo root is not on sys.path
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    import spindle_claude_driver as _claude_driver
+
 # fastmcp imports authlib, which announces a deprecation of its own internals as
 # it loads — three lines of stderr in front of the output of every single CLI
 # command, about something no spindle user can act on. A warnings filter can't
@@ -214,6 +226,81 @@ RELOAD_DRAIN_POLL_INTERVAL = 5  # seconds
 # so fell has no iteration cap (fell-r6+ spools are covered without enumeration).
 REVIEW_TAGS = {"review"}
 DEFAULT_REVIEW_TIMEOUT = int(os.environ.get("SPINDLE_REVIEW_TIMEOUT", str(90 * 60)))
+
+# Persistent stream-json driver for headless Claude spools (see
+# spindle_claude_driver.py and finding-20260724-2niy). Opt-in while the
+# provider behavior it depends on is being canaried; each spool records the
+# protocol it actually launched under so old one-shot spools and new driver
+# spools coexist across the rollout and across server restarts.
+CLAUDE_STREAM_DRIVER_ENV = "SPINDLE_CLAUDE_STREAM_DRIVER"
+CLAUDE_PROTOCOL_STREAM_V1 = _claude_driver.DRIVER_PROTOCOL
+
+
+def _claude_stream_driver_enabled() -> bool:
+    return os.environ.get(CLAUDE_STREAM_DRIVER_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _stream_driver_script_path() -> Optional[Path]:
+    """Locate the standalone driver script next to this package.
+
+    Works for both an installed wheel (top-level module beside the package in
+    site-packages) and a repo checkout (module at the repo root).
+    """
+    path = Path(_claude_driver.__file__).resolve()
+    return path if path.exists() else None
+
+
+def _claude_headless_cmd(prompt: str, flags: list) -> Tuple[list, Optional[str]]:
+    """Build the argv for a headless Claude launch, honoring the driver flag.
+
+    Returns ``(cmd, claude_protocol)`` — protocol is CLAUDE_PROTOCOL_STREAM_V1
+    when the persistent stream driver wraps the launch, None for the classic
+    one-shot ``claude -p``. Every headless launch also gets the background-task
+    guard: one-shot turns cannot receive Monitor/ScheduleWakeup notifications
+    (the process exits at end of turn, parking the agent — see
+    error_kind=headless_background_wait), so those tools are disallowed
+    outright. Under the driver, Monitor notifications are deliverable, but
+    ScheduleWakeup's fire-while-headless semantics are unverified, so it stays
+    disallowed there too. A backgrounded Bash command cannot be blocked by
+    tool name; the parked-turn detector remains the backstop for it.
+    """
+    if _claude_stream_driver_enabled():
+        driver = _stream_driver_script_path()
+        if driver is not None:
+            cmd = [
+                sys.executable,
+                str(driver),
+                "--prompt",
+                prompt,
+                "--",
+                "claude",
+                "-p",
+                "--input-format",
+                "stream-json",
+                "--output-format",
+                "stream-json",
+                "--replay-user-messages",
+                "--verbose",
+                "--disallowedTools",
+                "ScheduleWakeup",
+                *flags,
+            ]
+            return cmd, CLAUDE_PROTOCOL_STREAM_V1
+        logger.warning(
+            "spindle: %s is set but the driver script is missing; falling back to one-shot claude",
+            CLAUDE_STREAM_DRIVER_ENV,
+        )
+    cmd = [
+        "claude",
+        "-p",
+        prompt,
+        "--output-format",
+        "json",
+        "--disallowedTools",
+        "Monitor,ScheduleWakeup",
+        *flags,
+    ]
+    return cmd, None
 
 
 def _is_review_tag(tag: str) -> bool:
@@ -1913,6 +2000,17 @@ def _format_spool_failure(spool_id: str, spool: dict) -> str:
             f"safety grounds (not a task failure). Consider rephrasing or trying a "
             f"different model. Original message:\n{err}"
         )
+    if kind == "headless_background_wait":
+        pending = spool.get("pending_background_tasks") or []
+        ids = ", ".join(str(t.get("id", "?")) for t in pending if isinstance(t, dict)) or "unknown"
+        return (
+            f"Spool {spool_id} PARKED (headless background wait): the agent ended its "
+            f"turn still waiting on background task(s) [{ids}] whose completion "
+            f"notification can never reach a finished headless process. The stored "
+            f"result is the agent's parked stub, NOT a completed answer. "
+            f"respin({spool_id!r}, ...) rebuilds a clean continuation session from the "
+            f"transcript with those tasks abandoned. Original message:\n{err}"
+        )
     return f"Spool {spool_id} failed: {err}"
 
 
@@ -2400,11 +2498,20 @@ def _cleanup_old_spools() -> None:
 
 
 def _spool_has_complete_output(spool: dict, stdout_path: Path, stderr_path: Path) -> bool:
-    """Whether a non-Codex harness has published its terminal JSON object."""
+    """Whether a non-Codex harness has published its terminal JSON object.
+
+    Stream-driver spools are terminal only at the driver's own sentinel event.
+    An intermediate result event is NOT terminal there: the driver holds the
+    Claude process open across end-of-turn results while background tasks are
+    unresolved, so finalizing on a result would recreate the parked-stub false
+    completion the driver exists to prevent.
+    """
     if spool.get("harness") != "codex" and stdout_path.exists():
         try:
             content = stdout_path.read_text()
             if content.strip():
+                if spool.get("claude_protocol") == CLAUDE_PROTOCOL_STREAM_V1:
+                    return _claude_driver.ndjson_has_sentinel(content)
                 data = json.loads(content)
                 result = _extract_cc_result(data)
                 if result and ("result" in result or "error" in result or "response" in result):
@@ -2658,9 +2765,15 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
                 spool["error"] = no_output
 
         else:
-            # Claude Code: JSON object or JSON array of events
+            # Claude Code: JSON object, JSON array of events, or (stream-driver
+            # spools) newline-delimited JSON events ending in the driver sentinel.
             try:
-                data = json.loads(stdout)
+                if spool.get("claude_protocol") == CLAUDE_PROTOCOL_STREAM_V1:
+                    data = _claude_driver.parse_ndjson_events(stdout)
+                    if not data:
+                        raise json.JSONDecodeError("no parseable driver events", stdout, 0)
+                else:
+                    data = json.loads(stdout)
                 cc_result = _extract_cc_result(data)
                 if cc_result:
                     spool["result"] = cc_result.get("result", stdout)
@@ -2698,6 +2811,35 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
                     # Parsed JSON but no recognizable result structure
                     spool["result"] = stdout
                     spool["status"] = "complete"
+
+                # Parked-turn detection (finding-20260724-2niy): a turn that
+                # ended while nonpersistent background tasks (Monitor,
+                # background Bash, scheduled wakeup) were still unresolved is
+                # NOT a completed task — the process that would have delivered
+                # their notifications has exited, so the recorded result is the
+                # agent's waiting stub. Reuse status=error (no new status) so
+                # every existing unspool/spin_wait error path surfaces it.
+                # A genuine final report with an unresolved task is still
+                # flagged: the termination is invalid either way, and the
+                # report stays preserved in spool["result"].
+                if spool.get("status") == "complete" and isinstance(data, list):
+                    unresolved = _claude_driver.background_task_state(data)["unresolved"]
+                    if unresolved:
+                        pending = [
+                            {"id": t.get("id"), "source": t.get("source")} for t in unresolved
+                        ]
+                        ids = ", ".join(str(t["id"]) for t in pending)
+                        spool["status"] = "error"
+                        spool["error_kind"] = "headless_background_wait"
+                        spool["pending_background_tasks"] = pending
+                        spool["error"] = (
+                            f"Claude ended its headless turn while still waiting on "
+                            f"unresolved background task(s) [{ids}]. Their completion "
+                            f"notifications cannot reach an exited process, so this "
+                            f"spool did not finish its task; the stored result is the "
+                            f"agent's parked stub. Use respin() to continue — it will "
+                            f"rebuild a clean session from the transcript."
+                        )
             except json.JSONDecodeError:
                 if stdout.strip():
                     spool["result"] = stdout
@@ -2777,6 +2919,147 @@ def _recover_orphans() -> None:
                         pass
 
 
+def _parse_claude_transcript_events(transcript_text: str) -> list:
+    """Best-effort parse of a saved Claude transcript into a list of dict events.
+
+    Transcripts are the raw stdout of the original run: a JSON array of events
+    (one-shot protocol), NDJSON (stream-driver protocol), or a single JSON
+    object (the oldest CLI format). Unparseable text yields an empty list.
+    """
+    try:
+        data = json.loads(transcript_text)
+    except json.JSONDecodeError:
+        return _claude_driver.parse_ndjson_events(transcript_text)
+    if isinstance(data, list):
+        return [ev for ev in data if isinstance(ev, dict)]
+    if isinstance(data, dict):
+        return [data]
+    return []
+
+
+def _transcript_unresolved_tasks(transcript_text: str) -> list:
+    """Unresolved nonpersistent background tasks recorded in a saved transcript."""
+    events = _parse_claude_transcript_events(transcript_text)
+    if not events:
+        return []
+    return _claude_driver.background_task_state(events)["unresolved"]
+
+
+# Per-item caps for the sanitized transcript render. Tool results dominate raw
+# transcripts (full file reads, test logs); the caps bound the rebuilt session's
+# context while keeping far more signal than the result stub alone. Applied
+# after control-block stripping so a cut can't leave a half-open notification.
+SANITIZED_TOOL_RESULT_MAX_CHARS = 20000
+SANITIZED_TOOL_CALL_MAX_CHARS = 2000
+
+
+def _truncate_for_transcript(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"\n[... truncated, {len(text) - limit} chars omitted]"
+
+
+def _sanitize_claude_transcript(transcript_text: str) -> str:
+    """Render a saved Claude transcript as readable conversation prose.
+
+    Keeps user messages, assistant prose, tool calls, and tool output. Strips
+    provider control blocks (task notifications, queued-command attachments)
+    and lifecycle noise (system/init/thinking/result events). A resumed model
+    must never see a stale task-notification control block adjacent to the new
+    continuation — that adjacency is exactly what made rescue respins read as
+    prompt injection (issue-20260724-tqs3).
+
+    Falls back to the raw text (still control-block-stripped) when the
+    transcript does not parse as events.
+    """
+    events = _parse_claude_transcript_events(transcript_text)
+    lines = []
+    for ev in events:
+        etype = ev.get("type")
+        message = ev.get("message")
+        if not isinstance(message, dict):
+            continue
+        if etype == "assistant":
+            content = message.get("content")
+            if isinstance(content, str):
+                text = content.strip()
+                if text:
+                    lines.append(f"[assistant] {text}")
+                continue
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                btype = block.get("type")
+                if btype == "text":
+                    text = (block.get("text") or "").strip()
+                    if text:
+                        lines.append(f"[assistant] {text}")
+                elif btype == "tool_use":
+                    name = block.get("name", "tool")
+                    try:
+                        rendered_input = json.dumps(block.get("input", {}))
+                    except (TypeError, ValueError):
+                        rendered_input = str(block.get("input"))
+                    lines.append(
+                        f"[tool call] {name}: "
+                        f"{_truncate_for_transcript(rendered_input, SANITIZED_TOOL_CALL_MAX_CHARS)}"
+                    )
+        elif etype == "user":
+            for channel, text in _claude_driver.iter_user_texts(ev):
+                cleaned = _claude_driver.strip_control_blocks(text).strip()
+                if not cleaned:
+                    continue
+                if channel == "tool_result":
+                    lines.append(
+                        f"[tool result] "
+                        f"{_truncate_for_transcript(cleaned, SANITIZED_TOOL_RESULT_MAX_CHARS)}"
+                    )
+                else:
+                    lines.append(f"[user] {cleaned}")
+    if not lines:
+        return _claude_driver.strip_control_blocks(transcript_text)
+    return "\n\n".join(lines)
+
+
+def _build_transcript_continuation_prompt(
+    transcript_text: str, new_message: str, abandoned_tasks: Optional[list] = None
+) -> str:
+    """Build the fresh-session prompt that continues a saved conversation.
+
+    Shared by the expired-session fallback and the parked-spool respin
+    recovery, so every transcript-rebuilt session gets the same sanitized
+    rendering and the same explicit statement that old background tasks are
+    dead — never a raw control block the model has to second-guess.
+    """
+    parts = [
+        "Previous conversation transcript (sanitized: provider control notifications were removed):",
+        "",
+        _sanitize_claude_transcript(transcript_text),
+        "",
+    ]
+    if abandoned_tasks:
+        ids = ", ".join(str(t.get("id", "?")) for t in abandoned_tasks if isinstance(t, dict))
+        parts.extend(
+            [
+                f"Background task(s) [{ids}] from the previous session were abandoned when its "
+                f"process exited: no notification from them will ever arrive. Do not wait for "
+                f"them or re-arm monitors on them. If that background work still matters, re-run "
+                f"it in the foreground and finish within a single turn.",
+                "",
+            ]
+        )
+    parts.extend(
+        [
+            "---",
+            "",
+            f"Continue from the conversation above. New message: {new_message}",
+        ]
+    )
+    return "\n".join(parts)
+
+
 def _handle_expired_session(spool_id: str, spool: dict) -> bool:
     """Serialize transcript fallback with spool and shared-worktree transitions."""
     snapshot = _read_spool(spool_id) or spool
@@ -2847,18 +3130,19 @@ def _handle_expired_session_locked(spool_id: str, spool: dict) -> bool:
     except IOError:
         return False
 
-    # Build new prompt with transcript context
-    context_prompt = f"""Previous conversation transcript:
+    # Build new prompt with transcript context via the shared sanitized
+    # renderer: raw transcripts embed provider control blocks (task
+    # notifications and queued commands) that a resumed model reads as
+    # contradictory/injected input. Any background tasks recorded in the
+    # transcript died with the original process — say so explicitly.
+    context_prompt = _build_transcript_continuation_prompt(
+        transcript,
+        spool["prompt"].split(": ", 1)[-1],
+        abandoned_tasks=_transcript_unresolved_tasks(transcript),
+    )
 
-{transcript}
-
----
-
-Continue from above. New message: {spool["prompt"].split(": ", 1)[-1]}"""
-
-    # Spawn new process without --resume flag, with transcript as context
-    cmd = ["claude", "-p", context_prompt, "--output-format", "json"]
-
+    # Spawn new process without --resume flag, with transcript as context.
+    #
     # A bare `claude -p` (this transcript fallback) sets NEITHER --permission-mode
     # NOR --allowedTools, so the resumed spool silently changes capability from the
     # original spin — the same tier-drop as a bare `--resume`, surviving on the
@@ -2868,9 +3152,9 @@ Continue from above. New message: {spool["prompt"].split(": ", 1)[-1]}"""
     # concern to guard against here.
     orig_permission = original_spool.get("permission")
     orig_allowed_tools = original_spool.get("allowed_tools")
-    cmd.extend(["--permission-mode", _claude_permission_mode(orig_permission)])
+    cmd_flags = ["--permission-mode", _claude_permission_mode(orig_permission)]
     if orig_allowed_tools:
-        cmd.extend(["--allowedTools", orig_allowed_tools])
+        cmd_flags.extend(["--allowedTools", orig_allowed_tools])
 
     # Profile spools: rebuild the alt endpoint/key spawn env fresh and re-inject
     # --model/extra_args so the transcript fallback hits the same endpoint as the
@@ -2885,9 +3169,11 @@ Continue from above. New message: {spool["prompt"].split(": ", 1)[-1]}"""
     )
     if resolved:
         if eff_model:
-            cmd.extend(["--model", CLAUDE_MODEL_ALIASES.get(eff_model, eff_model)])
+            cmd_flags.extend(["--model", CLAUDE_MODEL_ALIASES.get(eff_model, eff_model)])
         if profile_extra_args:
-            cmd.extend(profile_extra_args)
+            cmd_flags.extend(profile_extra_args)
+
+    cmd, claude_protocol = _claude_headless_cmd(context_prompt, cmd_flags)
 
     shard_info = spool.get("shard") or original_spool.get("shard")
     fallback_cwd = spool.get("working_dir") or (shard_info or {}).get("worktree_path")
@@ -2913,6 +3199,9 @@ Continue from above. New message: {spool["prompt"].split(": ", 1)[-1]}"""
             spool["shard"] = shard_info
         spool["used_transcript_fallback"] = True
         spool["transcript_injected_at"] = datetime.now().isoformat()
+        # The retried process's output replaces this spool's stdout capture, so
+        # the finalizer must parse it under the protocol it was launched with.
+        spool["claude_protocol"] = claude_protocol
         _write_spool(spool_id, spool)
 
         return True
@@ -3215,27 +3504,29 @@ Your task:
 """
         effective_prompt = shard_preamble + effective_prompt
 
-    claude_cmd = ["claude", "-p", effective_prompt, "--output-format", "json"]
+    claude_flags = []
 
     if model:
         resolved_model = CLAUDE_MODEL_ALIASES.get(model, model)
-        claude_cmd.extend(["--model", resolved_model])
+        claude_flags.extend(["--model", resolved_model])
 
     # Select the permission mode for this tier. careful and the None default
     # resolve to auto (no allowlist); readonly/manual keep acceptEdits + their
     # tight allowlist; full/shard/+shard get bypassPermissions. See
     # _claude_permission_mode for the full table.
-    claude_cmd.extend(["--permission-mode", _claude_permission_mode(permission)])
+    claude_flags.extend(["--permission-mode", _claude_permission_mode(permission)])
 
     if system_prompt:
-        claude_cmd.extend(["--system-prompt", system_prompt])
+        claude_flags.extend(["--system-prompt", system_prompt])
 
     if resolved_tools:
-        claude_cmd.extend(["--allowedTools", resolved_tools])
+        claude_flags.extend(["--allowedTools", resolved_tools])
 
     # Profile extra_args are appended verbatim to the claude invocation.
     if extra_args:
-        claude_cmd.extend(extra_args)
+        claude_flags.extend(extra_args)
+
+    claude_cmd, claude_protocol = _claude_headless_cmd(effective_prompt, claude_flags)
 
     # Wrap in bwrap sandbox for shards - worktree writable unless research output
     # is explicitly routed to a file/dir target.
@@ -3355,6 +3646,7 @@ Your task:
         "timeout": timeout,
         "env": env,
         "profile": profile,
+        "claude_protocol": claude_protocol,
         "created_at": datetime.now().isoformat(),
         "completed_at": None,
         "pid": None,
@@ -3944,6 +4236,39 @@ async def spools() -> str:
     return await asyncio.to_thread(_spools_sync)
 
 
+def _respin_parked_state(original_spool: dict) -> Tuple[list, Optional[str]]:
+    """Whether a Claude spool parked on background tasks, and its transcript.
+
+    Returns ``(parked_tasks, transcript_text)``. A non-empty task list means
+    the spool's last turn ended still waiting on background tasks that died
+    with its process, so respin must rebuild a fresh session instead of
+    ``--resume`` (whose orphan scan injects a stale stopped notification ahead
+    of the continuation — issue-20260724-tqs3). Detector-marked spools
+    (error_kind=headless_background_wait) carry their task list; legacy spools
+    finalized as complete before the detector existed are recognized by
+    scanning the saved transcript, so no migration is needed.
+    """
+    if original_spool.get("harness", "claude-code") != "claude-code":
+        return [], None
+
+    transcript_text = None
+    transcript_path = _get_transcript_path(original_spool["id"])
+    if transcript_path.exists():
+        try:
+            transcript_text = transcript_path.read_text()
+        except IOError:
+            transcript_text = None
+
+    if original_spool.get("error_kind") == "headless_background_wait":
+        tasks = [t for t in original_spool.get("pending_background_tasks") or [] if isinstance(t, dict)]
+        return tasks or [{"id": "unknown", "source": "unknown"}], transcript_text
+
+    if original_spool.get("status") == "complete" and transcript_text:
+        return _transcript_unresolved_tasks(transcript_text), transcript_text
+
+    return [], transcript_text
+
+
 def _respin_sync(handle: str, prompt: str) -> str:
     """Synchronous implementation of respin - auto-detects harness.
 
@@ -4011,6 +4336,21 @@ def _respin_sync(handle: str, prompt: str) -> str:
         if conflict:
             return f"Error: {conflict}"
 
+        # A spool that parked on background tasks must not --resume: the CLI's
+        # resume-time orphan scan inserts a stale "stopped" task-notification
+        # as a user message directly ahead of the continuation, and the model
+        # correctly reads that contradictory blob as injected input and parks
+        # again. Rebuild a fresh session from the sanitized transcript instead,
+        # with the dead tasks explicitly abandoned.
+        parked_tasks, parked_transcript = _respin_parked_state(original_spool)
+        if parked_tasks and not parked_transcript:
+            return (
+                f"Spool '{original_spool.get('id', handle)}' parked waiting on background "
+                f"task(s) [{', '.join(str(t.get('id', '?')) for t in parked_tasks)}] and has no "
+                f"saved transcript to rebuild from. Resuming it would replay a stale task "
+                f"notification and park again — start a fresh spin() with the task context instead."
+            )
+
         # Generate spool ID first
         spool_id = str(uuid.uuid4())[:8]
 
@@ -4021,9 +4361,18 @@ def _respin_sync(handle: str, prompt: str) -> str:
 
         # Slot reserved via spool creation - continue with setup
 
-        # Try to resume with session_id first
-        # If that fails (session expired), fall back to transcript injection
-        cmd = ["claude", "-p", prompt, "--resume", session_id, "--output-format", "json"]
+        if parked_tasks:
+            # Fresh session continuing the sanitized transcript; old background
+            # tasks are stated dead so the model doesn't wait on them.
+            effective_prompt = _build_transcript_continuation_prompt(
+                parked_transcript, prompt, abandoned_tasks=parked_tasks
+            )
+            cmd_flags = []
+        else:
+            # Try to resume with session_id first
+            # If that fails (session expired), fall back to transcript injection
+            effective_prompt = prompt
+            cmd_flags = ["--resume", session_id]
 
         # A bare `claude --resume` sets NEITHER --permission-mode NOR --allowedTools,
         # so a resumed spool silently changes capability from the original spin (a
@@ -4032,10 +4381,12 @@ def _respin_sync(handle: str, prompt: str) -> str:
         # resume stays auto, a readonly resume keeps its allowlist, etc. The stored
         # allowed_tools mirrors exactly what the original spin used, so no
         # re-resolution (and no research-target re-validation) is needed here.
+        # The parked-recovery fresh session needs the same re-application for the
+        # same reason.
         orig_allowed_tools = original_spool.get("allowed_tools")
-        cmd.extend(["--permission-mode", _claude_permission_mode(orig_permission)])
+        cmd_flags.extend(["--permission-mode", _claude_permission_mode(orig_permission)])
         if orig_allowed_tools:
-            cmd.extend(["--allowedTools", orig_allowed_tools])
+            cmd_flags.extend(["--allowedTools", orig_allowed_tools])
 
         shard_info = original_spool.get("shard")
         cwd = original_spool.get("working_dir") or (shard_info or {}).get("worktree_path") or os.getcwd()
@@ -4076,9 +4427,17 @@ def _respin_sync(handle: str, prompt: str) -> str:
         )
         if resolved:
             if resume_model:
-                cmd.extend(["--model", CLAUDE_MODEL_ALIASES.get(resume_model, resume_model)])
+                cmd_flags.extend(["--model", CLAUDE_MODEL_ALIASES.get(resume_model, resume_model)])
             if profile_extra_args:
-                cmd.extend(profile_extra_args)
+                cmd_flags.extend(profile_extra_args)
+        elif parked_tasks and original_spool.get("model"):
+            # A --resume session carries its model, but the parked-recovery
+            # fresh session does not — re-inject the recorded one so recovery
+            # keeps the original spin's model instead of the CLI default.
+            orig_model = original_spool["model"]
+            cmd_flags.extend(["--model", CLAUDE_MODEL_ALIASES.get(orig_model, orig_model)])
+
+        cmd, claude_protocol = _claude_headless_cmd(effective_prompt, cmd_flags)
 
         if shard_info:
             cmd = _codex_bwrap_wrap(
@@ -4091,9 +4450,15 @@ def _respin_sync(handle: str, prompt: str) -> str:
         spool = {
             "id": spool_id,
             "status": "pending",
-            "prompt": f"Continue {session_id}: {prompt}",
+            "prompt": (
+                f"Continue {original_spool['id']} (parked recovery): {prompt}"
+                if parked_tasks
+                else f"Continue {session_id}: {prompt}"
+            ),
             "result": None,
-            "session_id": session_id,
+            # Parked recovery starts a fresh session; its id is unknown until
+            # the CLI's result event and is filled in at finalization.
+            "session_id": None if parked_tasks else session_id,
             "working_dir": cwd,
             "allowed_tools": orig_allowed_tools,
             "permission": orig_permission,
@@ -4102,6 +4467,7 @@ def _respin_sync(handle: str, prompt: str) -> str:
             "env": caller_env,
             "profile": profile_name,
             "shard": shard_info,
+            "claude_protocol": claude_protocol,
             "created_at": datetime.now().isoformat(),
             "completed_at": None,
             "pid": None,
@@ -4109,6 +4475,9 @@ def _respin_sync(handle: str, prompt: str) -> str:
             "error": None,
             "harness": "claude-code",
         }
+        if parked_tasks:
+            spool["parked_recovery_of"] = original_spool["id"]
+            spool["abandoned_background_tasks"] = parked_tasks
 
         startup_error = _start_spool_process(spool, cmd, cwd, spawn_env)
         if startup_error:
@@ -4131,7 +4500,12 @@ async def respin(
 
     Auto-detects the harness (claude-code, codex, gemini, kimi) from the
     original spool. For Claude Code sessions, falls back to transcript
-    injection if the session has expired.
+    injection if the session has expired. A Claude spool that parked waiting
+    on background tasks (error_kind=headless_background_wait, or a legacy
+    stub whose transcript shows unresolved tasks) is not resumed — resume
+    would replay a stale task notification into the model's context; instead
+    a fresh session is rebuilt from the sanitized transcript with those
+    tasks explicitly abandoned.
 
     Args:
         session_id: The handle of the session to continue. Accepts the
