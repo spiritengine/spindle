@@ -48,6 +48,10 @@ spindle = "spindle:main"
 
 [tool.setuptools]
 packages = ["spindle"]
+# The stream driver is deliberately a top-level module, not a spindle
+# submodule: the driver child process imports it without triggering the
+# package's MCP server startup side effects.
+py-modules = ["spindle_claude_driver"]
 
 [tool.setuptools.dynamic]
 version = { attr = "spindle._version.__version__" }
