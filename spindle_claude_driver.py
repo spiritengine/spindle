@@ -51,7 +51,12 @@ DRIVER_PROTOCOL = "stream-driver-v1"
 SENTINEL_TYPE = "spindle_driver_terminal"
 
 # Statuses inside a <task-notification> that end a task's lifecycle.
-TERMINAL_TASK_STATUSES = {"completed", "failed", "stopped"}
+# "killed" is delivered when a background command is stopped mid-run
+# (KillShell, harness/user stop) — observed in the live spool store and in
+# interactive session JSONLs (fell round 4, finding-20260724-ja3l). The
+# binary also carries a "timed_out" literal, but it has zero observed
+# occurrences and Monitor timeouts are already bounded by the park deadline.
+TERMINAL_TASK_STATUSES = {"completed", "failed", "stopped", "killed"}
 
 TASK_NOTIFICATION_RE = re.compile(r"<task-notification>(.*?)</task-notification>", re.DOTALL)
 TASK_ID_RE = re.compile(r"<task-id>\s*([^<\s]+)\s*</task-id>")

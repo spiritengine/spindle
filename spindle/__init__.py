@@ -2945,8 +2945,16 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
                 if (
                     driver_stream
                     and sentinel is None
-                    and spool.get("status") == "complete"
                     and isinstance(data, list)
+                    # Same eligibility as the parked-sentinel branch, evaluated
+                    # at execution time (the crash branch above may just have
+                    # set a kind-less error): an error-shaped final result must
+                    # not shield a parked stream from its metadata, or respin
+                    # would --resume it (fell round 4, finding-20260724-ja3l).
+                    and (
+                        spool.get("status") == "complete"
+                        or (spool.get("status") == "error" and not spool.get("error_kind"))
+                    )
                 ):
                     task_state = _claude_driver.background_task_state(data)
                     pending_src = task_state["unresolved"] or task_state["stale_resolved"]
@@ -2955,6 +2963,7 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
                             {"id": t.get("id"), "source": t.get("source")} for t in pending_src
                         ]
                         ids = ", ".join(str(t["id"]) for t in pending)
+                        prior_error = spool.get("error")
                         spool["status"] = "error"
                         spool["error_kind"] = "headless_background_wait"
                         spool["pending_background_tasks"] = pending
@@ -2965,6 +2974,7 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
                             f"result is not a completed answer. Use respin() to "
                             f"continue — it will rebuild a clean session from the "
                             f"transcript."
+                            + (f" Original error: {prior_error[:300]}" if prior_error else "")
                         )
             except json.JSONDecodeError:
                 if stdout.strip():
@@ -4629,10 +4639,15 @@ def _respin_sync(handle: str, prompt: str, rebuild: bool = False) -> str:
                 cmd_flags.extend(["--model", CLAUDE_MODEL_ALIASES.get(resume_model, resume_model)])
             if profile_extra_args:
                 cmd_flags.extend(profile_extra_args)
-        elif parked_tasks and original_spool.get("model"):
+        elif parked_tasks and not profile_name and original_spool.get("model"):
             # A --resume session carries its model, but the parked-recovery
             # fresh session does not — re-inject the recorded one so recovery
             # keeps the original spin's model instead of the CLI default.
+            # Profile spools only get their model via successful resolution
+            # above: a degraded profile (resolved=False) has lost its alt
+            # endpoint, and forcing that endpoint's model onto the default
+            # endpoint would fail the launch — match the degraded-resume
+            # convention and omit --model (fell round 4, finding-20260724-ja3l).
             orig_model = original_spool["model"]
             cmd_flags.extend(["--model", CLAUDE_MODEL_ALIASES.get(orig_model, orig_model)])
 

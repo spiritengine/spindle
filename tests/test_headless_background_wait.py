@@ -185,10 +185,20 @@ class TestBackgroundTaskDetector:
         events = [monitor_arm_event("t1"), notification_event("t1", "completed"), result_event("done")]
         assert driver.background_task_state(events)["unresolved"] == []
 
-    def test_failed_and_stopped_notifications_resolve(self):
-        for status in ("failed", "stopped"):
+    def test_failed_stopped_and_killed_notifications_resolve(self):
+        """killed is a real delivered terminal status (KillShell / harness
+        stop, observed live) — fell r4."""
+        for status in ("failed", "stopped", "killed"):
             events = [monitor_arm_event("t1"), notification_event("t1", status)]
             assert driver.background_task_state(events)["unresolved"] == [], status
+
+    def test_killed_system_event_resolves(self):
+        events = [
+            background_bash_event("bg1"),
+            system_task_notification_event("bg1", "killed"),
+            result_event("done"),
+        ]
+        assert driver.background_task_state(events)["unresolved"] == []
 
     def test_nonterminal_status_does_not_resolve(self):
         events = [monitor_arm_event("t1"), notification_event("t1", "running")]
@@ -383,6 +393,18 @@ class TestFinalizeParkedDetection:
         spool = self._finalize(tmp_path, [background_bash_event("bg7"), result_event("stub")])
         assert spool["status"] == "error"
         assert spool["pending_background_tasks"] == [{"id": "bg7", "source": "background_shell"}]
+
+    def test_error_shaped_result_without_sentinel_still_parks(self, tmp_path):
+        """Fell r4: arm -> is_error result -> driver dies pre-sentinel. The
+        backstop must record parked metadata on the kind-less error too, or
+        respin --resumes the parked session."""
+        error_result = dict(result_event("API error: connection reset"), is_error=True)
+        events = [monitor_arm_event("t3"), error_result]
+        spool = self._finalize(tmp_path, events)
+        assert spool["status"] == "error"
+        assert spool["error_kind"] == "headless_background_wait"
+        assert spool["pending_background_tasks"] == [{"id": "t3", "source": "monitor"}]
+        assert "API error: connection reset" in spool["error"]
 
     def test_stale_resolution_without_sentinel_is_error(self, tmp_path):
         """SIGTERM-killed driver: resolution after the last result, no
@@ -956,6 +978,19 @@ class TestRespinParkedRecovery:
         content = Path(stdin_path).read_text()
         assert big_text in content
         assert content.rstrip().endswith("continue now")
+
+    def test_parked_recovery_omits_model_when_profile_unresolvable(self, tmp_path):
+        """Fell r4: a parked alt-profile spool whose profile no longer
+        resolves degrades to the default endpoint — the endpoint-specific
+        recorded model must not be forced onto it."""
+        spool = self._parked_spool("ghostprof")
+        spool["profile"] = "no-such-profile"
+        spool["model"] = "alt-endpoint-only-model"
+        events = [monitor_arm_event(), result_event(PARKED_STUB)]
+        result, cmd, _, _ = self._respin(tmp_path, spool, events)
+        assert not result.startswith(("Error", "Spool")), result
+        assert "--resume" not in cmd
+        assert "--model" not in cmd
 
     def test_parked_recovery_disallows_background_tools(self, tmp_path):
         events = [monitor_arm_event(), result_event(PARKED_STUB)]
