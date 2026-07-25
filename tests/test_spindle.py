@@ -541,7 +541,7 @@ class TestPermissionProfiles:
         assert "--allowedTools" not in captured_cmd[0]
 
 
-def _spin_claude_cmd(tmp_path, permission, *, shard_info=None):
+def _spin_claude_cmd(tmp_path, permission, *, shard_info=None, model=None):
     """Run _spin_sync (claude harness) with _spawn_detached stubbed, returning the
     captured claude argv. Pass shard_info to exercise the shard path without git;
     when bwrap is present the claude flags are still present in the wrapped argv."""
@@ -566,7 +566,7 @@ def _spin_claude_cmd(tmp_path, permission, *, shard_info=None):
             working_dir=str(tmp_path),
             allowed_tools=None,
             tags=None,
-            model=None,
+            model=model,
             timeout=None,
             skeinless=True,
             env=None,
@@ -586,6 +586,11 @@ def _allowed_tools_of(cmd):
     if "--allowedTools" not in cmd:
         return None
     return cmd[cmd.index("--allowedTools") + 1]
+
+
+def test_claude_opus_5_alias_reaches_cli(tmp_path):
+    cmd = _spin_claude_cmd(tmp_path, "careful", model="opus-5")
+    assert cmd[cmd.index("--model") + 1] == "claude-opus-5"
 
 
 class TestClaudePermissionMode:
@@ -4944,12 +4949,13 @@ class TestSpinHarnesses:
         assert result["claude-code"]["models"] == CLAUDE_MODEL_ALIASES
 
     def test_claude_code_advertises_frontier_aliases(self):
-        """spin_harnesses should advertise the fable and opus-4.8 aliases."""
+        """spin_harnesses should advertise the fable and current Opus aliases."""
         result = _get_harnesses()
         models = result["claude-code"]["models"]
         assert models["fable"] == "claude-fable-5"
         assert models["fable-5"] == "claude-fable-5"
         assert models["opus-4.8"] == "claude-opus-4-8"
+        assert models["opus-5"] == "claude-opus-5"
 
     def test_claude_code_default_model_unchanged(self):
         """Adding frontier aliases must not change the claude-code default."""

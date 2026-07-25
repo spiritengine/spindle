@@ -222,6 +222,9 @@ spin("Summarize this file", model="haiku")
 # Complex work to opus
 spin("Design the new architecture", model="opus")
 
+# Pin Claude Opus 5
+spin("Implement the new architecture", model="opus-5")
+
 # Auto-kill if it takes too long
 spin("Should be quick", timeout=60)
 ```
@@ -474,7 +477,7 @@ for a worked example and the full schema reference.
 - `harness` (optional): "claude-code" (default), "codex", "gemini", or "kimi"
 - `working_dir` (optional for Claude, required for Codex/Gemini/Kimi): Project directory
 - `permission` (optional): "readonly" (alias "manual"), "careful" (default, = auto), "full", "shard", "careful+shard", "research", "research+shard", "auto", "auto+shard" (readonly/manual cannot be combined with a shard — the pairing is rejected however the shard intent arrives: `readonly+shard`/`manual+shard`, or `readonly`/`manual` with `shard=True`)
-- `model` (optional): Model to use ("sonnet", "opus", "haiku" for Claude; "flash", "pro" for Gemini; "k3", "latest", "thinking", "k2.7-code", "k2.6", "k2.5" for Kimi)
+- `model` (optional): Model to use ("sonnet", "opus", "opus-5", "haiku" for Claude; "flash", "pro" for Gemini; "k3", "latest", "thinking", "k2.7-code", "k2.6", "k2.5" for Kimi)
 - `timeout` (optional): Auto-kill after N seconds
 - `tags` (optional): Comma-separated tags for organization
 - `shard` (optional): Create isolated git worktree (can also use `permission="shard"`)

@@ -7,6 +7,8 @@ and run alongside another install without confusing the two.
 
 ### Added
 
+- Claude Opus 5 model selection via `model="opus-5"`, resolved to the canonical
+  `claude-opus-5` model ID and advertised by `spin_harnesses`.
 - `spindle doctor` — one command that reports the CLI's version and path,
   whether the service answering the port is *this* install, whether the spool
   store is writable, which harness CLIs are on PATH (with versions), and whether

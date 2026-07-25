@@ -3860,7 +3860,7 @@ async def spin(
         working_dir: Directory for the agent to work in (defaults to current)
         allowed_tools: Override permission profile with explicit tool list
         tags: Comma-separated tags for organizing spools (e.g. "batch-1,triage")
-        model: Model to use - for Claude: "haiku", "sonnet", "opus", "fable" (claude-fable-5, access ends 2026-07-12), or versioned aliases like "opus-4.8";
+        model: Model to use - for Claude: "haiku", "sonnet", "opus", "fable" (claude-fable-5, access ends 2026-07-12), or versioned aliases like "opus-5";
                for Gemini: "flash", "pro", or full model names like "gemini-2.5-pro";
                for Kimi: "k3"/"latest"/"thinking" (K3, always thinking), "k2.6", "k2.5", "k2.7-code"/"code" (coding-focused, thinking-only), "highspeed", or full model names.
                Use spin_harnesses() to see all available models.
@@ -7334,7 +7334,7 @@ def _codex_respin_sync(session_id: str, prompt: str) -> str:
 # Short aliases for common Claude models. Anything not here passes through.
 # The plain "haiku"/"sonnet"/"opus" aliases are also accepted by the claude CLI
 # directly; they're listed here so spin_harnesses() can advertise them.
-# Source of truth: anthropics/skills/skills/claude-api/shared/models.md
+# Source of truth: https://platform.claude.com/docs/en/about-claude/models/overview
 CLAUDE_MODEL_ALIASES = {
     "haiku": "haiku",
     "sonnet": "sonnet",
@@ -7344,6 +7344,7 @@ CLAUDE_MODEL_ALIASES = {
     "opus-4.6": "claude-opus-4-6",
     "opus-4.7": "claude-opus-4-7",
     "opus-4.8": "claude-opus-4-8",
+    "opus-5": "claude-opus-5",
     # Fable access sunsets 2026-07-12; after that the claude CLI will reject
     # the model (the alias itself stays harmless — unknowns pass through).
     "fable": "claude-fable-5",
@@ -9996,7 +9997,7 @@ def main():
     spin_parser.add_argument(
         "--model",
         "-m",
-        help="Model to use (e.g. haiku/sonnet/opus/fable for Claude, flash/pro for Gemini, k3/latest/thinking/k2.6/k2.7-code for Kimi)",
+        help="Model to use (e.g. haiku/sonnet/opus/opus-5/fable for Claude, flash/pro for Gemini, k3/latest/thinking/k2.6/k2.7-code for Kimi)",
     )
     spin_parser.add_argument("--harness", help="Harness to use: claude-code (default), codex, gemini, or kimi")
     spin_parser.add_argument("--timeout", "-t", type=int, help="Kill spool after N seconds")
