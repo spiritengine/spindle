@@ -140,12 +140,21 @@ and run alongside another install without confusing the two.
   invocation exits before the first model turn (`/tmp` is not a repo), and a
   binary enforcing nothing leaves no file either. The section now leads with the
   deterministic no-model `codex sandbox` probe and a writable positive control,
-  and the end-to-end `codex exec` check takes its evidence from `--json`
-  `command_execution` captured output. Neither the model's narration nor a
-  marker grep is proof: on 0.145.0 the model usually reports the expected
-  read-only error from priors without executing anything, and the plain
-  transcript echoes the prompt back (so a marker matches even when auth fails
-  and no model turn happens at all).
+  and documents no `codex exec` pass condition at all: on 0.145.0 the model
+  will not perform a write it expects to fail (one execution in 14 attempts),
+  so such a check can only return "cannot tell" at an API call apiece, and the
+  evidence it would need is not the marker but the `command_execution` item's
+  `command` plus a non-zero `exit_code` — a model asked to `echo` the refusal
+  string satisfies any marker-based criterion with nothing sandboxed. What the
+  section keeps is the reasoning: narration is never proof, and
+  `spindle doctor --smoke --harness codex` is the end-to-end check of the spool
+  path.
+- The other `codex exec` snippets in `docs/CODEX_SETUP.md` pass
+  `--skip-git-repo-check` too, so they no longer die outside a git repo. The
+  post-install "Verify authentication" step was the worst of these: it failed
+  with a trusted-directory error that reads as broken credentials. Those
+  snippets also now say `--sandbox workspace-write` instead of `--full-auto`,
+  which the same page warns silently overrides `--sandbox`.
 
 ### Changed
 
