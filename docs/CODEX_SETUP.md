@@ -397,35 +397,13 @@ print(f"enforces sandbox: {_codex_sandbox_enforces(binary)}")
 If that prints `False`, spindle will refuse `readonly`/`careful` (and other restrictive)
 codex spools rather than run them unsandboxed.
 
-To confirm enforcement end-to-end, ask a read-only run to write and check nothing appears:
-```bash
-cd /tmp && rm -f /tmp/probe.txt
-codex exec --skip-git-repo-check --sandbox read-only \
-  "run: echo PROBE_RAN ; echo x > /tmp/probe.txt — then report the literal error"
-echo "codex exit: $?"
-ls /tmp/probe.txt   # must not exist
-```
-A pass needs **both** halves:
+To confirm enforcement by hand, check it two ways. Start with the no-model probe: it is
+deterministic and cannot be argued out of a verdict. The `codex exec` check after it exercises
+the path spools actually take, and is only worth running with `--json`.
 
-1. `PROBE_RAN` appears in the output — a shell command actually ran under the sandbox.
-2. No `/tmp/probe.txt`, and the error the agent reports names a read-only filesystem — the
-   wording depends on which shell codex used (`zsh:1: read-only file system: /tmp/probe.txt`,
-   `/bin/sh: 1: cannot create /tmp/probe.txt: Read-only file system`).
-
-An absent file on its own proves nothing. codex exits before the first model turn on several
-conditions — not logged in, no network, or (before `--skip-git-repo-check` was added here)
-running outside a git repo, which `/tmp` is — and every one of those leaves no file behind
-too. That is what the `codex exit:` line is for: a nonzero exit with no `PROBE_RAN` means
-codex stopped before running anything, so the check is **void, not passed** — read the error
-and re-run it. Spindle passes `--skip-git-repo-check` on every codex launch, so the flag here
-also keeps the check faithful to how spools are really spawned.
-
-If the file appears, this codex is not enforcing `--sandbox` — do not use it for readonly
-spools.
-
-The same check without a model turn — deterministic, no API cost, and no
-`--skip-git-repo-check` needed, since `codex sandbox` does not do the git-repo check. This is
-the shape Spindle's own probe uses (`_codex_sandbox_probe_argvs`):
+**1. No-model probe — start here.** The shape Spindle's own probe uses
+(`_codex_sandbox_probe_argvs`): no API cost, no model in the loop, and no
+`--skip-git-repo-check` needed, since `codex sandbox` does no git-repo check.
 ```bash
 cd /tmp && rm -f /tmp/probe.txt
 codex -c sandbox_mode=read-only sandbox -- /bin/sh -c 'echo PROBE_RAN; echo x > /tmp/probe.txt'
@@ -436,13 +414,66 @@ d=$(mktemp -d) && cd "$d"
 codex -c sandbox_mode=workspace-write sandbox -- /bin/sh -c 'echo PROBE_RAN; echo x > ./probe.txt'
 ls ./probe.txt      # must exist
 ```
-Verified on codex 0.145.0 from `/tmp`: the read-only run prints `PROBE_RAN`, reports `cannot
-create /tmp/probe.txt: Read-only file system`, writes no file, and exits 2; the
-workspace-write control prints the marker and creates the file. Run the control — it is what
+Here `PROBE_RAN` is real evidence: it is the sandboxed shell's own stdout, and there is no
+prompt for codex to echo it out of. Verified on 0.145.0 from `/tmp` — the read-only run prints
+`PROBE_RAN`, reports `/bin/sh: 1: cannot create /tmp/probe.txt: Read-only file system`, writes
+no file, and exits 2; the control prints the marker and creates the file. Run the control: it
 separates "the sandbox blocked the write" from "that write was never going to succeed".
 
-On codex ~0.125.x the subcommand nests under the platform (`codex -c sandbox_mode=read-only
-sandbox linux -- ...`); `codex sandbox` takes the tier only via `-c`, never `--sandbox`.
+`codex sandbox` takes the tier only via `-c`, never `--sandbox`. On codex ~0.125.x the
+subcommand nested under the platform (`... sandbox linux -- ...`); on 0.145.0 that form is
+gone and panics with `Failed to execvp linux: No such file or directory` (exit 101), because
+`linux` is read as the command. Spindle tries both shapes for this reason.
+
+**2. End-to-end `codex exec` check.** Pass `--json` and read the marker out of the
+`command_execution` item — that is the only place the sandboxed command's own output appears.
+```bash
+cd /tmp && rm -f /tmp/probe.txt
+codex exec --json --skip-git-repo-check --sandbox read-only \
+  "Run the shell command: echo PROBE_RAN; echo x > /tmp/probe.txt — then report its exact output verbatim." \
+  > /tmp/probe.jsonl < /dev/null
+ls /tmp/probe.txt   # must not exist
+python3 - /tmp/probe.jsonl <<'PY'
+import json, sys
+
+outs = []
+for line in open(sys.argv[1]):
+    if not line.startswith("{"):
+        continue
+    item = json.loads(line).get("item") or {}
+    if item.get("type") == "command_execution":
+        outs.append(item.get("aggregated_output", ""))
+print("commands actually executed:", len(outs))
+print("marker in captured output :", any("PROBE_RAN" in o for o in outs))
+print("write refused by sandbox  :", any("read-only file system" in o.lower() for o in outs))
+PY
+```
+A pass is all three lines true (a non-zero count, both booleans `True`) **and** no
+`/tmp/probe.txt`. Anything else is **void, not a pass** — read the output and re-run.
+
+Two traps, both observed on 0.145.0, are why the check is written this way:
+
+- The model often answers without running anything, and its answer looks right. Of four
+  read-only attempts on 0.145.0 (`gpt-5.6-sol`), only one actually executed: the other three
+  exited 0, emitted **no** `command_execution` item, and reported `zsh:1: read-only file
+  system: /tmp/probe.txt` from priors — one of them printing a fabricated `PROBE_RAN` line
+  above it. No file appeared, the narration was perfect, and nothing had been tested. An error
+  this predictable is what a model guesses instead of running, which is why `commands actually
+  executed` is the first line rather than a footnote, and why the no-model probe is the
+  primary check. Re-run until that count is non-zero; a run that never executed decides
+  nothing either way.
+- Do not grep the plain transcript or the raw JSON stream. Without `--json` the transcript
+  echoes your prompt and never prints the sandboxed command's stdout, so a marker grep matches
+  the echo — it matches even when auth fails and no model turn happens at all. And inside the
+  JSON, the `command_execution` item's `command` field also contains the marker, because the
+  marker is part of the command string. Only `aggregated_output` is evidence.
+
+If the file appears, this codex is not enforcing `--sandbox` — do not use it for readonly
+spools.
+
+Spindle passes `--skip-git-repo-check` on every codex `exec` launch (spin and respin), so the
+flag above matches how spools are really spawned. Its three other codex calls — `--version`,
+`login status`, and the `codex sandbox` probe — neither pass it nor need it.
 
 ### Test Codex Manually
 

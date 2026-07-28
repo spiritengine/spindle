@@ -135,12 +135,17 @@ and run alongside another install without confusing the two.
   pinned by `--sandbox` plus a matching `-c sandbox_mode`, and the git check
   only ever gated startup.
 - `docs/CODEX_SETUP.md`'s "Verify Sandbox Enforcement" recipe no longer passes
-  itself when codex never starts. It ran `codex exec --sandbox read-only` from
+  itself when nothing was enforced. It ran `codex exec --sandbox read-only` from
   `/tmp` and called "no file appeared" a pass — but on codex 0.145.0 that
-  invocation exited before the first model turn (`/tmp` is not a repo), and a
-  binary enforcing nothing would leave no file either. The recipe now requires
-  positive proof the sandboxed command ran, and documents a no-model variant
-  with a writable positive control.
+  invocation exits before the first model turn (`/tmp` is not a repo), and a
+  binary enforcing nothing leaves no file either. The section now leads with the
+  deterministic no-model `codex sandbox` probe and a writable positive control,
+  and the end-to-end `codex exec` check takes its evidence from `--json`
+  `command_execution` captured output. Neither the model's narration nor a
+  marker grep is proof: on 0.145.0 the model usually reports the expected
+  read-only error from priors without executing anything, and the plain
+  transcript echoes the prompt back (so a marker matches even when auth fails
+  and no model turn happens at all).
 
 ### Changed
 
