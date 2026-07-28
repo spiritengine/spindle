@@ -7081,8 +7081,9 @@ Your task:
     # doctor smoke's temp dir, a scratch research dir. Without it codex 0.145.0 refuses to
     # start there ("Not inside a trusted directory") unless the operator happens to have
     # listed that path under [projects] in ~/.codex/config.toml, which would make whether a
-    # spool can run depend on personal config. It widens nothing: containment is --sandbox
-    # (pinned by the matching -c sandbox_mode above), and this check only ever gated startup.
+    # spool can run depend on personal config. It widens nothing: containment is the
+    # --sandbox / `-c sandbox_mode` pair appended a few lines down (see the note that opens
+    # this block), and the git check only ever gated startup.
     codex_cmd = [codex_bin or "codex", "exec", "--json", "--skip-git-repo-check"]
 
     if resolved_model:

@@ -134,6 +134,13 @@ and run alongside another install without confusing the two.
   `resume` path pass it. Containment is unchanged: the sandbox tier is still
   pinned by `--sandbox` plus a matching `-c sandbox_mode`, and the git check
   only ever gated startup.
+- `docs/CODEX_SETUP.md`'s "Verify Sandbox Enforcement" recipe no longer passes
+  itself when codex never starts. It ran `codex exec --sandbox read-only` from
+  `/tmp` and called "no file appeared" a pass — but on codex 0.145.0 that
+  invocation exited before the first model turn (`/tmp` is not a repo), and a
+  binary enforcing nothing would leave no file either. The recipe now requires
+  positive proof the sandboxed command ran, and documents a no-model variant
+  with a writable positive control.
 
 ### Changed
 

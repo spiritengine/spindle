@@ -400,11 +400,49 @@ codex spools rather than run them unsandboxed.
 To confirm enforcement end-to-end, ask a read-only run to write and check nothing appears:
 ```bash
 cd /tmp && rm -f /tmp/probe.txt
-codex exec --sandbox read-only "run: echo x > /tmp/probe.txt ; report the literal error"
+codex exec --skip-git-repo-check --sandbox read-only \
+  "run: echo PROBE_RAN ; echo x > /tmp/probe.txt — then report the literal error"
+echo "codex exit: $?"
 ls /tmp/probe.txt   # must not exist
 ```
-Expected: `zsh:1: read-only file system: /tmp/probe.txt`, and no file. If the file appears,
-this codex is not enforcing `--sandbox` — do not use it for readonly spools.
+A pass needs **both** halves:
+
+1. `PROBE_RAN` appears in the output — a shell command actually ran under the sandbox.
+2. No `/tmp/probe.txt`, and the error the agent reports names a read-only filesystem — the
+   wording depends on which shell codex used (`zsh:1: read-only file system: /tmp/probe.txt`,
+   `/bin/sh: 1: cannot create /tmp/probe.txt: Read-only file system`).
+
+An absent file on its own proves nothing. codex exits before the first model turn on several
+conditions — not logged in, no network, or (before `--skip-git-repo-check` was added here)
+running outside a git repo, which `/tmp` is — and every one of those leaves no file behind
+too. That is what the `codex exit:` line is for: a nonzero exit with no `PROBE_RAN` means
+codex stopped before running anything, so the check is **void, not passed** — read the error
+and re-run it. Spindle passes `--skip-git-repo-check` on every codex launch, so the flag here
+also keeps the check faithful to how spools are really spawned.
+
+If the file appears, this codex is not enforcing `--sandbox` — do not use it for readonly
+spools.
+
+The same check without a model turn — deterministic, no API cost, and no
+`--skip-git-repo-check` needed, since `codex sandbox` does not do the git-repo check. This is
+the shape Spindle's own probe uses (`_codex_sandbox_probe_argvs`):
+```bash
+cd /tmp && rm -f /tmp/probe.txt
+codex -c sandbox_mode=read-only sandbox -- /bin/sh -c 'echo PROBE_RAN; echo x > /tmp/probe.txt'
+ls /tmp/probe.txt   # must not exist
+
+# Positive control: the same command at a tier that permits the write must succeed.
+d=$(mktemp -d) && cd "$d"
+codex -c sandbox_mode=workspace-write sandbox -- /bin/sh -c 'echo PROBE_RAN; echo x > ./probe.txt'
+ls ./probe.txt      # must exist
+```
+Verified on codex 0.145.0 from `/tmp`: the read-only run prints `PROBE_RAN`, reports `cannot
+create /tmp/probe.txt: Read-only file system`, writes no file, and exits 2; the
+workspace-write control prints the marker and creates the file. Run the control — it is what
+separates "the sandbox blocked the write" from "that write was never going to succeed".
+
+On codex ~0.125.x the subcommand nests under the platform (`codex -c sandbox_mode=read-only
+sandbox linux -- ...`); `codex sandbox` takes the tier only via `-c`, never `--sandbox`.
 
 ### Test Codex Manually
 
