@@ -138,9 +138,12 @@ and run alongside another install without confusing the two.
   itself when nothing was enforced. It ran `codex exec --sandbox read-only` from
   `/tmp` and called "no file appeared" a pass — but on codex 0.145.0 that
   invocation exits before the first model turn (`/tmp` is not a repo), and a
-  binary enforcing nothing leaves no file either. The section now leads with the
-  deterministic no-model `codex sandbox` probe and a writable positive control,
-  and documents no `codex exec` pass condition at all: on 0.145.0 the model
+  binary enforcing nothing leaves no file either. The only check is now the
+  deterministic no-model `codex sandbox` probe, run twice against one fresh
+  directory — refuse-the-write leg and allow-the-write control on the same
+  target, the shell command Spindle's own probe uses, with the marker emitted
+  after the write so it proves the attempt completed. The doc documents no
+  `codex exec` pass condition at all: on 0.145.0 the model
   will not perform a write it expects to fail (one execution in 14 attempts),
   so such a check can only return "cannot tell" at an API call apiece, and the
   evidence it would need is not the marker but the `command_execution` item's

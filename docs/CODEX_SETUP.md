@@ -400,28 +400,44 @@ print(f"enforces sandbox: {_codex_sandbox_enforces(binary)}")
 If that prints `False`, spindle will refuse `readonly`/`careful` (and other restrictive)
 codex spools rather than run them unsandboxed.
 
-To confirm enforcement by hand, run the no-model probe. It is deterministic, costs nothing,
-and cannot be argued out of a verdict. It is the shape Spindle's own probe uses
-(`_codex_sandbox_probe_argvs`): no model in the loop, and no `--skip-git-repo-check` needed,
-since `codex sandbox` does no git-repo check.
+To confirm enforcement by hand, run the no-model probe. It is deterministic, costs nothing, and
+cannot be argued out of a verdict. This is the shell command Spindle's own probe runs
+(`_codex_sandbox_probe`), against a fresh directory, twice: once at a tier that must refuse the
+write and once at a tier that must allow it. No model in the loop, and no
+`--skip-git-repo-check` needed, since `codex sandbox` does no git-repo check.
 ```bash
-cd /tmp && rm -f /tmp/probe.txt
-codex -c sandbox_mode=read-only sandbox -- /bin/sh -c 'echo PROBE_RAN; echo x > /tmp/probe.txt'
-ls /tmp/probe.txt   # must not exist
-
-# Positive control: the same command at a tier that permits the write must succeed.
 d=$(mktemp -d) && cd "$d"
-codex -c sandbox_mode=workspace-write sandbox -- /bin/sh -c 'echo PROBE_RAN; echo x > ./probe.txt'
-ls ./probe.txt      # must exist
-```
-Here `PROBE_RAN` is real evidence: it is the sandboxed shell's own stdout, and there is no
-prompt for codex to echo it out of. Verified on 0.145.0 from `/tmp` — the read-only run prints
-`PROBE_RAN`, reports `/bin/sh: 1: cannot create /tmp/probe.txt: Read-only file system`, writes
-no file, and exits 2; the control prints the marker and creates the file. Run the control: it
-separates "the sandbox blocked the write" from "that write was never going to succeed".
 
-If the read-only run creates the file, this codex is not enforcing its sandbox — do not use it
-for readonly spools.
+# Leg 1 — read-only: the write must be refused.
+codex -c sandbox_mode=read-only sandbox -- \
+  /bin/sh -c 'printf BROKEN > probe.txt; write_rc=$?; echo PROBE_RAN; exit $write_rc'
+ls probe.txt   # must NOT exist
+
+# Leg 2 — positive control: same command, same directory, same target, at a tier that allows it.
+codex -c sandbox_mode=workspace-write sandbox -- \
+  /bin/sh -c 'printf BROKEN > probe.txt; write_rc=$?; echo PROBE_RAN; exit $write_rc'
+ls probe.txt   # must exist
+```
+All three of these must hold. Check them; do not eyeball the output.
+
+1. **Both legs print `PROBE_RAN`.** The marker is emitted *after* the write is attempted, so it
+   proves the attempt ran to completion inside the sandbox. No marker means the command never
+   ran at all — wrong CLI shape for this version, or codex failed to start — and the leg
+   decides nothing either way.
+2. **Leg 1 leaves no `probe.txt`, and exits non-zero** (observed: exit 2, `/bin/sh: 1: cannot
+   create probe.txt: Read-only file system`). The directory is fresh, so nothing pre-exists
+   there and any `probe.txt` afterwards was written by leg 1 — if one appears, this codex is
+   not enforcing its sandbox, and must not be used for readonly spools.
+3. **Leg 2 creates `probe.txt`, and exits 0.** Same directory and same filename as leg 1, which
+   is the point: it certifies that *this exact path* was writable, so leg 1's empty result was
+   the sandbox's doing.
+
+Leg 2 is not a formality, and it has to use leg 1's own target. A control that writes somewhere
+else certifies nothing about the probe's path, and plenty of things refuse a write without any
+sandbox involved — directory permissions, a read-only mount, a quota, a stale file. Verified on
+0.145.0: with the target's parent directory set to mode 555, leg 1 behaves exactly like a clean
+pass (marker, exit 2, `Read-only file system`, no file) at *both* tiers, including the one that
+permits writes. Only the failing control distinguishes that from real enforcement.
 
 `codex sandbox` takes the tier only via `-c`, never `--sandbox`. On codex ~0.125.x the
 subcommand nested under the platform (`... sandbox linux -- ...`); on 0.145.0 that form is
@@ -432,18 +448,19 @@ There is deliberately **no `codex exec` version of this check**. On 0.145.0 the 
 perform a write it expects to fail: across 14 read-only attempts under several phrasings —
 including one explicitly demanding the shell tool be used — exactly one actually ran the
 command. The rest exited 0, emitted no `command_execution` item at all, and fabricated the
-transcript, some printing the error line *before* the marker, an ordering the real command
-cannot produce. Control prompts that attempt no write (`pwd`, or an `echo` of the error text)
+transcript — marker, exact error text and all. Control prompts that attempt no write (`pwd`, or
+an `echo` of the error text)
 executed on the first try, so this is specific to the doomed write, not general flakiness. A
 recipe here would answer "cannot tell" on nearly every run at an API call apiece, and repeated
 "cannot tell" reads as a broken binary rather than a model that declined.
 
 Two traps if you write your own anyway, both observed on 0.145.0:
 
-- Narration is not evidence. The fabricated transcripts are byte-identical to a real refusal,
-  and without `--json` the transcript also echoes your prompt back — so grepping it for a
-  marker matches even when auth fails and no model turn happens at all (observed: exit 1,
-  HTTP 401, marker present, from the echo alone).
+- Narration is not evidence. All nine captured fabrications contain both the marker and the
+  exact error string, so no grep of the reported text distinguishes them from a real refusal.
+  Without `--json` the transcript also echoes your prompt back, so a marker grep matches even
+  when auth fails and no model turn happens at all (observed: exit 1, HTTP 401, marker present
+  from the echo alone).
 - A marker in `--json`'s `command_execution.aggregated_output` is not enough either. Asked to
   `echo` the error text instead of attempting the write, the model produced
   `aggregated_output: 'PROBE_RAN\nzsh:1: read-only file system: /tmp/probe.txt\n'` with
@@ -459,8 +476,8 @@ the spool path runs; the probe above is the verdict on whether the sandbox holds
 
 Spindle passes `--skip-git-repo-check` on every codex `exec` launch (spin and respin), so
 spools are spawned the way this section describes. Its four non-`exec` codex calls — `codex
---version` twice (the binary resolver and `doctor`'s harness probe), `codex login status`, and
-the `codex sandbox` probe — neither pass it nor need it.
+--version` twice (`_codex_cli_version`, and `_probe_command` for `doctor`'s harness check),
+`codex login status`, and the `codex sandbox` probe — neither pass it nor need it.
 
 ### Test Codex Manually
 
