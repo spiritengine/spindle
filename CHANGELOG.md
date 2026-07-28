@@ -124,6 +124,16 @@ and run alongside another install without confusing the two.
   line; a genuine stat error still warns. No change to the probe's verdict.
 - Importing spindle no longer prints authlib's deprecation warning (three lines
   of stderr ahead of every CLI command's output).
+- Codex spools launch with `--skip-git-repo-check`, so a working directory that
+  is not a git repository still runs. codex 0.145.0 refuses to start outside a
+  repo (`Not inside a trusted directory and --skip-git-repo-check was not
+  specified`) unless that exact path is listed under `[projects]` in
+  `~/.codex/config.toml`, which made whether a spool could run depend on the
+  operator's personal config — `spindle doctor --smoke`, which runs in a temp
+  dir, failed its codex leg on every machine. Both the fresh spin and the
+  `resume` path pass it. Containment is unchanged: the sandbox tier is still
+  pinned by `--sandbox` plus a matching `-c sandbox_mode`, and the git check
+  only ever gated startup.
 
 ### Changed
 

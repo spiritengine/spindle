@@ -78,11 +78,18 @@ file or directory` (fails closed — nothing escapes, but nothing runs either).
 Spindle always passes the tier explicitly:
 
 ```bash
-codex exec --json --sandbox <mode> "your task"
+codex exec --json --skip-git-repo-check --sandbox <mode> "your task"
 ```
 
 `--full-auto` is never passed: it carries its own workspace-write tier that overrides
 `--sandbox` regardless of order, and `codex exec` is already non-interactive without it.
+
+`--skip-git-repo-check` is always passed because a working dir is not always a repo — a
+`spindle doctor --smoke` temp dir, a scratch research dir. Without it codex refuses to start
+there (`Not inside a trusted directory and --skip-git-repo-check was not specified`) unless
+that exact path is listed under `[projects]` in `~/.codex/config.toml`, so whether a spool
+could run would depend on the operator's personal config. It relaxes no containment: the
+sandbox tier above is the boundary, and the git check only ever gated startup.
 
 ### Sandbox Policies
 

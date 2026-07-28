@@ -7349,6 +7349,20 @@ class TestCodexSandboxEnforcement:
         cmd = captured_cmd[0]
         assert "--full-auto" not in cmd, f"--full-auto would nullify --sandbox, got {cmd!r}"
 
+    def test_spin_skips_the_git_repo_check(self, tmp_path):
+        """A spool's working dir is often not a repo, and codex refuses to start there.
+
+        codex 0.145.0 exits with "Not inside a trusted directory and --skip-git-repo-check was
+        not specified" outside a git repo unless the path is listed under [projects] in
+        ~/.codex/config.toml. `spindle doctor --smoke` runs in a temp dir, so dropping this flag
+        breaks it. Containment stays with --sandbox; this check only ever gated startup.
+        """
+        with self._captured_codex_spin(tmp_path) as captured_cmd:
+            _codex_spin_sync("do work", str(tmp_path), None, "read-only", None, None, None, permission="readonly")
+
+        cmd = captured_cmd[0]
+        assert "--skip-git-repo-check" in cmd, f"Expected --skip-git-repo-check in codex command, got {cmd!r}"
+
     def test_respin_never_passes_full_auto(self, tmp_path):
         """A respin must not re-widen the tier via --full-auto either."""
         original = {
@@ -7517,6 +7531,27 @@ class TestCodexSandboxEnforcement:
         cmd, _, _ = self._respin_with_spool(tmp_path, original)
 
         assert cmd.index("--sandbox") < cmd.index("resume"), f"got {cmd!r}"
+
+    def test_respin_skips_the_git_repo_check(self, tmp_path):
+        """The resumed session's working dir may be a non-repo, so the respin needs the flag too.
+
+        Placed before `resume` alongside the other pre-subcommand flags (verified on codex
+        0.145.0: `codex exec resume` accepts it there as well as after).
+        """
+        original = {
+            "id": "codex-orig-nogit",
+            "status": "complete",
+            "session_id": "sess-nogit",
+            "working_dir": str(tmp_path),
+            "sandbox": "read-only",
+            "permission": "readonly",
+            "harness": "codex",
+            "tags": ["codex"],
+        }
+        cmd, _, _ = self._respin_with_spool(tmp_path, original)
+
+        assert "--skip-git-repo-check" in cmd, f"Expected --skip-git-repo-check in respin command, got {cmd!r}"
+        assert cmd.index("--skip-git-repo-check") < cmd.index("resume"), f"got {cmd!r}"
 
     def test_respin_record_carries_tier_forward_for_chained_respins(self, tmp_path):
         """A respin record shares its session_id, so it must carry the tier itself.

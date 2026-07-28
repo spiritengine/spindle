@@ -7076,7 +7076,14 @@ Your task:
     # "--sandbox read-only". It is not needed for non-interactive use either — `codex exec`
     # already reports "approval: never" on its own. Verified against codex 0.125.0,
     # 2026-07-16. Re-adding it silently disables every tier below workspace-write.
-    codex_cmd = [codex_bin or "codex", "exec", "--json"]
+    #
+    # --skip-git-repo-check because a spool's working dir is often not a repo at all — a
+    # doctor smoke's temp dir, a scratch research dir. Without it codex 0.145.0 refuses to
+    # start there ("Not inside a trusted directory") unless the operator happens to have
+    # listed that path under [projects] in ~/.codex/config.toml, which would make whether a
+    # spool can run depend on personal config. It widens nothing: containment is --sandbox
+    # (pinned by the matching -c sandbox_mode above), and this check only ever gated startup.
+    codex_cmd = [codex_bin or "codex", "exec", "--json", "--skip-git-repo-check"]
 
     if resolved_model:
         codex_cmd.extend(["--model", resolved_model])
@@ -7248,7 +7255,19 @@ def _codex_respin_sync(session_id: str, prompt: str) -> str:
     # accept, so they must all precede the `resume` subcommand. --sandbox is paired with a
     # matching `-c sandbox_mode=<tier>` so config.toml can't widen the tier on a respin either
     # (see the note in _codex_spin_sync).
-    codex_cmd = [codex_bin or "codex", "exec", "--sandbox", sandbox, "-c", f"sandbox_mode={sandbox}"]
+    #
+    # --skip-git-repo-check for the same reason as a fresh spin: the session being resumed may
+    # have run in a non-repo working dir, and codex refuses to start there without it. Placed
+    # before `resume` with the rest, though this one is accepted on either side of it.
+    codex_cmd = [
+        codex_bin or "codex",
+        "exec",
+        "--skip-git-repo-check",
+        "--sandbox",
+        sandbox,
+        "-c",
+        f"sandbox_mode={sandbox}",
+    ]
     if shard_info:
         codex_cmd.extend(["--cd", shard_info["worktree_path"]])
 
