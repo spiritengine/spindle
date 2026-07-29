@@ -116,6 +116,25 @@ spin(
 
 The Kimi harness uses Moonshot AI's Kimi Code CLI in headless mode. Full agent with tool use, file access, and multi-step reasoning. Auth via Kimi/Moonshot API credentials configured in `~/.kimi/config.toml`.
 
+Headless Kimi auto-approves tool calls and has no classifier-vetted or genuinely
+"careful" mode. Spindle does not claim otherwise: every Kimi process except
+`full` without shard intent runs inside Spindle's own bwrap filesystem boundary.
+The default write set is the requested working directory plus Kimi's state
+directory; the rest of the host is read-only, `/tmp` is private, and `/run` is
+replaced so filesystem-path Docker, D-Bus, SSH-agent, and similar runtime sockets
+are not reachable. Resolver data needed for outbound API access is restored as a
+read-only file. Host process, IPC, UTS, and terminal-session state are isolated.
+The network namespace remains shared so Kimi can reach its model API; localhost
+services and abstract-namespace Unix sockets such as X11 or D-Bus therefore
+remain reachable. Kimi refuses to start if its work directory is read-only, so
+`readonly`, `manual`, `careful`, and `research` do not narrow its powers inside
+that box. A shard substitutes its worktree, but external Git metadata stays
+read-only: Kimi edits the shard and leaves its changes uncommitted. The caller
+inspects and commits them inside the worktree, then calls `shard_merge`.
+Research adds its explicit file/directory target. Shard intent always stays
+contained; `full` without a shard is the explicit uncontained escape hatch.
+Bubblewrap is therefore required for normal Kimi use.
+
 **Usage:**
 ```python
 spin(
@@ -184,6 +203,9 @@ spool_id = spin(
 **Kimi-specific parameters:**
 - `working_dir` - Required project directory
 - `system_prompt` - Prepended to prompt
+- `permission` - Shared Spindle compatibility input, not a Kimi approval mode.
+  Shared labels do not narrow its in-box powers; research adds an output target,
+  shard substitutes a worktree, and `full` without shard intent opts out.
 
 ### unspool()
 
@@ -390,6 +412,42 @@ Every codex spool is launched with an explicit `--sandbox` tier, mapped from Cla
 
 The mapping happens automatically in `_codex_spin_sync()`, and the tier that was actually
 passed is stored on the spool record as `sandbox` (alongside the requested `permission`).
+
+### Kimi Filesystem Containment
+
+Kimi's `--print` mode auto-approves its tools, so Spindle treats the harness as
+fully autonomous inside an external filesystem box:
+
+- default/shared `careful` input: working directory and Kimi state writable
+- `readonly` / `manual`: same box; kimi-cli will not run with a read-only work directory
+- `research`: same box plus the explicit file/directory output target
+- `shard` / `careful+shard`: shard worktree and Kimi state writable; external
+  Git metadata remains read-only, so changes are left for the caller to inspect,
+  commit inside the worktree, and then merge with `shard_merge`
+- `full` without shard intent: no bwrap and no filesystem containment
+- `full` with shard intent: shard box; shard intent always wins
+
+`spool_retry` is a fresh rerun. A Kimi shard retry creates a fresh contained
+worktree; the original failed worktree remains available for inspection or
+recovery.
+
+The shared `careful` string remains an API compatibility input. It is not a
+claim about Kimi's behavior. Each spool records the actual boundary, execution
+directory, and writable paths. `respin` recomputes the narrow write set and
+refuses if a recorded path has been substituted or would widen.
+
+Writable paths may be located beneath `/tmp`, but cannot equal or replace the
+sandbox's reserved mounts (`/`, `/tmp`, `/dev`, `/proc`, `/run`, or `/sys`).
+For example, use `dir:/tmp/report-output`, not `file:/tmp/report.md`. With shard intent,
+`KIMI_SHARE_DIR` must be absolute so the same state path is preflighted before
+the worktree is created and used after launch.
+
+Contained launches neutralize dynamic-loader and shell-startup hooks before the
+outer wrapper runs (`LD_*`, `DYLD_*`, `BASH_ENV`, `ENV`, `SHELLOPTS`,
+`BASHOPTS`, `BASH_FUNC_*`, `PS4`, `BASH_XTRACEFD`, `GCONV_PATH`, `LOCPATH`,
+and `NLSPATH`). Ordinary Kimi configuration and secret environment variables
+remain available inside the boundary. `full` without shard intent is
+uncontained and does not apply this sanitization.
 
 ## Codex Sandbox Enforcement
 
