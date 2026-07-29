@@ -1821,14 +1821,44 @@ def _prepare_pending_spool_for_spawn(spool: dict) -> bool:
         return False
 
 
-def _record_pre_spawn_failure(spool_id: str, error: str) -> None:
+def _record_pre_spawn_failure(
+    spool_id: str,
+    error: str,
+    spool_metadata: Optional[dict] = None,
+) -> None:
     """Finalize an unlaunched reservation without deleting a recovery winner."""
     with _spool_lock(spool_id) as acquired:
         if not acquired:
             return
         current = _read_spool(spool_id)
-        if not current or current.get("status") != "pending":
+        if not current:
             return
+        if current.get("status") != "pending":
+            if spool_metadata and spool_metadata.get("shard_created_by_spool"):
+                for key in (
+                    "working_dir",
+                    "shard",
+                    "shard_created_by_spool",
+                    "shard_source_dir",
+                    "base_branch",
+                    "harness",
+                ):
+                    if key in spool_metadata:
+                        current[key] = spool_metadata[key]
+                _preserve_failed_spool_shard(current)
+                _write_spool(spool_id, current)
+            return
+        if spool_metadata:
+            for key in (
+                "working_dir",
+                "shard",
+                "shard_created_by_spool",
+                "shard_source_dir",
+                "base_branch",
+                "harness",
+            ):
+                if key in spool_metadata:
+                    current[key] = spool_metadata[key]
         current["status"] = "error"
         current["error"] = error
         current["completed_at"] = datetime.now().isoformat()
@@ -3853,6 +3883,11 @@ async def spin(
                     code-modifying work (adds isolated git worktree, bypass inside
                     the bwrap-contained shard); "auto"/"auto+shard" are explicit
                     aliases of the careful default.
+                    Kimi accepts the shared names for API compatibility but has
+                    no classifier-vetted "careful" mode. Shared labels do not
+                    narrow its powers inside the box; research adds an output
+                    target, shard substitutes a worktree but leaves Git metadata
+                    read-only, and "full" without shard intent opts out of bwrap.
         research_target: Required for permission="research" or "research+shard".
                          Accepted forms: site:<id>, file:<absolute-path>, dir:<absolute-path>.
         shard: Run in isolated git worktree (SKEIN-aware with graceful fallback)
@@ -5412,6 +5447,10 @@ async def spool_retry(spool_id: str) -> str:
             spool.get("timeout"),
             tags_str,
             spool.get("env"),
+            permission=spool.get("permission"),
+            shard=_permission_implies_shard(spool.get("permission")) or bool(spool.get("shard")),
+            base_branch=spool.get("base_branch"),
+            research_target=spool.get("research_target"),
         )
     else:
         # Default to Claude Code harness
@@ -7536,6 +7575,195 @@ def _kimi_validate_model(resolved_model: Optional[str]) -> Optional[str]:
     )
 
 
+def _kimi_bwrap_binary(process_env: Dict[str, str]) -> Optional[str]:
+    """Resolve Spindle's external filesystem boundary for Kimi."""
+    del process_env  # Caller env belongs to kimi-cli, not the trusted wrapper.
+    resolved = shutil.which("bwrap")
+    if not resolved or not Path(resolved).is_absolute():
+        return None
+    return resolved
+
+
+def _kimi_contained_spawn_env(env: Optional[Dict[str, str]]) -> Dict[str, str]:
+    """Neutralize environment hooks that execute before bwrap creates its namespace."""
+    sanitized = dict(env or {})
+    unsafe_exact = {
+        "BASHOPTS",
+        "BASH_ENV",
+        "BASH_XTRACEFD",
+        "ENV",
+        "GCONV_PATH",
+        "LOCPATH",
+        "NLSPATH",
+        "PS4",
+        "SHELLOPTS",
+    }
+    for key in {*os.environ, *sanitized}:
+        if key in unsafe_exact or key.startswith(("LD_", "DYLD_", "BASH_FUNC_")):
+            sanitized[key] = ""
+    return sanitized
+
+
+def _kimi_bwrap_required_message(permission: Optional[str], shard: bool) -> str:
+    if permission == "full" and shard:
+        return (
+            "bwrap is required because shard intent remains filesystem-contained "
+            "even with permission=full; install bubblewrap or omit shard=True to "
+            "run Kimi uncontained"
+        )
+    return (
+        "bwrap is required for Kimi filesystem containment; install bubblewrap "
+        "or use permission=full without shard intent to run Kimi uncontained"
+    )
+
+
+def _kimi_share_dir(process_env: Dict[str, str], cwd: str) -> Path:
+    """Resolve kimi-cli's writable state directory in the child environment."""
+    configured = process_env.get("KIMI_SHARE_DIR")
+    if configured:
+        path = Path(configured)
+        if not path.is_absolute():
+            path = Path(cwd) / path
+    else:
+        path = Path(process_env.get("HOME", str(Path.home()))) / ".kimi"
+    return path.resolve()
+
+
+def _kimi_boundary_write_paths(
+    permission: Optional[str],
+    cwd: str,
+    shard_info: Optional[dict],
+    research_target_info: Optional[Dict[str, str]],
+    process_env: Dict[str, str],
+) -> list[str]:
+    """Return the host paths Kimi may write through Spindle's bwrap.
+
+    Kimi's headless mode auto-approves tool calls, and kimi-cli refuses to start
+    unless its work directory is writable. Shared permission names therefore do
+    not narrow Kimi's in-box powers: the useful boundary is the requested working
+    directory (or shard worktree), plus an explicit research output path when
+    present. The kimi-cli state directory is also writable so sessions, logs,
+    credentials, and downloaded helper binaries continue to work.
+    """
+    paths: list[Path] = []
+    del permission  # Compatibility input; kimi-cli has no corresponding policy.
+
+    work_path = Path(shard_info["worktree_path"]) if shard_info else Path(cwd)
+    paths.append(work_path)
+    if research_target_info and research_target_info["type"] in {"file", "dir"}:
+        paths.append(Path(_research_writable_path(research_target_info)))
+
+    share_dir = _kimi_share_dir(process_env, cwd)
+    if not share_dir.exists() or not share_dir.is_dir():
+        raise ValueError(
+            f"Kimi state directory {share_dir} does not exist; initialize kimi-cli first "
+            f"or use permission=full without shard intent for an uncontained setup run"
+        )
+    paths.append(share_dir)
+
+    result: list[str] = []
+    seen: set[str] = set()
+    for candidate in paths:
+        resolved = str(candidate.resolve())
+        if not Path(resolved).exists():
+            raise ValueError(f"Kimi writable path does not exist: {resolved}")
+        resolved_path = Path(resolved)
+        if (
+            resolved_path in {Path("/"), Path("/tmp")}
+            or resolved_path.is_relative_to("/dev")
+            or resolved_path.is_relative_to("/proc")
+            or resolved_path.is_relative_to("/run")
+            or resolved_path.is_relative_to("/sys")
+        ):
+            raise ValueError(f"Kimi writable path cannot replace reserved sandbox mount {resolved}")
+        if resolved not in seen:
+            result.append(resolved)
+            seen.add(resolved)
+    return result
+
+
+def _kimi_research_target_for_replay(
+    research_target: Optional[str],
+    working_dir: str,
+) -> Optional[Dict[str, str]]:
+    """Reconstruct a persisted target without depending on mutable SKEIN state."""
+    if not research_target:
+        return None
+    parsed = _parse_research_target(research_target)
+    if parsed["type"] == "site":
+        return parsed
+    return _validate_research_target(research_target, working_dir)
+
+
+def _kimi_bwrap_wrap(
+    kimi_cmd: list,
+    cwd: str,
+    writable_paths: list[str],
+    process_env: Dict[str, str],
+    bwrap_bin: Optional[str] = None,
+) -> list:
+    """Put the whole Kimi process behind a read-only-root filesystem boundary.
+
+    This is deliberately external to kimi-cli: headless Kimi auto-approves its
+    tools, while bwrap makes those approvals harmless outside the explicit write
+    set. A private tmpfs prevents `/tmp` from becoming a host-wide escape hatch.
+    """
+    resolved_bwrap = bwrap_bin or _kimi_bwrap_binary(process_env)
+    if not resolved_bwrap or not Path(resolved_bwrap).is_absolute():
+        raise ValueError(
+            "bwrap is required for Kimi filesystem containment; install bubblewrap "
+            "or use permission=full without shard intent to run Kimi uncontained"
+        )
+
+    resolved_cwd = str(Path(cwd).resolve())
+    if resolved_cwd != cwd or not Path(resolved_cwd).is_dir():
+        raise ValueError(f"Kimi working directory changed or is not canonical: {cwd}")
+
+    command = [
+        resolved_bwrap,
+        "--die-with-parent",
+        "--new-session",
+        "--unshare-pid",
+        "--unshare-ipc",
+        "--unshare-uts",
+        "--ro-bind",
+        "/",
+        "/",
+        "--tmpfs",
+        "/tmp",
+        "--tmpfs",
+        "/run",
+    ]
+    resolver_path = Path("/etc/resolv.conf").resolve()
+    runtime_root = Path("/run")
+    if resolver_path.is_file() and resolver_path.is_relative_to(runtime_root):
+        runtime_parents: list[Path] = []
+        parent = resolver_path.parent
+        while parent != runtime_root:
+            runtime_parents.append(parent)
+            parent = parent.parent
+        for runtime_parent in reversed(runtime_parents):
+            command.extend(["--dir", str(runtime_parent)])
+        command.extend(["--ro-bind", str(resolver_path), str(resolver_path)])
+    for path in writable_paths:
+        resolved = str(Path(path).resolve())
+        if resolved != path or not Path(resolved).exists():
+            raise ValueError(f"Kimi writable path changed or is not canonical: {path}")
+        command.extend(["--bind", resolved, resolved])
+    command.extend(
+        [
+            "--dev",
+            "/dev",
+            "--proc",
+            "/proc",
+            "--chdir",
+            cwd,
+        ]
+    )
+    command.extend(kimi_cmd)
+    return command
+
+
 def _gemini_spin_sync(
     prompt: str,
     working_dir: Optional[str],
@@ -7806,6 +8034,9 @@ def _kimi_spin_sync(
 
     working_dir = str(Path(working_dir).resolve())
     base_branch = base_branch or _detect_default_branch(working_dir)
+    process_env = _process_env(env)
+    # Shard intent always wins: full is uncontained only without a shard.
+    use_bwrap = permission != "full" or shard
 
     try:
         research_target_info = (
@@ -7829,6 +8060,26 @@ def _kimi_spin_sync(
     if model_error:
         return model_error
 
+    # Refuse before reserving a slot or creating a worktree. bwrap itself cannot
+    # fail open: if it later cannot construct the namespace, kimi-cli never runs.
+    bwrap_bin = _kimi_bwrap_binary(process_env) if use_bwrap else None
+    if use_bwrap and not bwrap_bin:
+        return f"Error: {_kimi_bwrap_required_message(permission, shard)}"
+    configured_share_dir = process_env.get("KIMI_SHARE_DIR")
+    if use_bwrap and shard and configured_share_dir and not Path(configured_share_dir).is_absolute():
+        return (
+            "Error: relative KIMI_SHARE_DIR is not supported with Kimi shard intent; "
+            "use an absolute state-directory path"
+        )
+
+    if use_bwrap:
+        try:
+            # This preflight catches a missing Kimi state directory before a slot
+            # is reserved. Recompute after shard creation to include its worktree.
+            _kimi_boundary_write_paths(permission, working_dir, None, research_target_info, process_env)
+        except ValueError as exc:
+            return f"Error: {exc}"
+
     # Generate spool ID and session ID
     spool_id = "kimi-" + str(uuid.uuid4())[:8]
     session_id = str(uuid.uuid4())  # Generate our own session ID
@@ -7848,7 +8099,12 @@ def _kimi_spin_sync(
             shard_info, shard_error = _spawn_shard(spool_id, cwd, base_branch=base_branch)
             shard_newly_created = shard_info is not None
             if shard_info:
+                shard_info = dict(shard_info)
+                shard_info["worktree_path"] = str(Path(shard_info["worktree_path"]).resolve())
                 cwd = shard_info["worktree_path"]
+        elif shard_info:
+            shard_info = dict(shard_info)
+            shard_info["worktree_path"] = str(Path(shard_info["worktree_path"]).resolve())
         if shard_info is None:
             error = (
                 f"Failed to create SHARD worktree — {shard_error}"
@@ -7863,36 +8119,19 @@ def _kimi_spin_sync(
         effective_prompt = _research_target_preamble(research_target_info) + prompt
 
     if shard_info and not _research_omits_shard_commit_preamble(research_target_info):
-        if _has_skein(working_dir) and not skeinless:
-            worktree_name = shard_info.get("shard_id", spool_id)
-            skein_preamble = f"""You are working in an isolated SHARD worktree.
+        shard_preamble = """You are working in an isolated SHARD worktree.
 
-Before starting work, orient yourself with SKEIN:
-1. Run: skein ignite --message "{prompt[:100]}..."
-2. Then: skein ready
-
-After completing work:
-1. Commit: git add -A && git commit -m "Your commit message"
-2. Tender: skein shard tender {worktree_name} --summary "What you did" --confidence N
-   (confidence 1-10: 10=safe/isolated, 5=needs review, 1=risky)
-3. Retire: skein torch && skein complete
+Modify the requested files and leave the changes in the worktree for the caller.
+Git metadata outside the worktree is read-only inside this Kimi boundary.
+Do not commit, tender, torch, or run another SKEIN lifecycle command.
 
 Your task:
 """
-            effective_prompt = skein_preamble + effective_prompt
-        else:
-            shard_preamble = """You are working in an isolated SHARD worktree.
+        effective_prompt = shard_preamble + effective_prompt
 
-After completing work:
-1. Commit: git add -A && git commit -m "Your commit message"
-
-Your task:
-"""
-            effective_prompt = shard_preamble + effective_prompt
-
-    # Build kimi command: headless mode with auto-approve, stream-json output, and explicit session ID
-    # Kimi has no allowedTools-equivalent; research restrictions are prompt-level,
-    # plus bwrap's filesystem boundary when running in shard mode.
+    # Build kimi command: headless mode with auto-approve, stream-json output, and
+    # explicit session ID. Kimi has no classifier-vetted "careful" mode; every
+    # non-full launch is bounded externally below.
     kimi_cmd = [
         "kimi-cli",
         "--session",
@@ -7922,14 +8161,55 @@ Your task:
         prompt_idx = kimi_cmd.index("-p") + 1
         kimi_cmd[prompt_idx] = combined_prompt
 
-    if shard_info:
-        kimi_cmd = _codex_bwrap_wrap(
-            kimi_cmd,
-            shard_info,
-            cwd,
-            research_target_info=research_target_info,
-            process_env=_process_env(env),
-        )
+    writable_paths: list[str] = []
+    readable_rebinds: list[str] = []
+    filesystem_boundary = {
+        "kind": "none",
+        "writable_paths": [],
+        "readable_rebinds": [],
+        "private_tmp": False,
+        "private_run": False,
+        "isolated_processes": False,
+    }
+    if use_bwrap:
+        try:
+            writable_paths = _kimi_boundary_write_paths(
+                permission,
+                cwd,
+                shard_info,
+                research_target_info,
+                process_env,
+            )
+            kimi_cmd = _kimi_bwrap_wrap(
+                kimi_cmd,
+                cwd,
+                writable_paths,
+                process_env,
+                bwrap_bin=bwrap_bin,
+            )
+        except ValueError as exc:
+            _record_pre_spawn_failure(
+                spool_id,
+                str(exc),
+                {
+                    "working_dir": working_dir,
+                    "shard": shard_info,
+                    "shard_created_by_spool": shard_newly_created,
+                    "shard_source_dir": working_dir if shard_newly_created else None,
+                    "base_branch": base_branch,
+                    "harness": "kimi",
+                },
+            )
+            return f"Error: {exc}"
+        filesystem_boundary = {
+            "kind": "bwrap",
+            "root": "read-only",
+            "writable_paths": writable_paths,
+            "readable_rebinds": readable_rebinds,
+            "private_tmp": True,
+            "private_run": True,
+            "isolated_processes": True,
+        }
 
     # Parse tags
     tag_list = [t.strip() for t in tags.split(",")] if tags else []
@@ -7943,12 +8223,15 @@ Your task:
         "result": None,
         "session_id": session_id,  # Store our generated session ID
         "working_dir": working_dir,
+        "execution_cwd": cwd,
         "model": resolved_model or "auto",
         "thinking": enable_thinking,
         "system_prompt": system_prompt,
         "tags": tag_list,
         "timeout": timeout,
         "env": env,
+        "permission": permission,
+        "filesystem_boundary": filesystem_boundary,
         "research_target": research_target,
         "shard": shard_info,
         "shard_created_by_spool": shard_newly_created,
@@ -7961,7 +8244,8 @@ Your task:
         "harness": "kimi",
     }
 
-    startup_error = _start_spool_process(spool, kimi_cmd, cwd, env)
+    launch_env = _kimi_contained_spawn_env(env) if use_bwrap else env
+    startup_error = _start_spool_process(spool, kimi_cmd, cwd, launch_env)
     if startup_error:
         return startup_error
 
@@ -7980,6 +8264,30 @@ def _kimi_respin_sync(
     working_dir = original_spool.get("working_dir")
     if not working_dir:
         return "Error: original spool missing working_dir"
+    execution_cwd = original_spool.get("execution_cwd")
+    if not execution_cwd:
+        shard_info = original_spool.get("shard")
+        if original_spool.get("shard_created_by_spool") and isinstance(shard_info, dict):
+            execution_cwd = shard_info.get("worktree_path")
+    execution_cwd = str(Path(execution_cwd or working_dir).resolve())
+    process_env = _process_env(original_spool.get("env"))
+
+    original_boundary = original_spool.get("filesystem_boundary")
+    if isinstance(original_boundary, dict) and original_boundary.get("kind") in {"bwrap", "none"}:
+        use_bwrap = original_boundary["kind"] == "bwrap"
+    else:
+        # Legacy Kimi records did not persist a boundary or permission. Contain
+        # them at the default working-directory write set rather than inheriting
+        # the old unrestricted launch.
+        use_bwrap = original_spool.get("permission") != "full" or bool(original_spool.get("shard"))
+
+    bwrap_bin = _kimi_bwrap_binary(process_env) if use_bwrap else None
+    if use_bwrap and not bwrap_bin:
+        message = _kimi_bwrap_required_message(
+            original_spool.get("permission"),
+            bool(original_spool.get("shard")),
+        )
+        return f"Error: {message}"
 
     # Inherit model from original spool. The stored model is already a resolved
     # "moonshot-ai/<model>" key (or "auto"); validate it before reserving a slot so a
@@ -7993,6 +8301,50 @@ def _kimi_respin_sync(
 
     # Inherit thinking mode from the original spool.
     enable_thinking = bool(original_spool.get("thinking"))
+
+    research_target = original_spool.get("research_target")
+
+    if use_bwrap:
+        try:
+            research_target_info = _kimi_research_target_for_replay(research_target, working_dir)
+            computed_paths = _kimi_boundary_write_paths(
+                original_spool.get("permission"),
+                execution_cwd,
+                original_spool.get("shard"),
+                research_target_info,
+                process_env,
+            )
+            recorded_paths = (
+                original_boundary.get("writable_paths")
+                if isinstance(original_boundary, dict) and original_boundary.get("kind") == "bwrap"
+                else None
+            )
+            if recorded_paths is not None and not isinstance(recorded_paths, list):
+                return "Error: original Kimi spool has invalid filesystem boundary metadata"
+            if recorded_paths is not None and recorded_paths != computed_paths:
+                return (
+                    "Error: Kimi boundary paths changed since the original spin; "
+                    "start a fresh spin instead of widening the recorded boundary"
+                )
+            recorded_rebinds = (
+                original_boundary.get("readable_rebinds")
+                if isinstance(original_boundary, dict) and original_boundary.get("kind") == "bwrap"
+                else None
+            )
+            if recorded_rebinds is not None and not isinstance(recorded_rebinds, list):
+                return "Error: original Kimi spool has invalid filesystem boundary metadata"
+            if recorded_rebinds:
+                return (
+                    "Error: original Kimi spool contains unsupported external readable mounts; "
+                    "start a fresh spin with the simplified boundary"
+                )
+            writable_paths = computed_paths
+            readable_rebinds = []
+        except ValueError as exc:
+            return f"Error: {exc}"
+    else:
+        writable_paths = []
+        readable_rebinds = []
 
     # Generate new spool ID
     spool_id = "kimi-" + str(uuid.uuid4())[:8]
@@ -8021,8 +8373,21 @@ def _kimi_respin_sync(
     if enable_thinking:
         kimi_cmd.append("--thinking")
 
-    if working_dir:
-        kimi_cmd.extend(["-w", working_dir])
+    if execution_cwd:
+        kimi_cmd.extend(["-w", execution_cwd])
+
+    if use_bwrap:
+        try:
+            kimi_cmd = _kimi_bwrap_wrap(
+                kimi_cmd,
+                execution_cwd,
+                writable_paths,
+                process_env,
+                bwrap_bin=bwrap_bin,
+            )
+        except ValueError as exc:
+            _record_pre_spawn_failure(spool_id, str(exc))
+            return f"Error: {exc}"
 
     # Parse tags
     tag_list = ["kimi", "respin"]
@@ -8035,12 +8400,24 @@ def _kimi_respin_sync(
         "result": None,
         "session_id": session_id,  # Keep reference to original
         "working_dir": working_dir,
+        "execution_cwd": execution_cwd,
         "model": model or "auto",
         "thinking": enable_thinking,
         "system_prompt": None,
         "tags": tag_list,
         "timeout": original_spool.get("timeout"),
         "env": original_spool.get("env"),
+        "permission": original_spool.get("permission"),
+        "filesystem_boundary": {
+            "kind": "bwrap" if use_bwrap else "none",
+            "root": "read-only" if use_bwrap else None,
+            "writable_paths": writable_paths,
+            "readable_rebinds": readable_rebinds,
+            "private_tmp": use_bwrap,
+            "private_run": use_bwrap,
+            "isolated_processes": use_bwrap,
+        },
+        "research_target": research_target,
         "shard": original_spool.get("shard"),
         "created_at": datetime.now().isoformat(),
         "completed_at": None,
@@ -8049,7 +8426,9 @@ def _kimi_respin_sync(
         "harness": "kimi",
     }
 
-    startup_error = _start_spool_process(spool, kimi_cmd, working_dir, original_spool.get("env"))
+    original_env = original_spool.get("env")
+    launch_env = _kimi_contained_spawn_env(original_env) if use_bwrap else original_env
+    startup_error = _start_spool_process(spool, kimi_cmd, execution_cwd, launch_env)
     if startup_error:
         return startup_error
 
@@ -8183,10 +8562,9 @@ async def spindle_reload(force: bool = False) -> str:
 DOCTOR_SMOKE_TOKEN = "spindle-doctor-ok"
 DOCTOR_SMOKE_PROMPT = f"Reply with exactly this token and nothing else: {DOCTOR_SMOKE_TOKEN}"
 
-# Harnesses the smoke will run. Restricted to the two with a real read-only
-# tier: codex gets sandbox=read-only, claude-code gets the allowlisted readonly
-# profile. Gemini has no enforced read-only tier here and kimi runs --yolo, so a
-# "harmless read-only smoke" through them would be a lie.
+# Harnesses the default smoke will run. Codex and Claude are the established
+# smoke pair; Kimi's external bwrap boundary is exercised by a direct behavioral
+# test, and Gemini still has no enforced read-only tier here.
 DOCTOR_SMOKE_HARNESSES = ("claude-code", "codex")
 
 # Statuses that end a spool, i.e. stop the smoke's poll loop.
@@ -8611,7 +8989,9 @@ def _doctor_shard_check() -> dict:
         status = "warn"
         lines.append(
             "bwrap: not found — shard worktrees are created but NOT filesystem-contained; "
-            "do not treat `careful+shard` as containment on this machine"
+            "do not treat `careful+shard` as containment on this machine. "
+            "Kimi refuses every launch that requires containment; only `full` "
+            "without shard intent remains available."
         )
 
     detail = "git and bwrap present" if status == "ok" else "shard support is incomplete"

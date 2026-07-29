@@ -64,6 +64,7 @@ from spindle import (
     _handle_expired_session,
     _is_pid_alive,
     _is_review_tag,
+    _kimi_bwrap_wrap,
     _kimi_respin_sync,
     _kimi_spin_sync,
     _kimi_unspool_sync,
@@ -4391,16 +4392,45 @@ class TestGeminiHarness:
         assert (str(host_home / ".codex"), str(host_home / ".codex")) not in binds
 
 
+def test_kimi_bwrap_resolution_ignores_caller_path():
+    with patch("spindle.shutil.which", return_value="/usr/bin/bwrap") as which:
+        assert spindle._kimi_bwrap_binary({"PATH": "/project/bin"}) == "/usr/bin/bwrap"
+
+    which.assert_called_once_with("bwrap")
+
+
+def test_kimi_bwrap_resolution_rejects_relative_service_path():
+    with patch("spindle.shutil.which", return_value="project-bin/bwrap") as which:
+        assert spindle._kimi_bwrap_binary({"PATH": "/malicious/caller/bin"}) is None
+
+    which.assert_called_once_with("bwrap")
+
+
+def test_kimi_bwrap_wrapper_rejects_relative_explicit_binary(tmp_path):
+    with pytest.raises(ValueError, match="bwrap is required"):
+        _kimi_bwrap_wrap(
+            ["kimi-cli"],
+            str(tmp_path),
+            [str(tmp_path)],
+            {},
+            bwrap_bin="project-bin/bwrap",
+        )
+
+
 class TestKimiHarness:
     """Test Kimi CLI harness implementation."""
 
     @pytest.fixture(autouse=True)
-    def _skip_model_validation(self):
+    def _skip_model_validation(self, tmp_path, monkeypatch):
         """Disable model-config validation by default so command-construction tests
         don't depend on the machine's ~/.kimi/config.toml. Validation-specific tests
         re-patch _kimi_registered_models with an explicit set."""
+        fake_home = tmp_path / "default-home"
+        (fake_home / ".kimi").mkdir(parents=True)
+        monkeypatch.setenv("HOME", str(fake_home))
         with patch("spindle._kimi_registered_models", return_value=None):
-            yield
+            with patch("spindle._kimi_bwrap_binary", return_value="/usr/bin/bwrap"):
+                yield
 
     def test_kimi_model_aliases(self):
         """Aliases should resolve only to models the managed provider actually serves."""
@@ -4680,7 +4710,10 @@ class TestKimiHarness:
                         env=None,
                     )
 
-        assert captured_cmd[0] == "kimi-cli"
+        assert captured_cmd[0] == "/usr/bin/bwrap"
+        assert "--ro-bind" in captured_cmd
+        assert "--tmpfs" in captured_cmd
+        assert "kimi-cli" in captured_cmd
         assert "--session" in captured_cmd
         assert "--print" in captured_cmd
         assert "--yolo" in captured_cmd
@@ -4690,6 +4723,629 @@ class TestKimiHarness:
         assert "-m" in captured_cmd
         assert "moonshot-ai/kimi-k2.6" in captured_cmd
         assert "-w" in captured_cmd
+
+    def test_kimi_default_boundary_records_real_write_set(self, tmp_path):
+        """Kimi's shared default label compiles to an external filesystem boundary,
+        not a claim that kimi-cli itself has a careful approval mode."""
+        fake_home = tmp_path / "home"
+        kimi_state = fake_home / ".kimi"
+        kimi_state.mkdir(parents=True)
+
+        with patch("spindle.SPINDLE_DIR", tmp_path / "spools"):
+            with patch("spindle._spawn_detached", return_value=12345):
+                with patch("spindle._count_running", return_value=0):
+                    spool_id = _kimi_spin_sync(
+                        prompt="Inspect this",
+                        working_dir=str(tmp_path),
+                        model=None,
+                        system_prompt=None,
+                        timeout=None,
+                        tags=None,
+                        env={"HOME": str(fake_home)},
+                    )
+
+            spool = _read_spool(spool_id)
+
+        assert spool["filesystem_boundary"] == {
+            "kind": "bwrap",
+            "root": "read-only",
+            "writable_paths": [str(tmp_path.resolve()), str(kimi_state.resolve())],
+            "readable_rebinds": [],
+            "private_tmp": True,
+            "private_run": True,
+            "isolated_processes": True,
+        }
+        assert spool["permission"] is None
+        assert spool["execution_cwd"] == str(tmp_path.resolve())
+
+    def test_kimi_nonshard_boundary_never_expands_cwd_from_git_metadata(self, tmp_path):
+        fake_home = tmp_path / "home"
+        kimi_state = fake_home / ".kimi"
+        working_dir = tmp_path / "subdir"
+        kimi_state.mkdir(parents=True)
+        working_dir.mkdir()
+
+        with patch(
+            "spindle._detect_existing_shard",
+            side_effect=AssertionError("non-shard boundary must not inspect Git metadata"),
+        ):
+            paths = spindle._kimi_boundary_write_paths(
+                "careful",
+                str(working_dir),
+                None,
+                None,
+                {"HOME": str(fake_home)},
+            )
+
+        assert paths == [str(working_dir.resolve()), str(kimi_state.resolve())]
+
+    @pytest.mark.parametrize("permission", ["readonly", "manual", "careful"])
+    def test_kimi_shared_permission_names_do_not_claim_narrower_box(self, tmp_path, permission):
+        fake_home = tmp_path / "home"
+        kimi_state = fake_home / ".kimi"
+        kimi_state.mkdir(parents=True)
+        captured_cmd = []
+
+        def fake_spawn(spool_id, cmd, cwd, env=None):
+            captured_cmd.extend(cmd)
+            return 12345
+
+        with patch("spindle.SPINDLE_DIR", tmp_path / "spools"):
+            with patch("spindle._spawn_detached", side_effect=fake_spawn):
+                with patch("spindle._count_running", return_value=0):
+                    spool_id = _kimi_spin_sync(
+                        prompt="Inspect this",
+                        working_dir=str(tmp_path),
+                        model=None,
+                        system_prompt=None,
+                        timeout=None,
+                        tags=None,
+                        env={"HOME": str(fake_home)},
+                        permission=permission,
+                    )
+
+            spool = _read_spool(spool_id)
+
+        binds = {
+            (captured_cmd[i + 1], captured_cmd[i + 2]) for i, token in enumerate(captured_cmd[:-2]) if token == "--bind"
+        }
+        assert (str(kimi_state.resolve()), str(kimi_state.resolve())) in binds
+        assert (str(tmp_path.resolve()), str(tmp_path.resolve())) in binds
+        assert spool["filesystem_boundary"]["writable_paths"] == [
+            str(tmp_path.resolve()),
+            str(kimi_state.resolve()),
+        ]
+
+    def test_kimi_full_is_explicitly_uncontained(self, tmp_path):
+        captured_cmd = []
+
+        def fake_spawn(spool_id, cmd, cwd, env=None):
+            captured_cmd.extend(cmd)
+            return 12345
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle._spawn_detached", side_effect=fake_spawn):
+                with patch("spindle._count_running", return_value=0):
+                    spool_id = _kimi_spin_sync(
+                        prompt="Set up Kimi",
+                        working_dir=str(tmp_path),
+                        model=None,
+                        system_prompt=None,
+                        timeout=None,
+                        tags=None,
+                        env=None,
+                        permission="full",
+                    )
+
+            spool = _read_spool(spool_id)
+
+        assert captured_cmd[0] == "kimi-cli"
+        assert spool["filesystem_boundary"]["kind"] == "none"
+        assert spool["filesystem_boundary"]["writable_paths"] == []
+
+    def test_kimi_missing_bwrap_refuses_before_slot_or_shard(self, tmp_path):
+        with patch("spindle._kimi_bwrap_binary", return_value=None):
+            with patch("spindle._try_reserve_slot_and_create") as reserve:
+                with patch("spindle._spawn_shard") as spawn_shard:
+                    result = _kimi_spin_sync(
+                        prompt="Change code",
+                        working_dir=str(tmp_path),
+                        model=None,
+                        system_prompt=None,
+                        timeout=None,
+                        tags=None,
+                        env=None,
+                        permission="shard",
+                        shard=True,
+                    )
+
+        assert result.startswith("Error:")
+        assert "bwrap is required" in result
+        assert "permission=full" in result
+        reserve.assert_not_called()
+        spawn_shard.assert_not_called()
+
+    def test_kimi_full_with_shard_still_requires_bwrap(self, tmp_path):
+        with patch("spindle._kimi_bwrap_binary", return_value=None):
+            with patch("spindle._try_reserve_slot_and_create") as reserve:
+                with patch("spindle._spawn_shard") as spawn_shard:
+                    result = _kimi_spin_sync(
+                        prompt="Change code",
+                        working_dir=str(tmp_path),
+                        model=None,
+                        system_prompt=None,
+                        timeout=None,
+                        tags=None,
+                        env=None,
+                        permission="full",
+                        shard=True,
+                    )
+
+        assert result.startswith("Error:")
+        assert "shard intent remains filesystem-contained" in result
+        assert "omit shard=True" in result
+        reserve.assert_not_called()
+        spawn_shard.assert_not_called()
+
+    def test_kimi_relative_state_dir_with_shard_refuses_before_reservation(self, tmp_path):
+        with patch("spindle._try_reserve_slot_and_create") as reserve:
+            with patch("spindle._spawn_shard") as spawn_shard:
+                result = _kimi_spin_sync(
+                    prompt="Change code",
+                    working_dir=str(tmp_path),
+                    model=None,
+                    system_prompt=None,
+                    timeout=None,
+                    tags=None,
+                    env={"KIMI_SHARE_DIR": ".kimi-state"},
+                    permission="shard",
+                    shard=True,
+                )
+
+        assert result.startswith("Error: relative KIMI_SHARE_DIR")
+        reserve.assert_not_called()
+        spawn_shard.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "reserved_path_source",
+        [
+            "cwd",
+            "state",
+            "research",
+            "dev-research",
+            "proc-state",
+            "run-state",
+            "sys-state",
+        ],
+    )
+    def test_kimi_reserved_mounts_refuse_before_reservation(self, tmp_path, reserved_path_source):
+        working_dir = tmp_path / "project"
+        kimi_state = tmp_path / "kimi-state"
+        working_dir.mkdir()
+        kimi_state.mkdir()
+        env = {"KIMI_SHARE_DIR": str(kimi_state)}
+        permission = "careful"
+        research_target = None
+        if reserved_path_source == "cwd":
+            working_dir = Path("/tmp")
+        elif reserved_path_source == "state":
+            env = {"KIMI_SHARE_DIR": "/tmp"}
+        elif reserved_path_source == "research":
+            permission = "research"
+            research_target = "file:/tmp/kimi-report.md"
+        elif reserved_path_source == "dev-research":
+            permission = "research"
+            research_target = "file:/dev/shm/kimi-report.md"
+        elif reserved_path_source == "run-state":
+            env = {"KIMI_SHARE_DIR": "/run"}
+        elif reserved_path_source == "sys-state":
+            env = {"KIMI_SHARE_DIR": "/sys"}
+        else:
+            env = {"KIMI_SHARE_DIR": "/proc/self"}
+
+        with patch("spindle._try_reserve_slot_and_create") as reserve:
+            result = _kimi_spin_sync(
+                prompt="Inspect",
+                working_dir=str(working_dir),
+                model=None,
+                system_prompt=None,
+                timeout=None,
+                tags=None,
+                env=env,
+                permission=permission,
+                research_target=research_target,
+                require_research_target=permission == "research",
+            )
+
+        assert result.startswith("Error: Kimi writable path cannot replace reserved sandbox mount ")
+        reserve.assert_not_called()
+
+    def test_kimi_bwrap_blocks_sibling_and_symlink_escape(self, tmp_path):
+        """Execute the real wrapper: cwd and Kimi state write, a sibling and a
+        symlink into that sibling do not, and sandbox /tmp is not host /tmp."""
+        bwrap = shutil.which("bwrap")
+        if not bwrap:
+            pytest.skip("bubblewrap is not installed")
+
+        root = tmp_path / "boundary"
+        work = root / "work"
+        outside = root / "outside"
+        share = root / "kimi-state"
+        work.mkdir(parents=True)
+        outside.mkdir()
+        share.mkdir()
+        (work / "escape").symlink_to(outside, target_is_directory=True)
+        private_tmp_marker = f"kimi-bwrap-{tmp_path.name}"
+        host_run_device = str(os.stat("/run").st_dev)
+        host_pid = str(os.getpid())
+        host_start_time = Path("/proc/self/stat").read_text().split()[21]
+
+        inner = [
+            "/bin/sh",
+            "-c",
+            (
+                'touch "$1/work-ok" && touch "$2/state-ok" && '
+                'touch "/tmp/$3" && ! touch "$4/sibling-bad" && '
+                '! touch "$1/escape/symlink-bad" && '
+                '[ "$(stat -c %d /run)" != "$5" ] && '
+                "test -s /etc/resolv.conf && "
+                '[ "$(cut -d " " -f 22 "/proc/$6/stat" 2>/dev/null)" != "$7" ]'
+            ),
+            "sh",
+            str(work),
+            str(share),
+            private_tmp_marker,
+            str(outside),
+            host_run_device,
+            host_pid,
+            host_start_time,
+        ]
+        command = _kimi_bwrap_wrap(
+            inner,
+            str(work),
+            [str(work), str(share)],
+            os.environ.copy(),
+            bwrap_bin=bwrap,
+        )
+        proc = subprocess.run(command, capture_output=True, text=True)
+
+        assert proc.returncode == 0, proc.stderr
+        assert (work / "work-ok").exists()
+        assert (share / "state-ok").exists()
+        assert not (outside / "sibling-bad").exists()
+        assert not (outside / "symlink-bad").exists()
+        assert not (Path("/tmp") / private_tmp_marker).exists()
+
+    def test_kimi_bwrap_payload_stops_when_detached_group_is_terminated(self, tmp_path):
+        bwrap = shutil.which("bwrap")
+        if not bwrap:
+            pytest.skip("bubblewrap is not installed")
+
+        work = tmp_path / "work"
+        share = tmp_path / "kimi-state"
+        spool_dir = tmp_path / "spools"
+        for path in (work, share, spool_dir):
+            path.mkdir()
+        heartbeat = work / "heartbeat"
+        command = _kimi_bwrap_wrap(
+            [
+                "/bin/sh",
+                "-c",
+                'while :; do printf x >> "$1"; sleep 0.05; done',
+                "sh",
+                str(heartbeat),
+            ],
+            str(work),
+            [str(work), str(share)],
+            os.environ.copy(),
+            bwrap_bin=bwrap,
+        )
+        spool_id = "kimi-terminate-test"
+        pid = None
+        handle = None
+
+        with patch("spindle.SPINDLE_DIR", spool_dir):
+            try:
+                pid = spindle._spawn_detached(
+                    spool_id,
+                    command,
+                    str(work),
+                    spindle._kimi_contained_spawn_env(None),
+                )
+                deadline = time.monotonic() + 5
+                while (not heartbeat.exists() or heartbeat.stat().st_size < 2) and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                assert heartbeat.exists() and heartbeat.stat().st_size >= 2
+
+                assert spindle._terminate_process_group(pid, 0.2) is True
+                handle = spindle._PROC_HANDLES.pop(spool_id, None)
+                if handle is not None:
+                    handle.wait(timeout=2)
+                stopped_size = heartbeat.stat().st_size
+                time.sleep(0.15)
+                assert heartbeat.stat().st_size == stopped_size
+            finally:
+                if pid is not None and spindle._is_process_group_alive(pid):
+                    spindle._terminate_process_group(pid, 0.1)
+                if handle is None:
+                    handle = spindle._PROC_HANDLES.pop(spool_id, None)
+                if handle is not None:
+                    with contextlib.suppress(subprocess.TimeoutExpired):
+                        handle.wait(timeout=2)
+
+    def test_kimi_linked_worktree_git_metadata_stays_read_only(self, tmp_path):
+        """Kimi may edit a worktree but cannot stage through external Git metadata."""
+        bwrap = shutil.which("bwrap")
+        if not bwrap:
+            pytest.skip("bubblewrap is not installed")
+
+        repo = tmp_path / "repo"
+        worktree = tmp_path / "feature-worktree"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+        (repo / "tracked.txt").write_text("base\n")
+        subprocess.run(["git", "add", "tracked.txt"], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-m", "base"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "worktree", "add", "-b", "feature", str(worktree), "main"],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+        )
+        (worktree / "tracked.txt").write_text("changed\n")
+
+        fake_home = tmp_path / "home"
+        kimi_state = fake_home / ".kimi"
+        kimi_state.mkdir(parents=True)
+        process_env = os.environ.copy()
+        process_env["HOME"] = str(fake_home)
+        writable_paths = spindle._kimi_boundary_write_paths(
+            "careful",
+            str(worktree),
+            None,
+            None,
+            process_env,
+        )
+        assert writable_paths == [str(worktree.resolve()), str(kimi_state.resolve())]
+
+        command = _kimi_bwrap_wrap(
+            ["/bin/sh", "-c", "printf 'contained\\n' > tracked.txt && ! git add tracked.txt"],
+            str(worktree),
+            writable_paths,
+            process_env,
+            bwrap_bin=bwrap,
+        )
+        proc = subprocess.run(command, capture_output=True, text=True, env=process_env)
+
+        assert proc.returncode == 0, proc.stderr
+        assert (worktree / "tracked.txt").read_text() == "contained\n"
+        staged = subprocess.run(
+            ["git", "diff", "--cached", "--quiet"],
+            cwd=worktree,
+            capture_output=True,
+        )
+        assert staged.returncode == 0
+
+    def test_kimi_shard_prompt_leaves_changes_uncommitted(self, tmp_path):
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        fake_home = tmp_path / "home"
+        (fake_home / ".kimi").mkdir(parents=True)
+        shard_info = {
+            "worktree_path": str(worktree),
+            "branch_name": "shard-kimi",
+            "shard_id": "kimi",
+        }
+        captured_cmd = []
+
+        def fake_spawn(spool_id, cmd, cwd, env=None):
+            captured_cmd.extend(cmd)
+            return 12345
+
+        with patch("spindle.SPINDLE_DIR", tmp_path / "spools"):
+            with patch("spindle._detect_existing_shard", return_value=shard_info):
+                with patch("spindle._spawn_detached", side_effect=fake_spawn):
+                    with patch("spindle._count_running", return_value=0):
+                        _kimi_spin_sync(
+                            prompt="Change code",
+                            working_dir=str(worktree),
+                            model=None,
+                            system_prompt=None,
+                            timeout=None,
+                            tags=None,
+                            env={"HOME": str(fake_home)},
+                            permission="shard",
+                            shard=True,
+                        )
+
+        prompt = captured_cmd[captured_cmd.index("-p") + 1]
+        assert "Do not commit" in prompt
+        assert "git add" not in prompt
+        assert "skein ignite" not in prompt
+
+    def test_kimi_existing_shard_preserves_requested_subdirectory(self, tmp_path):
+        worktree = tmp_path / "worktree"
+        requested_cwd = worktree / "src"
+        requested_cwd.mkdir(parents=True)
+        fake_home = tmp_path / "home"
+        kimi_state = fake_home / ".kimi"
+        kimi_state.mkdir(parents=True)
+        shard_info = {
+            "worktree_path": str(worktree),
+            "branch_name": "shard-kimi",
+            "shard_id": "kimi",
+        }
+        captured = {}
+
+        def fake_spawn(spool_id, cmd, cwd, env=None):
+            captured["cmd"] = list(cmd)
+            captured["cwd"] = cwd
+            return 12345
+
+        with patch("spindle.SPINDLE_DIR", tmp_path / "spools"):
+            with patch("spindle._detect_existing_shard", return_value=shard_info):
+                with patch("spindle._spawn_detached", side_effect=fake_spawn):
+                    with patch("spindle._count_running", return_value=0):
+                        spool_id = _kimi_spin_sync(
+                            prompt="Change code",
+                            working_dir=str(requested_cwd),
+                            model=None,
+                            system_prompt=None,
+                            timeout=None,
+                            tags=None,
+                            env={"HOME": str(fake_home)},
+                            permission="shard",
+                            shard=True,
+                        )
+
+            spool = _read_spool(spool_id)
+
+        assert captured["cwd"] == str(requested_cwd.resolve())
+        assert captured["cmd"][captured["cmd"].index("--chdir") + 1] == str(requested_cwd.resolve())
+        assert captured["cmd"][captured["cmd"].index("-w") + 1] == str(requested_cwd.resolve())
+        assert spool["execution_cwd"] == str(requested_cwd.resolve())
+        assert spool["shard"]["worktree_path"] == str(worktree.resolve())
+        assert spool["filesystem_boundary"]["writable_paths"] == [
+            str(worktree.resolve()),
+            str(kimi_state.resolve()),
+        ]
+
+    def test_kimi_new_shard_uses_canonical_worktree_path(self, tmp_path):
+        source = tmp_path / "source"
+        actual_store = tmp_path / "actual-worktrees"
+        source.mkdir()
+        actual_store.mkdir()
+        (source / "worktrees").symlink_to(actual_store, target_is_directory=True)
+        raw_worktree = source / "worktrees" / "kimi-test"
+        actual_worktree = actual_store / "kimi-test"
+        actual_worktree.mkdir()
+        kimi_state = tmp_path / "kimi-state"
+        kimi_state.mkdir()
+        shard_info = {
+            "worktree_path": str(raw_worktree),
+            "branch_name": "shard-kimi-test",
+            "shard_id": "kimi-test",
+        }
+        captured = {}
+
+        def fake_spawn(spool_id, cmd, cwd, env=None):
+            captured["cwd"] = cwd
+            return 12345
+
+        with patch("spindle.SPINDLE_DIR", tmp_path / "spools"):
+            with patch("spindle._detect_existing_shard", return_value=None):
+                with patch("spindle._spawn_shard", return_value=(shard_info, None)):
+                    with patch("spindle._spawn_detached", side_effect=fake_spawn):
+                        with patch("spindle._count_running", return_value=0):
+                            spool_id = _kimi_spin_sync(
+                                prompt="Change code",
+                                working_dir=str(source),
+                                model=None,
+                                system_prompt=None,
+                                timeout=None,
+                                tags=None,
+                                env={"KIMI_SHARE_DIR": str(kimi_state)},
+                                permission="shard",
+                                shard=True,
+                            )
+
+            spool = _read_spool(spool_id)
+
+        assert captured["cwd"] == str(actual_worktree.resolve())
+        assert spool["execution_cwd"] == str(actual_worktree.resolve())
+        assert spool["shard"]["worktree_path"] == str(actual_worktree.resolve())
+
+    def test_kimi_post_shard_boundary_failure_preserves_shard(self, tmp_path):
+        source = tmp_path / "source"
+        worktree = tmp_path / "worktree"
+        kimi_state = tmp_path / "kimi-state"
+        source.mkdir()
+        worktree.mkdir()
+        kimi_state.mkdir()
+        shard_info = {
+            "worktree_path": str(worktree),
+            "branch_name": "shard-kimi-test",
+            "shard_id": "kimi-test",
+        }
+
+        with patch("spindle.SPINDLE_DIR", tmp_path / "spools"):
+            with patch("spindle._detect_existing_shard", return_value=None):
+                with patch("spindle._spawn_shard", return_value=(shard_info, None)):
+                    with patch(
+                        "spindle._kimi_boundary_write_paths",
+                        side_effect=[
+                            [str(source), str(kimi_state)],
+                            ValueError("post-shard boundary failure"),
+                        ],
+                    ):
+                        with patch("spindle._count_running", return_value=0):
+                            result = _kimi_spin_sync(
+                                prompt="Change code",
+                                working_dir=str(source),
+                                model=None,
+                                system_prompt=None,
+                                timeout=None,
+                                tags=None,
+                                env={"KIMI_SHARE_DIR": str(kimi_state)},
+                                permission="shard",
+                                shard=True,
+                            )
+
+            spool_files = list((tmp_path / "spools").glob("kimi-*.json"))
+            assert len(spool_files) == 1
+            spool = json.loads(spool_files[0].read_text())
+
+        assert result == "Error: post-shard boundary failure"
+        assert spool["status"] == "error"
+        assert spool["shard"]["worktree_path"] == str(worktree.resolve())
+        assert spool["shard"]["startup_failure_preserved"] is True
+        assert spool["shard_cleanup_preserved"] is True
+
+    def test_kimi_terminal_recovery_race_still_attaches_created_shard(self, tmp_path):
+        spool_id = "kimi-race"
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        completed_at = datetime.now().isoformat()
+        terminal_reservation = {
+            "id": spool_id,
+            "status": "error",
+            "error": "pending reservation expired before shard returned",
+            "created_at": datetime.now().isoformat(),
+            "completed_at": completed_at,
+        }
+        shard = {
+            "worktree_path": str(worktree),
+            "branch_name": "shard-kimi-race",
+            "shard_id": "kimi-race",
+        }
+        metadata = {
+            "working_dir": str(tmp_path),
+            "shard": shard,
+            "shard_created_by_spool": True,
+            "shard_source_dir": str(tmp_path),
+            "base_branch": "main",
+            "harness": "kimi",
+        }
+
+        with patch("spindle.SPINDLE_DIR", tmp_path / "spools"):
+            _write_spool(spool_id, terminal_reservation)
+            spindle._record_pre_spawn_failure(
+                spool_id,
+                "later boundary failure",
+                metadata,
+            )
+            spool = _read_spool(spool_id)
+
+        assert spool["error"] == terminal_reservation["error"]
+        assert spool["completed_at"] == completed_at
+        assert spool["shard"] == {
+            **shard,
+            "startup_failure_preserved": True,
+        }
+        assert spool["shard_created_by_spool"] is True
+        assert spool["shard_cleanup_preserved"] is True
 
     def test_kimi_spin_system_prompt_prepended(self, tmp_path):
         """System prompt should be prepended to the prompt."""
@@ -4736,10 +5392,28 @@ class TestKimiHarness:
                         system_prompt=None,
                         timeout=None,
                         tags=None,
-                        env={"KIMI_API_KEY": "test-key"},
+                        env={
+                            "KIMI_API_KEY": "test-key",
+                            "LD_PRELOAD": "/project/escape.so",
+                            "LD_AUDIT": "/project/audit.so",
+                            "BASH_ENV": "/project/bash-env",
+                            "SHELLOPTS": "xtrace",
+                            "BASHOPTS": "extdebug",
+                            "PS4": "$(touch /tmp/pre-bwrap)",
+                            "BASH_XTRACEFD": "9",
+                            "BASH_FUNC_printf%%": "() { touch /tmp/pre-bwrap; }",
+                        },
                     )
 
-        assert captured_env[0] == {"KIMI_API_KEY": "test-key"}
+        assert captured_env[0]["KIMI_API_KEY"] == "test-key"
+        assert captured_env[0]["LD_PRELOAD"] == ""
+        assert captured_env[0]["LD_AUDIT"] == ""
+        assert captured_env[0]["BASH_ENV"] == ""
+        assert captured_env[0]["SHELLOPTS"] == ""
+        assert captured_env[0]["BASHOPTS"] == ""
+        assert captured_env[0]["PS4"] == ""
+        assert captured_env[0]["BASH_XTRACEFD"] == ""
+        assert captured_env[0]["BASH_FUNC_printf%%"] == ""
 
     def test_kimi_research_requires_target(self, tmp_path):
         """Kimi research permission must reject missing research_target before spawn."""
@@ -4783,6 +5457,50 @@ class TestKimiHarness:
         prompt = captured_cmd[captured_cmd.index("-p") + 1]
         assert "You are a research agent" in prompt
         assert f"Write your final report to exactly {target}" in prompt
+
+    def test_kimi_research_adds_output_to_required_writable_working_dir(self, tmp_path):
+        fake_home = tmp_path / "home"
+        kimi_state = fake_home / ".kimi"
+        kimi_state.mkdir(parents=True)
+        working_dir = tmp_path / "project"
+        working_dir.mkdir()
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+        captured_cmd = []
+
+        def fake_spawn(spool_id, cmd, cwd, env=None):
+            captured_cmd.extend(cmd)
+            return 12345
+
+        with patch("spindle.SPINDLE_DIR", tmp_path / "spools"):
+            with patch("spindle._count_running", return_value=0):
+                with patch("spindle._spawn_detached", side_effect=fake_spawn):
+                    spool_id = _kimi_spin_sync(
+                        prompt="research this",
+                        working_dir=str(working_dir),
+                        model=None,
+                        system_prompt=None,
+                        timeout=None,
+                        tags=None,
+                        env={"HOME": str(fake_home)},
+                        permission="research",
+                        research_target=f"dir:{output_dir}",
+                        require_research_target=True,
+                    )
+
+            spool = _read_spool(spool_id)
+
+        binds = {
+            (captured_cmd[i + 1], captured_cmd[i + 2]) for i, token in enumerate(captured_cmd[:-2]) if token == "--bind"
+        }
+        assert (str(output_dir.resolve()), str(output_dir.resolve())) in binds
+        assert (str(kimi_state.resolve()), str(kimi_state.resolve())) in binds
+        assert (str(working_dir.resolve()), str(working_dir.resolve())) in binds
+        assert spool["filesystem_boundary"]["writable_paths"] == [
+            str(working_dir.resolve()),
+            str(output_dir.resolve()),
+            str(kimi_state.resolve()),
+        ]
 
     def test_kimi_unspool_complete(self, tmp_path):
         """Unspool should return result for complete spool."""
@@ -4910,6 +5628,354 @@ class TestKimiHarness:
                     )
 
         assert "--thinking" not in captured_cmd
+
+    def test_kimi_respin_replays_recorded_boundary_and_execution_cwd(self, tmp_path):
+        fake_home = tmp_path / "home"
+        kimi_state = fake_home / ".kimi"
+        kimi_state.mkdir(parents=True)
+        source = tmp_path / "source"
+        worktree = tmp_path / "worktree"
+        source.mkdir()
+        worktree.mkdir()
+        captured = {}
+
+        def fake_spawn(spool_id, cmd, cwd, env=None):
+            captured["cmd"] = list(cmd)
+            captured["cwd"] = cwd
+            captured["env"] = env
+            return 12345
+
+        original_spool = {
+            "id": "kimi-original",
+            "session_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "working_dir": str(source),
+            "execution_cwd": str(worktree),
+            "model": "moonshot-ai/kimi-k2.6",
+            "thinking": False,
+            "env": {
+                "HOME": str(fake_home),
+                "LD_PRELOAD": "/project/escape.so",
+                "ENV": "/project/sh-env",
+                "SHELLOPTS": "xtrace",
+                "PS4": "$(touch /tmp/pre-bwrap)",
+            },
+            "permission": "shard",
+            "shard": {
+                "worktree_path": str(worktree),
+                "branch_name": "shard-kimi",
+                "shard_id": "kimi",
+            },
+            "filesystem_boundary": {
+                "kind": "bwrap",
+                "root": "read-only",
+                "writable_paths": [str(worktree), str(kimi_state)],
+                "readable_rebinds": [],
+                "private_tmp": True,
+                "private_run": True,
+                "isolated_processes": True,
+            },
+            "research_target": "site:closed-after-original-spin",
+        }
+
+        with patch("spindle.SPINDLE_DIR", tmp_path / "spools"):
+            with patch("spindle._spawn_detached", side_effect=fake_spawn):
+                with patch("spindle._count_running", return_value=0):
+                    with patch(
+                        "spindle._validate_research_target",
+                        side_effect=AssertionError("recorded boundary must not revalidate target"),
+                    ):
+                        spool_id = _kimi_respin_sync(
+                            session_id=original_spool["session_id"],
+                            prompt="Continue",
+                            original_spool=original_spool,
+                        )
+
+            spool = _read_spool(spool_id)
+
+        assert captured["cwd"] == str(worktree.resolve())
+        assert captured["cmd"][0] == "/usr/bin/bwrap"
+        assert captured["cmd"][captured["cmd"].index("--chdir") + 1] == str(worktree.resolve())
+        assert captured["cmd"][captured["cmd"].index("-w") + 1] == str(worktree.resolve())
+        assert captured["env"]["HOME"] == str(fake_home)
+        assert captured["env"]["LD_PRELOAD"] == ""
+        assert captured["env"]["ENV"] == ""
+        assert captured["env"]["SHELLOPTS"] == ""
+        assert captured["env"]["PS4"] == ""
+        assert spool["execution_cwd"] == str(worktree.resolve())
+        assert spool["filesystem_boundary"] == original_spool["filesystem_boundary"]
+
+    @pytest.mark.parametrize("shard_created_by_spool", [False, True])
+    def test_kimi_legacy_respin_recovers_original_execution_cwd(self, tmp_path, shard_created_by_spool):
+        fake_home = tmp_path / "home"
+        (fake_home / ".kimi").mkdir(parents=True)
+        source = tmp_path / "source"
+        worktree = tmp_path / "worktree"
+        requested_subdir = worktree / "src"
+        source.mkdir()
+        requested_subdir.mkdir(parents=True)
+        working_dir = source if shard_created_by_spool else requested_subdir
+        expected_cwd = worktree if shard_created_by_spool else requested_subdir
+        captured = {}
+
+        def fake_spawn(spool_id, cmd, cwd, env=None):
+            captured["cmd"] = list(cmd)
+            captured["cwd"] = cwd
+            return 12345
+
+        original_spool = {
+            "id": "kimi-legacy",
+            "session_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "working_dir": str(working_dir),
+            "model": "moonshot-ai/kimi-k2.6",
+            "thinking": False,
+            "env": {"HOME": str(fake_home)},
+            "permission": "shard",
+            "shard": {
+                "worktree_path": str(worktree),
+                "branch_name": "shard-kimi",
+                "shard_id": "kimi",
+            },
+            "shard_created_by_spool": shard_created_by_spool,
+        }
+
+        with patch("spindle.SPINDLE_DIR", tmp_path / "spools"):
+            with patch("spindle._spawn_detached", side_effect=fake_spawn):
+                with patch("spindle._count_running", return_value=0):
+                    spool_id = _kimi_respin_sync(
+                        session_id=original_spool["session_id"],
+                        prompt="Continue",
+                        original_spool=original_spool,
+                    )
+
+            spool = _read_spool(spool_id)
+
+        expected_cwd = str(expected_cwd.resolve())
+        assert captured["cwd"] == expected_cwd
+        assert captured["cmd"][captured["cmd"].index("--chdir") + 1] == expected_cwd
+        assert captured["cmd"][captured["cmd"].index("-w") + 1] == expected_cwd
+        assert spool["execution_cwd"] == expected_cwd
+        assert spool["filesystem_boundary"]["writable_paths"][0] == str(worktree.resolve())
+
+    @pytest.mark.parametrize("substituted_path", ["work", "state"])
+    def test_kimi_respin_refuses_symlink_substitution(self, tmp_path, substituted_path):
+        work = tmp_path / "work"
+        kimi_state = tmp_path / "home" / ".kimi"
+        victim = tmp_path / "victim"
+        work.mkdir()
+        kimi_state.mkdir(parents=True)
+        victim.mkdir()
+        original_spool = {
+            "id": "kimi-original",
+            "session_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "working_dir": str(work),
+            "execution_cwd": str(work),
+            "model": "moonshot-ai/kimi-k2.6",
+            "thinking": False,
+            "env": {"HOME": str(tmp_path / "home")},
+            "permission": "careful",
+            "filesystem_boundary": {
+                "kind": "bwrap",
+                "root": "read-only",
+                "writable_paths": [str(work), str(kimi_state)],
+                "readable_rebinds": [],
+                "private_tmp": True,
+                "private_run": True,
+                "isolated_processes": True,
+            },
+        }
+        target = work if substituted_path == "work" else kimi_state
+        target.rename(tmp_path / f"original-{substituted_path}")
+        target.symlink_to(victim, target_is_directory=True)
+
+        with patch("spindle._try_reserve_slot_and_create") as reserve:
+            with patch("spindle._spawn_detached") as spawn:
+                result = _kimi_respin_sync(
+                    session_id=original_spool["session_id"],
+                    prompt="Continue",
+                    original_spool=original_spool,
+                )
+
+        assert result.startswith("Error: Kimi boundary paths changed")
+        reserve.assert_not_called()
+        spawn.assert_not_called()
+
+    def test_kimi_retry_creates_fresh_shard_preserving_research_boundary(self, tmp_path):
+        _retry = spool_retry.fn if hasattr(spool_retry, "fn") else spool_retry
+        source = tmp_path / "source"
+        original_worktree = tmp_path / "original-worktree"
+        retry_worktree = tmp_path / "retry-worktree"
+        kimi_state = tmp_path / "home" / ".kimi"
+        output = tmp_path / "research-output"
+        for path in (source, original_worktree, retry_worktree, kimi_state, output):
+            path.mkdir(parents=True)
+        original_shard = {
+            "worktree_path": str(original_worktree),
+            "branch_name": "shard-kimi-original",
+            "shard_id": "kimi-original",
+        }
+        retry_shard = {
+            "worktree_path": str(retry_worktree),
+            "branch_name": "shard-kimi-retry",
+            "shard_id": "kimi-retry",
+        }
+        original_writable_paths = [
+            str(original_worktree.resolve()),
+            str(output.resolve()),
+            str(kimi_state.resolve()),
+        ]
+        original = {
+            "id": "kimi-retry-original",
+            "status": "error",
+            "prompt": "Continue the research edit",
+            "working_dir": str(source),
+            "execution_cwd": str(original_worktree),
+            "model": "moonshot-ai/kimi-k2.6",
+            "system_prompt": "Keep the report concise",
+            "timeout": 120,
+            "tags": ["kimi", "research"],
+            "env": {"HOME": str(tmp_path / "home")},
+            "permission": "research+shard",
+            "research_target": f"dir:{output}",
+            "shard": original_shard,
+            "base_branch": "main",
+            "filesystem_boundary": {
+                "kind": "bwrap",
+                "root": "read-only",
+                "writable_paths": original_writable_paths,
+                "readable_rebinds": [],
+                "private_tmp": True,
+                "private_run": True,
+                "isolated_processes": True,
+            },
+            "harness": "kimi",
+            "created_at": datetime.now().isoformat(),
+        }
+        captured = {}
+
+        def fake_spawn(spool_id, cmd, cwd, env=None):
+            captured["cwd"] = cwd
+            return 12345
+
+        with patch("spindle.SPINDLE_DIR", tmp_path / "spools"):
+            _write_spool(original["id"], original)
+            with patch("spindle._detect_existing_shard", return_value=None):
+                with patch("spindle._spawn_shard", return_value=(retry_shard, None)) as spawn_shard:
+                    with patch("spindle._spawn_detached", side_effect=fake_spawn):
+                        with patch("spindle._start_spool_monitor"):
+                            with patch("spindle._count_running", return_value=0):
+                                retry_id = asyncio.run(_retry(original["id"]))
+            retry = _read_spool(retry_id)
+
+        spawn_shard.assert_called_once()
+        assert captured["cwd"] == str(retry_worktree.resolve())
+        assert retry["execution_cwd"] == str(retry_worktree.resolve())
+        assert retry["permission"] == original["permission"]
+        assert retry["research_target"] == original["research_target"]
+        assert retry["base_branch"] == original["base_branch"]
+        assert retry["shard"]["worktree_path"] == str(retry_worktree.resolve())
+        assert retry["filesystem_boundary"]["writable_paths"] == [
+            str(retry_worktree.resolve()),
+            str(output.resolve()),
+            str(kimi_state.resolve()),
+        ]
+        assert str(source.resolve()) not in retry["filesystem_boundary"]["writable_paths"]
+        assert str(original_worktree.resolve()) not in retry["filesystem_boundary"]["writable_paths"]
+
+    def test_kimi_retry_permission_only_shard_intent_creates_shard(self, tmp_path):
+        _retry = spool_retry.fn if hasattr(spool_retry, "fn") else spool_retry
+        source = tmp_path / "source"
+        worktree = tmp_path / "worktree"
+        kimi_state = tmp_path / "home" / ".kimi"
+        for path in (source, worktree, kimi_state):
+            path.mkdir(parents=True)
+        original = {
+            "id": "kimi-retry-shard-intent",
+            "status": "error",
+            "prompt": "Retry the edit",
+            "working_dir": str(source),
+            "model": "moonshot-ai/kimi-k2.6",
+            "tags": ["kimi"],
+            "env": {"HOME": str(tmp_path / "home")},
+            "permission": "shard",
+            "shard": None,
+            "base_branch": "main",
+            "harness": "kimi",
+            "created_at": datetime.now().isoformat(),
+        }
+        shard = {
+            "worktree_path": str(worktree),
+            "branch_name": "shard-kimi-retry-intent",
+            "shard_id": "kimi-retry-intent",
+        }
+        captured = {}
+
+        def fake_spawn(spool_id, cmd, cwd, env=None):
+            captured["cwd"] = cwd
+            return 12345
+
+        with patch("spindle.SPINDLE_DIR", tmp_path / "spools"):
+            _write_spool(original["id"], original)
+            with patch("spindle._detect_existing_shard", return_value=None):
+                with patch("spindle._spawn_shard", return_value=(shard, None)) as spawn_shard:
+                    with patch("spindle._spawn_detached", side_effect=fake_spawn):
+                        with patch("spindle._start_spool_monitor"):
+                            with patch("spindle._count_running", return_value=0):
+                                retry_id = asyncio.run(_retry(original["id"]))
+            retry = _read_spool(retry_id)
+
+        spawn_shard.assert_called_once()
+        assert captured["cwd"] == str(worktree.resolve())
+        assert retry["permission"] == "shard"
+        assert retry["shard"]["worktree_path"] == str(worktree.resolve())
+        assert retry["filesystem_boundary"]["writable_paths"] == [
+            str(worktree.resolve()),
+            str(kimi_state.resolve()),
+        ]
+        assert str(source.resolve()) not in retry["filesystem_boundary"]["writable_paths"]
+
+    def test_kimi_full_respin_stays_uncontained(self, tmp_path):
+        captured_cmd = []
+
+        def fake_spawn(spool_id, cmd, cwd, env=None):
+            captured_cmd.extend(cmd)
+            return 12345
+
+        original_spool = {
+            "id": "kimi-original",
+            "session_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "working_dir": str(tmp_path),
+            "execution_cwd": str(tmp_path),
+            "model": "moonshot-ai/kimi-k2.6",
+            "thinking": False,
+            "env": None,
+            "permission": "full",
+            "filesystem_boundary": {
+                "kind": "none",
+                "writable_paths": [],
+                "private_tmp": False,
+                "private_run": False,
+                "isolated_processes": False,
+            },
+            "research_target": "site:closed-after-original-spin",
+        }
+
+        with patch("spindle.SPINDLE_DIR", tmp_path / "spools"):
+            with patch("spindle._spawn_detached", side_effect=fake_spawn):
+                with patch("spindle._count_running", return_value=0):
+                    with patch(
+                        "spindle._validate_research_target",
+                        side_effect=AssertionError("uncontained respin must not revalidate target"),
+                    ):
+                        spool_id = _kimi_respin_sync(
+                            session_id=original_spool["session_id"],
+                            prompt="Continue",
+                            original_spool=original_spool,
+                        )
+
+            spool = _read_spool(spool_id)
+
+        assert captured_cmd[0] == "kimi-cli"
+        assert spool["filesystem_boundary"]["kind"] == "none"
 
 
 class TestSpinHarnesses:
@@ -5231,17 +6297,21 @@ class TestSpawnFailureRecovery:
 
     def test_kimi_spin_sync_spawn_failure_marks_error(self, tmp_path):
         """If _spawn_detached raises in kimi path, spool should be marked as error."""
+        working_dir = tmp_path / "work"
+        kimi_home = tmp_path / "home"
+        working_dir.mkdir()
+        (kimi_home / ".kimi").mkdir(parents=True)
         with patch("spindle.SPINDLE_DIR", tmp_path):
             with patch("spindle._count_running", return_value=0):
                 with patch("spindle._spawn_detached", side_effect=FileNotFoundError("kimi-cli not found")):
                     result = _kimi_spin_sync(
                         prompt="test prompt",
-                        working_dir="/tmp",
+                        working_dir=str(working_dir),
                         model=None,
                         system_prompt=None,
                         timeout=None,
                         tags=None,
-                        env=None,
+                        env={"HOME": str(kimi_home)},
                     )
 
             assert "Error" in result
@@ -10472,6 +11542,25 @@ class TestDoctorHarnesses:
 
     def test_harness_commands_cover_every_builtin(self):
         assert set(spindle.HARNESS_COMMANDS) == spindle.BUILTIN_HARNESSES
+
+
+class TestDoctorShards:
+    def test_missing_bwrap_explains_kimi_refusal(self, monkeypatch):
+        monkeypatch.setattr(
+            spindle,
+            "_probe_command",
+            lambda cmd, timeout=5.0: ("/usr/bin/git", "git version 2.43.0"),
+        )
+        monkeypatch.setattr(spindle.shutil, "which", lambda cmd: None)
+
+        result = spindle._doctor_shard_check()
+
+        assert result["status"] == "warn"
+        assert any(
+            "Kimi refuses every launch that requires containment" in line
+            and "`full` without shard intent remains available" in line
+            for line in result["lines"]
+        )
 
 
 class TestDoctorSmoke:

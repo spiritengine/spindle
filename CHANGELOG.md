@@ -28,6 +28,18 @@ and run alongside another install without confusing the two.
 
 ### Fixed
 
+- Kimi no longer runs auto-approved headless tools against the entire host for
+  ordinary spools. Every launch except `full` without shard intent now runs
+  inside Spindle's own bwrap boundary with a read-only root, private `/tmp`,
+  hidden filesystem-path `/run` sockets, isolated host process/IPC state, and an
+  explicit write set; the shared network still exposes localhost and abstract
+  Unix sockets. Missing bwrap refuses before reserving a slot or creating a
+  shard. Spool records store the actual
+  boundary, and respins and retries preserve the shard/research boundary without
+  accepting substituted paths. External Git metadata is never writable, so Kimi
+  leaves shard changes uncommitted for the caller to inspect and commit before
+  `shard_merge`. Shard intent always stays contained; `full` without a shard is
+  the explicit uncontained mode.
 - `spindle spin --harness <name>` now resolves the same names the `spin` MCP
   tool does. A lodged profile name used to fall through to plain Claude Code
   with none of the profile's model, endpoint, or extra arguments applied, and an

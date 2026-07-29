@@ -30,7 +30,8 @@ MCP server for multi-harness AI agent delegation. Spawn background agents (Claud
   - [Gemini CLI](https://github.com/google-gemini/gemini-cli) (`gemini`)
   - [Kimi CLI](https://github.com/MoonshotAI/kimi-cli) (`kimi-cli`)
 - Git (for shard/worktree functionality)
-- `bwrap` (bubblewrap), on Linux, if you want shard worktrees filesystem-contained
+- `bwrap` (bubblewrap), on Linux, for filesystem-contained shards and every
+  non-`full` Kimi launch
 
 ## Install
 
@@ -328,6 +329,21 @@ Spindle supports multiple AI agent harnesses, allowing you to choose the best to
 - Fast startup (~5-10 seconds to first response)
 - Thinking mode for complex reasoning
 - Models: `"k3"`/`"latest"`/`"thinking"` (K3, always thinking; default), `"k2.7-code"`, `"k2.6"`, `"k2.5"`, or any full model name
+- Kimi headless mode auto-approves its tool calls; it has no classifier-vetted
+  or genuinely "careful" mode. Spindle therefore wraps every Kimi process
+  except `full` without shard intent in its own bwrap filesystem boundary. The
+  default makes only the requested working directory and Kimi's state directory
+  writable, with private `/tmp` and filesystem-path runtime sockets hidden behind
+  a private `/run`; host processes and IPC are in separate namespaces. The
+  network namespace remains shared, so localhost services and abstract Unix
+  sockets remain reachable. Shards substitute their worktree, and research adds
+  its explicit output target. External Git metadata stays read-only, so Kimi leaves shard changes
+  uncommitted. The caller inspects and commits them in the worktree, then calls
+  `shard_merge`. Kimi refuses to
+  start with a read-only work directory, so shared names such as `readonly` and
+  `careful` do not narrow its powers inside that box. Shard intent always stays
+  contained; `full` without a shard explicitly runs uncontained. Shard launches
+  require an absolute `KIMI_SHARE_DIR` when that override is used.
 - Use `harness="kimi"`
 
 ### Basic Usage
@@ -397,6 +413,8 @@ result = unspool(spool_id)  # Auto-detects harness
 **Kimi CLI:**
 - [Kimi CLI](https://github.com/MoonshotAI/kimi-cli) installed (`pip install kimi-cli`)
 - Auth via `kimi-cli login` or API key in `~/.kimi/config.toml`
+- Bubblewrap (`bwrap`) installed for normal use; only `permission="full"` opts
+  out of Spindle's external filesystem containment
 
 See [docs/MULTI_HARNESS_GUIDE.md](docs/MULTI_HARNESS_GUIDE.md) and [docs/CODEX_SETUP.md](docs/CODEX_SETUP.md) for detailed documentation.
 
@@ -476,7 +494,7 @@ for a worked example and the full schema reference.
 - `prompt` (required): The task for the agent
 - `harness` (optional): "claude-code" (default), "codex", "gemini", or "kimi"
 - `working_dir` (optional for Claude, required for Codex/Gemini/Kimi): Project directory
-- `permission` (optional): "readonly" (alias "manual"), "careful" (default, = auto), "full", "shard", "careful+shard", "research", "research+shard", "auto", "auto+shard" (readonly/manual cannot be combined with a shard — the pairing is rejected however the shard intent arrives: `readonly+shard`/`manual+shard`, or `readonly`/`manual` with `shard=True`)
+- `permission` (optional): "readonly" (alias "manual"), "careful" (default, = auto), "full", "shard", "careful+shard", "research", "research+shard", "auto", "auto+shard" (readonly/manual cannot be combined with shard intent; `auto` variants are Claude-only; other names map to harness-specific enforcement, and Kimi accepts them for compatibility but has no "careful" approval mode)
 - `model` (optional): Model to use ("sonnet", "opus", "opus-5", "haiku" for Claude; "flash", "pro" for Gemini; "k3", "latest", "thinking", "k2.7-code", "k2.6", "k2.5" for Kimi)
 - `timeout` (optional): Auto-kill after N seconds
 - `tags` (optional): Comma-separated tags for organization
