@@ -1714,6 +1714,7 @@ class TestCodexResultExtraction:
                 str(tmp_path),
                 {"PATH": str(tmp_path / "empty-path")},
             )
+            spindle._finish_spawn_barrier(spool_id, start=True)
             proc = spindle._PROC_HANDLES.pop(spool_id)
             assert proc.wait(timeout=5) == 7
             spool = _read_spool(spool_id)
@@ -2394,6 +2395,7 @@ class TestExitCodeCapture:
                 ],
                 str(tmp_path),
             )
+            spindle._finish_spawn_barrier(sid, start=True)
             spool = _read_spool(sid)
             spool["pid"] = pid
             spool["process_start_time"] = spindle._process_start_time(pid)
@@ -5052,6 +5054,7 @@ class TestKimiHarness:
                     str(work),
                     spindle._kimi_contained_spawn_env(None),
                 )
+                spindle._finish_spawn_barrier(spool_id, start=True)
                 deadline = time.monotonic() + 5
                 while (not heartbeat.exists() or heartbeat.stat().st_size < 2) and time.monotonic() < deadline:
                     time.sleep(0.05)

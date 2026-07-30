@@ -185,6 +185,11 @@ DEFAULT_PORT = _default_port()
 # Live subprocess handles keyed by spool_id, populated by _spawn_detached so
 # finalization can capture the child's exit code. Process-local; not persisted.
 _PROC_HANDLES: Dict[str, "subprocess.Popen"] = {}
+# Write ends of one-shot launch barriers. A detached wrapper cannot exec its
+# harness until the parent has durably published the wrapper PID. If the parent
+# dies first, kernel close-on-exit turns the wrapper's read into EOF and the
+# harness is never started.
+_SPAWN_BARRIERS: Dict[str, int] = {}
 _SPOOL_MONITORS: set[str] = set()
 _SPOOL_MONITORS_LOCK = threading.Lock()
 
@@ -212,6 +217,11 @@ UNSPOOL_TAIL_CHARS = int(os.environ.get("SPINDLE_UNSPOOL_TAIL_CHARS", "12000"))
 # overrides keep the real-subprocess crash contracts fast without adding a
 # production switch that can disable durable ownership.
 PENDING_SPAWN_TIMEOUT = float(os.environ.get("SPINDLE_PENDING_SPAWN_TIMEOUT", "60"))
+# A live launcher may legitimately spend longer than the stale-reservation
+# threshold creating a shard or importing a harness. Its durable PID protects
+# that setup window, but only for a bounded interval so a long-lived service
+# cannot leave a pending spool wedged after an internal exception.
+PENDING_LAUNCH_TIMEOUT = float(os.environ.get("SPINDLE_PENDING_LAUNCH_TIMEOUT", "120"))
 
 # Poll interval for monitoring detached processes
 MONITOR_POLL_INTERVAL = float(os.environ.get("SPINDLE_MONITOR_POLL_INTERVAL", "2"))
@@ -1994,7 +2004,11 @@ def _try_reserve_slot_and_create(
                 "status": initial_status,
                 "created_at": datetime.now().isoformat(),
                 "spool_schema_version": SPOOL_SCHEMA_VERSION,
+                "launcher_pid": os.getpid(),
             }
+            launcher_start_time = _process_start_time(os.getpid())
+            if launcher_start_time is not None:
+                spool["launcher_start_time"] = launcher_start_time
             if reservation_metadata:
                 spool.update(reservation_metadata)
             with _spool_lock(spool_id) as acquired:
@@ -2017,6 +2031,9 @@ def _prepare_pending_spool_for_spawn(spool: dict) -> bool:
                 "spool_schema_version",
                 current.get("spool_schema_version", SPOOL_SCHEMA_VERSION),
             )
+            for key in ("launcher_pid", "launcher_start_time"):
+                if key in current:
+                    spool.setdefault(key, current[key])
             _write_spool(spool_id, spool)
             return True
 
@@ -2080,43 +2097,52 @@ def _record_pre_spawn_failure(
         current["status"] = "error"
         current["error"] = error
         current["completed_at"] = datetime.now().isoformat()
+        current.pop("launcher_pid", None)
+        current.pop("launcher_start_time", None)
         _preserve_failed_spool_shard(current)
         _write_spool(spool_id, current)
 
 
 def _publish_spawned_process(spool_id: str, pid: int) -> bool:
     """Atomically move a reserved spool to running or retire its late process."""
-    with _spool_lock(spool_id) as acquired:
-        current = _read_spool(spool_id) if acquired else None
-        if current and current.get("status") == "pending":
-            current["pid"] = pid
-            process_start_time = _process_start_time(pid)
-            if process_start_time is not None:
-                current["process_start_time"] = process_start_time
-            current["status"] = "running"
-            _write_spool(spool_id, current)
-            return True
+    published = False
+    try:
+        with _spool_lock(spool_id) as acquired:
+            current = _read_spool(spool_id) if acquired else None
+            if current and current.get("status") == "pending":
+                current["pid"] = pid
+                process_start_time = _process_start_time(pid)
+                if process_start_time is not None:
+                    current["process_start_time"] = process_start_time
+                current["status"] = "running"
+                current.pop("launcher_pid", None)
+                current.pop("launcher_start_time", None)
+                _write_spool(spool_id, current)
+                published = True
+                return True
 
-        # Recovery or cancellation finalized the reservation while Popen was
-        # starting. Never leave that untracked process running in its shard.
-        process_start_time = _process_start_time(pid)
-        spawned_process = {"id": spool_id, "pid": pid}
-        if process_start_time is not None:
-            spawned_process["process_start_time"] = process_start_time
-        group_resolution = _resolve_spool_process_group(spawned_process, 0.2)
-        cleanup_succeeded = group_resolution in {"gone", "terminated"}
-        _pop_and_reap_process_handle(spool_id)
-        if current is not None and not cleanup_succeeded:
-            current["pid"] = pid
+            # Recovery or cancellation finalized the reservation while Popen was
+            # starting. Never leave that untracked process running in its shard.
+            process_start_time = _process_start_time(pid)
+            spawned_process = {"id": spool_id, "pid": pid}
             if process_start_time is not None:
-                current["process_start_time"] = process_start_time
-            else:
-                current.pop("process_start_time", None)
-            current["process_group_cleanup_warning"] = (
-                "Process group survived cleanup after spool startup lost its terminal race"
-            )
-            _write_spool(spool_id, current)
-        return False
+                spawned_process["process_start_time"] = process_start_time
+            group_resolution = _resolve_spool_process_group(spawned_process, 0.2)
+            cleanup_succeeded = group_resolution in {"gone", "terminated"}
+            _pop_and_reap_process_handle(spool_id)
+            if current is not None and not cleanup_succeeded:
+                current["pid"] = pid
+                if process_start_time is not None:
+                    current["process_start_time"] = process_start_time
+                else:
+                    current.pop("process_start_time", None)
+                current["process_group_cleanup_warning"] = (
+                    "Process group survived cleanup after spool startup lost its terminal race"
+                )
+                _write_spool(spool_id, current)
+            return False
+    finally:
+        _finish_spawn_barrier(spool_id, start=published)
 
 
 def _start_spool_process(
@@ -3267,20 +3293,72 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
 
 
 def _recover_deterministic_shard(current: dict) -> None:
-    """Attach a plain-git shard discoverable from a minimal reservation."""
+    """Attach a plain-git or SKEIN-named shard from a minimal reservation."""
     if current.get("shard") or not current.get("shard_requested"):
         return
     source = current.get("launch_working_dir")
     if not source:
         return
     worktree = Path(source) / "worktrees" / current["id"]
+    if worktree.exists():
+        shard_info = {
+            "worktree_path": str(worktree),
+            "branch_name": f"shard-{current['id']}",
+            "shard_id": current["id"],
+        }
+    else:
+        # SKEIN names a shard `{agent}-{YYYYMMDD}-{seq}` even though Spindle
+        # supplies the spool id as `--agent`. Query Git directly so recovery
+        # does not depend on SKEIN's server or SQLite metadata surviving the
+        # launcher. Exact agent and branch matching avoids adopting another
+        # spool's worktree; max() selects the newest zero-padded sequence if a
+        # previous crashed attempt with the same id also remains.
+        try:
+            result = subprocess.run(
+                ["git", "worktree", "list", "--porcelain"],
+                cwd=source,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            return
+        if result.returncode != 0:
+            return
+
+        candidates = []
+        candidate_path = None
+        candidate_branch = None
+        for line in [*result.stdout.splitlines(), ""]:
+            if line.startswith("worktree "):
+                if candidate_path is not None:
+                    candidates.append((candidate_path, candidate_branch))
+                candidate_path = Path(line.split(" ", 1)[1])
+                candidate_branch = None
+            elif line.startswith("branch "):
+                candidate_branch = line.split(" ", 1)[1].removeprefix("refs/heads/")
+            elif not line and candidate_path is not None:
+                candidates.append((candidate_path, candidate_branch))
+                candidate_path = None
+                candidate_branch = None
+
+        name_pattern = re.compile(rf"^{re.escape(current['id'])}-\d{{8}}-\d{{3}}$")
+        matching = [
+            (path, branch)
+            for path, branch in candidates
+            if name_pattern.fullmatch(path.name) and branch == f"shard-{path.name}" and path.exists()
+        ]
+        if not matching:
+            return
+        worktree, branch_name = max(matching, key=lambda item: item[0].name)
+        shard_info = {
+            "worktree_path": str(worktree),
+            "branch_name": branch_name,
+            "shard_id": f"shard-{worktree.name}",
+        }
+
     if not worktree.exists():
         return
-    shard_info = {
-        "worktree_path": str(worktree),
-        "branch_name": f"shard-{current['id']}",
-        "shard_id": current["id"],
-    }
     current.update(
         {
             "working_dir": str(worktree),
@@ -3306,12 +3384,23 @@ def _reconcile_pending_spool(spool_id: str) -> bool:
         except (KeyError, TypeError, ValueError):
             return True
         now = datetime.now(timezone.utc) if created.tzinfo else datetime.now()
-        if (now - created).total_seconds() <= PENDING_SPAWN_TIMEOUT:
+        elapsed = (now - created).total_seconds()
+        if elapsed <= PENDING_SPAWN_TIMEOUT:
             return True
+        launcher_pid = current.get("launcher_pid")
+        if launcher_pid and elapsed <= PENDING_LAUNCH_TIMEOUT:
+            expected_start_time = current.get("launcher_start_time")
+            if expected_start_time is None:
+                if _is_pid_alive(launcher_pid):
+                    return True
+            elif _process_start_time(launcher_pid) == str(expected_start_time):
+                return True
         _recover_deterministic_shard(current)
         current["status"] = "error"
         current["error"] = "spawn timeout - never started"
         current["completed_at"] = now.isoformat()
+        current.pop("launcher_pid", None)
+        current.pop("launcher_start_time", None)
         _preserve_failed_spool_shard(current)
         _write_spool(spool_id, current)
         return False
@@ -3616,11 +3705,14 @@ def _handle_expired_session_locked(spool_id: str, spool: dict) -> bool:
             process_env=_process_env(spawn_env),
         )
 
+    spawned = False
+    started = False
     try:
         if spawn_stdin is not None:
             new_pid = _spawn_detached(spool_id, cmd, fallback_cwd, spawn_env, stdin_path=spawn_stdin)
         else:
             new_pid = _spawn_detached(spool_id, cmd, fallback_cwd, spawn_env)
+        spawned = True
 
         # Update spool with new PID and mark as using transcript fallback
         spool["pid"] = new_pid
@@ -3638,9 +3730,15 @@ def _handle_expired_session_locked(spool_id: str, spool: dict) -> bool:
         spool["claude_protocol"] = claude_protocol
         _write_spool(spool_id, spool)
 
+        started = True
         return True
     except Exception:
         return False
+    finally:
+        if spawned:
+            _finish_spawn_barrier(spool_id, start=started)
+            if not started:
+                _pop_and_reap_process_handle(spool_id)
 
 
 def _spool_elapsed_seconds(spool: dict) -> Optional[float]:
@@ -3801,6 +3899,22 @@ def _run_store_supervisor(store: str, lock_fd: int) -> None:
             os.close(owned_fd)
 
 
+def _finish_spawn_barrier(spool_id: str, *, start: bool) -> None:
+    """Release a durably published launch, or close the gate without exec."""
+    barrier_fd = _SPAWN_BARRIERS.pop(spool_id, None)
+    if barrier_fd is None:
+        return
+    try:
+        if start:
+            os.write(barrier_fd, b"go\n")
+    except OSError:
+        # A child that died before publication will be reconciled from its
+        # durable PID and exit-status file like any other failed launch.
+        pass
+    finally:
+        os.close(barrier_fd)
+
+
 def _spawn_detached(
     spool_id: str,
     cmd: list,
@@ -3835,14 +3949,33 @@ def _spawn_detached(
 
     # A Popen handle is process-local and disappears when the Spindle server
     # restarts. Keep a tiny detached shell as the process-group leader so it can
-    # persist the real child exit status for orphan recovery. The shell writes
-    # one integer before exiting, so readers only inspect it after the PID is
-    # dead; a partial/missing write fails closed. `"$@"` passes every argv item
-    # literally, and no non-POSIX utility path is required.
-    wrapper_script = 'status_file="$1"; shift; "$@"; rc=$?; printf "%s\\n" "$rc" > "$status_file"; exit "$rc"'
-    wrapped_cmd = ["/bin/sh", "-c", wrapper_script, "spindle-exit-status", str(exit_path), *cmd]
-
+    # persist the real child exit status for orphan recovery. Before exec it
+    # blocks on an inherited pipe: the parent releases that barrier only after
+    # the PID is durable. Parent death produces EOF, records a startup failure,
+    # and exits without ever running the harness. `"$@"` passes argv literally.
     stdin_file = open(stdin_path, "r") if stdin_path is not None else None
+    try:
+        barrier_read_fd, barrier_write_fd = os.pipe()
+    except Exception:
+        if stdin_file is not None:
+            stdin_file.close()
+        raise
+    wrapper_script = (
+        'barrier_fd="$1"; status_file="$2"; shift 2; '
+        'if ! IFS= read -r token < "/dev/fd/$barrier_fd"; then '
+        'rc=125; printf "%s\\n" "$rc" > "$status_file"; exit "$rc"; fi; '
+        '"$@"; rc=$?; printf "%s\\n" "$rc" > "$status_file"; exit "$rc"'
+    )
+    wrapped_cmd = [
+        "/bin/sh",
+        "-c",
+        wrapper_script,
+        "spindle-exit-status",
+        str(barrier_read_fd),
+        str(exit_path),
+        *cmd,
+    ]
+
     try:
         with open(stdout_path, "w") as stdout_file, open(stderr_path, "w") as stderr_file:
             proc = subprocess.Popen(
@@ -3853,14 +3986,20 @@ def _spawn_detached(
                 cwd=cwd,
                 env=process_env,
                 start_new_session=True,  # Detach from parent
+                pass_fds=(barrier_read_fd,),
             )
+    except Exception:
+        os.close(barrier_write_fd)
+        raise
     finally:
+        os.close(barrier_read_fd)
         if stdin_file is not None:
             stdin_file.close()
 
     # Keep the handle for fast-path polling and reaping. The exit-status file is
     # authoritative after a restart when this in-memory handle no longer exists.
     _PROC_HANDLES[spool_id] = proc
+    _SPAWN_BARRIERS[spool_id] = barrier_write_fd
     return proc.pid
 
 

@@ -524,6 +524,65 @@ def test_cli_process_group_death_does_not_kill_detached_owner_or_harness(supervi
     assert _wait_spool(store, spool_id, "complete")["result"] == "durable result"
 
 
+def test_launcher_death_between_popen_and_pid_publication_never_executes_harness(supervisor_env):
+    env, store, workdir = supervisor_env
+    spool_id = "post-popen-launcher-death"
+    marker = store / "harness-ran"
+    harness = f"from pathlib import Path; Path({str(marker)!r}).touch()"
+    launcher = textwrap.dedent(
+        f"""\
+        import os
+        import sys
+        from datetime import datetime
+
+        import spindle
+
+        spool_id = {spool_id!r}
+        ok, error = spindle._try_reserve_slot_and_create(
+            spool_id,
+            reservation_metadata={{"harness": "claude-code"}},
+        )
+        assert ok, error
+        spool = {{
+            "id": spool_id,
+            "status": "pending",
+            "prompt": "post-Popen crash",
+            "result": None,
+            "session_id": None,
+            "working_dir": {str(workdir)!r},
+            "created_at": datetime.now().isoformat(),
+            "completed_at": None,
+            "pid": None,
+            "error": None,
+            "harness": "claude-code",
+        }}
+        assert spindle._prepare_pending_spool_for_spawn(spool)
+        spindle._spawn_detached(
+            spool_id,
+            [sys.executable, "-c", {harness!r}],
+            {str(workdir)!r},
+            None,
+        )
+        os._exit(77)
+        """
+    )
+
+    launcher_proc = subprocess.run(
+        [sys.executable, "-c", launcher],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert launcher_proc.returncode == 77, launcher_proc.stderr
+    spool = _wait_spool(store, spool_id, "error", timeout=5)
+    assert spool.get("pid") is None
+    assert "spawn timeout" in spool["error"]
+    assert not marker.exists()
+
+
 def test_launcher_death_after_shard_creation_preserves_recovery_metadata(supervisor_env, tmp_path):
     env, store, _ = supervisor_env
     repo = tmp_path / "repo"
@@ -581,6 +640,137 @@ def test_launcher_death_after_shard_creation_preserves_recovery_metadata(supervi
     assert worktree.name == spool_id
     assert spool["shard"]["branch_name"] == f"shard-{spool_id}"
     assert spool["shard_cleanup_preserved"] is True
+
+
+def test_launcher_death_mid_skein_spawn_recovers_created_shard(supervisor_env, tmp_path):
+    env, store, _ = supervisor_env
+    env["SPINDLE_PENDING_SPAWN_TIMEOUT"] = "2"
+    repo = tmp_path / "skein-repo"
+    repo.mkdir()
+    (repo / ".skein").mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
+    (repo / "README.md").write_text("base\n")
+    subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Spindle Test",
+            "-c",
+            "user.email=spindle@example.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "base",
+        ],
+        cwd=repo,
+        check=True,
+    )
+
+    ready = store / "skein-spawn.ready"
+    release = store / "skein-spawn.release"
+    env["FAKE_SKEIN_READY"] = str(ready)
+    env["FAKE_SKEIN_RELEASE"] = str(release)
+    fake_skein = Path(env["PATH"].split(os.pathsep)[0]) / "skein"
+    fake_skein.write_text(
+        textwrap.dedent(
+            """\
+            #!/usr/bin/env python3
+            import json
+            import os
+            import subprocess
+            import sys
+            import time
+            from pathlib import Path
+
+            args = sys.argv[1:]
+            if args and args[0] == "health":
+                print(json.dumps({"healthy": True}))
+                raise SystemExit(0)
+
+            agent = args[args.index("--agent") + 1]
+            repo = Path.cwd()
+            worktrees = repo / "worktrees"
+            worktree = worktrees / f"{agent}-20990101-001"
+            branch = f"shard-{agent}-20990101-001"
+            if args[:2] == ["shard", "spawn"]:
+                worktrees.mkdir(exist_ok=True)
+                subprocess.run(
+                    ["git", "worktree", "add", str(worktree), "-b", branch, "main"],
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                Path(os.environ["FAKE_SKEIN_READY"]).touch()
+                release = Path(os.environ["FAKE_SKEIN_RELEASE"])
+                while not release.exists():
+                    time.sleep(0.02)
+                print(f"Worktree: {worktree}")
+                print(f"Branch: {branch}")
+                raise SystemExit(0)
+
+            if args[:2] == ["shard", "list"]:
+                items = []
+                if worktree.exists():
+                    items.append({
+                        "worktree_name": worktree.name,
+                        "worktree_path": str(worktree),
+                        "branch_name": branch,
+                        "name": agent,
+                        "date": "20990101",
+                        "seq": "001",
+                    })
+                print(json.dumps(items))
+                raise SystemExit(0)
+
+            raise SystemExit(2)
+            """
+        )
+    )
+    fake_skein.chmod(0o755)
+
+    spool_id = "skein-crash-window"
+    launcher = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            textwrap.dedent(
+                f"""\
+                import spindle
+                ok, error = spindle._try_reserve_slot_and_create(
+                    {spool_id!r},
+                    reservation_metadata={{
+                        "launch_working_dir": {str(repo)!r},
+                        "base_branch": "main",
+                        "harness": "claude-code",
+                        "shard_requested": True,
+                    }},
+                )
+                assert ok, error
+                spindle._spawn_shard({spool_id!r}, {str(repo)!r}, base_branch="main")
+                """
+            ),
+        ],
+        cwd=REPO_ROOT,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        _wait_for(ready.exists, timeout=10, description="SKEIN worktree creation")
+        launcher.kill()
+        launcher.wait(timeout=5)
+
+        spool = _wait_spool(store, spool_id, "error", timeout=10)
+        expected_worktree = repo / "worktrees" / f"{spool_id}-20990101-001"
+        assert spool["shard"]["worktree_path"] == str(expected_worktree)
+        assert spool["shard"]["branch_name"] == f"shard-{spool_id}-20990101-001"
+        assert spool["working_dir"] == str(expected_worktree)
+        assert spool["shard_created_by_spool"] is True
+        assert spool["shard_cleanup_preserved"] is True
+    finally:
+        release.touch()
 
 
 def test_expired_session_replacement_remains_owned_to_terminal(supervisor_env):
