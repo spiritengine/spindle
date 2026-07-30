@@ -766,6 +766,7 @@ def test_launcher_death_mid_skein_spawn_recovers_created_shard(supervisor_env, t
         expected_worktree = repo / "worktrees" / f"{spool_id}-20990101-001"
         assert spool["shard"]["worktree_path"] == str(expected_worktree)
         assert spool["shard"]["branch_name"] == f"shard-{spool_id}-20990101-001"
+        assert spool["shard"]["shard_id"] == expected_worktree.name
         assert spool["working_dir"] == str(expected_worktree)
         assert spool["shard_created_by_spool"] is True
         assert spool["shard_cleanup_preserved"] is True

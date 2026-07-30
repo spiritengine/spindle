@@ -2411,6 +2411,45 @@ class TestExitCodeCapture:
         assert saved["exit_code"] == 0
         assert saved["result"].strip() == stream
 
+    def test_detached_wrapper_closes_barrier_and_exposes_portable_identity(self, tmp_path):
+        if not Path("/proc/self/fd").exists():
+            pytest.skip("fd inheritance probe requires procfs")
+
+        spool_id = "portable-process-identity"
+        ready = tmp_path / "ready"
+        fds = tmp_path / "fds.json"
+        child = (
+            "import json, os, time; "
+            "from pathlib import Path; "
+            f"root=Path('/proc/self/fd'); Path({str(fds)!r}).write_text("
+            "json.dumps([os.readlink(path) for path in root.iterdir() "
+            "if path.name.isdigit() and path.exists()])); "
+            f"Path({str(ready)!r}).touch(); time.sleep(30)"
+        )
+        pid = spindle._spawn_detached(
+            spool_id,
+            [sys.executable, "-c", child],
+            str(tmp_path),
+        )
+        handle = spindle._PROC_HANDLES.pop(spool_id)
+        spindle._finish_spawn_barrier(spool_id, start=True)
+        try:
+            deadline = time.monotonic() + 5
+            while not ready.exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            assert ready.exists()
+
+            # This is the supervisor's post-restart view: no local Popen handle
+            # and no Linux /proc birth token persisted on the spool.
+            spool = {"id": spool_id, "pid": pid}
+            assert spindle._spool_process_group_identity_matches(spool) is True
+            assert all(not target.startswith("pipe:") for target in json.loads(fds.read_text()))
+        finally:
+            spindle._terminate_process_group(pid, 0.2)
+            handle.wait(timeout=5)
+
+        assert spindle._spool_process_group_identity_matches(spool) is False
+
 
 class TestCancellationTermination:
     @pytest.mark.parametrize("tool_path", ["sync", "async"])

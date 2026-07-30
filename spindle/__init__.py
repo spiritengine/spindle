@@ -1177,6 +1177,11 @@ def _get_exit_path(spool_id: str) -> Path:
     return SPINDLE_DIR / f"{spool_id}.exit"
 
 
+def _get_process_identity_path(spool_id: str) -> Path:
+    """Get the portable lifetime-lock path for a detached wrapper."""
+    return SPINDLE_DIR / f"{spool_id}.process"
+
+
 def _get_prompt_path(spool_id: str) -> Path:
     """Get path to a spool's file-delivered prompt.
 
@@ -2496,8 +2501,29 @@ def _spool_process_identity_matches(spool: dict) -> bool:
     expected_start_time = spool.get("process_start_time")
     if expected_start_time is not None:
         return _process_start_time(pid) == str(expected_start_time)
+    if _process_identity_lock_is_held(spool.get("id")):
+        return _is_pid_alive(pid)
     proc = _PROC_HANDLES.get(spool.get("id"))
     return proc is not None and getattr(proc, "pid", None) == pid and proc.poll() is None
+
+
+def _process_identity_lock_is_held(spool_id: Optional[str]) -> bool:
+    """Whether the original detached wrapper still owns its portable lock."""
+    if not spool_id:
+        return False
+    path = _get_process_identity_path(spool_id)
+    if not path.exists():
+        return False
+    fd = os.open(path, os.O_RDWR)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(fd)
 
 
 def _spool_process_group_identity_matches(spool: dict) -> bool:
@@ -2517,6 +2543,12 @@ def _spool_process_group_identity_matches(spool: dict) -> bool:
         if current_start_time is not None:
             return current_start_time == str(expected_start_time)
         return not _is_pid_alive(pid) and _is_process_group_alive(pid)
+    if _process_identity_lock_is_held(spool.get("id")):
+        return _is_pid_alive(pid)
+    if not _is_pid_alive(pid) and _is_process_group_alive(pid):
+        # The old group keeps its numeric ID reserved after its leader exits,
+        # so no unrelated process can yet reuse that PID as a new group leader.
+        return True
     return _spool_process_identity_matches(spool)
 
 
@@ -2791,6 +2823,7 @@ def _cleanup_old_spools() -> None:
                 stdout_path = _get_output_path(spool_id)
                 stderr_path = _get_stderr_path(spool_id)
                 exit_path = _get_exit_path(spool_id)
+                process_identity_path = _get_process_identity_path(spool_id)
                 lock_path = _get_lock_path(spool_id)
                 if stdout_path.exists():
                     stdout_path.unlink()
@@ -2798,6 +2831,8 @@ def _cleanup_old_spools() -> None:
                     stderr_path.unlink()
                 if exit_path.exists():
                     exit_path.unlink()
+                if process_identity_path.exists():
+                    process_identity_path.unlink()
                 if lock_path.exists():
                     lock_path.unlink()
         except Exception:
@@ -3287,6 +3322,7 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
             exit_path = _get_exit_path(spool_id)
             if exit_path.exists():
                 exit_path.unlink()
+            _get_process_identity_path(spool_id).unlink(missing_ok=True)
             _get_prompt_path(spool_id).unlink(missing_ok=True)
 
         return True
@@ -3354,7 +3390,7 @@ def _recover_deterministic_shard(current: dict) -> None:
         shard_info = {
             "worktree_path": str(worktree),
             "branch_name": branch_name,
-            "shard_id": f"shard-{worktree.name}",
+            "shard_id": worktree.name,
         }
 
     if not worktree.exists():
@@ -3811,6 +3847,7 @@ def _reconcile_spool_step(spool_id: str) -> bool:
                     _reap_process_handle_later(proc)
                 if "process_group_cleanup_warning" not in spool:
                     _get_exit_path(spool_id).unlink(missing_ok=True)
+                    _get_process_identity_path(spool_id).unlink(missing_ok=True)
             return False
 
     # A successful same-spool replacement stays running. The supervisor sees
@@ -3948,30 +3985,56 @@ def _spawn_detached(
         raise FileNotFoundError(f"executable not found or not runnable: {executable}")
 
     # A Popen handle is process-local and disappears when the Spindle server
-    # restarts. Keep a tiny detached shell as the process-group leader so it can
-    # persist the real child exit status for orphan recovery. Before exec it
-    # blocks on an inherited pipe: the parent releases that barrier only after
-    # the PID is durable. Parent death produces EOF, records a startup failure,
-    # and exits without ever running the harness. `"$@"` passes argv literally.
+    # restarts. Keep a tiny detached Python wrapper as the process-group leader
+    # so it can persist the real child exit status and hold a portable lifetime
+    # lock. Before starting the harness it blocks on an inherited pipe: the
+    # parent releases that barrier only after the PID is durable. Parent death
+    # produces EOF and exits without ever running the harness.
     stdin_file = open(stdin_path, "r") if stdin_path is not None else None
+    identity_path = _get_process_identity_path(spool_id)
+    identity_fd = os.open(identity_path, os.O_CREAT | os.O_RDWR)
     try:
+        fcntl.flock(identity_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         barrier_read_fd, barrier_write_fd = os.pipe()
-    except Exception:
+    except (BlockingIOError, OSError):
+        os.close(identity_fd)
         if stdin_file is not None:
             stdin_file.close()
         raise
     wrapper_script = (
-        'barrier_fd="$1"; status_file="$2"; shift 2; '
-        'if ! IFS= read -r token < "/dev/fd/$barrier_fd"; then '
-        'rc=125; printf "%s\\n" "$rc" > "$status_file"; exit "$rc"; fi; '
-        '"$@"; rc=$?; printf "%s\\n" "$rc" > "$status_file"; exit "$rc"'
+        "import os, subprocess, sys\n"
+        "barrier_fd = int(sys.argv[1])\n"
+        "identity_fd = int(sys.argv[2])\n"
+        "status_path = sys.argv[3]\n"
+        "command = sys.argv[4:]\n"
+        "try:\n"
+        "    try:\n"
+        "        released = bool(os.read(barrier_fd, 3))\n"
+        "    finally:\n"
+        "        os.close(barrier_fd)\n"
+        "    os.set_inheritable(identity_fd, False)\n"
+        "    if released:\n"
+        "        try:\n"
+        "            rc = subprocess.run(command).returncode\n"
+        "            if rc < 0:\n"
+        "                rc = 128 - rc\n"
+        "        except OSError as exc:\n"
+        "            print(f'spindle: harness exec failed: {exc}', file=sys.stderr, flush=True)\n"
+        "            rc = 127\n"
+        "    else:\n"
+        "        rc = 125\n"
+        "    with open(status_path, 'w') as status_file:\n"
+        "        status_file.write(f'{rc}\\n')\n"
+        "finally:\n"
+        "    os.close(identity_fd)\n"
+        "raise SystemExit(rc)\n"
     )
     wrapped_cmd = [
-        "/bin/sh",
+        sys.executable,
         "-c",
         wrapper_script,
-        "spindle-exit-status",
         str(barrier_read_fd),
+        str(identity_fd),
         str(exit_path),
         *cmd,
     ]
@@ -3986,13 +4049,15 @@ def _spawn_detached(
                 cwd=cwd,
                 env=process_env,
                 start_new_session=True,  # Detach from parent
-                pass_fds=(barrier_read_fd,),
+                pass_fds=(barrier_read_fd, identity_fd),
             )
     except Exception:
         os.close(barrier_write_fd)
+        identity_path.unlink(missing_ok=True)
         raise
     finally:
         os.close(barrier_read_fd)
+        os.close(identity_fd)
         if stdin_file is not None:
             stdin_file.close()
 
@@ -4730,6 +4795,7 @@ def _spin_drop_locked(spool_id: str) -> str:
         if stderr_path.exists():
             stderr_path.unlink()
         _get_exit_path(spool_id).unlink(missing_ok=True)
+        _get_process_identity_path(spool_id).unlink(missing_ok=True)
 
     result = f"Dropped spool {spool_id}"
     if not group_cleanup_succeeded:
