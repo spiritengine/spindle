@@ -2450,6 +2450,13 @@ class TestExitCodeCapture:
 
         assert spindle._spool_process_group_identity_matches(spool) is False
 
+    def test_child_environment_strips_supervisor_import_guard(self, monkeypatch):
+        guard = spindle.SUPERVISOR_IMPORT_GUARD
+        monkeypatch.setenv(guard, "1")
+
+        assert guard not in spindle._process_env()
+        assert guard not in spindle._process_env({guard: "1"})
+
 
 class TestCancellationTermination:
     @pytest.mark.parametrize("tool_path", ["sync", "async"])
@@ -11525,6 +11532,7 @@ class TestDoctorStorage:
         store = tmp_path / "spools"
         monkeypatch.setattr(spindle, "SPINDLE_DIR", store)
         spindle._write_spool("abc12345", {"id": "abc12345", "status": "complete"})
+        (store / ".supervisor.json").write_text('{"pid": 123}')
         result = spindle._doctor_storage_check()
         assert result["status"] == "ok"
         assert result["data"]["spools"] == 1

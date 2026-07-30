@@ -7121,6 +7121,10 @@ def _process_env(overrides: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     process_env = os.environ.copy()
     if overrides:
         process_env.update(overrides)
+    # This guard belongs only to the explicitly launched store supervisor.
+    # Never let a supervisor retry leak it into a harness (or a nested Spindle
+    # server started by that harness).
+    process_env.pop(SUPERVISOR_IMPORT_GUARD, None)
     return process_env
 
 
@@ -9425,7 +9429,7 @@ def _doctor_storage_check() -> dict:
         except OSError:
             pass
 
-    count = len(list(store.glob("*.json")))
+    count = sum(1 for path in store.glob("*.json") if not path.name.startswith("."))
     return _doctor_result(
         "storage",
         "ok",
