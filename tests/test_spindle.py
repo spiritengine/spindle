@@ -1714,6 +1714,7 @@ class TestCodexResultExtraction:
                 str(tmp_path),
                 {"PATH": str(tmp_path / "empty-path")},
             )
+            spindle._finish_spawn_barrier(spool_id, start=True)
             proc = spindle._PROC_HANDLES.pop(spool_id)
             assert proc.wait(timeout=5) == 7
             spool = _read_spool(spool_id)
@@ -2394,6 +2395,7 @@ class TestExitCodeCapture:
                 ],
                 str(tmp_path),
             )
+            spindle._finish_spawn_barrier(sid, start=True)
             spool = _read_spool(sid)
             spool["pid"] = pid
             spool["process_start_time"] = spindle._process_start_time(pid)
@@ -2408,6 +2410,52 @@ class TestExitCodeCapture:
         assert saved["status"] == "complete"
         assert saved["exit_code"] == 0
         assert saved["result"].strip() == stream
+
+    def test_detached_wrapper_closes_barrier_and_exposes_portable_identity(self, tmp_path):
+        if not Path("/proc/self/fd").exists():
+            pytest.skip("fd inheritance probe requires procfs")
+
+        spool_id = "portable-process-identity"
+        ready = tmp_path / "ready"
+        fds = tmp_path / "fds.json"
+        child = (
+            "import json, os, time; "
+            "from pathlib import Path; "
+            f"root=Path('/proc/self/fd'); Path({str(fds)!r}).write_text("
+            "json.dumps([os.readlink(path) for path in root.iterdir() "
+            "if path.name.isdigit() and path.exists()])); "
+            f"Path({str(ready)!r}).touch(); time.sleep(30)"
+        )
+        pid = spindle._spawn_detached(
+            spool_id,
+            [sys.executable, "-c", child],
+            str(tmp_path),
+        )
+        handle = spindle._PROC_HANDLES.pop(spool_id)
+        spindle._finish_spawn_barrier(spool_id, start=True)
+        try:
+            deadline = time.monotonic() + 5
+            while not ready.exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            assert ready.exists()
+
+            # This is the supervisor's post-restart view: no local Popen handle
+            # and no Linux /proc birth token persisted on the spool.
+            spool = {"id": spool_id, "pid": pid}
+            assert spindle._spool_process_group_identity_matches(spool) is True
+            assert all(not target.startswith("pipe:") for target in json.loads(fds.read_text()))
+        finally:
+            spindle._terminate_process_group(pid, 0.2)
+            handle.wait(timeout=5)
+
+        assert spindle._spool_process_group_identity_matches(spool) is False
+
+    def test_child_environment_strips_supervisor_import_guard(self, monkeypatch):
+        guard = spindle.SUPERVISOR_IMPORT_GUARD
+        monkeypatch.setenv(guard, "1")
+
+        assert guard not in spindle._process_env()
+        assert guard not in spindle._process_env({guard: "1"})
 
 
 class TestCancellationTermination:
@@ -5052,6 +5100,7 @@ class TestKimiHarness:
                     str(work),
                     spindle._kimi_contained_spawn_env(None),
                 )
+                spindle._finish_spawn_barrier(spool_id, start=True)
                 deadline = time.monotonic() + 5
                 while (not heartbeat.exists() or heartbeat.stat().st_size < 2) and time.monotonic() < deadline:
                     time.sleep(0.05)
@@ -11483,6 +11532,7 @@ class TestDoctorStorage:
         store = tmp_path / "spools"
         monkeypatch.setattr(spindle, "SPINDLE_DIR", store)
         spindle._write_spool("abc12345", {"id": "abc12345", "status": "complete"})
+        (store / ".supervisor.json").write_text('{"pid": 123}')
         result = spindle._doctor_storage_check()
         assert result["status"] == "ok"
         assert result["data"]["spools"] == 1

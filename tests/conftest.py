@@ -65,8 +65,7 @@ def _isolate_spindle_store(tmp_path, monkeypatch):
     spindle._reload_pending = False
 
     # Don't let *_spin_sync spawn a real background monitor thread: with the
-    # subprocess mocked there's nothing to monitor, and a daemon thread that
-    # outlives the test races SPINDLE_DIR teardown. The two tests that exercise
-    # _monitor_spool directly call it via their own imported reference, which
-    # this module-attribute patch doesn't touch.
+    # subprocess mocked there's nothing to monitor. Durable-supervisor contract
+    # tests use fresh subprocesses and therefore do not inherit these patches.
     monkeypatch.setattr(spindle, "_monitor_spool", lambda spool_id: None)
+    monkeypatch.setattr(spindle, "_ensure_store_supervisor_locked", lambda: (True, None))
