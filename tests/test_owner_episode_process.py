@@ -8,8 +8,7 @@ the spool record is the only thing these tests read for lifecycle truth.
 from __future__ import annotations
 
 import json
-import threading
-from concurrent.futures import ThreadPoolExecutor
+import multiprocessing
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -212,14 +211,18 @@ def test_late_prior_generation_watchdog_write_cannot_touch_the_next_reservation(
 
 def test_synchronous_spawn_failure_aborts_the_reserved_episode(episode_store, tmp_path):
     spool_id = "sync-spawn-failure"
-    episode_store.write(spool_id, status="pending", episode=make_episode("reserved", generation=1))
+    reserved = make_episode("reserved", generation=1, path="before_watchdog")
+    assert reserved["revision"] == 1
+    assert "watchdog" not in reserved
+    episode_store.write(spool_id, status="pending", episode=reserved)
 
     error = spindle._start_spool_process({"id": spool_id}, ["/nonexistent/spindle-provider"], str(tmp_path), None)
 
     assert error is not None and "spawn" in error
     stored = episode_store.episode(spool_id)
     assert stored is not None, "the failed spawn dropped the episode"
-    assert (stored["phase"], stored["generation"]) == ("aborted", 1)
+    assert (stored["phase"], stored["generation"], stored["revision"]) == ("aborted", 1, 2)
+    assert "watchdog" not in stored
     assert stored["failure"]
     assert spindle._count_running() == 0
 
@@ -334,6 +337,10 @@ def _start_final_sweep_case(watchdog_owner_case, caller, tmp_path, checkpoint):
         spool_id=spool_id,
         spool_overrides=overrides,
     )
+    if caller == "timeout":
+        spool = owner.spool()
+        assert spool["timeout"] == 1
+        assert spool[EPISODE_KEY]["deadline"] == spool["wall_deadline_at"]
     if caller == "expired_session":
         (owner.store / f"{spool_id}.stderr").write_text(
             "No conversation found with session ID: expired-session"
@@ -392,7 +399,8 @@ def test_final_sweep_guard_wins_and_later_caller_creates_no_request(
     assert owner.receive_checkpoint(timeout=2)["name"] == "final_mailbox_guard_acquired"
     assert list(iter_control_requests(owner.store, owner.spool_id)) == []
 
-    attempted = threading.Event()
+    process_context = multiprocessing.get_context("fork")
+    attempted = process_context.Event()
     real_guard = spindle.mailbox_guard
 
     @contextmanager
@@ -402,16 +410,29 @@ def test_final_sweep_guard_wins_and_later_caller_creates_no_request(
             yield
 
     monkeypatch.setattr(spindle, "mailbox_guard", observed_guard)
-    executor = ThreadPoolExecutor(max_workers=1)
-    future = executor.submit(_invoke_final_sweep_caller, caller, owner, tmp_path)
+    waiter = process_context.Process(target=_invoke_final_sweep_caller, args=(caller, owner, tmp_path))
+    waiter.start()
+    owner_resumed = False
     try:
         assert attempted.wait(timeout=2), f"{caller} did not enter mailbox-first admission"
-        assert not future.done(), f"{caller} bypassed the final-sweep mailbox guard"
-    finally:
+        assert waiter.is_alive(), f"{caller} bypassed the final-sweep mailbox guard"
         owner.resume()
-        executor.shutdown(wait=True)
+        owner_resumed = True
+        waiter.join(timeout=8)
+        if waiter.is_alive():
+            pytest.fail(f"{caller} remained blocked after the owner released the final-sweep guard")
+        assert waiter.exitcode == 0, f"{caller} waiter exited with {waiter.exitcode}"
+    finally:
+        if not owner_resumed:
+            owner.resume()
+        if waiter.is_alive():
+            waiter.terminate()
+            waiter.join(timeout=2)
+        if waiter.is_alive():
+            waiter.kill()
+            waiter.join(timeout=2)
+        waiter.close()
 
-    future.result()
     owner.process.wait(timeout=8)
     assert list(iter_control_requests(owner.store, owner.spool_id)) == []
 

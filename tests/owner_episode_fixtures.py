@@ -223,7 +223,9 @@ def make_episode(
         "generation": generation,
         "revision": path_revision if revision is None else revision,
         "phase": phase,
-        "phase_times": {name: "2026-08-11T00:00:00+00:00" for name in _phase_history(phase)},
+        "phase_times": {
+            name: "2026-08-11T00:00:00+00:00" for name in _phase_history(phase, phase_facts)
+        },
     }
     episode.update(facts_for(*phase_facts))
     if deadline is not None:
@@ -232,11 +234,20 @@ def make_episode(
     return episode
 
 
-def _phase_history(phase: str) -> tuple:
+def _phase_history(phase: str, phase_facts: tuple) -> tuple:
     if phase == "aborted":
         return ("reserved", "aborted")
-    order = ("reserved", "lock_bound", "accepted", "cleanup_proven", "released")
-    return order[: order.index(phase) + 1]
+    history = ["reserved"]
+    for fact, reached_phase in (
+        ("owner", "lock_bound"),
+        ("provider", "accepted"),
+        ("cleanup", "cleanup_proven"),
+        ("release", "released"),
+    ):
+        if fact in phase_facts:
+            history.append(reached_phase)
+    assert history[-1] == phase
+    return tuple(history)
 
 
 # --- production-name indirection -------------------------------------------

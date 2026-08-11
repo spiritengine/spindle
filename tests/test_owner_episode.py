@@ -109,6 +109,33 @@ def test_episode_format_marker_is_published(episode_api):
     assert episode_api.OWNER_EPISODE_FORMAT == OWNER_EPISODE_FORMAT
 
 
+def test_fixture_phase_times_follow_the_selected_episode_path():
+    normal = make_episode("released")
+    pre_watchdog_abort = make_episode("aborted", path="launcher_before_watchdog")
+    pre_acceptance_cleanup = make_episode("cleanup_proven", path="before_acceptance")
+    pre_acceptance_release = make_episode("released", path="before_acceptance")
+
+    assert tuple(normal["phase_times"]) == (
+        "reserved",
+        "lock_bound",
+        "accepted",
+        "cleanup_proven",
+        "released",
+    )
+    assert tuple(pre_watchdog_abort["phase_times"]) == ("reserved", "aborted")
+    assert tuple(pre_acceptance_cleanup["phase_times"]) == (
+        "reserved",
+        "lock_bound",
+        "cleanup_proven",
+    )
+    assert tuple(pre_acceptance_release["phase_times"]) == (
+        "reserved",
+        "lock_bound",
+        "cleanup_proven",
+        "released",
+    )
+
+
 # --- 2. transition table ----------------------------------------------------
 
 
@@ -790,7 +817,9 @@ def test_replacement_spawn_reserves_instead_of_restoring_a_stale_episode(episode
 
 def test_pre_spawn_failure_aborts_the_reservation_it_finalizes(episode_store):
     spool_id = "writer-pre-spawn-failure"
-    reserved = make_episode("reserved", generation=2)
+    reserved = make_episode("reserved", generation=2, path="before_watchdog")
+    assert reserved["revision"] == 1
+    assert "watchdog" not in reserved
     episode_store.write(spool_id, status="pending", episode=reserved)
 
     spindle._record_pre_spawn_failure(spool_id, "spawn failed: boom")
@@ -798,13 +827,21 @@ def test_pre_spawn_failure_aborts_the_reservation_it_finalizes(episode_store):
     record = episode_store.read(spool_id)
     stored = record.get(EPISODE_KEY)
     assert stored is not None, "pre-spawn failure dropped the episode"
-    assert (record["status"], stored["phase"], stored["generation"]) == ("error", "aborted", 2)
+    assert (record["status"], stored["phase"], stored["generation"], stored["revision"]) == (
+        "error",
+        "aborted",
+        2,
+        2,
+    )
+    assert "watchdog" not in stored
     assert stored["failure"]
 
 
 def test_sandbox_refusal_preserves_and_aborts_the_episode(episode_store):
     spool_id = "writer-sandbox-refusal"
-    reserved = make_episode("reserved", generation=2)
+    reserved = make_episode("reserved", generation=2, path="before_watchdog")
+    assert reserved["revision"] == 1
+    assert "watchdog" not in reserved
     episode_store.write(spool_id, status="pending", episode=reserved)
 
     message = spindle._persist_codex_sandbox_refusal(
@@ -820,7 +857,8 @@ def test_sandbox_refusal_preserves_and_aborts_the_episode(episode_store):
     stored = record.get(EPISODE_KEY)
     assert message.startswith("Error:")
     assert stored is not None, "sandbox refusal replaced the record and dropped the episode"
-    assert (stored["phase"], stored["generation"]) == ("aborted", 2)
+    assert (stored["phase"], stored["generation"], stored["revision"]) == ("aborted", 2, 2)
+    assert "watchdog" not in stored
 
 
 def test_finalization_persists_release_from_cleanup_proven(episode_store):
@@ -1136,6 +1174,13 @@ def test_a_live_pre_episode_owner_must_drain_before_maintenance(episode_store, m
 
     assert maintenance == ["cleanup", "recovery"]
     assert (episode_store.root / ".supervisor.json").read_bytes() == before
+
+    success, error = spindle._try_reserve_slot_and_create("post-drain-current")
+
+    assert success is True, error
+    reserved = episode_store.read("post-drain-current")
+    assert reserved[EPISODE_KEY][FORMAT_FIELD] == OWNER_EPISODE_FORMAT
+    assert (reserved[EPISODE_KEY]["phase"], reserved[EPISODE_KEY]["revision"]) == ("reserved", 1)
 
 
 def test_reservation_refuses_a_live_pre_episode_record_without_mutating_it(episode_store):

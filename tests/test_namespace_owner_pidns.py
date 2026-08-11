@@ -201,14 +201,16 @@ def test_s2_x_time_01_owner_self_timeout_does_not_depend_on_foreign_observer(
     owner_clock,
 ):
     _current, advance, clock_fd = owner_clock
-    owner = watchdog_owner_case("ignore-term", timeout=1, controlled_clock_fd=clock_fd.fileno())
+    owner = watchdog_owner_case("ignore-term", timeout=100, controlled_clock_fd=clock_fd.fileno())
+    reserved = owner.spool()
+    assert reserved["owner_episode"]["deadline"] == reserved["wall_deadline_at"]
     source = OBSERVER_PROLOGUE + r"""
 spool = json.loads((store / f"{sys.argv[2]}.json").read_text())
 print(json.dumps({"status": spool["status"], "visible": Path(f"/proc/{spool['owner_pid']}").exists()}))
 """
     observed = foreign_pid_namespace(owner.store, source, owner.spool_id)
     assert observed == {"status": "running", "visible": False}
-    advance(2)
+    advance(101)
     assert _terminal(owner, "timeout")["lifecycle"]["normalized_terminal_kind"] == "timeout"
 
 

@@ -421,12 +421,14 @@ def watchdog_owner_case(namespace_owner_env, fake_provider_factory, process_ledg
             "timeout": timeout,
             "spool_schema_version": 1 if store_kind == "bridge_schema1" else 2,
         }
-        deadline = None
-        if timeout is not None and controlled_clock_fd is None:
-            deadline = (datetime.now(timezone.utc) + timedelta(seconds=timeout)).isoformat()
-            spool["wall_deadline_at"] = deadline
         if spool_overrides:
             spool.update(spool_overrides)
+        effective_timeout = spool.get("timeout")
+        deadline = spool.get("wall_deadline_at")
+        if effective_timeout is not None:
+            if deadline is None:
+                deadline = (datetime.now(timezone.utc) + timedelta(seconds=effective_timeout)).isoformat()
+            spool["wall_deadline_at"] = deadline
         starter = {
             "pid": os.getpid(),
             "birth_token": read_proc_starttime(os.getpid()),
@@ -470,8 +472,8 @@ def watchdog_owner_case(namespace_owner_env, fake_provider_factory, process_ledg
         if controlled_clock_fd is not None:
             pass_fds.append(controlled_clock_fd)
             args.extend(["--clock-fd", str(controlled_clock_fd)])
-        if timeout is not None:
-            args.extend(["--timeout", str(timeout)])
+        if effective_timeout is not None:
+            args.extend(["--timeout", str(effective_timeout)])
             if deadline is not None:
                 args.extend(["--deadline", deadline])
         if disable_pdeathsig:
