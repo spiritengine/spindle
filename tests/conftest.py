@@ -23,6 +23,9 @@ os.environ["SPINDLE_HOME"] = tempfile.mkdtemp(prefix="spindle-test-home-")
 import pytest  # noqa: E402
 
 
+pytest_plugins = ["tests.namespace_owner_fixtures"]
+
+
 def _snapshot(path: Path) -> frozenset:
     if not path.exists():
         return frozenset()
