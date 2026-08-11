@@ -262,12 +262,15 @@ def test_concurrent_launchers_share_one_store_owner(supervisor_env):
         description="supervisor owner record",
     )
 
-    assert record["supervisor_protocol_version"] == 1
+    assert record["supervisor_protocol_version"] == 2
     assert record["spool_schema_version"] == 1
-    assert record["supported_supervisor_protocol_range"] == {"min": 1, "max": 1}
+    assert record["supported_supervisor_protocol_range"] == {"min": 2, "max": 2}
     assert record["readable_spool_schemas"] == [1]
     assert record["writable_spool_schema"] == 1
-    assert record["supervisor_capabilities"] == ["supervisor-compatibility-ranges"]
+    assert record["supervisor_capabilities"] == [
+        "supervisor-compatibility-ranges",
+        "owner-episode-v1",
+    ]
     assert _pid_alive(record["pid"])
     terminal = [_wait_spool(store, spool_id, "complete") for spool_id in spool_ids]
     assert {spool["result"] for spool in terminal} == {"durable result"}
@@ -404,7 +407,7 @@ def _start_supervisor_lock_holder(
     return proc, stop
 
 
-@pytest.mark.parametrize(("protocol", "schema"), [(999, 1), (1, 999)])
+@pytest.mark.parametrize(("protocol", "schema"), [(999, 1), (2, 999)])
 def test_incompatible_owner_is_rejected_before_reservation(supervisor_env, protocol: int, schema: int):
     env, store, workdir = supervisor_env
     holder, stop = _start_supervisor_lock_holder(
@@ -430,21 +433,24 @@ def test_incompatible_owner_is_rejected_before_reservation(supervisor_env, proto
     [
         (
             {
-                "supported_supervisor_protocol_range": {"min": 2, "max": 3},
+                "supported_supervisor_protocol_range": {"min": 2, "max": 2},
                 "readable_spool_schemas": [1],
                 "writable_spool_schema": 1,
                 "supervisor_capabilities": ["supervisor-compatibility-ranges"],
             },
-            "owner_supported=2-3 launcher_required=1-1",
+            "launcher_requires_capabilities=['owner-episode-v1', 'supervisor-compatibility-ranges']",
         ),
         (
             {
                 "supported_supervisor_protocol_range": {"min": 1, "max": 1},
                 "readable_spool_schemas": [1],
                 "writable_spool_schema": 1,
-                "supervisor_capabilities": [],
+                "supervisor_capabilities": [
+                    "supervisor-compatibility-ranges",
+                    "owner-episode-v1",
+                ],
             },
-            "launcher_requires_capabilities=['supervisor-compatibility-ranges']",
+            "owner_supported=1-1 launcher_required=2-2",
         ),
     ],
 )
@@ -463,7 +469,7 @@ def test_incompatible_bridge_owner_is_rejected_before_reservation_and_monitor(
     holder, stop = _start_supervisor_lock_holder(
         env,
         store,
-        protocol=1,
+        protocol=2,
         schema=1,
         package="/foreign/spindle",
         record_updates=record_updates,
@@ -522,9 +528,18 @@ def test_compatible_foreign_package_identity_is_diagnostic_not_rejected(supervis
     holder, stop = _start_supervisor_lock_holder(
         env,
         store,
-        protocol=1,
+        protocol=2,
         schema=1,
         package="/foreign/spindle",
+        record_updates={
+            "supported_supervisor_protocol_range": {"min": 2, "max": 2},
+            "readable_spool_schemas": [1],
+            "writable_spool_schema": 1,
+            "supervisor_capabilities": [
+                "supervisor-compatibility-ranges",
+                "owner-episode-v1",
+            ],
+        },
     )
     try:
         cli = _spin_cli(env, workdir)
