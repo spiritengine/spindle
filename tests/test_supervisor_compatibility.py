@@ -192,6 +192,67 @@ def test_maintenance_gate_fails_safe_on_unreadable_lock(monkeypatch, tmp_path):
         lock.chmod(0o600)
 
 
+def _control_lock_is_free(store) -> bool:
+    fd = os.open(store / ".supervisor-control.lock", os.O_CREAT | os.O_RDWR)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return True
+    finally:
+        os.close(fd)
+
+
+def test_store_maintenance_holds_control_lock_and_defers_monitors(monkeypatch, tmp_path):
+    store = tmp_path / "spools"
+    store.mkdir()
+    monkeypatch.setattr(spindle, "SPINDLE_DIR", store)
+    events = []
+    monkeypatch.setattr(
+        spindle, "_cleanup_old_spools", lambda: events.append(("cleanup", _control_lock_is_free(store)))
+    )
+    monkeypatch.setattr(
+        spindle,
+        "_recovery_pass",
+        lambda: events.append(("pass", _control_lock_is_free(store))) or ["needs-monitor"],
+    )
+    monkeypatch.setattr(
+        spindle,
+        "_start_spool_monitor",
+        lambda spool_id: events.append(("monitor", spool_id, _control_lock_is_free(store))),
+    )
+
+    spindle._run_store_maintenance(cleanup=True)
+
+    # The probe and both mutating passes share one lock hold; monitor starts
+    # happen after release because they reacquire the control lock themselves.
+    assert events == [("cleanup", False), ("pass", False), ("monitor", "needs-monitor", True)]
+
+
+def test_store_maintenance_refused_only_while_incompatible_owner_lives(monkeypatch, tmp_path):
+    store = tmp_path / "spools"
+    store.mkdir()
+    monkeypatch.setattr(spindle, "SPINDLE_DIR", store)
+    ran = []
+    monkeypatch.setattr(spindle, "_cleanup_old_spools", lambda: ran.append("cleanup"))
+    monkeypatch.setattr(spindle, "_recovery_pass", lambda: ran.append("pass") or [])
+    record = spindle._supervisor_identity(os.getpid())
+    record["supported_supervisor_protocol_range"] = {"min": 2, "max": 3}
+    (store / ".supervisor.json").write_text(json.dumps(record))
+    lock_fd = os.open(store / ".supervisor.lock", os.O_CREAT | os.O_RDWR)
+    fcntl.flock(lock_fd, fcntl.LOCK_EX)
+    try:
+        spindle._run_store_maintenance(cleanup=True)
+        assert ran == []
+    finally:
+        os.close(lock_fd)
+
+    spindle._run_store_maintenance(cleanup=True)
+    assert ran == ["cleanup", "pass"]
+
+
 def test_compatibility_checks_do_not_rewrite_unknown_spool_fields(monkeypatch, tmp_path):
     store = tmp_path / "spools"
     store.mkdir()

@@ -1699,37 +1699,70 @@ def _ensure_store_supervisor() -> tuple[bool, Optional[str]]:
         return _ensure_store_supervisor_locked()
 
 
+def _live_owner_refuses_maintenance_locked() -> bool:
+    """Compatibility probe for store maintenance. Caller holds the control lock.
+
+    A held lifetime lock whose record fails negotiation, a held lock with no
+    readable handshake, or a lifetime lock this process cannot open all refuse
+    maintenance: ownership that cannot be assessed is not ours to clean.
+    """
+    try:
+        lock_fd = os.open(_supervisor_lifetime_lock_path(), os.O_RDWR)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    try:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return _supervisor_compatibility_error(_read_supervisor_record()) is not None
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(lock_fd)
+
+
 def _live_owner_blocks_store_maintenance() -> bool:
     """True when a live store owner fails compatibility negotiation.
 
-    Import-time cleanup and orphan recovery rewrite and retire spool records.
-    A launcher that is about to refuse an incompatible live owner must not
-    mutate that owner's store first; the rejection diagnostic has to reach the
-    caller with the store untouched. A held lifetime lock with no readable
-    handshake, or a lifetime lock this process cannot open, also blocks
-    maintenance: ownership that cannot be assessed is not ours to clean.
+    Cleanup and orphan recovery rewrite and retire spool records. A process
+    that would refuse an incompatible live owner must not mutate that owner's
+    store; the rejection diagnostic has to reach the caller with the store
+    untouched.
     """
     if not SPINDLE_DIR.is_dir():
         return False
     try:
         with _supervisor_control_lock():
-            try:
-                lock_fd = os.open(_supervisor_lifetime_lock_path(), os.O_RDWR)
-            except FileNotFoundError:
-                return False
-            except OSError:
-                return True
-            try:
-                try:
-                    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except BlockingIOError:
-                    return _supervisor_compatibility_error(_read_supervisor_record()) is not None
-                fcntl.flock(lock_fd, fcntl.LOCK_UN)
-                return False
-            finally:
-                os.close(lock_fd)
+            return _live_owner_refuses_maintenance_locked()
     except OSError:
         return True
+
+
+def _run_store_maintenance(*, cleanup: bool = False) -> None:
+    """Run cleanup and orphan recovery for callers that are not the store owner.
+
+    The compatibility probe and the maintenance mutations share one continuous
+    control-lock hold, so an incompatible owner cannot start between the probe
+    and the pass. Monitor starts are deferred until the lock is released:
+    _start_spool_monitor reacquires the control lock via
+    _ensure_store_supervisor, and its negotiation independently refuses
+    ownership of a store whose live owner is incompatible.
+    """
+    if not SPINDLE_DIR.is_dir():
+        return
+    try:
+        with _supervisor_control_lock():
+            if _live_owner_refuses_maintenance_locked():
+                return
+            if cleanup:
+                _cleanup_old_spools()
+            needs_monitor = _recovery_pass()
+    except OSError:
+        return
+    for spool_id in needs_monitor:
+        _start_spool_monitor(spool_id)
 
 
 def _find_spool_by_session(session_id: str) -> Optional[dict]:
@@ -2155,11 +2188,11 @@ def _count_running() -> int:
 
 def _spools_idle() -> bool:
     """Finalize any finished-but-unmarked spools, then report whether the queue
-    is empty (no running or pending spools). Uses _recover_orphans so that both
+    is empty (no running or pending spools). Uses gated maintenance so that both
     a dead-but-unmarked running spool and a stuck pending one (silent spawn
     failure, cleared after PENDING_SPAWN_TIMEOUT) are cleaned - otherwise either
     could hold the queue open and wedge a drain forever."""
-    _recover_orphans()
+    _run_store_maintenance()
     return _count_running() == 0
 
 
@@ -3644,13 +3677,26 @@ def _reconcile_pending_spool(spool_id: str) -> bool:
 
 def _recover_orphans() -> None:
     """Run a bounded recovery pass and ensure durable ownership of active work."""
+    for spool_id in _recovery_pass():
+        _start_spool_monitor(spool_id)
+
+
+def _recovery_pass() -> list:
+    """Reconcile every active spool; return the IDs that still need a monitor.
+
+    Split from monitor starting so gated maintenance can run this pass under
+    the control lock: _start_spool_monitor reacquires that lock and would
+    deadlock if called from inside the held section.
+    """
+    needs_monitor = []
     for spool in _list_spools():
         if spool.get("status") == "running":
             if not _check_and_finalize_spool(spool["id"]):
-                _start_spool_monitor(spool["id"])
+                needs_monitor.append(spool["id"])
         elif spool.get("status") == "pending":
             if _reconcile_pending_spool(spool["id"]):
-                _start_spool_monitor(spool["id"])
+                needs_monitor.append(spool["id"])
+    return needs_monitor
 
 
 def _parse_claude_transcript_events(transcript_text: str) -> list:
@@ -4272,12 +4318,10 @@ def _spawn_detached(
 # sets the guard before importing this package, then receives its explicit
 # store path; touching an environment-resolved store first would be incorrect.
 # A store held by a live owner this launcher would reject is equally not ours:
-# negotiation must reject with the store byte-identical, so maintenance waits
-# until no live incompatible owner holds the lifetime lock.
+# negotiation must reject with the store byte-identical, so maintenance is
+# gated on the lifetime-lock compatibility probe inside the same lock hold.
 if os.environ.get(SUPERVISOR_IMPORT_GUARD) != "1":
-    if not _live_owner_blocks_store_maintenance():
-        _cleanup_old_spools()
-        _recover_orphans()
+    _run_store_maintenance(cleanup=True)
 
 
 def _spin_sync(
@@ -4931,7 +4975,7 @@ async def unspool(
 
 def _spools_sync() -> str:
     """Synchronous implementation of spools."""
-    _recover_orphans()
+    _run_store_maintenance()
     all_spools = _list_spools()
     return json.dumps(
         {
@@ -6384,7 +6428,7 @@ def _get_shard_change_stats(spool: dict) -> Optional[dict]:
 
 def _spool_dashboard_sync() -> str:
     """Synchronous implementation of spool_dashboard."""
-    _recover_orphans()
+    _run_store_maintenance()
     all_spools = _list_spools()
     now = datetime.now()
     hour_ago = now - timedelta(hours=1)

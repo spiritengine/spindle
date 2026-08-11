@@ -479,6 +479,24 @@ def test_incompatible_bridge_owner_is_rejected_before_reservation_and_monitor(
         assert after == before
         assert _read_json(store / "stale-pending.json")["status"] == "pending"
         assert not harness_count.exists()
+
+        # Post-import commands that trigger recovery (listing, dashboard,
+        # drain) must be equally hands-off while the incompatible owner lives.
+        listing = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import spindle; spindle._spools_sync(); spindle._spool_dashboard_sync(); spindle._spools_idle()",
+            ],
+            cwd=REPO_ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        assert listing.returncode == 0, listing.stderr
+        after_listing = {path.name: path.read_bytes() for path in store.glob("*.json")}
+        assert after_listing == before
     finally:
         stop.touch()
         holder.wait(timeout=5)
