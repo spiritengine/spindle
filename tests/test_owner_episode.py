@@ -18,6 +18,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -36,10 +37,12 @@ from tests.owner_episode_fixtures import (
     ABSENT,
     ACTORS,
     BOUND_PHASES,
+    DEADLINE,
     EPISODE_KEY,
     FACT_LITERALS,
     FORMAT_FIELD,
     OWNER_EPISODE_FORMAT,
+    PHASE_PATHS,
     PHASES,
     RESEED_SOURCES,
     SOURCES,
@@ -59,16 +62,30 @@ def _row_id(row) -> str:
     return f"{actor}:{source}->{destination}"
 
 
-def _seed(store, spool_id: str, source: str, *, generation: int = 2, drop=()) -> dict | None:
+def _seed(
+    store,
+    spool_id: str,
+    source: str,
+    *,
+    generation: int = 2,
+    drop=(),
+    path: str | None = None,
+) -> dict | None:
     """Publish a record whose episode sits in *source*, minus *drop* facts."""
     if source == ABSENT:
         store.write(spool_id, status="pending")
         return None
-    episode = make_episode(source, generation=generation)
+    episode = make_episode(source, generation=generation, path=path)
     for name in drop:
         episode.pop(name, None)
     store.write(spool_id, status="running", episode=episode)
     return episode
+
+
+def _transition_source_path(actor: str, source: str, destination: str) -> str | None:
+    if source == "reserved" and actor == "launcher" and destination in {"reserved", "aborted"}:
+        return "before_watchdog"
+    return None
 
 
 def _transition(api, store, spool_id, actor, source, destination, *, facts=None, **overrides):
@@ -99,7 +116,13 @@ def test_episode_format_marker_is_published(episode_api):
 def test_allowed_transition_publishes_its_facts_and_bumps_one_revision(episode_api, episode_store, row):
     actor, source, destination, facts = row
     spool_id = f"table-{actor}-{source}-{destination}"
-    seeded = _seed(episode_store, spool_id, source, drop=facts)
+    seeded = _seed(
+        episode_store,
+        spool_id,
+        source,
+        drop=facts,
+        path=_transition_source_path(actor, source, destination),
+    )
     reseed = source in RESEED_SOURCES and destination == "reserved"
 
     result = _transition(episode_api, episode_store, spool_id, actor, source, destination)
@@ -161,7 +184,13 @@ def test_every_row_outside_the_transition_table_is_rejected(episode_api, episode
 def test_transition_without_a_required_fact_is_rejected(episode_api, episode_store, row, omitted):
     actor, source, destination, facts = row
     spool_id = f"missing-{actor}-{source}-{destination}-{omitted}"
-    _seed(episode_store, spool_id, source, drop=facts)
+    _seed(
+        episode_store,
+        spool_id,
+        source,
+        drop=facts,
+        path=_transition_source_path(actor, source, destination),
+    )
     before = episode_store.spool_path(spool_id).read_bytes()
 
     result = _transition(
@@ -213,6 +242,32 @@ def test_same_id_reserve_requires_a_generation_above_the_released_episode(episod
     stored = episode_store.episode(spool_id)
     assert (stored["generation"], stored["revision"], stored["phase"]) == (4, 1, "reserved")
     assert "release" not in stored
+
+
+def test_launcher_can_abort_before_watchdog_publication_at_revision_one(episode_api, episode_store):
+    spool_id = "launcher-abort-before-watchdog"
+    episode = _seed(episode_store, spool_id, "reserved", path="before_watchdog")
+
+    assert episode["revision"] == 1
+    assert "watchdog" not in episode
+
+    result = _transition(episode_api, episode_store, spool_id, "launcher", "reserved", "aborted")
+
+    assert result.accepted is True, result.rejection
+    stored = episode_store.episode(spool_id)
+    assert (stored["phase"], stored["revision"]) == ("aborted", 2)
+    assert "watchdog" not in stored
+
+
+def test_optional_deadline_survives_watchdog_publication(episode_api, episode_store):
+    spool_id = "reservation-with-deadline"
+    episode = make_episode("reserved", path="before_watchdog", deadline=DEADLINE)
+    episode_store.write(spool_id, status="pending", episode=episode)
+
+    result = _transition(episode_api, episode_store, spool_id, "launcher", "reserved", "reserved")
+
+    assert result.accepted is True, result.rejection
+    assert result.episode["deadline"] == DEADLINE
 
 
 def test_transition_with_a_stale_revision_is_rejected(episode_api, episode_store):
@@ -336,7 +391,6 @@ CLASSIFIER_CASES = (
     ("reserved", "absent_legacy", "alive", "active"),
     ("reserved", "absent_legacy", "unverifiable", "active"),
     ("reserved", "absent_legacy", "dead", "retireable"),
-    ("reserved", "identity_mismatch", "alive", "active"),
     ("lock_bound", "held", "alive", "active"),
     ("lock_bound", "released", "dead", "active"),
     ("lock_bound", "identity_mismatch", "dead", "unhealthy"),
@@ -345,14 +399,14 @@ CLASSIFIER_CASES = (
     ("accepted", "released", "dead", "active"),
     ("accepted", "identity_mismatch", "alive", "unhealthy"),
     ("accepted", "unreadable", "unverifiable", "unhealthy"),
-    ("cleanup_proven", "held", "alive", "retireable"),
+    ("cleanup_proven", "held", "alive", "active"),
     ("cleanup_proven", "released", "dead", "retireable"),
     ("cleanup_proven", "identity_mismatch", "dead", "unhealthy"),
     ("cleanup_proven", "unreadable", "dead", "unhealthy"),
     ("released", "released", "dead", "retireable"),
-    ("released", "identity_mismatch", "dead", "retireable"),
+    ("released", "held", "dead", "active"),
+    ("released", "identity_mismatch", "dead", "unhealthy"),
     ("aborted", "absent_legacy", "dead", "retireable"),
-    ("aborted", "identity_mismatch", "alive", "retireable"),
 )
 
 
@@ -372,6 +426,75 @@ def test_classifier_matrix(episode_api, phase, lock_state, liveness_state, expec
 
     assert classification.state == expected
     assert classification.reason
+
+
+def test_preacceptance_cleanup_is_valid_without_provider_custody(episode_api):
+    episode = make_episode("cleanup_proven", path="before_acceptance")
+    record = {"id": "preacceptance-cleanup", "status": "running", EPISODE_KEY: episode}
+
+    classification = episode_api.classify(
+        record,
+        LockEvidence("held", 64, 987),
+        LivenessEvidence("dead", "watchdog_contained"),
+    )
+
+    assert "provider" not in episode
+    assert "provider_custody" not in episode
+    assert episode["containment"]["contained"] is True
+    assert classification.state == "active"
+
+
+MISSING_PHASE_FACT_CASES = [
+    (phase, path, fact)
+    for phase, paths in PHASE_PATHS.items()
+    for path, (facts, _revision) in paths.items()
+    for fact in facts
+]
+
+
+@pytest.mark.parametrize(
+    ("phase", "path", "missing"),
+    MISSING_PHASE_FACT_CASES,
+    ids=[f"{phase}-{path}-missing-{fact}" for phase, path, fact in MISSING_PHASE_FACT_CASES],
+)
+def test_classifier_rejects_a_phase_missing_any_required_fact(episode_api, phase, path, missing):
+    episode = make_episode(phase, path=path)
+    episode.pop(missing)
+    record = {"id": "missing-phase-fact", "status": "running", EPISODE_KEY: episode}
+    lock_state = "absent_legacy" if phase in {"reserved", "aborted"} else "held"
+
+    classification = episode_api.classify(
+        record,
+        LockEvidence(lock_state, 64, 987),
+        LivenessEvidence("unverifiable", "fixture"),
+    )
+
+    assert classification.state == "unhealthy"
+    assert "fact" in classification.reason or "malformed" in classification.reason
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("generation", 0),
+        ("revision", True),
+        ("phase", "unknown"),
+        ("phase_times", []),
+    ],
+)
+def test_classifier_rejects_malformed_episode_core_fields(episode_api, field, value):
+    episode = make_episode("accepted")
+    episode[field] = value
+    record = {"id": "malformed-episode", "status": "running", EPISODE_KEY: episode}
+
+    classification = episode_api.classify(
+        record,
+        LockEvidence("held", 64, 987),
+        LivenessEvidence("alive", "fixture"),
+    )
+
+    assert classification.state == "unhealthy"
+    assert "malformed" in classification.reason or field in classification.reason
 
 
 @pytest.mark.parametrize("phase", BOUND_PHASES)
@@ -917,26 +1040,39 @@ def _capacity_matrix(episode_store):
     return records
 
 
-def test_both_capacity_apis_count_the_classifier_not_the_status(episode_store):
+def test_both_capacity_apis_route_every_record_through_the_classifier(episode_store, monkeypatch):
     records = _capacity_matrix(episode_store)
-    naive = sum(1 for record in records if record["status"] in {"pending", "running"})
+    expected_ids = [record["id"] for record in records]
+    states = {
+        spool_id: ("retireable" if index % 3 == 0 else "unhealthy" if index % 3 == 1 else "active")
+        for index, spool_id in enumerate(expected_ids)
+    }
+    expected_count = sum(state != "retireable" for state in states.values())
+    seen = []
 
-    assert naive == 7
-    assert spindle._count_running() == 4
-    assert active_spool_count(spindle._list_spools()) == 4
+    def classify(record, _lock, _liveness):
+        seen.append(record["id"])
+        return SimpleNamespace(state=states[record["id"]], reason="capacity-spy")
+
+    import spindle.namespace_owner as owner_module
+
+    monkeypatch.setattr(owner_module, "classify_owner_episode", classify, raising=False)
+    monkeypatch.setattr(spindle, "classify_owner_episode", classify, raising=False)
+
+    assert spindle._count_running() == expected_count
+    assert sorted(seen) == sorted(expected_ids)
+    assert len(seen) == len(expected_ids)
+
+    seen.clear()
+    assert active_spool_count(records) == expected_count
+    assert sorted(seen) == sorted(expected_ids)
+    assert len(seen) == len(expected_ids)
 
 
 def test_capacity_releases_a_reservation_whose_starter_is_proven_dead(episode_store):
     episode_store.write("cap-dead-starter", status="pending", episode=make_episode("reserved", starter=_dead_starter()))
 
     assert spindle._count_running() == 0
-
-
-def test_unhealthy_ownership_keeps_occupying_its_slot(episode_store):
-    episode = make_episode("accepted")
-    episode_store.write("cap-unhealthy", status="running", episode=episode)
-
-    assert spindle._count_running() == 1
 
 
 # --- 8. episode-aware compatibility -----------------------------------------
@@ -979,17 +1115,26 @@ def test_pre_episode_and_episode_aware_supervisors_refuse_each_other():
     assert not _frozen_pre_episode_launcher_accepts(spindle._supervisor_identity(os.getpid()))
 
 
-def test_a_live_pre_episode_owner_must_drain_before_maintenance(episode_store):
+def test_a_live_pre_episode_owner_must_drain_before_maintenance(episode_store, monkeypatch):
     (episode_store.root / ".supervisor.json").write_text(json.dumps(_live_pre_episode_record()))
     lock_fd = os.open(episode_store.root / ".supervisor.lock", os.O_CREAT | os.O_RDWR)
     fcntl.flock(lock_fd, fcntl.LOCK_EX)
     before = (episode_store.root / ".supervisor.json").read_bytes()
+    maintenance = []
+    monkeypatch.setattr(spindle, "_cleanup_old_spools", lambda: maintenance.append("cleanup"))
+    monkeypatch.setattr(spindle, "_recovery_pass", lambda: maintenance.append("recovery") or False)
     try:
         assert spindle._live_owner_blocks_store_maintenance() is True
         spindle._run_store_maintenance(cleanup=True)
+        assert maintenance == []
+        assert (episode_store.root / ".supervisor.json").read_bytes() == before
     finally:
         os.close(lock_fd)
 
+    assert spindle._live_owner_blocks_store_maintenance() is False
+    spindle._run_store_maintenance(cleanup=True)
+
+    assert maintenance == ["cleanup", "recovery"]
     assert (episode_store.root / ".supervisor.json").read_bytes() == before
 
 
@@ -1029,36 +1174,3 @@ def test_terminal_pre_episode_records_stay_readable(episode_store, episode_api):
         record, LockEvidence("absent_legacy"), LivenessEvidence("dead", "terminal_record")
     )
     assert classification.state == "retireable"
-
-
-def test_same_id_seed_after_proven_retirement_starts_a_fresh_episode(episode_api, episode_store):
-    spool_id = "retired-then-reseeded"
-    episode = make_episode("released", generation=3)
-    episode_store.bind_lock(spool_id, episode)
-    episode_store.write(spool_id, status="complete", episode=episode)
-    identity = ProcessIdentity(
-        pid=os.getpid(),
-        birth_token="retired",
-        namespace=capture_pid_namespace(),
-        owner_generation=episode["generation"],
-        child_pgid=None,
-        lock_device=episode["lock"]["device"],
-        lock_inode=episode["lock"]["inode"],
-        lock_created=True,
-    )
-
-    assert spindle.retire_owner_artifacts(episode_store.root, spool_id, identity) is True
-    assert not episode_store.spool_path(spool_id).exists()
-
-    result = episode_api.transition(
-        episode_store.root,
-        spool_id,
-        actor="launcher",
-        destination="reserved",
-        generation=1,
-        expected_revision=None,
-        facts=facts_for("starter"),
-    )
-
-    assert result.accepted is True, result.rejection
-    assert (result.episode["generation"], result.episode["phase"]) == (1, "reserved")

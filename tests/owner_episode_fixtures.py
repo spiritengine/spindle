@@ -63,7 +63,6 @@ TRANSITION_TABLE = (
     ("watchdog", "reserved", "aborted", ("failure",)),
     ("watchdog", "lock_bound", "cleanup_proven", ("containment", "cleanup")),
     ("watchdog", "accepted", "cleanup_proven", ("containment", "cleanup")),
-    ("reconciler", "reserved", "aborted", ("failure",)),
     ("reconciler", "cleanup_proven", "released", ("release",)),
 )
 
@@ -98,10 +97,11 @@ STARTER = {"pid": 4242, "birth_token": "9001", "namespace": NAMESPACE}
 WATCHDOG = {"pid": 4243, "birth_token": "9002", "namespace": NAMESPACE}
 OWNER = {"pid": 4244, "birth_token": "9003", "namespace": NAMESPACE}
 LOCK = {"device": 64, "inode": 987}
-PROVIDER = {"pid": 4245, "pgid": 4245, "birth_token": "9004"}
+PROVIDER = {"pid": 4245, "pgid": 4245, "birth_token": "9004", "namespace": NAMESPACE}
 PROVIDER_CUSTODY = {"pidfd_acquired": True, "containment": "watchdog", "published_at": "2026-08-11T00:00:03+00:00"}
 WINNING_REQUEST = {"request_id": "req-1", "kind": "cancel", "desired_terminal_kind": "cancelled"}
 ACKNOWLEDGEMENT = {"acknowledged_at": "2026-08-11T00:00:04+00:00"}
+DEADLINE = "2026-08-11T00:01:00+00:00"
 CLEANUP = {
     "outcome": "natural_exit",
     "provider_reaped": True,
@@ -128,53 +128,106 @@ FACT_LITERALS = {
     "release": RELEASE,
 }
 
-# Facts already durable when an episode is observed in a phase.  A transition
-# republishing one of these with a different value is contradictory.
-PHASE_FACTS = {
-    "reserved": ("starter", "watchdog"),
-    "lock_bound": ("starter", "watchdog", "owner", "lock"),
-    "accepted": ("starter", "watchdog", "owner", "lock", "provider", "provider_custody"),
-    "cleanup_proven": ("starter", "watchdog", "owner", "lock", "provider", "provider_custody", "cleanup"),
-    "released": (
-        "starter",
-        "watchdog",
-        "owner",
-        "lock",
-        "provider",
-        "provider_custody",
-        "cleanup",
-        "release",
-    ),
-    "aborted": ("starter", "watchdog", "failure"),
+# A phase can be reached through more than one valid history.  In particular,
+# launcher failure can abort revision 1 before watchdog publication, while a
+# watchdog can prove cleanup from ``lock_bound`` before provider acceptance.
+# Keeping those paths explicit prevents fixtures from inventing facts which
+# were never durably published.
+PHASE_PATHS = {
+    "reserved": {
+        "before_watchdog": (("starter",), 1),
+        "watchdog_published": (("starter", "watchdog"), 2),
+    },
+    "lock_bound": {
+        "owner_bound": (("starter", "watchdog", "owner", "lock"), 3),
+    },
+    "accepted": {
+        "provider_accepted": (
+            ("starter", "watchdog", "owner", "lock", "provider", "provider_custody"),
+            4,
+        ),
+    },
+    "cleanup_proven": {
+        "after_acceptance": (
+            ("starter", "watchdog", "owner", "lock", "provider", "provider_custody", "cleanup"),
+            5,
+        ),
+        "before_acceptance": (
+            ("starter", "watchdog", "owner", "lock", "containment", "cleanup"),
+            4,
+        ),
+    },
+    "released": {
+        "after_acceptance": (
+            (
+                "starter",
+                "watchdog",
+                "owner",
+                "lock",
+                "provider",
+                "provider_custody",
+                "cleanup",
+                "release",
+            ),
+            6,
+        ),
+        "before_acceptance": (
+            ("starter", "watchdog", "owner", "lock", "containment", "cleanup", "release"),
+            5,
+        ),
+    },
+    "aborted": {
+        "launcher_before_watchdog": (("starter", "failure"), 2),
+        "watchdog_after_publication": (("starter", "watchdog", "failure"), 3),
+    },
 }
 
-# One transition per published fact set, so a revision is countable by eye.
-PHASE_REVISIONS = {
-    "reserved": 2,
-    "lock_bound": 3,
-    "accepted": 4,
-    "cleanup_proven": 5,
-    "released": 6,
-    "aborted": 3,
+DEFAULT_PHASE_PATH = {
+    "reserved": "watchdog_published",
+    "lock_bound": "owner_bound",
+    "accepted": "provider_accepted",
+    "cleanup_proven": "after_acceptance",
+    "released": "after_acceptance",
+    "aborted": "watchdog_after_publication",
 }
+
+# Compatibility aliases for tests which intentionally exercise the ordinary
+# accepted-provider route.
+PHASE_FACTS = {phase: paths[DEFAULT_PHASE_PATH[phase]][0] for phase, paths in PHASE_PATHS.items()}
+PHASE_REVISIONS = {phase: paths[DEFAULT_PHASE_PATH[phase]][1] for phase, paths in PHASE_PATHS.items()}
 
 
 def facts_for(*names) -> dict:
     return {name: dict(FACT_LITERALS[name]) for name in names}
 
 
-def make_episode(phase: str = "accepted", *, generation: int = 2, revision: int | None = None, **overrides) -> dict:
+def make_episode(
+    phase: str = "accepted",
+    *,
+    generation: int = 2,
+    revision: int | None = None,
+    path: str | None = None,
+    deadline: str | None = None,
+    **overrides,
+) -> dict:
     """Build the literal episode a production transition sequence must produce."""
     if phase not in PHASES:
         raise KeyError(phase)
+    path = path or DEFAULT_PHASE_PATH[phase]
+    try:
+        phase_facts, path_revision = PHASE_PATHS[phase][path]
+    except KeyError:
+        raise KeyError((phase, path)) from None
     episode = {
         FORMAT_FIELD: OWNER_EPISODE_FORMAT,
         "generation": generation,
-        "revision": PHASE_REVISIONS[phase] if revision is None else revision,
+        "revision": path_revision if revision is None else revision,
         "phase": phase,
         "phase_times": {name: "2026-08-11T00:00:00+00:00" for name in _phase_history(phase)},
     }
-    episode.update(facts_for(*PHASE_FACTS[phase]))
+    episode.update(facts_for(*phase_facts))
+    if deadline is not None:
+        episode["deadline"] = deadline
     episode.update(overrides)
     return episode
 

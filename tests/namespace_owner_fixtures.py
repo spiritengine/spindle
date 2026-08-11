@@ -13,7 +13,7 @@ import subprocess
 import sys
 import threading
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -62,6 +62,13 @@ def fake_provider_factory(namespace_owner_env):
             "SPOOL_ID = os.environ['SPINDLE_OWNER_SPOOL_ID']\n"
             "CONTROL_FD = int(os.environ['SPINDLE_PROVIDER_CONTROL_FD'])\n"
             "control = socket.socket(fileno=CONTROL_FD)\n"
+            "if MODE == 'setsid-grandchild':\n"
+            "    child = os.fork()\n"
+            "    if child == 0:\n"
+            "        os.setsid()\n"
+            "        signal.signal(signal.SIGTERM, lambda *_: None)\n"
+            "        while True: time.sleep(0.05)\n"
+            "    (STORE / f'{SPOOL_ID}.descendant-pid').write_text(str(child))\n"
             "print(f'ready {os.getpid()} {os.getpgrp()}', flush=True)\n"
             "if MODE == 'immediate-exit': raise SystemExit(0)\n"
             "if MODE == 'silent-exit': raise SystemExit(17)\n"
@@ -82,13 +89,6 @@ def fake_provider_factory(namespace_owner_env):
             "            time.sleep(0.05)\n"
             "            raise SystemExit(0)\n"
             "    raise SystemExit(0)\n"
-            "if MODE == 'setsid-grandchild':\n"
-            "    child = os.fork()\n"
-            "    if child == 0:\n"
-            "        os.setsid()\n"
-            "        signal.signal(signal.SIGTERM, lambda *_: None)\n"
-            "        while True: time.sleep(0.05)\n"
-            "    (STORE / f'{SPOOL_ID}.descendant-pid').write_text(str(child))\n"
             "if MODE == 'ignore-term':\n"
             "    signal.signal(signal.SIGTERM, lambda *_: None)\n"
             "    while True: time.sleep(0.05)\n"
@@ -358,7 +358,10 @@ class WatchdogOwnerHandle:
         readable, _, _ = select.select([self.checkpoint], [], [], timeout)
         if not readable:
             raise AssertionError("owner did not reach checkpoint")
-        return json.loads(self.checkpoint.recv(4096).splitlines()[0])
+        payload = self.checkpoint.recv(4096)
+        if not payload:
+            raise AssertionError("owner exited before reaching checkpoint")
+        return json.loads(payload.splitlines()[0])
 
     def resume(self):
         self.checkpoint.sendall(b"continue\n")
@@ -386,6 +389,9 @@ def watchdog_owner_case(namespace_owner_env, fake_provider_factory, process_ledg
         controlled_clock_fd=None,
         store_kind="bridge_schema1",
     ):
+        from spindle.namespace_owner import capture_pid_namespace, read_proc_starttime
+        from tests.owner_episode_fixtures import make_episode
+
         store = (
             namespace_owner_env["store"]
             if store_kind == "bridge_schema1"
@@ -393,6 +399,21 @@ def watchdog_owner_case(namespace_owner_env, fake_provider_factory, process_ledg
         )
         store.mkdir(parents=True, exist_ok=True)
         spool_id = spool_id or f"stage4-{len(handles)}"
+        previous_generation = 0
+        for path in (store / f"{spool_id}.json", store / f"{spool_id}.owner-identity"):
+            try:
+                previous = json.loads(path.read_text())
+            except (FileNotFoundError, json.JSONDecodeError, OSError):
+                continue
+            previous_generation = max(
+                previous_generation,
+                int((previous.get("owner_episode") or {}).get("generation") or 0),
+                int(previous.get("owner_generation") or 0),
+            )
+        if generation <= previous_generation or generation <= 0:
+            raise AssertionError(
+                f"generation {generation} must be positive and above durable generation {previous_generation}"
+            )
         spool = {
             "id": spool_id,
             "status": "pending",
@@ -400,12 +421,29 @@ def watchdog_owner_case(namespace_owner_env, fake_provider_factory, process_ledg
             "timeout": timeout,
             "spool_schema_version": 1 if store_kind == "bridge_schema1" else 2,
         }
+        deadline = None
+        if timeout is not None and controlled_clock_fd is None:
+            deadline = (datetime.now(timezone.utc) + timedelta(seconds=timeout)).isoformat()
+            spool["wall_deadline_at"] = deadline
         if spool_overrides:
             spool.update(spool_overrides)
+        starter = {
+            "pid": os.getpid(),
+            "birth_token": read_proc_starttime(os.getpid()),
+            "namespace": capture_pid_namespace().to_dict(),
+        }
+        spool["owner_episode"] = make_episode(
+            "reserved",
+            generation=generation,
+            path="before_watchdog",
+            deadline=deadline if deadline is not None else None,
+            starter=starter,
+        )
         (store / f"{spool_id}.json").write_text(json.dumps(spool))
         provider = fake_provider_factory(mode)
         ready_read, ready_write = os.pipe()
-        pass_fds = [ready_write]
+        barrier_read, barrier_write = os.pipe()
+        pass_fds = [ready_write, barrier_read]
         args = [
             sys.executable,
             str(owner_script),
@@ -417,6 +455,8 @@ def watchdog_owner_case(namespace_owner_env, fake_provider_factory, process_ledg
             str(generation),
             "--ready-fd",
             str(ready_write),
+            "--launch-barrier-fd",
+            str(barrier_read),
         ]
         checkpoint_controller = None
         if pause_checkpoint:
@@ -432,24 +472,47 @@ def watchdog_owner_case(namespace_owner_env, fake_provider_factory, process_ledg
             args.extend(["--clock-fd", str(controlled_clock_fd)])
         if timeout is not None:
             args.extend(["--timeout", str(timeout)])
+            if deadline is not None:
+                args.extend(["--deadline", deadline])
         if disable_pdeathsig:
             args.append("--disable-pdeathsig")
         args.extend(["--", str(provider)])
-        proc = process_ledger(
-            subprocess.Popen(
-                args,
-                cwd=repo_root,
-                env=dict(namespace_owner_env["env"]),
-                pass_fds=tuple(pass_fds),
-                start_new_session=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
+        try:
+            proc = process_ledger(
+                subprocess.Popen(
+                    args,
+                    cwd=repo_root,
+                    env=dict(namespace_owner_env["env"]),
+                    pass_fds=tuple(pass_fds),
+                    start_new_session=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
             )
-        )
+        finally:
+            os.close(barrier_read)
         os.close(ready_write)
         if checkpoint_owner is not None:
             checkpoint_owner.close()
+        try:
+            record = json.loads((store / f"{spool_id}.json").read_text())
+            episode = record["owner_episode"]
+            assert (episode["generation"], episode["revision"], episode["phase"]) == (
+                generation,
+                1,
+                "reserved",
+            )
+            episode["watchdog"] = {
+                "pid": proc.pid,
+                "birth_token": read_proc_starttime(proc.pid),
+                "namespace": capture_pid_namespace().to_dict(),
+            }
+            episode["revision"] = 2
+            (store / f"{spool_id}.json").write_text(json.dumps(record))
+            os.write(barrier_write, b"go\n")
+        finally:
+            os.close(barrier_write)
         candidates = [ready_read]
         if checkpoint_controller is not None:
             candidates.append(checkpoint_controller)

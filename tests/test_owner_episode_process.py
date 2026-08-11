@@ -8,7 +8,10 @@ the spool record is the only thing these tests read for lifecycle truth.
 from __future__ import annotations
 
 import json
-import time
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
@@ -34,16 +37,6 @@ def forbidden(*args, **kwargs):
 os.kill = forbidden
 os.killpg = forbidden
 """
-
-
-def wait_until(predicate, timeout=8):
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        value = predicate()
-        if value:
-            return value
-        time.sleep(0.02)
-    raise AssertionError("condition did not become true")
 
 
 def _episode(owner) -> dict:
@@ -120,9 +113,10 @@ def test_crash_after_acceptance_ends_in_watchdog_cleanup_then_reconciled_release
     accepted = _episode(owner)
     assert accepted["phase"] == "accepted"
     assert accepted["provider"]["pid"] == owner.provider_pid
+    assert accepted["provider"]["namespace"] == accepted["owner"]["namespace"]
 
     owner.kill_owner()
-    wait_until(lambda: not Path(f"/proc/{owner.provider_pid}").exists())
+    assert not Path(f"/proc/{owner.provider_pid}").exists()
 
     contained = _episode(owner)
     assert contained["phase"] == "cleanup_proven"
@@ -179,10 +173,10 @@ def test_owner_crash_contains_a_setsid_descendant_and_records_it_in_the_episode(
     owner = watchdog_owner_case("setsid-grandchild", pause_checkpoint="provider_ready", disable_pdeathsig=True)
     assert owner.receive_checkpoint()["name"] == "provider_ready"
     descendant_path = owner.store / f"{owner.spool_id}.descendant-pid"
-    descendant = int(wait_until(lambda: descendant_path.read_text() if descendant_path.exists() else None))
+    descendant = int(descendant_path.read_text())
 
     owner.kill_owner()
-    wait_until(lambda: not Path(f"/proc/{descendant}").exists())
+    assert not Path(f"/proc/{descendant}").exists()
 
     contained = _episode(owner)
     assert contained["phase"] == "cleanup_proven"
@@ -202,7 +196,7 @@ def test_late_prior_generation_watchdog_write_cannot_touch_the_next_reservation(
     )
     assert owner.receive_checkpoint()["owner_generation"] == 1
     record = owner.spool()
-    replacement = make_episode("reserved", generation=2, revision=1)
+    replacement = make_episode("reserved", generation=2, path="before_watchdog")
     record[EPISODE_KEY] = replacement
     (owner.store / f"{owner.spool_id}.json").write_text(json.dumps(record))
 
@@ -316,17 +310,108 @@ def test_admitted_request_is_recorded_in_the_episode_and_settled(watchdog_owner_
     assert terminal["lifecycle"]["normalized_terminal_kind"] == "cancelled"
 
 
-def test_final_sweep_wins_and_no_durable_request_is_created(watchdog_owner_case):
-    owner = watchdog_owner_case("silent-exit", pause_checkpoint="natural_exit_evidence_published")
-    assert owner.receive_checkpoint()["name"] == "natural_exit_evidence_published"
-    assert _episode(owner)["phase"] == "cleanup_proven"
+FINAL_SWEEP_CALLERS = ("drop", "timeout", "expired_session", "shard_abandon")
 
+
+def _start_final_sweep_case(watchdog_owner_case, caller, tmp_path, checkpoint):
+    spool_id = f"final-sweep-{caller}-{checkpoint}"
+    overrides = {
+        "created_at": (datetime.now() - timedelta(hours=1)).isoformat(),
+        "prompt": "work",
+    }
+    if caller == "timeout":
+        overrides["timeout"] = 1
+    elif caller == "expired_session":
+        overrides["session_id"] = "expired-session"
+    elif caller == "shard_abandon":
+        worktree = tmp_path / spool_id / "worktree"
+        worktree.mkdir(parents=True)
+        overrides["working_dir"] = str(worktree)
+        overrides["shard"] = {"worktree_path": str(worktree), "branch_name": "episode-test"}
+    owner = watchdog_owner_case(
+        "silent-exit",
+        pause_checkpoint=checkpoint,
+        spool_id=spool_id,
+        spool_overrides=overrides,
+    )
+    if caller == "expired_session":
+        (owner.store / f"{spool_id}.stderr").write_text(
+            "No conversation found with session ID: expired-session"
+        )
+    return owner
+
+
+def _invoke_final_sweep_caller(caller, owner, tmp_path):
     with patch("spindle.SPINDLE_DIR", owner.store):
-        message = spindle._spin_drop_sync(owner.spool_id)
+        if caller == "drop":
+            return spindle._spin_drop_sync(owner.spool_id)
+        if caller == "shard_abandon":
+            return spindle._shard_abandon_sync(owner.spool_id, False, str(tmp_path))
+        return spindle._reconcile_spool_step(owner.spool_id)
 
-    assert "Cancellation requested" not in message, message
-    assert list(iter_control_requests(owner.store, owner.spool_id)) == []
+
+@pytest.mark.parametrize("caller", FINAL_SWEEP_CALLERS)
+def test_request_wins_before_final_sweep_and_is_durably_settled(
+    watchdog_owner_case,
+    caller,
+    tmp_path,
+):
+    owner = _start_final_sweep_case(
+        watchdog_owner_case,
+        caller,
+        tmp_path,
+        "natural_exit_evidence_published",
+    )
+    assert owner.receive_checkpoint()["name"] == "natural_exit_evidence_published"
+
+    _invoke_final_sweep_caller(caller, owner, tmp_path)
+    requests = list(iter_control_requests(owner.store, owner.spool_id))
+    assert len(requests) == 1, f"{caller} did not win request admission before the final sweep"
+
     owner.resume()
+    owner.process.wait(timeout=8)
+    receipt = read_control_receipt(owner.store, owner.spool_id, requests[0].request_id)
+    assert receipt is not None
+    assert receipt.owner_acknowledged_at is None
+    assert receipt.cleanup_outcome == "rejected_terminal"
+
+
+@pytest.mark.parametrize("caller", FINAL_SWEEP_CALLERS)
+def test_final_sweep_guard_wins_and_later_caller_creates_no_request(
+    watchdog_owner_case,
+    monkeypatch,
+    caller,
+    tmp_path,
+):
+    owner = _start_final_sweep_case(
+        watchdog_owner_case,
+        caller,
+        tmp_path,
+        "final_mailbox_guard_acquired",
+    )
+    assert owner.receive_checkpoint(timeout=2)["name"] == "final_mailbox_guard_acquired"
+    assert list(iter_control_requests(owner.store, owner.spool_id)) == []
+
+    attempted = threading.Event()
+    real_guard = spindle.mailbox_guard
+
+    @contextmanager
+    def observed_guard(*args, **kwargs):
+        attempted.set()
+        with real_guard(*args, **kwargs):
+            yield
+
+    monkeypatch.setattr(spindle, "mailbox_guard", observed_guard)
+    executor = ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(_invoke_final_sweep_caller, caller, owner, tmp_path)
+    try:
+        assert attempted.wait(timeout=2), f"{caller} did not enter mailbox-first admission"
+        assert not future.done(), f"{caller} bypassed the final-sweep mailbox guard"
+    finally:
+        owner.resume()
+        executor.shutdown(wait=True)
+
+    future.result()
     owner.process.wait(timeout=8)
     assert list(iter_control_requests(owner.store, owner.spool_id)) == []
 
