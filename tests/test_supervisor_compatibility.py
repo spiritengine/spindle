@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
+import os
 
 import pytest
 
@@ -139,6 +141,55 @@ def test_supervisor_record_write_preserves_unknown_additive_fields(monkeypatch, 
     assert written["pid"] == 789
     assert written["future_metadata"] == {"opaque": [1, 2, 3]}
     assert "retired_at" not in written
+
+
+def test_maintenance_gate_open_without_store_lock_or_holder(monkeypatch, tmp_path):
+    store = tmp_path / "spools"
+    monkeypatch.setattr(spindle, "SPINDLE_DIR", store)
+
+    assert spindle._live_owner_blocks_store_maintenance() is False
+    assert not store.exists()
+
+    store.mkdir()
+    assert spindle._live_owner_blocks_store_maintenance() is False
+
+    (store / ".supervisor.lock").touch()
+    assert spindle._live_owner_blocks_store_maintenance() is False
+
+
+def test_maintenance_gate_blocks_live_incompatible_or_silent_owner(monkeypatch, tmp_path):
+    store = tmp_path / "spools"
+    store.mkdir()
+    monkeypatch.setattr(spindle, "SPINDLE_DIR", store)
+    lock_fd = os.open(store / ".supervisor.lock", os.O_CREAT | os.O_RDWR)
+    fcntl.flock(lock_fd, fcntl.LOCK_EX)
+    try:
+        # A held lifetime lock with no handshake is not ours to maintain.
+        assert spindle._live_owner_blocks_store_maintenance() is True
+
+        record = spindle._supervisor_identity(os.getpid())
+        (store / ".supervisor.json").write_text(json.dumps(record))
+        assert spindle._live_owner_blocks_store_maintenance() is False
+
+        record["supported_supervisor_protocol_range"] = {"min": 2, "max": 3}
+        (store / ".supervisor.json").write_text(json.dumps(record))
+        assert spindle._live_owner_blocks_store_maintenance() is True
+    finally:
+        os.close(lock_fd)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="permission probes are meaningless as root")
+def test_maintenance_gate_fails_safe_on_unreadable_lock(monkeypatch, tmp_path):
+    store = tmp_path / "spools"
+    store.mkdir()
+    monkeypatch.setattr(spindle, "SPINDLE_DIR", store)
+    lock = store / ".supervisor.lock"
+    lock.touch()
+    lock.chmod(0)
+    try:
+        assert spindle._live_owner_blocks_store_maintenance() is True
+    finally:
+        lock.chmod(0o600)
 
 
 def test_compatibility_checks_do_not_rewrite_unknown_spool_fields(monkeypatch, tmp_path):

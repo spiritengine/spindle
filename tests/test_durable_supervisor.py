@@ -454,6 +454,12 @@ def test_incompatible_bridge_owner_is_rejected_before_reservation_and_monitor(
     env, store, workdir = supervisor_env
     harness_count = store / "harness.count"
     env["FAKE_HARNESS_COUNT"] = str(harness_count)
+    # A stale pending reservation is exactly what import-time recovery would
+    # finalize; it must survive untouched while the incompatible owner lives.
+    store.mkdir(parents=True, exist_ok=True)
+    (store / "stale-pending.json").write_text(
+        json.dumps({"id": "stale-pending", "status": "pending", "created_at": "2020-01-01T00:00:00"})
+    )
     holder, stop = _start_supervisor_lock_holder(
         env,
         store,
@@ -471,10 +477,26 @@ def test_incompatible_bridge_owner_is_rejected_before_reservation_and_monitor(
         assert f"live owner pid={owner['pid']}" in cli.stdout
         assert diagnostic in cli.stdout
         assert after == before
+        assert _read_json(store / "stale-pending.json")["status"] == "pending"
         assert not harness_count.exists()
     finally:
         stop.touch()
         holder.wait(timeout=5)
+
+    # Once no live incompatible owner holds the lifetime lock, ordinary import
+    # maintenance resumes and finalizes the abandoned reservation.
+    probe = subprocess.run(
+        [sys.executable, "-c", "import spindle"],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert probe.returncode == 0, probe.stderr
+    recovered = _read_json(store / "stale-pending.json")
+    assert recovered["status"] == "error"
+    assert "spawn timeout" in recovered["error"]
 
 
 def test_compatible_foreign_package_identity_is_diagnostic_not_rejected(supervisor_env):

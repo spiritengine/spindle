@@ -1699,6 +1699,39 @@ def _ensure_store_supervisor() -> tuple[bool, Optional[str]]:
         return _ensure_store_supervisor_locked()
 
 
+def _live_owner_blocks_store_maintenance() -> bool:
+    """True when a live store owner fails compatibility negotiation.
+
+    Import-time cleanup and orphan recovery rewrite and retire spool records.
+    A launcher that is about to refuse an incompatible live owner must not
+    mutate that owner's store first; the rejection diagnostic has to reach the
+    caller with the store untouched. A held lifetime lock with no readable
+    handshake, or a lifetime lock this process cannot open, also blocks
+    maintenance: ownership that cannot be assessed is not ours to clean.
+    """
+    if not SPINDLE_DIR.is_dir():
+        return False
+    try:
+        with _supervisor_control_lock():
+            try:
+                lock_fd = os.open(_supervisor_lifetime_lock_path(), os.O_RDWR)
+            except FileNotFoundError:
+                return False
+            except OSError:
+                return True
+            try:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    return _supervisor_compatibility_error(_read_supervisor_record()) is not None
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                return False
+            finally:
+                os.close(lock_fd)
+    except OSError:
+        return True
+
+
 def _find_spool_by_session(session_id: str) -> Optional[dict]:
     """Find a spool by its session_id."""
     for spool in _list_spools():
@@ -4238,9 +4271,13 @@ def _spawn_detached(
 # Run cleanup and recovery on ordinary module load. The detached supervisor
 # sets the guard before importing this package, then receives its explicit
 # store path; touching an environment-resolved store first would be incorrect.
+# A store held by a live owner this launcher would reject is equally not ours:
+# negotiation must reject with the store byte-identical, so maintenance waits
+# until no live incompatible owner holds the lifetime lock.
 if os.environ.get(SUPERVISOR_IMPORT_GUARD) != "1":
-    _cleanup_old_spools()
-    _recover_orphans()
+    if not _live_owner_blocks_store_maintenance():
+        _cleanup_old_spools()
+        _recover_orphans()
 
 
 def _spin_sync(
