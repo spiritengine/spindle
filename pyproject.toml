@@ -66,3 +66,4 @@ ignore = ["E501"]  # Line too long - handled by line-length
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = ["ns_required: requires a working real bubblewrap PID namespace"]

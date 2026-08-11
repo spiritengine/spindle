@@ -3,12 +3,18 @@
 from __future__ import annotations
 
 import errno
+import json
 import os
+import select
+import signal
 import socket
 import stat
 import subprocess
+import sys
 import threading
+import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -307,6 +313,214 @@ def process_identity_record():
         return ProcessIdentity(**values)
 
     return factory
+
+
+@dataclass
+class WatchdogOwnerHandle:
+    process: subprocess.Popen
+    store: Path
+    spool_id: str
+    ready: dict
+    checkpoint: socket.socket | None
+    initial_checkpoint: dict | None = None
+
+    def spool(self):
+        try:
+            return json.loads((self.store / f"{self.spool_id}.json").read_text())
+        except (FileNotFoundError, json.JSONDecodeError):
+            return None
+
+    @property
+    def owner_pid(self):
+        try:
+            return json.loads((self.store / f"{self.spool_id}.owner-identity").read_text())["pid"]
+        except FileNotFoundError:
+            if self.initial_checkpoint:
+                return self.initial_checkpoint["owner_pid"]
+            if self.ready.get("owner_pid"):
+                return self.ready["owner_pid"]
+            raise
+
+    @property
+    def provider_pid(self):
+        return self.ready.get("provider_pid") or (self.initial_checkpoint or {}).get("provider_pid")
+
+    def request(self, kind="cancel"):
+        from spindle.namespace_owner import create_control_request
+
+        generation = self.spool().get("owner_generation") or self.ready.get("owner_generation", 1)
+        return create_control_request(self.store, self.spool_id, kind, generation, "stage4-test")
+
+    def receive_checkpoint(self, timeout=5):
+        if self.initial_checkpoint is not None:
+            value, self.initial_checkpoint = self.initial_checkpoint, None
+            return value
+        readable, _, _ = select.select([self.checkpoint], [], [], timeout)
+        if not readable:
+            raise AssertionError("owner did not reach checkpoint")
+        return json.loads(self.checkpoint.recv(4096).splitlines()[0])
+
+    def resume(self):
+        self.checkpoint.sendall(b"continue\n")
+
+    def kill_owner(self):
+        os.kill(self.owner_pid, signal.SIGKILL)
+        self.process.wait(timeout=8)
+
+
+@pytest.fixture
+def watchdog_owner_case(namespace_owner_env, fake_provider_factory, process_ledger):
+    handles = []
+    repo_root = Path(__file__).resolve().parents[1]
+    owner_script = repo_root / "spindle_owner.py"
+
+    def start(
+        mode="healthy-turn",
+        *,
+        pause_checkpoint=None,
+        disable_pdeathsig=False,
+        timeout=None,
+        controlled_clock_fd=None,
+        store_kind="bridge_schema1",
+    ):
+        store = (
+            namespace_owner_env["store"]
+            if store_kind == "bridge_schema1"
+            else namespace_owner_env["home"] / "spools-v2"
+        )
+        store.mkdir(parents=True, exist_ok=True)
+        spool_id = f"stage4-{len(handles)}"
+        spool = {
+            "id": spool_id,
+            "status": "pending",
+            "created_at": datetime.now().isoformat(),
+            "timeout": timeout,
+            "spool_schema_version": 1 if store_kind == "bridge_schema1" else 2,
+        }
+        (store / f"{spool_id}.json").write_text(json.dumps(spool))
+        provider = fake_provider_factory(mode)
+        ready_read, ready_write = os.pipe()
+        pass_fds = [ready_write]
+        args = [
+            sys.executable,
+            str(owner_script),
+            "--store",
+            str(store),
+            "--spool-id",
+            spool_id,
+            "--ready-fd",
+            str(ready_write),
+        ]
+        checkpoint_controller = None
+        if pause_checkpoint:
+            checkpoint_controller, checkpoint_owner = socket.socketpair()
+            pass_fds.append(checkpoint_owner.fileno())
+            args.extend(
+                ["--checkpoint-fd", str(checkpoint_owner.fileno()), "--pause-checkpoint", pause_checkpoint]
+            )
+        else:
+            checkpoint_owner = None
+        if controlled_clock_fd is not None:
+            pass_fds.append(controlled_clock_fd)
+            args.extend(["--clock-fd", str(controlled_clock_fd)])
+        if timeout is not None:
+            args.extend(["--timeout", str(timeout)])
+        if disable_pdeathsig:
+            args.append("--disable-pdeathsig")
+        args.extend(["--", str(provider)])
+        proc = process_ledger(
+            subprocess.Popen(
+                args,
+                cwd=repo_root,
+                env=dict(namespace_owner_env["env"]),
+                pass_fds=tuple(pass_fds),
+                start_new_session=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        )
+        os.close(ready_write)
+        if checkpoint_owner is not None:
+            checkpoint_owner.close()
+        candidates = [ready_read]
+        if checkpoint_controller is not None:
+            candidates.append(checkpoint_controller)
+        readable, _, _ = select.select(candidates, [], [], 5)
+        if not readable:
+            stderr = proc.stderr.read() if proc.poll() is not None else ""
+            raise AssertionError(f"watchdog owner did not start: {stderr}")
+        initial = None
+        ready = {}
+        if ready_read in readable:
+            with os.fdopen(ready_read) as stream:
+                ready = json.loads(stream.readline())
+        else:
+            os.close(ready_read)
+            initial = json.loads(checkpoint_controller.recv(4096).splitlines()[0])
+            ready = {
+                "owner_pid": initial["owner_pid"],
+                "provider_pid": initial.get("provider_pid"),
+                "owner_generation": initial["owner_generation"],
+            }
+        handle = WatchdogOwnerHandle(proc, store, spool_id, ready, checkpoint_controller, initial)
+        handles.append(handle)
+        return handle
+
+    yield start
+    for handle in handles:
+        if handle.process.poll() is None:
+            try:
+                if handle.checkpoint is not None:
+                    handle.resume()
+                handle.request()
+                handle.process.wait(timeout=3)
+            except Exception:
+                handle.process.kill()
+                handle.process.wait(timeout=3)
+        if handle.checkpoint is not None:
+            handle.checkpoint.close()
+
+
+@pytest.fixture
+def foreign_pid_namespace(namespace_owner_env):
+    repo_root = Path(__file__).resolve().parents[1]
+
+    def run(store, source, *args):
+        env = dict(namespace_owner_env["env"])
+        env["_SPINDLE_STORE_SUPERVISOR"] = "1"
+        command = [
+            "bwrap",
+            "--unshare-pid",
+            "--as-pid-1",
+            "--ro-bind",
+            "/",
+            "/",
+            "--proc",
+            "/proc",
+            "--bind",
+            str(store),
+            str(store),
+            "--",
+            sys.executable,
+            "-c",
+            source,
+            str(store),
+            *map(str, args),
+        ]
+        completed = subprocess.run(
+            command,
+            cwd=repo_root,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if completed.returncode != 0:
+            pytest.fail(f"ns_required bwrap observer failed: {completed.stderr or completed.stdout}")
+        return json.loads(completed.stdout)
+
+    return run
 
 
 @dataclass

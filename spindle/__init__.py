@@ -86,7 +86,9 @@ from .namespace_owner import (  # noqa: E402
     assess_process_liveness,
     capture_pid_namespace,
     create_control_request,
+    iter_control_requests,
     probe_ownership_lock,
+    read_control_receipt,
     reconcile_owner_episode,
     retire_owner_artifacts,
 )
@@ -3334,6 +3336,60 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
         if reconciliation.state != "terminalizable":
             return False
 
+        try:
+            owner_exit = json.loads(_get_owner_exit_path(spool_id).read_text())
+        except (FileNotFoundError, OSError, json.JSONDecodeError, TypeError):
+            owner_exit = None
+        if owner_exit and owner_exit.get("owner_generation") == spool.get("owner_generation") and (
+            owner_exit.get("owner_crashed") or owner_exit.get("owner_crashed_after_cleanup")
+        ):
+            recovered_request = None
+            recovered_receipt = None
+            if owner_exit.get("owner_crashed_after_cleanup"):
+                for request in iter_control_requests(SPINDLE_DIR, spool_id):
+                    if request.owner_generation != spool.get("owner_generation"):
+                        continue
+                    receipt = read_control_receipt(SPINDLE_DIR, spool_id, request.request_id)
+                    if (
+                        receipt is not None
+                        and receipt.owner_acknowledged_at
+                        and receipt.child_exit_observed_at
+                        and receipt.cleanup_outcome == "cleaned"
+                    ):
+                        recovered_request = request
+                        recovered_receipt = receipt
+                        break
+            lifecycle = dict(spool.get("lifecycle") or {})
+            lifecycle.update({"ownership_state": "released", "transport_state": "lost"})
+            if recovered_request is not None and recovered_receipt is not None:
+                terminal_kind = recovered_request.desired_terminal_kind
+                lifecycle.update(
+                    {
+                        "public_stop_state": None,
+                        "normalized_terminal_kind": terminal_kind,
+                        "owner_crashed_after_cleanup": True,
+                    }
+                )
+                spool["status"] = "timeout" if terminal_kind == "timeout" else "error"
+                spool["error"] = (
+                    f"Timeout after {spool.get('timeout')}s" if terminal_kind == "timeout" else "Cancelled"
+                )
+            else:
+                lifecycle.update(
+                    {
+                        "normalized_terminal_kind": "indeterminate",
+                        "owner_crashed": True,
+                    }
+                )
+                spool["status"] = "error"
+                spool["error"] = "Logical owner exited before terminal publication"
+                spool["error_kind"] = "owner_transport_loss"
+                spool["result"] = None
+            spool["lifecycle"] = lifecycle
+            spool["completed_at"] = datetime.now().isoformat()
+            _write_spool(spool_id, spool)
+            return True
+
         proc = _PROC_HANDLES.get(spool_id)
         observed_exit_code = proc.poll() if proc is not None else None
 
@@ -4955,6 +5011,16 @@ def _budget_result(text: str, spool_id: str) -> str:
     return truncated
 
 
+def _running_spool_message(spool: dict) -> str:
+    reconciliation = _reconcile_spool_ownership(spool)
+    if reconciliation.state in {"unverifiable", "store_unhealthy"}:
+        return (
+            f"Spool {spool['id']} still running; ownership is {reconciliation.state} "
+            f"({reconciliation.reason}). Manual recovery is required before settlement."
+        )
+    return f"Spool {spool['id']} still running: {spool.get('prompt', '')[:50]}..."
+
+
 def _unspool_sync(spool_id: str) -> str:
     """Synchronous implementation of unspool - auto-detects harness."""
     # Auto-detect harness from spool metadata
@@ -4982,7 +5048,7 @@ def _unspool_sync(spool_id: str) -> str:
         if status == "pending":
             return f"Spool {spool_id} pending (not yet started)"
         elif status == "running":
-            return f"Spool {spool_id} still running: {spool.get('prompt', '')[:50]}..."
+            return _running_spool_message(spool)
         elif status == "complete":
             return spool.get("result", "No result")
         else:
@@ -8060,7 +8126,7 @@ def _codex_unspool_sync(spool_id: str) -> str:
     if status == "pending":
         return f"Spool {spool_id} pending (not yet started)"
     elif status == "running":
-        return f"Spool {spool_id} still running: {spool.get('prompt', '')[:50]}..."
+        return _running_spool_message(spool)
     elif status == "complete":
         return spool.get("result", "No result")
     else:
@@ -8838,7 +8904,7 @@ def _gemini_unspool_sync(spool_id: str) -> str:
     if status == "pending":
         return f"Spool {spool_id} pending (not yet started)"
     elif status == "running":
-        return f"Spool {spool_id} still running: {spool.get('prompt', '')[:50]}..."
+        return _running_spool_message(spool)
     elif status == "complete":
         return spool.get("result", "No result")
     else:
@@ -9291,7 +9357,7 @@ def _kimi_unspool_sync(spool_id: str) -> str:
     if status == "pending":
         return f"Spool {spool_id} pending (not yet started)"
     elif status == "running":
-        return f"Spool {spool_id} still running: {spool.get('prompt', '')[:50]}..."
+        return _running_spool_message(spool)
     elif status == "complete":
         return spool.get("result", "No result")
     else:

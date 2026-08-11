@@ -2423,7 +2423,7 @@ class TestExitCodeCapture:
             "if path.name.isdigit() and path.exists()])); "
             f"Path({str(ready)!r}).touch(); time.sleep(30)"
         )
-        pid = spindle._spawn_detached(
+        watchdog_pid = spindle._spawn_detached(
             spool_id,
             [sys.executable, "-c", child],
             str(tmp_path),
@@ -2438,15 +2438,25 @@ class TestExitCodeCapture:
 
             assert all(not target.startswith("pipe:") for target in json.loads(fds.read_text()))
             spool = _read_spool(spool_id)
-            assert spool["owner_pid"] == pid
             identity = json.loads(spindle._get_owner_identity_path(spool_id).read_text())
-            assert identity["pid"] == pid
+            assert spool["owner_pid"] == identity["pid"]
+            assert spool["owner_pid"] != watchdog_pid
+            assert handle.pid == watchdog_pid
             lock_target = str(spindle._get_owner_lock_path(spool_id))
             assert lock_target not in json.loads(fds.read_text())
             spindle.create_control_request(
                 spindle.SPINDLE_DIR, spool_id, "cancel", spool["owner_generation"], "test"
             )
         finally:
+            current = _read_spool(spool_id)
+            if current and current.get("owner_generation") and handle.poll() is None:
+                spindle.create_control_request(
+                    spindle.SPINDLE_DIR,
+                    spool_id,
+                    "cancel",
+                    current["owner_generation"],
+                    "test-cleanup",
+                )
             handle.wait(timeout=5)
 
         assert spindle._get_owner_lock_path(spool_id).exists()
@@ -2468,7 +2478,7 @@ class TestCancellationTermination:
                 spool_id,
                 {"id": spool_id, "status": "pending", "created_at": datetime.now().isoformat()},
             )
-            owner_pid = spindle._spawn_detached(
+            watchdog_pid = spindle._spawn_detached(
                 spool_id,
                 ["/bin/sh", "-c", 'trap "" TERM; while :; do sleep 1; done'],
                 str(tmp_path),
@@ -2494,7 +2504,9 @@ class TestCancellationTermination:
                     owner.wait(timeout=5)
             assert spindle._is_pid_alive(provider_pid) is False
             assert _read_spool(spool_id)["status"] == "error"
-            assert owner_pid == running["owner_pid"]
+            assert watchdog_pid != running["owner_pid"]
+            identity = json.loads(spindle._get_owner_identity_path(spool_id).read_text())
+            assert identity["pid"] == running["owner_pid"]
 
     @pytest.mark.parametrize("tool_path", ["sync", "async"])
     def test_drop_lock_prevents_finalizer_from_overwriting_terminal_state(self, tmp_path, tool_path):

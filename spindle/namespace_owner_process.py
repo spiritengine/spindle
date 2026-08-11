@@ -250,7 +250,6 @@ class LogicalOwner:
         stdin_stream = open(self.args.stdin_path, "r") if self.args.stdin_path else subprocess.DEVNULL
         try:
             with open(self.stdout_path, "w") as stdout, open(self.stderr_path, "w") as stderr:
-                self.checkpoints.reach("provider_forked_before_containment_armed")
                 self.provider = subprocess.Popen(
                     self.args.command,
                     cwd=self.args.cwd,
@@ -270,6 +269,10 @@ class LogicalOwner:
         self.control.setblocking(False)
         self.provider_pgid = self.provider.pid
         self.provider_birth = _starttime(self.provider.pid)
+        # The packaged watchdog is already the primary containment parent.
+        # This checkpoint exercises owner death in the narrow interval before
+        # the remaining provider identity/pidfd publication completes.
+        self.checkpoints.reach("provider_forked_before_containment_armed", self.provider.pid)
         try:
             self.provider_pidfd = os.pidfd_open(self.provider.pid)
         except (AttributeError, OSError):
@@ -305,7 +308,6 @@ class LogicalOwner:
             )
             spool.pop("replacement_starting", None)
             self._write_spool_unlocked(spool)
-        self.checkpoints.reach("provider_ready", self.provider.pid)
         if self.args.ready_fd is not None:
             ready = {
                 "owner_pid": os.getpid(),
@@ -318,6 +320,7 @@ class LogicalOwner:
             os.write(self.args.ready_fd, (json.dumps(ready, sort_keys=True) + "\n").encode())
             os.close(self.args.ready_fd)
             self.args.ready_fd = None
+        self.checkpoints.reach("provider_ready", self.provider.pid)
 
     def _provider_exited(self) -> bool:
         if self.provider is None:

@@ -4,18 +4,18 @@ These decisions implement the 21 open questions in
 `finding-20260811-igbj`. They are intentionally conservative and limited to
 the namespace-safe shared owner primitive.
 
-1. Primary containment: the owner is a Linux child subreaper, opens pidfds for
-   direct children immediately after spawn, and arms PDEATHSIG only as a
-   secondary net from the owner main thread with an immediate `getppid()`
-   re-check. A packaged watchdog will be added only if that combination cannot
-   pass S2-C-OWN-01 and S2-C-OWN-03. Ownership and terminal authority never
-   depend on PDEATHSIG.
-2. Descendant guarantee: the owner must reap all descendants which become its
-   children and must not release custody while tracked children survive.
-   Session/process-group escape is not accepted as cleanup. If subreaping and
-   pidfd tracking cannot contain an escaped descendant after owner crash, the
-   watchdog becomes mandatory. Adversarial nested subreapers are not promised
-   without that watchdog.
+1. Primary containment: S2-C-OWN-01 and S2-C-OWN-03 prove that owner-local
+   subreaping, pidfds, and PDEATHSIG cannot contain work after the owner itself
+   dies, so the conditional fallback is resolved: the packaged watchdog is
+   mandatory. It is the owner's longer-lived parent and a Linux child
+   subreaper. The owner still opens provider pidfds immediately and arms
+   PDEATHSIG with an immediate `getppid()` re-check as a secondary net.
+   Ownership and terminal authority never depend on PDEATHSIG.
+2. Descendant guarantee: the owner reaps descendants while healthy. If it
+   crashes, the watchdog adopts, kills, and reaps the provider plus descendants
+   reparented through it, including a `setsid` escape, before publishing crash
+   containment evidence. Session/process-group escape is not accepted as
+   cleanup. Adversarial nested subreapers remain outside the promise.
 3. pidfd acquisition: accept the narrow `fork` to `pidfd_open` window for a
    direct child under enforced zombie retention: the owner alone reaps, does
    not use `SIG_IGN`/`SA_NOCLDWAIT`, opens the pidfd immediately, and polls
@@ -110,3 +110,20 @@ the namespace-safe shared owner primitive.
     deleted. Production recovery uses unified reconciliation exclusively;
     maintenance suppresses only lock-acquisition `OSError`, and an explicit
     supervisor store root always refreshes `_STORE_LAYOUT` with `SPINDLE_DIR`.
+
+## Stage 4 refinements
+
+26. Watchdog authority: the watchdog records containment facts but does not
+    interpret provider output or publish ordinary provider terminals. Owner
+    crash before identity publication is a pre-acceptance launch failure;
+    otherwise the spool remains active until reconciliation proves exact lock
+    release and generation-matched watchdog evidence.
+27. Crash settlement: owner loss before durable cleanup normalizes to
+    `indeterminate`, preserving request and acknowledgement facts without
+    rewriting intent as outcome. Owner loss after an acknowledged cleanup
+    receipt and child-exit evidence recovers the requested terminal exactly
+    once and records `owner_crashed_after_cleanup`.
+28. Foreign dead-owner observation: namespace mismatch remains unverifiable
+    even after the watchdog has contained the provider and the exact owner lock
+    is released. A foreign observer cannot settle or free the spool; a
+    same-namespace recovery path may use the matching crash evidence.

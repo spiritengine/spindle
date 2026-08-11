@@ -9,7 +9,7 @@ import os
 # store path.
 os.environ.setdefault("_SPINDLE_STORE_SUPERVISOR", "1")
 
-main = importlib.import_module("spindle.namespace_owner_process").main
+main = importlib.import_module("spindle.owner_watchdog").main
 
 
 if __name__ == "__main__":
