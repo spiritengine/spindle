@@ -6,6 +6,7 @@ import os
 import socket
 import stat
 import subprocess
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -48,13 +49,48 @@ def fake_provider_factory(namespace_owner_env):
         path = namespace_owner_env["bin"] / f"fake-provider-{len(created)}"
         path.write_text(
             "#!/usr/bin/env python3\n"
-            "import os, signal, time\n"
+            "import json, os, signal, socket, sys, time\n"
+            "from pathlib import Path\n"
             f"MODE = {mode!r}\n"
+            "STORE = Path(os.environ['SPINDLE_OWNER_STORE'])\n"
+            "SPOOL_ID = os.environ['SPINDLE_OWNER_SPOOL_ID']\n"
+            "CONTROL_FD = int(os.environ['SPINDLE_PROVIDER_CONTROL_FD'])\n"
+            "control = socket.socket(fileno=CONTROL_FD)\n"
             "print(f'ready {os.getpid()} {os.getpgrp()}', flush=True)\n"
             "if MODE == 'immediate-exit': raise SystemExit(0)\n"
             "if MODE == 'silent-exit': raise SystemExit(17)\n"
-            "if MODE == 'ignore-term': signal.signal(signal.SIGTERM, lambda *_: None)\n"
-            "while True: time.sleep(0.05)\n"
+            "if MODE == 'record-launch':\n"
+            "    targets = []\n"
+            "    for item in Path('/proc/self/fd').iterdir():\n"
+            "        try: targets.append(os.readlink(item))\n"
+            "        except OSError: pass\n"
+            "    (STORE / f'{SPOOL_ID}.launch-record').write_text(json.dumps({\n"
+            "        'argv': sys.argv, 'env': os.environ.get('OWNER_TEST_ENV'),\n"
+            "        'cwd': os.getcwd(), 'fds': targets}))\n"
+            "    raise SystemExit(0)\n"
+            "if MODE == 'fork-burst':\n"
+            "    for _ in range(6):\n"
+            "        child = os.fork()\n"
+            "        if child == 0:\n"
+            "            time.sleep(0.05)\n"
+            "            raise SystemExit(0)\n"
+            "    raise SystemExit(0)\n"
+            "if MODE == 'setsid-grandchild':\n"
+            "    child = os.fork()\n"
+            "    if child == 0:\n"
+            "        os.setsid()\n"
+            "        signal.signal(signal.SIGTERM, lambda *_: None)\n"
+            "        while True: time.sleep(0.05)\n"
+            "    (STORE / f'{SPOOL_ID}.descendant-pid').write_text(str(child))\n"
+            "if MODE == 'ignore-term':\n"
+            "    signal.signal(signal.SIGTERM, lambda *_: None)\n"
+            "    while True: time.sleep(0.05)\n"
+            "if MODE == 'healthy-turn':\n"
+            "    print('partial provider output', flush=True)\n"
+            "message = control.recv(4096)\n"
+            "if b'cancel' in message:\n"
+            "    control.sendall(b'ack\\n')\n"
+            "raise SystemExit(0)\n"
         )
         path.chmod(path.stat().st_mode | stat.S_IXUSR)
         created.append(path)
@@ -75,14 +111,33 @@ def owner_checkpoint():
 def owner_clock():
     controller, owner = socket.socketpair()
     current = {"value": 0.0}
+    stopped = threading.Event()
 
     def advance(seconds):
         current["value"] += seconds
-        controller.sendall(f"{current['value']}\n".encode())
 
+    def respond():
+        pending = b""
+        while not stopped.is_set():
+            try:
+                chunk = controller.recv(4096)
+            except OSError:
+                return
+            if not chunk:
+                return
+            pending += chunk
+            while b"\n" in pending:
+                line, pending = pending.split(b"\n", 1)
+                if line == b"now":
+                    controller.sendall(f"{current['value']}\n".encode())
+
+    responder = threading.Thread(target=respond, daemon=True)
+    responder.start()
     yield current, advance, owner
+    stopped.set()
     controller.close()
     owner.close()
+    responder.join(timeout=1)
 
 
 @dataclass

@@ -50,7 +50,7 @@ spindle = "spindle:main"
 packages = ["spindle"]
 # Detached helpers are deliberately top-level modules. They set their process
 # guards before importing the spindle package and are packaged beside it.
-py-modules = ["spindle_claude_driver", "spindle_supervisor"]
+py-modules = ["spindle_claude_driver", "spindle_owner", "spindle_supervisor"]
 
 [tool.setuptools.dynamic]
 version = { attr = "spindle._version.__version__" }

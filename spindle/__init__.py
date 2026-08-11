@@ -2179,11 +2179,10 @@ def _count_running() -> int:
     """
     Count currently running spools.
 
-    Includes both "running" and "pending" spools, since pending spools
-    represent reserved slots that will become running shortly.
-    This prevents TOCTOU race in concurrency limit enforcement.
+    Pending reservations, running work, and structured stopping work all hold
+    capacity until a terminal state is durably committed.
     """
-    return sum(1 for s in _list_spools() if s.get("status") in ("running", "pending"))
+    return sum(1 for s in _list_spools() if s.get("status") in ("running", "pending", "stopping"))
 
 
 def _spools_idle() -> bool:

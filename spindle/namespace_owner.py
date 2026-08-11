@@ -12,6 +12,7 @@ import fcntl
 import json
 import os
 import select
+import shutil
 import tempfile
 import uuid
 from dataclasses import asdict, dataclass
@@ -418,6 +419,37 @@ def write_control_receipt(
     _atomic_json_write(path, asdict(receipt))
     return receipt
 
+def read_control_receipt(
+    root: str | os.PathLike[str],
+    spool_id: str,
+    request_id: str,
+) -> Optional[ControlReceipt]:
+    path = mailbox_path(root, spool_id) / f"{request_id}.receipt"
+    try:
+        return ControlReceipt.from_dict(json.loads(path.read_text()))
+    except FileNotFoundError:
+        return None
+
+
+def update_control_receipt(
+    root: str | os.PathLike[str],
+    spool_id: str,
+    request_id: str,
+    **facts,
+) -> ControlReceipt:
+    path = mailbox_path(root, spool_id) / f"{request_id}.receipt"
+    current = read_control_receipt(root, spool_id, request_id)
+    if current is None:
+        raise FileNotFoundError(path)
+    value = asdict(current)
+    for key, fact in facts.items():
+        if key not in value:
+            raise ValueError(f"unknown receipt fact: {key}")
+        value[key] = fact
+    updated = ControlReceipt.from_dict(value)
+    _atomic_json_write(path, asdict(updated))
+    return updated
+
 
 @dataclass(frozen=True)
 class LegacyAuthority:
@@ -474,3 +506,34 @@ def active_spool_count(spools: Iterable[dict]) -> int:
         if spool.get("status") in {"pending", "running"} or lifecycle.get("public_stop_state") == "stopping":
             count += 1
     return count
+
+
+def retire_owner_artifacts(
+    root: str | os.PathLike[str],
+    spool_id: str,
+    identity: ProcessIdentity,
+) -> bool:
+    """Retire a complete terminal artifact set under its recorded inode."""
+    root = Path(root)
+    lock_path = root / f"{spool_id}.process-owner"
+    if probe_ownership_lock(lock_path, identity).state != "released":
+        return False
+    held = acquire_ownership_lock(lock_path)
+    try:
+        if (held.device, held.inode) != (identity.lock_device, identity.lock_inode):
+            return False
+        for suffix in OWNER_ARTIFACT_SUFFIXES:
+            path = root / f"{spool_id}{suffix}"
+            if path == lock_path:
+                continue
+            if path.is_dir():
+                shutil.rmtree(path)
+            else:
+                path.unlink(missing_ok=True)
+        for suffix in (".json", ".stdout", ".stderr", ".exit", ".prompt"):
+            (root / f"{spool_id}{suffix}").unlink(missing_ok=True)
+        (root / "transcripts" / f"{spool_id}.txt").unlink(missing_ok=True)
+    finally:
+        held.close()
+    lock_path.unlink()
+    return True
