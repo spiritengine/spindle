@@ -211,6 +211,55 @@ class FakeProcessOps:
         raise AssertionError("observer attempted to signal a process group")
 
 
+@dataclass
+class ReconciliationSpy:
+    """Predetermined unified result with opt-in mutation tripwires."""
+
+    monkeypatch: object
+    state: str = "unverifiable"
+    calls: list = field(default_factory=list)
+    violations: list = field(default_factory=list)
+
+    def __call__(self, spool):
+        from spindle.namespace_owner import LivenessEvidence, LockEvidence, ReconciliationResult
+
+        self.calls.append(spool.get("id"))
+        return ReconciliationResult(
+            self.state,
+            f"spy_{self.state}",
+            LivenessEvidence("unverifiable", "namespace_mismatch"),
+            LockEvidence("held", detail="foreign-owner"),
+        )
+
+    def forbid_mutation(self):
+        import spindle
+
+        def forbidden(*_args, **_kwargs):
+            self.violations.append((_args, _kwargs))
+            raise AssertionError("PID-sensitive observer attempted destructive mutation")
+
+        for name in (
+            "_is_pid_alive",
+            "_is_process_group_alive",
+            "_terminate_process_group",
+            "_process_start_time",
+            "_write_spool",
+            "_cleanup_shard",
+            "retire_owner_artifacts",
+        ):
+            self.monkeypatch.setattr(spindle, name, forbidden)
+        self.monkeypatch.setattr(Path, "unlink", forbidden)
+
+
+@pytest.fixture
+def reconciliation_spy(monkeypatch):
+    import spindle
+
+    spy = ReconciliationSpy(monkeypatch)
+    monkeypatch.setattr(spindle, "_reconcile_spool_ownership", spy)
+    return spy
+
+
 @pytest.fixture
 def fake_process_ops():
     return FakeProcessOps()
@@ -308,20 +357,6 @@ def legacy_root_sweeper():
         return set(root.glob("*.json")), set(root.glob("*.lock"))
 
     return sweep
-
-
-@pytest.fixture
-def reconciliation_spy():
-    class Spy:
-        def __init__(self, result):
-            self.result = result
-            self.callers = []
-
-        def __call__(self, spool, *, caller=None, **_kwargs):
-            self.callers.append(caller)
-            return self.result
-
-    return Spy
 
 
 @pytest.fixture

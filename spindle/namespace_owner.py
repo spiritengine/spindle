@@ -164,21 +164,20 @@ def assess_process_liveness(identity: ProcessIdentity, *, ops=None) -> LivenessE
         return LivenessEvidence("unverifiable", "namespace_unavailable")
 
     try:
-        observed_birth = ops.read_starttime(identity.pid)
-    except OSError as exc:
-        if exc.errno in {errno.ENOENT, errno.EACCES, errno.EPERM}:
-            return LivenessEvidence("unverifiable", "proc_unavailable")
-        return LivenessEvidence("unverifiable", "proc_error")
-    if str(observed_birth) != str(identity.birth_token):
-        return LivenessEvidence("unverifiable", "identity_mismatch")
-
-    try:
         pidfd = ops.pidfd_open(identity.pid)
     except OSError as exc:
         if exc.errno == errno.ESRCH:
             return LivenessEvidence("dead", "pidfd_esrch")
         return LivenessEvidence("unverifiable", "pidfd_unavailable")
     try:
+        try:
+            observed_birth = ops.read_starttime(identity.pid)
+        except OSError as exc:
+            if exc.errno in {errno.ENOENT, errno.EACCES, errno.EPERM}:
+                return LivenessEvidence("unverifiable", "proc_unavailable")
+            return LivenessEvidence("unverifiable", "proc_error")
+        if str(observed_birth) != str(identity.birth_token):
+            return LivenessEvidence("unverifiable", "identity_mismatch")
         if ops.pidfd_is_readable(pidfd):
             return LivenessEvidence("dead", "pidfd_exited")
         return LivenessEvidence("alive", "pidfd_live")

@@ -90,3 +90,23 @@ the namespace-safe shared owner primitive.
     inherited socket FDs supplied on direct owner startup. Hooks are disabled
     when those FDs are absent; production behavior never uses sleeps or
     environment phase-marker files.
+
+## Stage 3 refinements
+
+22. Public launch ownership: every harness launch enters through the packaged
+    logical owner behind the existing pre-exec barrier. The compatibility
+    `pid` field names the owner; `owner_pid`, `provider_pid`, and
+    `provider_process_group_id` make the two process roles explicit.
+23. Record serialization: logical-owner read-modify-write transitions acquire
+    the same per-spool record lock as launchers and observers. Observers publish
+    durable requests while holding that lock; only the owner publishes a stop
+    terminal after cleanup. This prevents a stale observer write from replacing
+    an owner terminal record.
+24. Generation-scoped settlement: owner exit and cleanup evidence authorizes
+    settlement only when its `owner_generation` matches the current durable
+    identity. A same-ID replacement removes prior exit sidecars before launch
+    while retaining the identity needed to allocate the next generation.
+25. Legacy recovery retirement: the uncalled `_recover_orphans` path is
+    deleted. Production recovery uses unified reconciliation exclusively;
+    maintenance suppresses only lock-acquisition `OSError`, and an explicit
+    supervisor store root always refreshes `_STORE_LAYOUT` with `SPINDLE_DIR`.

@@ -16,7 +16,9 @@ import sys
 import textwrap
 from datetime import datetime
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
+
+import pytest
 
 import spindle_claude_driver as driver
 from spindle import (
@@ -37,6 +39,16 @@ from spindle import (
 )
 
 DRIVER_SCRIPT = Path(driver.__file__).resolve()
+
+
+@pytest.fixture(autouse=True)
+def _parser_tests_use_released_owner_evidence():
+    """This module tests provider parsing, not live ownership decisions."""
+    with patch(
+        "spindle._reconcile_spool_ownership",
+        return_value=MagicMock(state="terminalizable"),
+    ):
+        yield
 
 
 # --- event fixtures ---------------------------------------------------------

@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
 import errno
 import os
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
 
+import spindle
 from spindle.namespace_owner import (
     OWNER_ARTIFACT_SUFFIXES,
     LegacyAuthority,
@@ -244,6 +247,120 @@ def test_s2_u_rec_01_reconciliation_precedence_matrix(lock, liveness, exit_evide
     reconciled = reconcile_owner_episode(lock, liveness, exit_evidence=exit_evidence, legacy_authority=legacy)
     assert reconciled.state == result
     assert reconciled.reason
+
+
+@pytest.mark.parametrize(
+    "caller",
+    [
+        "finalize",
+        "reconcile_step",
+        "claude_unspool",
+        "codex_unspool",
+        "gemini_unspool",
+        "kimi_unspool",
+        "spool_grep",
+        "spin_wait",
+        "pending_recovery",
+        "expired_replacement",
+        "retention",
+        "timeout",
+        "drop",
+        "shard_merge",
+        "shard_abandon",
+    ],
+)
+def test_s2_u_rec_02_every_pid_sensitive_caller_uses_reconciliation(
+    tmp_path,
+    reconciliation_spy,
+    caller,
+):
+    spool_id = f"rec-{caller}"
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    old = (datetime.now() - timedelta(days=2)).isoformat()
+    spool = {
+        "id": spool_id,
+        "status": "running",
+        "harness": "claude-code",
+        "created_at": old,
+        "prompt": "still owned",
+        "result": "needle",
+        "owner_generation": 3,
+        "working_dir": str(worktree),
+        "shard": {"worktree_path": str(worktree), "branch_name": "test-branch"},
+    }
+    if caller == "pending_recovery":
+        spool.update(
+            status="pending",
+            launcher_pid=424242,
+            launcher_start_time="101",
+            launcher_namespace=NamespaceIdentity.supported(7, 11).to_dict(),
+        )
+    if caller == "timeout":
+        spool["timeout"] = 1
+    if caller == "expired_replacement":
+        spool["session_id"] = "session-expired"
+        source = {
+            "id": "rec-expired-source",
+            "status": "complete",
+            "session_id": "session-expired",
+            "created_at": old,
+        }
+        spindle._write_spool(source["id"], source)
+        transcript = spindle._get_transcript_path(source["id"])
+        transcript.parent.mkdir(parents=True, exist_ok=True)
+        transcript.write_text("prior transcript")
+
+    spindle._write_spool(spool_id, spool)
+    record_path = spindle._get_spool_path(spool_id)
+    before = record_path.read_bytes()
+    reconciliation_spy.forbid_mutation()
+
+    if caller == "finalize":
+        assert spindle._check_and_finalize_spool(spool_id) is False
+    elif caller in {"reconcile_step", "timeout"}:
+        assert spindle._reconcile_spool_step(spool_id) is True
+    elif caller == "claude_unspool":
+        assert "still running" in spindle._unspool_sync(spool_id)
+    elif caller == "codex_unspool":
+        assert "still running" in spindle._codex_unspool_sync(spool_id)
+    elif caller == "gemini_unspool":
+        assert "still running" in spindle._gemini_unspool_sync(spool_id)
+    elif caller == "kimi_unspool":
+        assert "still running" in spindle._kimi_unspool_sync(spool_id)
+    elif caller == "spool_grep":
+        grep = spindle.spool_grep.fn if hasattr(spindle.spool_grep, "fn") else spindle.spool_grep
+        assert "needle" in asyncio.run(grep("needle", spool_id=spool_id))
+    elif caller == "spin_wait":
+        assert "Still pending" in spindle._spin_wait_sync(spool_id, timeout=-1)
+    elif caller == "pending_recovery":
+        assert spindle._reconcile_pending_spool(spool_id) is True
+    elif caller == "expired_replacement":
+        assert spindle._handle_expired_session(spool_id, spool) is False
+    elif caller == "retention":
+        spindle._cleanup_old_spools()
+    elif caller == "drop":
+        assert "ownership unverifiable" in spindle._spin_drop_locked(spool_id)
+    elif caller == "shard_merge":
+        assert "still starting or running" in spindle._shard_merge_locked(spool_id, False, str(tmp_path))
+    elif caller == "shard_abandon":
+        assert "ownership unverifiable" in spindle._shard_abandon_locked(spool_id, False, str(tmp_path))
+    else:  # pragma: no cover - the parameter list is exhaustive
+        raise AssertionError(caller)
+
+    assert reconciliation_spy.calls, f"{caller} bypassed unified reconciliation"
+    assert spool_id in reconciliation_spy.calls
+    assert reconciliation_spy.violations == []
+    assert record_path.read_bytes() == before
+
+
+def test_owner_exit_evidence_is_scoped_to_current_generation(tmp_path):
+    spool_id = "generation-evidence"
+    spindle._get_owner_exit_path(spool_id).write_text(
+        '{"owner_generation":1,"provider_reaped":true,"cleanup_outcome":"stopped"}'
+    )
+    assert spindle._owner_exit_evidence(spool_id, 1) == (True, True)
+    assert spindle._owner_exit_evidence(spool_id, 2) == (False, False)
 
 
 def test_s2_u_slot_01_pending_running_and_stopping_count_as_active():

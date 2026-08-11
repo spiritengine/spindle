@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import fcntl
 import json
 import os
 import select
@@ -12,6 +13,7 @@ import socket
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional
 
@@ -114,6 +116,7 @@ class LogicalOwner:
         self.process_identity_path = self.store / f"{self.spool_id}.process-identity"
         self.owner_exit_path = self.store / f"{self.spool_id}.owner-exit"
         self.spool_path = self.store / f"{self.spool_id}.json"
+        self.spool_lock_path = self.store / f"{self.spool_id}.lock"
         self.stdout_path = self.store / f"{self.spool_id}.stdout"
         self.stderr_path = self.store / f"{self.spool_id}.stderr"
         self.exit_path = self.store / f"{self.spool_id}.exit"
@@ -128,28 +131,61 @@ class LogicalOwner:
         self.clock = OwnerClock(args.clock_fd)
         self.adopted_reaped = 0
 
+    def _await_launch_barrier(self) -> bool:
+        fd = self.args.launch_barrier_fd
+        if fd is None:
+            return True
+        try:
+            return bool(os.read(fd, 3))
+        finally:
+            os.close(fd)
+            self.args.launch_barrier_fd = None
+
     def _read_spool(self) -> dict:
         try:
             return json.loads(self.spool_path.read_text())
         except (FileNotFoundError, json.JSONDecodeError):
             return {"id": self.spool_id, "status": "pending", "created_at": _utc_now()}
 
-    def _write_spool(self, spool: dict) -> None:
+    def _write_spool_unlocked(self, spool: dict) -> None:
         _atomic_json_write(self.spool_path, spool)
 
+    @contextmanager
+    def _spool_record_guard(self):
+        """Join the launcher's compatibility record lock when it exists."""
+        try:
+            fd = os.open(self.spool_lock_path, os.O_RDWR)
+        except FileNotFoundError:
+            # Direct primitive users have no legacy record-lock sidecar.  The
+            # owner must not introduce a new ``*.lock`` artifact which an old
+            # store sweep can enumerate; public launch always creates this
+            # historical lock before releasing the owner barrier.
+            yield
+            return
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+
     def _update_spool(self, **values) -> dict:
-        spool = self._read_spool()
-        spool.update(values)
-        self._write_spool(spool)
-        return spool
+        with self._spool_record_guard():
+            spool = self._read_spool()
+            spool.update(values)
+            self._write_spool_unlocked(spool)
+            return spool
 
     def _set_lifecycle(self, **values) -> dict:
-        spool = self._read_spool()
-        lifecycle = dict(spool.get("lifecycle") or {})
-        lifecycle.update(values)
-        spool["lifecycle"] = lifecycle
-        self._write_spool(spool)
-        return spool
+        with self._spool_record_guard():
+            spool = self._read_spool()
+            lifecycle = dict(spool.get("lifecycle") or {})
+            lifecycle.update(values)
+            spool["lifecycle"] = lifecycle
+            self._write_spool_unlocked(spool)
+            return spool
 
     def _allocate_generation(self) -> None:
         try:
@@ -250,23 +286,25 @@ class LogicalOwner:
             "lock_inode": self.lock.inode,
         }
         _atomic_json_write(self.process_identity_path, process_identity)
-        spool = self._read_spool()
-        spool.update(
-            {
-                "status": "running",
-                "owner_pid": os.getpid(),
-                "provider_pid": self.provider.pid,
-                "provider_process_group_id": self.provider_pgid,
-                "owner_generation": self.generation,
-                "process_start_time": _starttime(os.getpid()),
-                "lifecycle": {
-                    **(spool.get("lifecycle") or {}),
-                    "ownership_state": "held",
-                    "transport_state": "connected",
-                },
-            }
-        )
-        self._write_spool(spool)
+        with self._spool_record_guard():
+            spool = self._read_spool()
+            spool.update(
+                {
+                    "status": "running",
+                    "owner_pid": os.getpid(),
+                    "provider_pid": self.provider.pid,
+                    "provider_process_group_id": self.provider_pgid,
+                    "owner_generation": self.generation,
+                    "process_start_time": _starttime(os.getpid()),
+                    "lifecycle": {
+                        **(spool.get("lifecycle") or {}),
+                        "ownership_state": "held",
+                        "transport_state": "connected",
+                    },
+                }
+            )
+            spool.pop("replacement_starting", None)
+            self._write_spool_unlocked(spool)
         self.checkpoints.reach("provider_ready", self.provider.pid)
         if self.args.ready_fd is not None:
             ready = {
@@ -461,25 +499,30 @@ class LogicalOwner:
         )
         self._write_exit_evidence(returncode, cleanup_outcome="stopped")
         self.checkpoints.reach("cleanup_receipt_durable", self.provider.pid)
-        spool = self._read_spool()
-        lifecycle = dict(spool.get("lifecycle") or {})
-        lifecycle.update(
-            {
-                "public_stop_state": None,
-                "transport_state": "reaped",
-                "normalized_terminal_kind": request.desired_terminal_kind,
-                "ownership_state": "held",
-            }
-        )
-        spool["lifecycle"] = lifecycle
-        spool["status"] = "timeout" if request.desired_terminal_kind == "timeout" else "error"
-        spool["error"] = "Timeout" if spool["status"] == "timeout" else "Cancelled"
-        spool["completed_at"] = _utc_now()
-        self.checkpoints.reach("before_terminal_publish", self.provider.pid)
-        self._write_spool(spool)
+        with self._spool_record_guard():
+            spool = self._read_spool()
+            lifecycle = dict(spool.get("lifecycle") or {})
+            lifecycle.update(
+                {
+                    "public_stop_state": None,
+                    "transport_state": "reaped",
+                    "normalized_terminal_kind": request.desired_terminal_kind,
+                    "ownership_state": "held",
+                }
+            )
+            spool["lifecycle"] = lifecycle
+            spool["status"] = "timeout" if request.desired_terminal_kind == "timeout" else "error"
+            spool["error"] = (
+                f"Timeout after {spool.get('timeout')}s" if spool["status"] == "timeout" else "Cancelled"
+            )
+            spool["completed_at"] = _utc_now()
+            self.checkpoints.reach("before_terminal_publish", self.provider.pid)
+            self._write_spool_unlocked(spool)
         return 0
 
     def run(self) -> int:
+        if not self._await_launch_barrier():
+            return 125
         _set_subreaper()
         self.lock = acquire_ownership_lock(self.lock_path)
         self._allocate_generation()
@@ -543,6 +586,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--spool-id", required=True)
     parser.add_argument("--generation", type=int, default=1)
     parser.add_argument("--ready-fd", type=int)
+    parser.add_argument("--launch-barrier-fd", type=int)
     parser.add_argument("--checkpoint-fd", type=int)
     parser.add_argument("--pause-checkpoint")
     parser.add_argument("--clock-fd", type=int)
