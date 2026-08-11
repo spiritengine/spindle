@@ -164,7 +164,9 @@ def supervisor_env(tmp_path):
             "SPINDLE_SUPERVISOR_POLL_INTERVAL": "0.05",
         }
     )
-    return env, store, workdir
+    assert not (home / "spools-v2").exists()
+    yield env, store, workdir
+    assert not (home / "spools-v2").exists()
 
 
 def _spin_cli(env: dict[str, str], workdir: Path, *, timeout: int | None = None) -> subprocess.CompletedProcess:
@@ -260,8 +262,12 @@ def test_concurrent_launchers_share_one_store_owner(supervisor_env):
         description="supervisor owner record",
     )
 
-    assert record["supervisor_protocol_version"] >= 1
-    assert record["spool_schema_version"] >= 1
+    assert record["supervisor_protocol_version"] == 1
+    assert record["spool_schema_version"] == 1
+    assert record["supported_supervisor_protocol_range"] == {"min": 1, "max": 1}
+    assert record["readable_spool_schemas"] == [1]
+    assert record["writable_spool_schema"] == 1
+    assert record["supervisor_capabilities"] == ["supervisor-compatibility-ranges"]
     assert _pid_alive(record["pid"])
     terminal = [_wait_spool(store, spool_id, "complete") for spool_id in spool_ids]
     assert {spool["result"] for spool in terminal} == {"durable result"}
@@ -329,11 +335,7 @@ def test_dead_supervisor_is_reclaimed_without_relaunching_harness(supervisor_env
         check=True,
     )
     replacement = _wait_for(
-        lambda: (
-            record
-            if (record := _read_json(store / SUPERVISOR_RECORD)).get("pid") != owner["pid"]
-            else None
-        ),
+        lambda: record if (record := _read_json(store / SUPERVISOR_RECORD)).get("pid") != owner["pid"] else None,
         description="replacement supervisor owner",
     )
     assert _pid_alive(replacement["pid"])
@@ -350,11 +352,7 @@ def test_abandoned_minimal_reservation_is_terminalized(supervisor_env):
         [
             sys.executable,
             "-c",
-            (
-                "import spindle; "
-                f"ok, error = spindle._try_reserve_slot_and_create({spool_id!r}); "
-                "assert ok, error"
-            ),
+            (f"import spindle; ok, error = spindle._try_reserve_slot_and_create({spool_id!r}); assert ok, error"),
         ],
         cwd=REPO_ROOT,
         env=env,
@@ -375,9 +373,11 @@ def _start_supervisor_lock_holder(
     protocol: int,
     schema: int,
     package: str,
+    record_updates: dict | None = None,
 ) -> tuple[subprocess.Popen, Path]:
     ready = store / "holder.ready"
     stop = store / "holder.stop"
+    updates = json.dumps(record_updates or {})
     script = textwrap.dedent(
         f"""\
         import fcntl, json, os, time
@@ -385,13 +385,15 @@ def _start_supervisor_lock_holder(
         store = Path({str(store)!r})
         fd = os.open(store / {SUPERVISOR_LIFETIME_LOCK!r}, os.O_CREAT | os.O_RDWR)
         fcntl.flock(fd, fcntl.LOCK_EX)
-        (store / {SUPERVISOR_RECORD!r}).write_text(json.dumps({{
+        record = {{
             "pid": os.getpid(),
             "supervisor_protocol_version": {protocol},
             "spool_schema_version": {schema},
             "package": {package!r},
             "package_version": "foreign",
-        }}))
+        }}
+        record.update(json.loads({updates!r}))
+        (store / {SUPERVISOR_RECORD!r}).write_text(json.dumps(record))
         Path({str(ready)!r}).touch()
         while not Path({str(stop)!r}).exists():
             time.sleep(0.02)
@@ -418,6 +420,58 @@ def test_incompatible_owner_is_rejected_before_reservation(supervisor_env, proto
         after = {path.name for path in store.glob("*.json")}
         assert cli.returncode != 0 or "Error:" in cli.stdout
         assert after == before
+    finally:
+        stop.touch()
+        holder.wait(timeout=5)
+
+
+@pytest.mark.parametrize(
+    ("record_updates", "diagnostic"),
+    [
+        (
+            {
+                "supported_supervisor_protocol_range": {"min": 2, "max": 3},
+                "readable_spool_schemas": [1],
+                "writable_spool_schema": 1,
+                "supervisor_capabilities": ["supervisor-compatibility-ranges"],
+            },
+            "owner_supported=2-3 launcher_required=1-1",
+        ),
+        (
+            {
+                "supported_supervisor_protocol_range": {"min": 1, "max": 1},
+                "readable_spool_schemas": [1],
+                "writable_spool_schema": 1,
+                "supervisor_capabilities": [],
+            },
+            "launcher_requires_capabilities=['supervisor-compatibility-ranges']",
+        ),
+    ],
+)
+def test_incompatible_bridge_owner_is_rejected_before_reservation_and_monitor(
+    supervisor_env, record_updates, diagnostic
+):
+    env, store, workdir = supervisor_env
+    harness_count = store / "harness.count"
+    env["FAKE_HARNESS_COUNT"] = str(harness_count)
+    holder, stop = _start_supervisor_lock_holder(
+        env,
+        store,
+        protocol=1,
+        schema=1,
+        package="/foreign/spindle",
+        record_updates=record_updates,
+    )
+    owner = _read_json(store / SUPERVISOR_RECORD)
+    before = {path.name: path.read_bytes() for path in store.glob("*.json")}
+    try:
+        cli = _spin_cli(env, workdir)
+        after = {path.name: path.read_bytes() for path in store.glob("*.json")}
+        assert cli.returncode != 0 or "Error:" in cli.stdout
+        assert f"live owner pid={owner['pid']}" in cli.stdout
+        assert diagnostic in cli.stdout
+        assert after == before
+        assert not harness_count.exists()
     finally:
         stop.touch()
         holder.wait(timeout=5)
@@ -816,10 +870,7 @@ def test_expired_session_replacement_remains_owned_to_terminal(supervisor_env):
         [
             sys.executable,
             "-c",
-            (
-                "import spindle; "
-                "print(spindle._respin_sync('fake-session', 'continue after expiry'), flush=True)"
-            ),
+            ("import spindle; print(spindle._respin_sync('fake-session', 'continue after expiry'), flush=True)"),
         ],
         cwd=REPO_ROOT,
         env=env,
@@ -905,6 +956,7 @@ async def test_http_service_launch_reaps_idle_supervisor(supervisor_env):
         stderr=subprocess.DEVNULL,
     )
     try:
+
         def healthy():
             try:
                 with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=0.2) as response:

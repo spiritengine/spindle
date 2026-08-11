@@ -29,6 +29,7 @@ import time
 import uuid
 import warnings
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Dict, Generator, Optional, Tuple
@@ -133,10 +134,33 @@ async def health_check(request: Request) -> JSONResponse:
     )
 
 
+@dataclass(frozen=True)
+class _StoreLayout:
+    """Names versioned store roots without creating or activating either one."""
+
+    schema1_root: Path
+    schema2_root: Path
+    active_root: Path
+    active_schema: int
+
+
+def _resolve_store_layout(spindle_home: Optional[Path] = None) -> _StoreLayout:
+    """Resolve today's schema-1 store and the reserved sibling schema-2 path."""
+    home = spindle_home or Path(os.environ.get("SPINDLE_HOME", str(Path.home() / ".spindle")))
+    schema1_root = home / "spools"
+    return _StoreLayout(
+        schema1_root=schema1_root,
+        schema2_root=home / "spools-v2",
+        active_root=schema1_root,
+        active_schema=1,
+    )
+
+
 # Storage directory. SPINDLE_HOME is honored (like the other config env vars
 # below) so tests can redirect the whole store to a tmp dir before import and
 # never touch the real ~/.spindle, even from an escaped monitor thread.
-SPINDLE_DIR = Path(os.environ.get("SPINDLE_HOME", str(Path.home() / ".spindle"))) / "spools"
+_STORE_LAYOUT = _resolve_store_layout()
+SPINDLE_DIR = _STORE_LAYOUT.active_root
 
 # Canonical location for lodged profiles (folder-per-profile, each holding a
 # profile.json). Sits beside the spool store and honors SPINDLE_HOME the same
@@ -233,6 +257,11 @@ OUTPUT_COMPLETION_GRACE_SECONDS = 5.0
 # process to parse records it does not understand.
 SUPERVISOR_PROTOCOL_VERSION = 1
 SPOOL_SCHEMA_VERSION = 1
+SUPPORTED_SUPERVISOR_PROTOCOL_RANGE = (SUPERVISOR_PROTOCOL_VERSION, SUPERVISOR_PROTOCOL_VERSION)
+READABLE_SPOOL_SCHEMAS = (SPOOL_SCHEMA_VERSION,)
+WRITABLE_SPOOL_SCHEMA = SPOOL_SCHEMA_VERSION
+SUPERVISOR_CAPABILITIES = ("supervisor-compatibility-ranges",)
+REQUIRED_SUPERVISOR_CAPABILITIES = frozenset(SUPERVISOR_CAPABILITIES)
 SUPERVISOR_IMPORT_GUARD = "_SPINDLE_STORE_SUPERVISOR"
 SUPERVISOR_POLL_INTERVAL = float(os.environ.get("SPINDLE_SUPERVISOR_POLL_INTERVAL", "0.5"))
 SUPERVISOR_IDLE_GRACE = float(os.environ.get("SPINDLE_SUPERVISOR_IDLE_GRACE", "5"))
@@ -1405,19 +1434,49 @@ def _read_supervisor_record() -> Optional[dict]:
     return data if isinstance(data, dict) else None
 
 
+_SUPERVISOR_MANAGED_FIELDS = frozenset(
+    {
+        "pid",
+        "supervisor_protocol_version",
+        "spool_schema_version",
+        "supported_supervisor_protocol_range",
+        "readable_spool_schemas",
+        "writable_spool_schema",
+        "supervisor_capabilities",
+        "package",
+        "package_version",
+        "started_at",
+        "retired_at",
+        "store",
+    }
+)
+
+
 def _write_supervisor_record(data: dict) -> None:
+    previous = _read_supervisor_record() or {}
+    record = {key: value for key, value in previous.items() if key not in _SUPERVISOR_MANAGED_FIELDS}
+    record.update(data)
     SPINDLE_DIR.mkdir(parents=True, exist_ok=True)
     path = _supervisor_record_path()
     tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(data, indent=2))
+    tmp.write_text(json.dumps(record, indent=2))
     os.replace(tmp, path)
 
 
 def _supervisor_identity(pid: int, *, started_at: Optional[str] = None) -> dict:
     return {
         "pid": pid,
+        # Pre-bridge readers require these exact scalar values. Bridge readers
+        # use the additive fields below when the complete set is present.
         "supervisor_protocol_version": SUPERVISOR_PROTOCOL_VERSION,
         "spool_schema_version": SPOOL_SCHEMA_VERSION,
+        "supported_supervisor_protocol_range": {
+            "min": SUPPORTED_SUPERVISOR_PROTOCOL_RANGE[0],
+            "max": SUPPORTED_SUPERVISOR_PROTOCOL_RANGE[1],
+        },
+        "readable_spool_schemas": list(READABLE_SPOOL_SCHEMAS),
+        "writable_spool_schema": WRITABLE_SPOOL_SCHEMA,
+        "supervisor_capabilities": list(SUPERVISOR_CAPABILITIES),
         "package": _package_path(),
         "package_version": __version__,
         "started_at": started_at or datetime.now().isoformat(),
@@ -1425,21 +1484,129 @@ def _supervisor_identity(pid: int, *, started_at: Optional[str] = None) -> dict:
     }
 
 
+_SUPERVISOR_NEGOTIATION_FIELDS = frozenset(
+    {
+        "supported_supervisor_protocol_range",
+        "readable_spool_schemas",
+        "writable_spool_schema",
+        "supervisor_capabilities",
+    }
+)
+
+
+def _compatibility_owner(record: dict) -> str:
+    pid = record.get("pid")
+    package = record.get("package")
+    if package:
+        return f"live owner pid={pid!r} package={package!r}"
+    return f"live owner pid={pid!r}"
+
+
+def _positive_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _parse_supervisor_negotiation(record: dict) -> tuple[Optional[dict], Optional[str]]:
+    protocol_range = record.get("supported_supervisor_protocol_range")
+    if not isinstance(protocol_range, dict) or not {"min", "max"}.issubset(protocol_range):
+        return None, "supported_supervisor_protocol_range must contain integer min and max"
+    protocol_min = protocol_range["min"]
+    protocol_max = protocol_range["max"]
+    if not _positive_int(protocol_min) or not _positive_int(protocol_max) or protocol_min > protocol_max:
+        return None, "supported_supervisor_protocol_range must be a positive ordered range"
+
+    readable = record.get("readable_spool_schemas")
+    if not isinstance(readable, list) or not readable or any(not _positive_int(schema) for schema in readable):
+        return None, "readable_spool_schemas must be a nonempty list of positive integers"
+
+    writable = record.get("writable_spool_schema")
+    if not _positive_int(writable):
+        return None, "writable_spool_schema must be a positive integer"
+
+    capabilities = record.get("supervisor_capabilities")
+    if not isinstance(capabilities, list) or any(
+        not isinstance(capability, str) or not capability for capability in capabilities
+    ):
+        return None, "supervisor_capabilities must be a list of nonempty strings"
+
+    return {
+        "protocol_range": (protocol_min, protocol_max),
+        "readable_schemas": frozenset(readable),
+        "writable_schema": writable,
+        "capabilities": frozenset(capabilities),
+    }, None
+
+
 def _supervisor_compatibility_error(record: Optional[dict]) -> Optional[str]:
     if not record:
         return "active store supervisor did not publish its compatibility record"
-    protocol = record.get("supervisor_protocol_version")
-    schema = record.get("spool_schema_version")
-    if protocol != SUPERVISOR_PROTOCOL_VERSION:
+
+    negotiation_fields = _SUPERVISOR_NEGOTIATION_FIELDS.intersection(record)
+    if not negotiation_fields:
+        # A live pre-bridge supervisor has only the scalar handshake. Preserve
+        # its exact v1 semantics until schema-1 work is drained in a later slice.
+        protocol = record.get("supervisor_protocol_version")
+        schema = record.get("spool_schema_version")
+        if protocol != SUPERVISOR_PROTOCOL_VERSION:
+            return (
+                "active store supervisor protocol is incompatible "
+                f"({_compatibility_owner(record)}; owner={protocol!r}, launcher={SUPERVISOR_PROTOCOL_VERSION})"
+            )
+        if schema != SPOOL_SCHEMA_VERSION:
+            return (
+                "active spool schema is incompatible "
+                f"({_compatibility_owner(record)}; owner={schema!r}, launcher={SPOOL_SCHEMA_VERSION})"
+            )
+        return None
+
+    if negotiation_fields != _SUPERVISOR_NEGOTIATION_FIELDS:
+        missing = sorted(_SUPERVISOR_NEGOTIATION_FIELDS - negotiation_fields)
         return (
-            "active store supervisor protocol is incompatible "
-            f"(owner={protocol!r}, launcher={SUPERVISOR_PROTOCOL_VERSION})"
+            "active store supervisor compatibility record is incomplete "
+            f"({_compatibility_owner(record)}; missing={missing})"
         )
-    if schema != SPOOL_SCHEMA_VERSION:
+
+    negotiation, invalid = _parse_supervisor_negotiation(record)
+    if invalid:
+        return f"active store supervisor compatibility record is invalid ({_compatibility_owner(record)}; {invalid})"
+    assert negotiation is not None
+
+    owner_min, owner_max = negotiation["protocol_range"]
+    launcher_min, launcher_max = SUPPORTED_SUPERVISOR_PROTOCOL_RANGE
+    protocol_compatible = max(owner_min, launcher_min) <= min(owner_max, launcher_max)
+    owner_readable = negotiation["readable_schemas"]
+    owner_writable = negotiation["writable_schema"]
+    missing_capabilities = REQUIRED_SUPERVISOR_CAPABILITIES - negotiation["capabilities"]
+    launcher_can_write = WRITABLE_SPOOL_SCHEMA in owner_readable
+    launcher_can_read = owner_writable in READABLE_SPOOL_SCHEMAS
+
+    problems = []
+    if not protocol_compatible:
+        problems.append(
+            f"supervisor protocol owner_supported={owner_min}-{owner_max} "
+            f"launcher_required={launcher_min}-{launcher_max}"
+        )
+    if not launcher_can_write:
+        problems.append(
+            f"owner_readable_spool_schemas={sorted(owner_readable)} "
+            f"launcher_requires_writable_schema={WRITABLE_SPOOL_SCHEMA}"
+        )
+    if not launcher_can_read:
+        problems.append(
+            f"owner_writable_spool_schema={owner_writable} "
+            f"launcher_readable_spool_schemas={list(READABLE_SPOOL_SCHEMAS)}"
+        )
+    if missing_capabilities:
+        problems.append(
+            f"owner_capabilities={sorted(negotiation['capabilities'])} "
+            f"launcher_requires_capabilities={sorted(REQUIRED_SUPERVISOR_CAPABILITIES)}"
+        )
+    if problems:
         return (
-            "active spool schema is incompatible "
-            f"(owner={schema!r}, launcher={SPOOL_SCHEMA_VERSION})"
+            "active store supervisor capabilities are incompatible "
+            f"({_compatibility_owner(record)}; {'; '.join(problems)})"
         )
+
     return None
 
 
