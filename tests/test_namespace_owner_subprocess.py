@@ -503,6 +503,28 @@ def test_s2_s_fin_01_real_exit_sidecar_and_released_lock_authorize_finalization(
     assert owner.lock_path.exists()
 
 
+def test_natural_exit_final_mailbox_settlement_receipts_racing_request(owner_case):
+    owner = owner_case("silent-exit", pause_checkpoint="natural_exit_evidence_published")
+    readable, _, _ = select.select([owner.checkpoint], [], [], 5)
+    assert readable
+    checkpoint = json.loads(owner.checkpoint.recv(4096).splitlines()[0])
+    assert checkpoint["name"] == "natural_exit_evidence_published"
+    assert owner.owner_exit_path.exists()
+
+    request = owner.request(request_id="natural-exit-race")
+    assert owner.receipt(request.request_id) is None
+    owner.checkpoint.sendall(b"continue\n")
+    evidence = owner.wait_exit()
+    receipt = owner.receipt(request.request_id)
+
+    assert evidence["cleanup_outcome"] == "natural_exit"
+    assert receipt.owner_generation == owner.generation
+    assert receipt.owner_acknowledged_at is None
+    assert receipt.cleanup_outcome == "rejected_terminal"
+    identity = ProcessIdentity.from_dict(json.loads(owner.owner_identity_path.read_text()))
+    assert probe_ownership_lock(owner.lock_path, identity).state == "released"
+
+
 def test_s2_s_time_01_owner_self_timeout_uses_control_and_reaps_before_terminal(owner_case, owner_clock):
     _current, advance, owner_clock_socket = owner_clock
     owner = owner_case("ignore-term", timeout=10, controlled_clock_fd=owner_clock_socket.fileno())

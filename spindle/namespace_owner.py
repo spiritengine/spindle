@@ -174,6 +174,8 @@ def assess_process_liveness(identity: ProcessIdentity, *, ops=None) -> LivenessE
         try:
             observed_birth = ops.read_starttime(identity.pid)
         except OSError as exc:
+            if exc.errno == errno.ENOENT and ops.pidfd_is_readable(pidfd):
+                return LivenessEvidence("dead", "pidfd_exited")
             if exc.errno in {errno.ENOENT, errno.EACCES, errno.EPERM}:
                 return LivenessEvidence("unverifiable", "proc_unavailable")
             return LivenessEvidence("unverifiable", "proc_error")
@@ -247,7 +249,22 @@ def probe_ownership_lock(path: str | os.PathLike[str], identity: ProcessIdentity
             return LockEvidence("held", *observed)
         except OSError as exc:
             return LockEvidence("unreadable", *observed, detail=f"flock:{exc.errno}")
-        return LockEvidence("released", *observed)
+        try:
+            acquired_descriptor_info = os.fstat(fd)
+            acquired_pathname_info = os.stat(path)
+        except FileNotFoundError:
+            return LockEvidence("identity_mismatch", detail="path_replaced_after_flock")
+        except OSError as exc:
+            return LockEvidence("unreadable", detail=f"post_flock_stat:{exc.errno}")
+        acquired_descriptor = (acquired_descriptor_info.st_dev, acquired_descriptor_info.st_ino)
+        acquired_observed = (acquired_pathname_info.st_dev, acquired_pathname_info.st_ino)
+        if acquired_descriptor != acquired_observed or not _identity_matches(*acquired_observed, identity):
+            return LockEvidence(
+                "identity_mismatch",
+                *acquired_observed,
+                detail="inode_mismatch_after_flock",
+            )
+        return LockEvidence("released", *acquired_observed)
     finally:
         if acquired:
             try:

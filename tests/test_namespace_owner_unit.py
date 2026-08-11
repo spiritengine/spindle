@@ -82,6 +82,24 @@ def test_s2_u_live_02_same_namespace_pidfd_dead(fake_process_ops, pidfd_result, 
     assert assess_process_liveness(_identity(namespace), ops=fake_process_ops) == LivenessEvidence("dead", reason)
 
 
+def test_pidfd_readable_wins_when_proc_disappears_after_open(fake_process_ops):
+    namespace = NamespaceIdentity.supported(5, 9)
+    fake_process_ops.namespace = namespace
+    fake_process_ops.pidfd_readable = True
+    fake_process_ops.starttime = FileNotFoundError(errno.ENOENT, "proc entry disappeared")
+
+    result = assess_process_liveness(_identity(namespace), ops=fake_process_ops)
+
+    assert result == LivenessEvidence("dead", "pidfd_exited")
+    assert fake_process_ops.calls == [
+        ("current_namespace",),
+        ("pidfd_open", 123),
+        ("read_starttime", 123),
+        ("pidfd_is_readable", 91),
+        ("close", 91),
+    ]
+
+
 def test_s2_u_live_03_different_namespace_is_unverifiable_before_pid_access(fake_process_ops):
     fake_process_ops.namespace = NamespaceIdentity.supported(5, 10)
     record = _identity(NamespaceIdentity.supported(5, 11))
@@ -183,6 +201,52 @@ def test_s2_u_lock_07_lock_identity_includes_device(tmp_path, process_identity_r
     assert probe_ownership_lock(path, record).state == "identity_mismatch"
 
 
+def test_probe_reverifies_recorded_inode_after_observer_acquires_flock(tmp_path, monkeypatch):
+    import fcntl
+
+    path = tmp_path / "racing.process-owner"
+    path.touch(mode=0o600)
+    held_fd = os.open(path, os.O_RDWR)
+    real_flock = fcntl.flock
+    real_flock(held_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    recorded = path.stat()
+    identity = ProcessIdentity(
+        pid=os.getpid(),
+        birth_token="test",
+        namespace=capture_pid_namespace(),
+        owner_generation=1,
+        child_pgid=None,
+        lock_device=recorded.st_dev,
+        lock_inode=recorded.st_ino,
+        lock_created=True,
+    )
+    replaced = {"value": False}
+
+    def replace_between_observation_and_flock(fd, operation):
+        if fd != held_fd and operation == fcntl.LOCK_EX | fcntl.LOCK_NB and not replaced["value"]:
+            real_flock(held_fd, fcntl.LOCK_UN)
+            path.unlink()
+            path.touch(mode=0o600)
+            replaced["value"] = True
+        return real_flock(fd, operation)
+
+    monkeypatch.setattr(fcntl, "flock", replace_between_observation_and_flock)
+    try:
+        evidence = probe_ownership_lock(path, identity)
+    finally:
+        os.close(held_fd)
+
+    assert replaced["value"] is True
+    assert evidence.state == "identity_mismatch"
+    assert evidence.detail == "inode_mismatch_after_flock"
+    reconciliation = reconcile_owner_episode(
+        evidence,
+        LivenessEvidence("dead", "pidfd_exited"),
+        exit_evidence=True,
+    )
+    assert reconciliation.state == "store_unhealthy"
+
+
 @pytest.mark.parametrize("kind,terminal", [("cancel", "cancelled"), ("timeout", "timeout"), ("drop", "cancelled")])
 def test_s2_u_ctl_01_control_request_records_complete_provenance(tmp_path, kind, terminal):
     namespace = NamespaceIdentity.supported(13, 17)
@@ -249,6 +313,86 @@ def test_every_owner_exit_code_is_disjoint_from_watchdog_crash_channel():
     for exit_code in range(256):
         assert _owner_process_crashed(exit_code << 8, exception_reported=False) is False
         assert _owner_process_crashed(exit_code << 8, exception_reported=True) is True
+
+
+def test_natural_exit_retries_descendant_cleanup_before_evidence_or_release(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from spindle.namespace_owner_process import LogicalOwner
+
+    class TrackingLock:
+        fd = -1
+
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    owner = object.__new__(LogicalOwner)
+    owner.args = SimpleNamespace(timeout=None, poll_interval=0)
+    owner.store = tmp_path
+    owner.spool_id = "descendant-retry"
+    owner.provider = SimpleNamespace(pid=456)
+    owner.provider_pidfd = None
+    owner.control = None
+    owner.clock = SimpleNamespace(monotonic=lambda: 0.0)
+    owner.checkpoints = SimpleNamespace(reach=lambda *_args: None)
+    owner.lock = TrackingLock()
+    owner._await_launch_barrier = lambda: True
+    owner._allocate_generation = lambda: None
+    owner._ensure_wall_deadline = lambda: None
+    owner._remaining_wall_budget = lambda: None
+    owner._publish_owner_identity = lambda: None
+    owner._spawn_provider = lambda: None
+    owner._verify_lock = lambda: True
+    owner._next_current_request = lambda: None
+    owner._provider_exited = lambda: True
+    owner._finish_provider = lambda: 0
+    owner._set_lifecycle = lambda **_values: None
+    owner._settle_other_requests_unlocked = lambda *_args, **_kwargs: True
+    cleanup_calls = []
+
+    def settle_descendants(*, force):
+        cleanup_calls.append(force)
+        assert owner.lock.closed is False
+        return len(cleanup_calls) > 1
+
+    evidence_calls = []
+
+    def write_exit_evidence(returncode, *, cleanup_outcome):
+        assert cleanup_calls == [False, False]
+        assert owner.lock.closed is False
+        evidence_calls.append((returncode, cleanup_outcome))
+        return True
+
+    owner._settle_descendants = settle_descendants
+    owner._write_exit_evidence = write_exit_evidence
+    monkeypatch.setattr("spindle.namespace_owner_process._set_subreaper", lambda: None)
+    monkeypatch.setattr("spindle.namespace_owner_process.acquire_ownership_lock", lambda _path: owner.lock)
+    owner.lock_path = tmp_path / "descendant-retry.process-owner"
+
+    assert owner.run() == 0
+    assert evidence_calls == [(0, "natural_exit")]
+    assert owner.lock.closed is True
+
+
+def test_watchdog_retries_after_first_descendant_confirmation_deadline(monkeypatch):
+    import spindle.owner_watchdog as watchdog
+
+    outcomes = iter((False, True))
+    calls = []
+
+    def containment_pass():
+        calls.append("pass")
+        return next(outcomes)
+
+    monkeypatch.setattr(watchdog, "_contain_adopted_descendants", containment_pass)
+    monkeypatch.setattr(watchdog.time, "sleep", lambda _seconds: None)
+
+    watchdog._contain_adopted_descendants_until_clean()
+
+    assert calls == ["pass", "pass"]
 
 
 @pytest.mark.parametrize(
@@ -449,6 +593,68 @@ def test_store_health_authority_blocks_launch_doctor_and_recovers(tmp_path, monk
     assert (success, error) == (True, None)
     assert spindle._doctor_storage_check()["status"] == "ok"
     assert spindle._count_running() == 2
+
+
+@pytest.mark.parametrize(
+    ("identity_artifact", "reason"),
+    [("missing", "owner_identity_missing"), ("incomplete", "owner_identity_unreadable")],
+)
+def test_current_owner_identity_defects_block_production_admission_and_doctor(
+    tmp_path,
+    monkeypatch,
+    identity_artifact,
+    reason,
+):
+    spool_id = f"current-{identity_artifact}"
+    monkeypatch.setattr(spindle, "SPINDLE_DIR", tmp_path)
+    monkeypatch.setattr(spindle, "_ensure_store_supervisor_locked", lambda: (True, None))
+    spindle._write_spool(
+        spool_id,
+        {
+            "id": spool_id,
+            "status": "running",
+            "spool_schema_version": 1,
+            "owner_generation": 4,
+            "owner_pid": os.getpid(),
+            "lifecycle": {"ownership_state": "held", "transport_state": "connected"},
+        },
+    )
+    spindle._write_spool(
+        "legacy-schema1",
+        {
+            "id": "legacy-schema1",
+            "status": "running",
+            "spool_schema_version": 1,
+            "pid": os.getpid(),
+            "process_start_time": spindle._process_start_time(os.getpid()),
+        },
+    )
+    if identity_artifact == "incomplete":
+        spindle._get_owner_identity_path(spool_id).write_text('{"pid":1,"owner_generation":4}')
+
+    success, error = spindle._try_reserve_slot_and_create("must-not-exist")
+
+    assert success is False
+    assert reason in error
+    assert not spindle._get_spool_path("must-not-exist").exists()
+    assert spindle._reconcile_spool_ownership(spindle._read_spool("legacy-schema1")).reason == (
+        "legacy_authority_unproven"
+    )
+    diagnosis = spindle._doctor_storage_check()
+    assert diagnosis["status"] == "fail"
+    assert diagnosis["data"]["ownership_failures"] == [
+        {
+            "spool_id": spool_id,
+            "reason": reason,
+            "lock_state": "identity_mismatch" if identity_artifact == "missing" else "unreadable",
+            "detail": reason,
+            "recorded_device": None,
+            "recorded_inode": None,
+            "observed_device": None,
+            "observed_inode": None,
+        }
+    ]
+    assert reason in diagnosis["lines"][0]
 
 
 def test_s2_u_slot_01_pending_running_and_stopping_count_as_active():

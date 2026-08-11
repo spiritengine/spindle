@@ -528,7 +528,12 @@ class LogicalOwner:
                 return request
         return None
 
-    def _settle_other_requests_unlocked(self, accepted_request_id: str) -> bool:
+    def _settle_other_requests_unlocked(
+        self,
+        accepted_request_id: Optional[str],
+        *,
+        rejection_outcome: str = "rejected_superseded",
+    ) -> bool:
         """Give every durable non-winning request its generation-scoped receipt."""
         if not self._verify_lock():
             return False
@@ -543,6 +548,7 @@ class LogicalOwner:
                 request,
                 current_generation=self.generation,
                 accepted=False,
+                rejection_outcome=rejection_outcome,
             )
         return True
 
@@ -605,8 +611,22 @@ class LogicalOwner:
         if returncode is None:
             return -2
         descendants_clean = self._settle_descendants(force=True)
-        if forced_started is None and not descendants_clean:
-            forced_started = _utc_now()
+        while not descendants_clean:
+            if forced_started is None:
+                forced_started = _utc_now()
+            if not self._verify_lock():
+                return -2
+            update_control_receipt(
+                self.store,
+                self.spool_id,
+                request.request_id,
+                forced_cleanup_started_at=forced_started,
+                forced_cleanup_completed_at=None,
+                child_exit_observed_at=None,
+                cleanup_outcome="descendants_survived",
+            )
+            time.sleep(self.args.poll_interval)
+            descendants_clean = self._settle_descendants(force=True)
         if forced_started is not None:
             forced_completed = _utc_now()
         child_exit = _utc_now()
@@ -673,6 +693,7 @@ class LogicalOwner:
             monotonic_budget = min(float(self.args.timeout), remaining_wall_budget)
         self._spawn_provider()
         accepted_request = None
+        natural_exit_settled = False
         result = 0
         try:
             while True:
@@ -700,10 +721,16 @@ class LogicalOwner:
                     accepted_request = None
                 if self._provider_exited():
                     returncode = self._finish_provider()
-                    self._settle_descendants(force=False)
+                    descendants_clean = self._settle_descendants(force=False)
+                    if not descendants_clean:
+                        self._set_lifecycle(cleanup_outcome="descendants_survived")
+                        time.sleep(self.args.poll_interval)
+                        continue
                     if returncode is None or not self._write_exit_evidence(returncode, cleanup_outcome="natural_exit"):
                         time.sleep(self.args.poll_interval)
                         continue
+                    self.checkpoints.reach("natural_exit_evidence_published", self.provider.pid)
+                    natural_exit_settled = True
                     result = returncode
                     break
                 time.sleep(self.args.poll_interval)
@@ -716,6 +743,8 @@ class LogicalOwner:
             with mailbox_guard(self.store, self.spool_id):
                 if accepted_request is not None:
                     self._settle_other_requests_unlocked(accepted_request.request_id)
+                elif natural_exit_settled:
+                    self._settle_other_requests_unlocked(None, rejection_outcome="rejected_terminal")
                 self.checkpoints.reach("before_lock_release", self.provider.pid if self.provider else None)
                 self._verify_lock()
                 self.lock.close()

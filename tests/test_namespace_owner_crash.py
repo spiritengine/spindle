@@ -230,7 +230,16 @@ def test_same_id_replacement_crash_and_cancel_use_new_generation_without_slot_le
     assert "replacement_starting" not in spool
     assert read_control_receipt(store, spool_id, request.request_id) is None
     with patch("spindle.SPINDLE_DIR", store):
+        identity = ProcessIdentity.from_dict(json.loads((store / f"{spool_id}.owner-identity").read_text()))
+        evidence = json.loads((store / f"{spool_id}.owner-exit").read_text())
+        assert identity.owner_generation == 2
+        assert evidence["owner_generation"] == 2
+        assert evidence["cleanup_outcome"] == "preacceptance_failure"
+        assert spindle._reconcile_spool_ownership(spool).state == "terminalizable"
+        assert spindle._spool_blocks_destructive_action(spool) is False
         assert spindle._count_running() == 0
+        assert spindle.retire_owner_artifacts(store, spool_id, identity) is True
+        assert not (store / f"{spool_id}.json").exists()
 
 
 def test_s2_c_own_03_owner_crash_contains_setsid_escaped_descendant(

@@ -2872,6 +2872,25 @@ def _reconcile_spool_ownership(spool: dict) -> ReconciliationResult:
                 LivenessEvidence("unverifiable", "owner_identity_unreadable"),
                 LockEvidence("unreadable", detail="owner_identity_unreadable"),
             )
+        lifecycle = spool.get("lifecycle") or {}
+        current_owner_fields = any(
+            value is not None
+            for value in (
+                spool.get("owner_generation"),
+                spool.get("owner_pid"),
+                spool.get("provider_pid"),
+                spool.get("watchdog_pid"),
+                lifecycle.get("ownership_state"),
+                lifecycle.get("transport_state"),
+            )
+        )
+        if spool.get("status") == "running" and current_owner_fields:
+            return ReconciliationResult(
+                "store_unhealthy",
+                "owner_identity_missing",
+                LivenessEvidence("unverifiable", "owner_identity_missing"),
+                LockEvidence("identity_mismatch", detail="owner_identity_missing"),
+            )
 
     if spool.get("status") not in {"pending", "running"} and not spool.get("process_group_cleanup_warning"):
         return ReconciliationResult(
