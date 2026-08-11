@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import os
 import socket
 import stat
@@ -112,8 +113,12 @@ def owner_clock():
     controller, owner = socket.socketpair()
     current = {"value": 0.0}
     stopped = threading.Event()
+    primed = threading.Event()
+    errors = []
 
     def advance(seconds):
+        if not primed.wait(timeout=2):
+            raise AssertionError("owner clock was not primed before readiness")
         current["value"] += seconds
 
     def respond():
@@ -129,7 +134,22 @@ def owner_clock():
             while b"\n" in pending:
                 line, pending = pending.split(b"\n", 1)
                 if line == b"now":
-                    controller.sendall(f"{current['value']}\n".encode())
+                    try:
+                        controller.sendall(f"{current['value']}\n".encode())
+                    except OSError as exc:
+                        if stopped.is_set() or exc.errno in {
+                            errno.EBADF,
+                            errno.EPIPE,
+                            errno.ECONNRESET,
+                            errno.ENOTCONN,
+                        }:
+                            return
+                        errors.append(exc)
+                        return
+                    primed.set()
+                else:
+                    errors.append(AssertionError(f"unexpected owner clock request: {line!r}"))
+                    return
 
     responder = threading.Thread(target=respond, daemon=True)
     responder.start()
@@ -138,6 +158,10 @@ def owner_clock():
     controller.close()
     owner.close()
     responder.join(timeout=1)
+    if responder.is_alive():
+        pytest.fail("owner clock responder did not stop")
+    if errors:
+        pytest.fail(f"owner clock responder failed: {errors[0]!r}")
 
 
 @dataclass

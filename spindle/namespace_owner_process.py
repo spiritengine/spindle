@@ -486,8 +486,12 @@ class LogicalOwner:
         self.checkpoints.reach("identity_lock_acquired")
         self._publish_owner_identity()
         self.checkpoints.reach("identity_published")
-        self._spawn_provider()
+        # Establish the timeout epoch before publishing provider readiness.
+        # Callers may advance an injected clock as soon as readiness is
+        # visible; sampling the epoch afterward would move the deadline by
+        # that advance and leave the owner waiting forever at a frozen clock.
         started = self.clock.monotonic()
+        self._spawn_provider()
         accepted_request = None
         result = 0
         try:
