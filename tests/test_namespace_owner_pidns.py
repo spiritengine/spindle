@@ -165,19 +165,28 @@ def test_s2_x_ctl_02_foreign_timeout_reaches_owner_for_both_store_layouts(
     store_kind,
 ):
     _current, advance, clock_fd = owner_clock
-    deadline = datetime(2000, 1, 1, tzinfo=timezone.utc).isoformat()
+    episode_deadline = datetime(2000, 1, 1, tzinfo=timezone.utc).isoformat()
+    legacy_deadline = datetime(2100, 1, 1, tzinfo=timezone.utc).isoformat()
     owner = watchdog_owner_case(
         "ignore-term",
         pause_checkpoint="provider_ready",
         timeout=100,
         controlled_clock_fd=clock_fd.fileno(),
-        spool_overrides={"wall_deadline_at": deadline},
+        spool_overrides={"wall_deadline_at": legacy_deadline},
         store_kind=store_kind,
     )
     assert owner.receive_checkpoint()["name"] == "provider_ready"
-    spool = owner.spool()
-    assert spool["wall_deadline_at"] == deadline
-    assert spool["owner_episode"]["deadline"] == deadline
+    with patch("spindle.SPINDLE_DIR", owner.store):
+        with spindle._spool_lock(owner.spool_id) as acquired:
+            assert acquired
+            spool = spindle._read_spool(owner.spool_id)
+            assert spool["wall_deadline_at"] == legacy_deadline
+            spool["owner_episode"]["deadline"] = episode_deadline
+            spindle._write_spool(owner.spool_id, spool)
+    stored = owner.spool()
+    assert stored["wall_deadline_at"] == legacy_deadline
+    assert stored["owner_episode"]["deadline"] == episode_deadline
+    assert stored["wall_deadline_at"] != stored["owner_episode"]["deadline"]
     advance(101)
     source = OBSERVER_PROLOGUE + r"""
 active = spindle._reconcile_spool_step(sys.argv[2])
@@ -186,18 +195,20 @@ print(json.dumps({"active": active, "namespace": [ns.st_dev, ns.st_ino]}))
 """
     observed = foreign_pid_namespace(owner.store, source, owner.spool_id)
     assert observed["active"] is True
-    assert owner.spool()["status"] == "running"
-    with patch("spindle.SPINDLE_DIR", owner.store):
-        assert spindle._count_running() == 1
-    owner.resume()
-    owner.process.wait(timeout=8)
+    try:
+        requests = list(iter_control_requests(owner.store, owner.spool_id))
+        assert len(requests) == 1
+        assert owner.spool()["status"] == "running"
+        with patch("spindle.SPINDLE_DIR", owner.store):
+            assert spindle._count_running() == 1
+    finally:
+        owner.resume()
+        owner.process.wait(timeout=8)
     terminal = owner.spool()
     assert terminal["status"] == "timeout"
-    requests = list(iter_control_requests(owner.store, owner.spool_id))
-    assert len(requests) == 1
     request = requests[0]
     assert request.kind == "timeout"
-    assert request.deadline == deadline
+    assert request.deadline == episode_deadline
     assert [request.observer_namespace.device, request.observer_namespace.inode] == observed["namespace"]
     assert terminal["error"] == "Timeout after 100s"
 
