@@ -162,17 +162,14 @@ print(json.dumps({"message": message, "namespace": [ns.st_dev, ns.st_ino]}))
 def test_s2_x_ctl_02_foreign_timeout_reaches_owner_for_both_store_layouts(
     watchdog_owner_case,
     foreign_pid_namespace,
-    owner_clock,
     store_kind,
 ):
-    _current, advance, clock_fd = owner_clock
     episode_deadline = datetime(2000, 1, 1, tzinfo=timezone.utc).isoformat()
     legacy_deadline = datetime(2100, 1, 1, tzinfo=timezone.utc).isoformat()
     owner = watchdog_owner_case(
         "ignore-term",
         pause_checkpoint="provider_ready",
         timeout=100,
-        controlled_clock_fd=clock_fd.fileno(),
         spool_overrides={"wall_deadline_at": legacy_deadline},
         store_kind=store_kind,
     )
@@ -190,7 +187,6 @@ def test_s2_x_ctl_02_foreign_timeout_reaches_owner_for_both_store_layouts(
         assert stored["wall_deadline_at"] == legacy_deadline
         assert stored["owner_episode"]["deadline"] == episode_deadline
         assert stored["wall_deadline_at"] != stored["owner_episode"]["deadline"]
-        advance(101)
         source = OBSERVER_PROLOGUE + r"""
 active = spindle._reconcile_spool_step(sys.argv[2])
 ns = os.stat("/proc/self/ns/pid")
