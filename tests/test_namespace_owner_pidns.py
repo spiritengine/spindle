@@ -40,14 +40,29 @@ os.killpg = forbidden
 """
 
 
-def _terminal(owner, status):
-    return wait_until(
-        lambda: (
-            value
-            if (value := owner.spool()) and value.get("status") == status
-            else None
-        )
-    )
+def _finalize_after_owner_exit(owner, status, normalized_kind, error):
+    owner.process.wait(timeout=8)
+    proven = owner.spool()
+    episode = proven["owner_episode"]
+    assert proven["status"] == "running"
+    assert episode["phase"] == "cleanup_proven"
+    assert "release" not in episode
+    assert "normalized_terminal_kind" not in (proven.get("lifecycle") or {})
+    assert (proven.get("lifecycle") or {}).get("public_stop_state") == "stopping"
+    assert "error" not in proven
+    with patch("spindle.SPINDLE_DIR", owner.store):
+        assert spindle._count_running() == 0
+        assert spindle._check_and_finalize_spool(owner.spool_id) is True
+        assert spindle._count_running() == 0
+    terminal = owner.spool()
+    released = terminal["owner_episode"]
+    assert released["phase"] == "released"
+    assert released["release"]["proved_by"] == "reconciler"
+    assert terminal["status"] == status
+    assert terminal["lifecycle"]["normalized_terminal_kind"] == normalized_kind
+    assert "public_stop_state" not in terminal["lifecycle"]
+    assert terminal["error"] == error
+    return terminal
 
 
 def test_s2_x_ns_01_bwrap_observer_cannot_see_owner_pid_but_sees_held_lock(
@@ -118,7 +133,7 @@ print(json.dumps({"finalized": finalized, "active": active, "status": after["sta
     lock_after = (owner.store / f"{owner.spool_id}.process-owner").stat()
     assert (lock_after.st_dev, lock_after.st_ino) == (lock_before.st_dev, lock_before.st_ino)
     owner.resume()
-    assert _terminal(owner, "timeout")["lifecycle"]["normalized_terminal_kind"] == "timeout"
+    _finalize_after_owner_exit(owner, "timeout", "timeout", "Timeout after 1s")
 
 
 @pytest.mark.parametrize("store_kind", ["bridge_schema1", "schema2_legacy"])
@@ -150,9 +165,8 @@ print(json.dumps({"message": message, "namespace": [ns.st_dev, ns.st_ino]}))
     with patch("spindle.SPINDLE_DIR", owner.store):
         assert spindle._count_running() == 1
     owner.resume()
-    terminal = _terminal(owner, "error")
+    _finalize_after_owner_exit(owner, "error", "cancelled", "Cancelled")
     receipt = read_control_receipt(owner.store, owner.spool_id, request.request_id)
-    assert terminal["error"] == "Cancelled"
     assert receipt.forced_cleanup_started_at
     assert receipt.forced_cleanup_completed_at
     assert not Path(f"/proc/{owner.provider_pid}").exists()
@@ -201,14 +215,11 @@ print(json.dumps({"active": active, "namespace": [ns.st_dev, ns.st_ino]}))
             assert spindle._count_running() == 1
         owner.resume()
         owner_resumed = True
-        owner.process.wait(timeout=8)
-        terminal = owner.spool()
-        assert terminal["status"] == "timeout"
+        _finalize_after_owner_exit(owner, "timeout", "timeout", "Timeout after 100s")
         request = requests[0]
         assert request.kind == "timeout"
         assert request.deadline == episode_deadline
         assert [request.observer_namespace.device, request.observer_namespace.inode] == observed["namespace"]
-        assert terminal["error"] == "Timeout after 100s"
     finally:
         if owner.process.poll() is None:
             if not owner_resumed:
@@ -243,7 +254,7 @@ print(json.dumps({"status": spool["status"], "visible": Path(f"/proc/{spool['own
     observed = foreign_pid_namespace(owner.store, source, owner.spool_id)
     assert observed == {"status": "running", "visible": False}
     advance(101)
-    assert _terminal(owner, "timeout")["lifecycle"]["normalized_terminal_kind"] == "timeout"
+    _finalize_after_owner_exit(owner, "timeout", "timeout", "Timeout after 100s")
 
 
 def test_s2_x_leg_01_foreign_legacy_missing_lock_is_unverifiable_and_slot_counted(
@@ -296,18 +307,21 @@ spool = json.loads((store / f"{sys.argv[2]}.json").read_text())
 state = spindle._reconcile_spool_ownership(spool).state
 finalized = spindle._check_and_finalize_spool(sys.argv[2])
 count = spindle._count_running()
-after = (store / f"{sys.argv[2]}.json").read_bytes()
-print(json.dumps({"state": state, "finalized": finalized, "count": count, "record_size": len(after)}))
+after_bytes = (store / f"{sys.argv[2]}.json").read_bytes()
+after = json.loads(after_bytes)
+print(json.dumps({"state": state, "finalized": finalized, "count": count, "phase": after["owner_episode"]["phase"], "record_size": len(after_bytes)}))
 """
     observed = foreign_pid_namespace(owner.store, source, owner.spool_id)
     assert observed["state"] == "unverifiable"
     assert observed["finalized"] is False
     assert observed["count"] == 1
+    assert observed["phase"] == "cleanup_proven"
     assert record_path.read_bytes() == before
 
-    with patch("spindle.SPINDLE_DIR", owner.store):
-        assert spindle._check_and_finalize_spool(owner.spool_id) is True
-        assert spindle._count_running() == 0
-    terminal = owner.spool()
+    terminal = _finalize_after_owner_exit(
+        owner,
+        "error",
+        "indeterminate",
+        "Logical owner exited before terminal publication",
+    )
     assert terminal["error_kind"] == "owner_transport_loss"
-    assert terminal["lifecycle"]["normalized_terminal_kind"] == "indeterminate"

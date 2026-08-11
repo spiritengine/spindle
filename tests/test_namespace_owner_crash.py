@@ -6,6 +6,7 @@ import fcntl
 import json
 import os
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
@@ -34,11 +35,21 @@ def _provider_gone(owner):
 
 
 def _finalize_after_crash(owner):
+    before = owner.spool()
+    before_episode = before["owner_episode"]
+    assert before["status"] == "running"
+    assert before_episode["phase"] == "cleanup_proven"
+    assert "release" not in before_episode
+    assert "normalized_terminal_kind" not in (before.get("lifecycle") or {})
     with patch("spindle.SPINDLE_DIR", owner.store):
-        assert spindle._count_running() == 1
+        assert spindle._count_running() == 0
         assert spindle._check_and_finalize_spool(owner.spool_id) is True
         assert spindle._count_running() == 0
-    return owner.spool()
+    terminal = owner.spool()
+    released = terminal["owner_episode"]
+    assert released["phase"] == "released"
+    assert released["release"]["proved_by"] == "reconciler"
+    return terminal
 
 
 def _public_cancel(owner):
@@ -208,6 +219,7 @@ def test_same_id_replacement_crash_and_cancel_use_new_generation_without_slot_le
         spool_id=spool_id,
         spool_overrides={
             "status": "running",
+            "created_at": (datetime.now() - timedelta(days=2)).isoformat(),
             "owner_generation": 2,
             "replacement_starting": True,
             "replacement_owner_generation": 2,
@@ -215,31 +227,36 @@ def test_same_id_replacement_crash_and_cancel_use_new_generation_without_slot_le
     )
     checkpoint = owner.receive_checkpoint()
     assert checkpoint["owner_generation"] == 2
+    reserved = owner.spool()["owner_episode"]
+    assert (reserved["generation"], reserved["phase"]) == (2, "reserved")
 
     with patch("spindle.SPINDLE_DIR", store):
         message = spindle._spin_drop_locked(spool_id)
-    assert "Cancellation requested" in message
-    request = list(iter_control_requests(store, spool_id))[0]
-    assert request.owner_generation == 2
+    assert "not accepting control (reserved)" in message
+    assert list(iter_control_requests(store, spool_id)) == []
+    mailbox = store / f"{spool_id}.control-mailbox"
+    assert not list(mailbox.glob("*.request"))
+    assert not list(mailbox.glob("*.receipt"))
 
     owner.kill_owner()
     spool = owner.spool()
     assert spool["status"] == "error"
     assert spool["error_kind"] == "owner_preacceptance_failure"
-    assert spool["failed_owner_generation"] == 2
-    assert "replacement_starting" not in spool
-    assert read_control_receipt(store, spool_id, request.request_id) is None
+    episode = spool["owner_episode"]
+    assert (episode["generation"], episode["phase"]) == (2, "aborted")
+    assert episode["failure"]
+    assert "lock" not in episode
+    identity_path = store / f"{spool_id}.owner-identity"
+    assert json.loads(identity_path.read_text()) == stale_identity.to_dict()
+    assert not (store / f"{spool_id}.owner-exit").exists()
     with patch("spindle.SPINDLE_DIR", store):
-        identity = ProcessIdentity.from_dict(json.loads((store / f"{spool_id}.owner-identity").read_text()))
-        evidence = json.loads((store / f"{spool_id}.owner-exit").read_text())
-        assert identity.owner_generation == 2
-        assert evidence["owner_generation"] == 2
-        assert evidence["cleanup_outcome"] == "preacceptance_failure"
         assert spindle._reconcile_spool_ownership(spool).state == "terminalizable"
         assert spindle._spool_blocks_destructive_action(spool) is False
         assert spindle._count_running() == 0
-        assert spindle.retire_owner_artifacts(store, spool_id, identity) is True
+        spindle._cleanup_old_spools()
         assert not (store / f"{spool_id}.json").exists()
+        assert not (store / f"{spool_id}.process-owner").exists()
+        assert not (store / f"{spool_id}.owner-identity").exists()
 
 
 def test_s2_c_own_03_owner_crash_contains_setsid_escaped_descendant(
