@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import multiprocessing
 from contextlib import contextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -314,17 +314,13 @@ def test_admitted_request_is_recorded_in_the_episode_and_settled(watchdog_owner_
 
 
 FINAL_SWEEP_CALLERS = ("drop", "timeout", "expired_session", "shard_abandon")
+EXPIRED_TIMEOUT_DEADLINE = datetime(2000, 1, 1, tzinfo=timezone.utc).isoformat()
 
 
-def _start_final_sweep_case(watchdog_owner_case, caller, tmp_path, checkpoint):
+def _start_final_sweep_case(watchdog_owner_case, owner_clock, caller, tmp_path, checkpoint):
     spool_id = f"final-sweep-{caller}-{checkpoint}"
-    overrides = {
-        "created_at": (datetime.now() - timedelta(hours=1)).isoformat(),
-        "prompt": "work",
-    }
-    if caller == "timeout":
-        overrides["timeout"] = 1
-    elif caller == "expired_session":
+    overrides = {"prompt": "work"}
+    if caller == "expired_session":
         overrides["session_id"] = "expired-session"
     elif caller == "shard_abandon":
         worktree = tmp_path / spool_id / "worktree"
@@ -336,16 +332,27 @@ def _start_final_sweep_case(watchdog_owner_case, caller, tmp_path, checkpoint):
         pause_checkpoint=checkpoint,
         spool_id=spool_id,
         spool_overrides=overrides,
+        controlled_clock_fd=owner_clock[2].fileno() if caller == "timeout" else None,
     )
-    if caller == "timeout":
-        spool = owner.spool()
-        assert spool["timeout"] == 1
-        assert spool[EPISODE_KEY]["deadline"] == spool["wall_deadline_at"]
     if caller == "expired_session":
         (owner.store / f"{spool_id}.stderr").write_text(
             "No conversation found with session ID: expired-session"
         )
     return owner
+
+
+def _expire_timeout_at_checkpoint(owner, owner_clock):
+    spool = owner.spool()
+    spool["timeout"] = 100
+    spool["wall_deadline_at"] = EXPIRED_TIMEOUT_DEADLINE
+    spool[EPISODE_KEY]["deadline"] = EXPIRED_TIMEOUT_DEADLINE
+    with patch("spindle.SPINDLE_DIR", owner.store):
+        spindle._write_spool(owner.spool_id, spool)
+    owner_clock[1](101)
+    stored = owner.spool()
+    assert stored["timeout"] == 100
+    assert stored["wall_deadline_at"] == EXPIRED_TIMEOUT_DEADLINE
+    assert stored[EPISODE_KEY]["deadline"] == EXPIRED_TIMEOUT_DEADLINE
 
 
 def _invoke_final_sweep_caller(caller, owner, tmp_path):
@@ -360,23 +367,28 @@ def _invoke_final_sweep_caller(caller, owner, tmp_path):
 @pytest.mark.parametrize("caller", FINAL_SWEEP_CALLERS)
 def test_request_wins_before_final_sweep_and_is_durably_settled(
     watchdog_owner_case,
+    owner_clock,
     caller,
     tmp_path,
 ):
     owner = _start_final_sweep_case(
         watchdog_owner_case,
+        owner_clock,
         caller,
         tmp_path,
         "natural_exit_evidence_published",
     )
     assert owner.receive_checkpoint()["name"] == "natural_exit_evidence_published"
+    if caller == "timeout":
+        _expire_timeout_at_checkpoint(owner, owner_clock)
 
     _invoke_final_sweep_caller(caller, owner, tmp_path)
     requests = list(iter_control_requests(owner.store, owner.spool_id))
-    assert len(requests) == 1, f"{caller} did not win request admission before the final sweep"
-
     owner.resume()
     owner.process.wait(timeout=8)
+    assert len(requests) == 1, f"{caller} did not win request admission before the final sweep"
+    if caller == "timeout":
+        assert requests[0].deadline == EXPIRED_TIMEOUT_DEADLINE
     receipt = read_control_receipt(owner.store, owner.spool_id, requests[0].request_id)
     assert receipt is not None
     assert receipt.owner_acknowledged_at is None
@@ -386,17 +398,21 @@ def test_request_wins_before_final_sweep_and_is_durably_settled(
 @pytest.mark.parametrize("caller", FINAL_SWEEP_CALLERS)
 def test_final_sweep_guard_wins_and_later_caller_creates_no_request(
     watchdog_owner_case,
+    owner_clock,
     monkeypatch,
     caller,
     tmp_path,
 ):
     owner = _start_final_sweep_case(
         watchdog_owner_case,
+        owner_clock,
         caller,
         tmp_path,
         "final_mailbox_guard_acquired",
     )
     assert owner.receive_checkpoint(timeout=2)["name"] == "final_mailbox_guard_acquired"
+    if caller == "timeout":
+        _expire_timeout_at_checkpoint(owner, owner_clock)
     assert list(iter_control_requests(owner.store, owner.spool_id)) == []
 
     process_context = multiprocessing.get_context("fork")

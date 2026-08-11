@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -164,35 +164,42 @@ def test_s2_x_ctl_02_foreign_timeout_reaches_owner_for_both_store_layouts(
     owner_clock,
     store_kind,
 ):
-    _current, _advance, clock_fd = owner_clock
+    _current, advance, clock_fd = owner_clock
+    deadline = datetime(2000, 1, 1, tzinfo=timezone.utc).isoformat()
     owner = watchdog_owner_case(
         "ignore-term",
-        pause_checkpoint="after_term_before_kill",
+        pause_checkpoint="provider_ready",
         timeout=100,
         controlled_clock_fd=clock_fd.fileno(),
+        spool_overrides={"wall_deadline_at": deadline},
         store_kind=store_kind,
     )
-    with patch("spindle.SPINDLE_DIR", owner.store):
-        spool = owner.spool()
-        spool["timeout"] = 1
-        spool["created_at"] = (datetime.now() - timedelta(seconds=5)).isoformat()
-        spindle._write_spool(owner.spool_id, spool)
+    assert owner.receive_checkpoint()["name"] == "provider_ready"
+    spool = owner.spool()
+    assert spool["wall_deadline_at"] == deadline
+    assert spool["owner_episode"]["deadline"] == deadline
+    advance(101)
     source = OBSERVER_PROLOGUE + r"""
 active = spindle._reconcile_spool_step(sys.argv[2])
 ns = os.stat("/proc/self/ns/pid")
 print(json.dumps({"active": active, "namespace": [ns.st_dev, ns.st_ino]}))
 """
     observed = foreign_pid_namespace(owner.store, source, owner.spool_id)
-    assert owner.receive_checkpoint()["name"] == "after_term_before_kill"
-    request = list(iter_control_requests(owner.store, owner.spool_id))[0]
     assert observed["active"] is True
-    assert request.kind == "timeout"
-    assert [request.observer_namespace.device, request.observer_namespace.inode] == observed["namespace"]
     assert owner.spool()["status"] == "running"
     with patch("spindle.SPINDLE_DIR", owner.store):
         assert spindle._count_running() == 1
     owner.resume()
-    assert _terminal(owner, "timeout")["error"] == "Timeout after 1s"
+    owner.process.wait(timeout=8)
+    terminal = owner.spool()
+    assert terminal["status"] == "timeout"
+    requests = list(iter_control_requests(owner.store, owner.spool_id))
+    assert len(requests) == 1
+    request = requests[0]
+    assert request.kind == "timeout"
+    assert request.deadline == deadline
+    assert [request.observer_namespace.device, request.observer_namespace.inode] == observed["namespace"]
+    assert terminal["error"] == "Timeout after 100s"
 
 
 def test_s2_x_time_01_owner_self_timeout_does_not_depend_on_foreign_observer(
