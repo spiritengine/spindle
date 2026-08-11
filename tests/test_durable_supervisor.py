@@ -18,7 +18,7 @@ import sys
 import textwrap
 import time
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -106,11 +106,15 @@ def _write_fake_claude(bin_dir: Path) -> Path:
 
             mode = os.environ.get("FAKE_HARNESS_MODE", "success")
             delay = float(os.environ.get("FAKE_HARNESS_DELAY", "0"))
-            if mode == "ignore-term":
+            if mode == "ignore-term" or os.environ.get("FAKE_HARNESS_IGNORE_TERM") == "1":
                 signal.signal(signal.SIGTERM, signal.SIG_IGN)
             if delay:
                 time.sleep(delay)
             if mode == "expire-once" and count == 1:
+                expire_release = os.environ.get("FAKE_HARNESS_EXPIRE_RELEASE")
+                if expire_release:
+                    while not Path(expire_release).exists():
+                        time.sleep(0.01)
                 print("No conversation found with session ID fake-session", file=sys.stderr, flush=True)
                 while True:
                     time.sleep(1)
@@ -367,6 +371,74 @@ def test_abandoned_minimal_reservation_is_terminalized(supervisor_env):
     spool = _wait_spool(store, spool_id, "error", timeout=5)
     assert "spawn timeout" in spool["error"]
     assert spool.get("pid") is None
+
+
+def test_published_watchdog_keeps_reservation_live_after_starter_exit(supervisor_env):
+    env, store, _ = supervisor_env
+    spool_id = "published-watchdog"
+    watchdog = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], env=env)
+    launcher = textwrap.dedent(
+        f"""
+        import spindle
+        from spindle.namespace_owner import transition_owner_episode
+
+        ok, error = spindle._try_reserve_slot_and_create({spool_id!r})
+        assert ok, error
+        record = spindle._read_spool({spool_id!r})
+        episode = record["owner_episode"]
+        published = transition_owner_episode(
+            spindle.SPINDLE_DIR,
+            {spool_id!r},
+            actor="launcher",
+            destination="reserved",
+            generation=episode["generation"],
+            expected_revision=episode["revision"],
+            facts={{"watchdog": spindle._process_fact({watchdog.pid})}},
+        )
+        assert published.accepted, published.rejection
+        with spindle._spool_lock({spool_id!r}) as acquired:
+            assert acquired
+            record = spindle._read_spool({spool_id!r})
+            record["created_at"] = "2020-01-01T00:00:00"
+            spindle._write_spool({spool_id!r}, record)
+        """
+    )
+    try:
+        launched = subprocess.run(
+            [sys.executable, "-c", launcher],
+            cwd=REPO_ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert launched.returncode == 0, launched.stderr
+
+        probe_env = dict(env)
+        probe_env["_SPINDLE_STORE_SUPERVISOR"] = "1"
+        probe = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    f"import json, spindle; active = spindle._reconcile_pending_spool({spool_id!r}); "
+                    f"print(json.dumps([active, spindle._read_spool({spool_id!r})['status']]))"
+                ),
+            ],
+            cwd=REPO_ROOT,
+            env=probe_env,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert probe.returncode == 0, probe.stderr
+        assert json.loads(probe.stdout) == [True, "pending"]
+    finally:
+        watchdog.terminate()
+        watchdog.wait(timeout=5)
+
+    spool = _wait_spool(store, spool_id, "error", timeout=5)
+    assert "spawn timeout" in spool["error"]
 
 
 def _start_supervisor_lock_holder(
@@ -939,6 +1011,109 @@ def test_expired_session_replacement_remains_owned_to_terminal(supervisor_env):
     assert spool["used_transcript_fallback"] is True
     assert spool["result"] == "durable result"
     assert count.read_text() == "2"
+    assert spool["owner_episode"]["generation"] == 2
+    assert spool["owner_episode"]["phase"] == "released"
+    assert spool["watchdog_pid"] == spool["owner_episode"]["watchdog"]["pid"]
+    assert spool["watchdog_start_time"] == spool["owner_episode"]["watchdog"]["birth_token"]
+    assert spool["watchdog_namespace"] == spool["owner_episode"]["watchdog"]["namespace"]
+
+
+def test_expired_session_does_not_replace_after_inherited_deadline(supervisor_env):
+    env, store, workdir = supervisor_env
+    count = store / "harness.count"
+    expire_release = store / "expire.release"
+    env["FAKE_HARNESS_MODE"] = "expire-once"
+    env["FAKE_HARNESS_COUNT"] = str(count)
+    env["FAKE_HARNESS_IGNORE_TERM"] = "1"
+    env["FAKE_HARNESS_EXPIRE_RELEASE"] = str(expire_release)
+    original_id = "000-deadline-source"
+    (store / "transcripts").mkdir()
+    (store / f"{original_id}.json").write_text(
+        json.dumps(
+            {
+                "id": original_id,
+                "status": "complete",
+                "harness": "claude-code",
+                "session_id": "fake-session",
+                "working_dir": str(workdir),
+                "permission": "careful",
+                "allowed_tools": None,
+                "model": None,
+                "env": {
+                    "FAKE_HARNESS_MODE": "expire-once",
+                    "FAKE_HARNESS_COUNT": str(count),
+                    "FAKE_HARNESS_IGNORE_TERM": "1",
+                    "FAKE_HARNESS_EXPIRE_RELEASE": str(expire_release),
+                },
+                "created_at": datetime.now().isoformat(),
+                "completed_at": datetime.now().isoformat(),
+            }
+        )
+    )
+    (store / "transcripts" / f"{original_id}.txt").write_text(
+        json.dumps(
+            {
+                "type": "result",
+                "subtype": "success",
+                "result": "old result",
+                "session_id": "fake-session",
+            }
+        )
+    )
+
+    respin = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import spindle; print(spindle._respin_sync('fake-session', 'continue after expiry'), flush=True)",
+        ],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert respin.returncode == 0, respin.stderr
+    spool_id = respin.stdout.strip().splitlines()[-1]
+    _wait_for(
+        lambda: (
+            record
+            if (record := _read_json(store / f"{spool_id}.json")).get("owner_episode", {}).get("phase") == "accepted"
+            else None
+        ),
+        timeout=5,
+        description="accepted predecessor episode",
+    )
+    inherited_deadline = (datetime.now(timezone.utc) + timedelta(seconds=0.15)).isoformat()
+    lock_fd = os.open(store / f"{spool_id}.lock", os.O_RDWR)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        accepted = _read_json(store / f"{spool_id}.json")
+        accepted["owner_episode"]["deadline"] = inherited_deadline
+        accepted["wall_deadline_at"] = inherited_deadline
+        (store / f"{spool_id}.json").write_text(json.dumps(accepted))
+    finally:
+        os.close(lock_fd)
+    expire_release.touch()
+    _wait_spool(store, spool_id, "error", timeout=8)
+    skipped = _wait_for(
+        lambda: (
+            marker
+            if (marker := _read_json(store / f"{spool_id}.json")).get("expired_session_replacement_skipped")
+            else None
+        ),
+        timeout=5,
+        description="expired replacement refusal",
+    )
+
+    assert count.read_text() == "1"
+    assert skipped["owner_episode"]["generation"] == 1
+    assert skipped["owner_episode"]["phase"] == "released"
+    assert skipped["lifecycle"]["normalized_terminal_kind"] == "cancelled"
+    assert skipped["error"] == "Cancelled"
+    assert skipped["expired_session_replacement_skipped"]["reason"] == "inherited_deadline_expired"
+    assert skipped["expired_session_replacement_skipped"]["deadline"] == skipped["owner_episode"]["deadline"]
+    assert "expired_session_replacement_requested" not in skipped
 
 
 def _mcp_result_text(result) -> str:

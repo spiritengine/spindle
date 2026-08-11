@@ -29,6 +29,7 @@ from .namespace_owner import (
     mailbox_guard,
     parse_proc_stat_starttime,
     read_control_receipt,
+    transition_owner_episode,
     update_control_receipt,
     write_control_receipt,
 )
@@ -133,6 +134,7 @@ class LogicalOwner:
         self.clock = OwnerClock(args.clock_fd)
         self.adopted_reaped = 0
         self.wall_deadline_at: Optional[str] = args.deadline
+        self.episode_mode = False
 
     def _await_launch_barrier(self) -> bool:
         fd = self.args.launch_barrier_fd
@@ -191,6 +193,8 @@ class LogicalOwner:
             return spool
 
     def _allocate_generation(self) -> None:
+        if self.episode_mode:
+            return
         try:
             previous = json.loads(self.owner_identity_path.read_text()).get("owner_generation", 0)
         except (FileNotFoundError, json.JSONDecodeError, OSError):
@@ -201,6 +205,10 @@ class LogicalOwner:
 
     def _ensure_wall_deadline(self) -> None:
         """Persist one UTC deadline and reuse it across replacement owners."""
+        episode = self._read_spool().get("owner_episode") or {}
+        if episode:
+            self.wall_deadline_at = episode.get("deadline")
+            return
         if self.args.timeout is None:
             return
         with self._spool_record_guard():
@@ -236,6 +244,26 @@ class LogicalOwner:
             lock_inode=self.lock.inode,
             lock_created=True,
         )
+        if self.episode_mode:
+            episode = self._read_spool().get("owner_episode") or {}
+            result = transition_owner_episode(
+                self.store,
+                self.spool_id,
+                actor="owner",
+                destination="lock_bound",
+                generation=self.generation,
+                expected_revision=episode.get("revision"),
+                facts={
+                    "owner": {
+                        "pid": identity.pid,
+                        "birth_token": identity.birth_token,
+                        "namespace": identity.namespace.to_dict(),
+                    },
+                    "lock": {"device": self.lock.device, "inode": self.lock.inode},
+                },
+            )
+            if not result.accepted:
+                raise RuntimeError(f"owner lock binding rejected: {result.rejection}")
         _atomic_json_write(self.owner_identity_path, identity.to_dict())
         (self.store / f"{self.spool_id}.journal-guard").touch(exist_ok=True)
         (self.store / f"{self.spool_id}.control-mailbox").mkdir(exist_ok=True)
@@ -279,7 +307,7 @@ class LogicalOwner:
                 observed_lock_inode=pathname.st_ino,
             )
             return False
-        lifecycle = (self._read_spool().get("lifecycle") or {})
+        lifecycle = self._read_spool().get("lifecycle") or {}
         if lifecycle.get("ownership_state") in {"unreadable", "identity_mismatch"}:
             self._set_lifecycle(ownership_state="held")
         return True
@@ -335,6 +363,31 @@ class LogicalOwner:
             "lock_inode": self.lock.inode,
         }
         _atomic_json_write(self.process_identity_path, process_identity)
+        if self.episode_mode:
+            episode = self._read_spool().get("owner_episode") or {}
+            accepted = transition_owner_episode(
+                self.store,
+                self.spool_id,
+                actor="owner",
+                destination="accepted",
+                generation=self.generation,
+                expected_revision=episode.get("revision"),
+                facts={
+                    "provider": {
+                        "pid": self.provider.pid,
+                        "pgid": self.provider_pgid,
+                        "birth_token": self.provider_birth,
+                        "namespace": capture_pid_namespace().to_dict(),
+                    },
+                    "provider_custody": {
+                        "pidfd_acquired": self.provider_pidfd is not None,
+                        "containment": "watchdog",
+                        "published_at": _utc_now(),
+                    },
+                },
+            )
+            if not accepted.accepted:
+                raise RuntimeError(f"provider acceptance rejected: {accepted.rejection}")
         with self._spool_record_guard():
             spool = self._read_spool()
             spool.update(
@@ -368,6 +421,28 @@ class LogicalOwner:
             os.write(self.args.ready_fd, (json.dumps(ready, sort_keys=True) + "\n").encode())
             os.close(self.args.ready_fd)
             self.args.ready_fd = None
+        # A checkpoint named provider_ready is a test-only causal boundary: do
+        # not report it before the launched program has executed far enough to
+        # publish its first output (or has already exited).  Waiting on the
+        # pidfd keeps this deterministic without adding a production delay.
+        if self.checkpoints.socket is not None and self.checkpoints.pause_name == "provider_ready":
+            deadline = time.monotonic() + 2.0
+            readiness_poller = None
+            if self.provider_pidfd is not None:
+                readiness_poller = select.poll()
+                readiness_poller.register(self.provider_pidfd, select.POLLIN | select.POLLHUP | select.POLLERR)
+            while time.monotonic() < deadline:
+                try:
+                    if self.stdout_path.stat().st_size:
+                        break
+                except OSError:
+                    pass
+                if self._provider_exited():
+                    break
+                if readiness_poller is not None:
+                    readiness_poller.poll(10)
+                else:
+                    time.sleep(0.01)
         self.checkpoints.reach("provider_ready", self.provider.pid)
 
     def _provider_exited(self) -> bool:
@@ -570,6 +645,26 @@ class LogicalOwner:
             )
             if not self._settle_other_requests_unlocked(request.request_id):
                 return -2
+            if self.episode_mode:
+                episode = self._read_spool().get("owner_episode") or {}
+                accepted = transition_owner_episode(
+                    self.store,
+                    self.spool_id,
+                    actor="owner",
+                    destination="accepted",
+                    generation=self.generation,
+                    expected_revision=episode.get("revision"),
+                    facts={
+                        "winning_request": {
+                            "request_id": request.request_id,
+                            "kind": request.kind,
+                            "desired_terminal_kind": request.desired_terminal_kind,
+                        },
+                        "acknowledgement": {"acknowledged_at": receipt.owner_acknowledged_at},
+                    },
+                )
+                if not accepted.accepted:
+                    return -2
         if receipt.owner_acknowledged_at is None:
             return -1
         if not self._verify_lock():
@@ -646,28 +741,50 @@ class LogicalOwner:
             return -2
         if not self._write_exit_evidence(returncode, cleanup_outcome="stopped"):
             return -2
+        if self.episode_mode:
+            episode = self._read_spool().get("owner_episode") or {}
+            cleaned = transition_owner_episode(
+                self.store,
+                self.spool_id,
+                actor="owner",
+                destination="cleanup_proven",
+                generation=self.generation,
+                expected_revision=episode.get("revision"),
+                facts={
+                    "cleanup": {
+                        "outcome": "stopped",
+                        "provider_reaped": True,
+                        "adopted_children_reaped": self.adopted_reaped,
+                        "child_exit_observed_at": child_exit,
+                        "provider_exit_code": 128 - returncode if returncode < 0 else returncode,
+                    }
+                },
+            )
+            if not cleaned.accepted:
+                return -2
         self.checkpoints.reach("cleanup_receipt_durable", self.provider.pid)
         self.checkpoints.reach("before_terminal_publish", self.provider.pid)
         if not self._verify_lock():
             return -2
-        with self._spool_record_guard():
-            spool = self._read_spool()
-            lifecycle = dict(spool.get("lifecycle") or {})
-            lifecycle.update(
-                {
-                    "public_stop_state": None,
-                    "transport_state": "reaped",
-                    "normalized_terminal_kind": request.desired_terminal_kind,
-                    "ownership_state": "held",
-                }
-            )
-            spool["lifecycle"] = lifecycle
-            spool["status"] = "timeout" if request.desired_terminal_kind == "timeout" else "error"
-            spool["error"] = (
-                f"Timeout after {spool.get('timeout')}s" if spool["status"] == "timeout" else "Cancelled"
-            )
-            spool["completed_at"] = _utc_now()
-            self._write_spool_unlocked(spool)
+        if not self.episode_mode:
+            with self._spool_record_guard():
+                spool = self._read_spool()
+                lifecycle = dict(spool.get("lifecycle") or {})
+                lifecycle.update(
+                    {
+                        "public_stop_state": None,
+                        "transport_state": "reaped",
+                        "normalized_terminal_kind": request.desired_terminal_kind,
+                        "ownership_state": "held",
+                    }
+                )
+                spool["lifecycle"] = lifecycle
+                spool["status"] = "timeout" if request.desired_terminal_kind == "timeout" else "error"
+                spool["error"] = (
+                    f"Timeout after {spool.get('timeout')}s" if spool["status"] == "timeout" else "Cancelled"
+                )
+                spool["completed_at"] = _utc_now()
+                self._write_spool_unlocked(spool)
         if not self._settle_other_requests(request.request_id):
             return -2
         return 0
@@ -675,6 +792,9 @@ class LogicalOwner:
     def run(self) -> int:
         if not self._await_launch_barrier():
             return 125
+        self.episode_mode = (
+            isinstance(self._read_spool().get("owner_episode"), dict) if hasattr(self, "spool_path") else False
+        )
         _set_subreaper()
         self.lock = acquire_ownership_lock(self.lock_path)
         self._allocate_generation()
@@ -694,6 +814,7 @@ class LogicalOwner:
         self._spawn_provider()
         accepted_request = None
         natural_exit_settled = False
+        natural_cleanup = None
         result = 0
         try:
             while True:
@@ -729,6 +850,14 @@ class LogicalOwner:
                     if returncode is None or not self._write_exit_evidence(returncode, cleanup_outcome="natural_exit"):
                         time.sleep(self.args.poll_interval)
                         continue
+                    if self.episode_mode:
+                        natural_cleanup = {
+                            "outcome": "natural_exit",
+                            "provider_reaped": True,
+                            "adopted_children_reaped": self.adopted_reaped,
+                            "child_exit_observed_at": _utc_now(),
+                            "provider_exit_code": 128 - returncode if returncode < 0 else returncode,
+                        }
                     self.checkpoints.reach("natural_exit_evidence_published", self.provider.pid)
                     natural_exit_settled = True
                     result = returncode
@@ -741,6 +870,20 @@ class LogicalOwner:
             if self.control is not None:
                 self.control.close()
             with mailbox_guard(self.store, self.spool_id):
+                self.checkpoints.reach("final_mailbox_guard_acquired", self.provider.pid if self.provider else None)
+                if self.episode_mode and natural_cleanup is not None:
+                    episode = self._read_spool().get("owner_episode") or {}
+                    cleaned = transition_owner_episode(
+                        self.store,
+                        self.spool_id,
+                        actor="owner",
+                        destination="cleanup_proven",
+                        generation=self.generation,
+                        expected_revision=episode.get("revision"),
+                        facts={"cleanup": natural_cleanup},
+                    )
+                    if not cleaned.accepted:
+                        result = -2
                 if accepted_request is not None:
                     self._settle_other_requests_unlocked(accepted_request.request_id)
                 elif natural_exit_settled:

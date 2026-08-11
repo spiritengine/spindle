@@ -53,16 +53,20 @@ the namespace-safe shared owner primitive.
     maps its desired process terminal to `cancelled`; it must not delete live
     state. Whether the later retained public record differs from cancel remains
     a product decision.
-12. Owner generation: allocate a positive monotonic generation under the
-    stable ownership lock and persist it in owner identity before provider
-    launch. A replacement increments the last durable generation; it never
-    reuses a generation after restart.
+12. Owner generation: the launcher reserves a positive monotonic generation in
+    the authoritative spool episode under the record guard before watchdog
+    publication. The owner later binds the exact ownership inode and accepts
+    provider custody. A replacement increments the last durable generation; it
+    never reuses a generation after restart.
 13. Owner wakeup: bounded mailbox polling is authoritative. A future inotify or
     pipe wakeup may reduce latency but may not replace polling or correctness.
 14. Wall time: persist an absolute UTC deadline. A live owner measures elapsed
     execution with monotonic time. Restart/reboot recovery treats an overdue
     deadline as a durable timeout request, but still requires ownership and
-    cleanup evidence before terminalization.
+    cleanup evidence before terminalization. An expired-session replacement
+    inherits that deadline and does not reserve or launch a new generation once
+    it is overdue. If predecessor cleanup already accepted a stop request, that
+    first request retains its terminal provenance rather than being rewritten.
 15. Store repair: unreadable/replaced/missing-current ownership paths make the
     store unhealthy and reject launches. Diagnosis belongs in `doctor`;
     repair is an explicit operator action which validates the complete artifact
@@ -76,8 +80,11 @@ the namespace-safe shared owner primitive.
     per poll interval.
 18. Retirement unit: spool record, stable owner and journal-guard inodes,
     identities, mailbox requests/receipts, exit evidence, stdout, stderr,
-    prompt, transcript, and provider captures are one set. Retirement acquires
-    and verifies the recorded released inodes before deleting the set.
+    prompt, transcript, and provider captures are one set. A bound episode
+    requires acquisition and verification of its recorded released inode before
+    deletion. A valid aborted episode that never bound an inode instead acquires
+    and revalidates any harmless physical lock pathname without trusting a stale
+    identity mirror, then retires the same complete set.
 19. Provider cancellation interface: one narrow callback returns attempted,
     acknowledged, terminal-observed, or unsupported with timestamps. It neither
     parses provider events nor reduces lifecycle state.
@@ -99,9 +106,10 @@ the namespace-safe shared owner primitive.
     `provider_process_group_id` make the two process roles explicit.
 23. Record serialization: logical-owner read-modify-write transitions acquire
     the same per-spool record lock as launchers and observers. Observers publish
-    durable requests while holding that lock; only the owner publishes a stop
-    terminal after cleanup. This prevents a stale observer write from replacing
-    an owner terminal record.
+    durable requests while holding that lock. The owner may publish stopping and
+    cleanup facts, but only a reconciler may persist release and then project a
+    terminal status, error, and normalized terminal kind. This prevents a stale
+    observer write from replacing authoritative episode progress.
 24. Generation-scoped settlement: owner exit and cleanup evidence authorizes
     settlement only when its `owner_generation` matches the current durable
     identity. A same-ID replacement removes prior exit sidecars before launch
@@ -113,17 +121,53 @@ the namespace-safe shared owner primitive.
 
 ## Stage 4 refinements
 
-26. Watchdog authority: the watchdog records containment facts but does not
-    interpret provider output or publish ordinary provider terminals. Owner
-    crash before identity publication is a pre-acceptance launch failure;
-    otherwise the spool remains active until reconciliation proves exact lock
-    release and generation-matched watchdog evidence.
+26. Watchdog authority: the watchdog records containment and cleanup facts but
+    does not bind an ownership inode, invent acceptance, interpret provider
+    output, persist release, or publish terminals. Owner crash before inode
+    binding aborts the current reservation without fabricating current owner
+    identity or exit evidence. Otherwise status remains running through
+    `cleanup_proven` until reconciliation proves release.
 27. Crash settlement: owner loss before durable cleanup normalizes to
-    `indeterminate`, preserving request and acknowledgement facts without
-    rewriting intent as outcome. Owner loss after an acknowledged cleanup
-    receipt and child-exit evidence recovers the requested terminal exactly
-    once and records `owner_crashed_after_cleanup`.
-28. Foreign dead-owner observation: namespace mismatch remains unverifiable
-    even after the watchdog has contained the provider and the exact owner lock
-    is released. A foreign observer cannot settle or free the spool; a
-    same-namespace recovery path may use the matching crash evidence.
+    `indeterminate` only after reconciler release, preserving request and
+    acknowledgement facts without rewriting intent as outcome. Owner loss after
+    an acknowledged cleanup receipt and child-exit evidence recovers the
+    requested terminal exactly once and records `owner_crashed_after_cleanup`.
+28. Foreign dead-owner observation: a namespace-mismatched observer treats a
+    retireable released cleanup episode as `unverifiable`; it cannot settle,
+    mutate, retire, or free capacity. This refusal belongs to reconciliation,
+    finalization, and capacity consumers rather than the pure episode
+    classifier. A same-namespace reconciler may prove release from the same
+    preserved episode and publish its terminal, so foreign refusal is not a
+    permanent property of the record.
+
+## Generation-episode refinements
+
+29. Episode authority: `spindle.owner-episode/1` in the spool record is the
+    authority for a current live owner. Its generation, revision, phase,
+    identities with PID namespaces, exact lock inode, deadline, winning request,
+    acknowledgement, cleanup, failure, and release facts govern classification
+    and mutation. Flat fields and sidecars are compatibility or diagnostic
+    mirrors and cannot override it.
+30. Episode completion: `cleanup_proven` is active while its exact inode is
+    held and retireable after the inode is observed released. The reconciler
+    alone persists `released` with its proof. Only after that transition does it
+    publish terminal status and error, set the normalized terminal kind, and
+    remove `public_stop_state`; requested stops retain `stopping` until then.
+31. Capacity: every record reaches capacity and destructive consumers through
+    the same episode classification. Active and unhealthy records consume or
+    block capacity. Retireable cleanup and valid unbound aborts do not, except
+    that foreign namespace refusal retains capacity until an authorized
+    same-namespace observer reconciles the record.
+32. Control admission: a public drop, cancel, timeout, expired-session action,
+    or shard abandonment may publish a request only for an `accepted` current
+    episode whose exact recorded inode is held. Admission takes the mailbox
+    guard before the spool lock. A refusal creates no request or receipt.
+33. Pre-bind abort: an aborted reservation with no authoritative lock fact may
+    coexist with a released physical lock pathname and a stale predecessor
+    identity mirror. Maintenance validates the current aborted episode and
+    acquires the unbound pathname itself; it never uses the stale mirror as
+    custody authority or fabricates current owner identity or exit facts.
+34. Mixed versions: current supervisors advertise `owner-episode-v1` and do
+    not migrate a live pre-episode owner in place. Unknown or mixed live formats
+    are unhealthy. Schema-1 terminal history remains readable, and current
+    startup may proceed only after the incompatible lifetime owner drains.

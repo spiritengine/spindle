@@ -15,11 +15,33 @@ import select
 import shutil
 import tempfile
 import uuid
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Optional
+
+OWNER_EPISODE_FORMAT = "spindle.owner-episode/1"
+OWNER_EPISODE_KEY = "owner_episode"
+
+_EPISODE_PHASES = frozenset({"reserved", "lock_bound", "accepted", "cleanup_proven", "released", "aborted"})
+_EPISODE_TRANSITIONS = {
+    ("launcher", None, "reserved"): ("starter",),
+    ("launcher", "released", "reserved"): ("starter",),
+    ("launcher", "aborted", "reserved"): ("starter",),
+    ("launcher", "reserved", "reserved"): ("watchdog",),
+    ("launcher", "reserved", "aborted"): ("failure",),
+    ("owner", "reserved", "lock_bound"): ("owner", "lock"),
+    ("owner", "lock_bound", "lock_bound"): ("failure",),
+    ("owner", "lock_bound", "accepted"): ("provider", "provider_custody"),
+    ("owner", "accepted", "accepted"): ("winning_request", "acknowledgement"),
+    ("owner", "accepted", "cleanup_proven"): ("cleanup",),
+    ("watchdog", "reserved", "aborted"): ("failure",),
+    ("watchdog", "lock_bound", "cleanup_proven"): ("containment", "cleanup"),
+    ("watchdog", "accepted", "cleanup_proven"): ("containment", "cleanup"),
+    ("reconciler", "cleanup_proven", "released"): ("release",),
+}
+_EPISODE_EDGES = frozenset((source, destination) for _, source, destination in _EPISODE_TRANSITIONS)
 
 OWNER_ARTIFACT_SUFFIXES = (
     ".control-mailbox",
@@ -196,6 +218,19 @@ class LockEvidence:
     detail: Optional[str] = None
 
 
+@dataclass(frozen=True)
+class EpisodeTransitionResult:
+    accepted: bool
+    rejection: Optional[str]
+    episode: Optional[dict]
+
+
+@dataclass(frozen=True)
+class EpisodeClassification:
+    state: str
+    reason: str
+
+
 @dataclass
 class OwnershipLock:
     path: Path
@@ -246,7 +281,25 @@ def probe_ownership_lock(path: str | os.PathLike[str], identity: ProcessIdentity
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             acquired = True
         except BlockingIOError:
-            return LockEvidence("held", *observed)
+            # A blocked flock proves that some descriptor holds this inode, but
+            # not that the pathname still names it.  Revalidate both views
+            # after the flock result just as on the acquired branch.
+            try:
+                held_descriptor_info = os.fstat(fd)
+                held_pathname_info = os.stat(path)
+            except FileNotFoundError:
+                return LockEvidence("identity_mismatch", detail="path_replaced_after_flock")
+            except OSError as exc:
+                return LockEvidence("unreadable", detail=f"post_flock_stat:{exc.errno}")
+            held_descriptor = (held_descriptor_info.st_dev, held_descriptor_info.st_ino)
+            held_observed = (held_pathname_info.st_dev, held_pathname_info.st_ino)
+            if held_descriptor != held_observed or not _identity_matches(*held_observed, identity):
+                return LockEvidence(
+                    "identity_mismatch",
+                    *held_observed,
+                    detail="inode_mismatch_after_flock",
+                )
+            return LockEvidence("held", *held_observed)
         except OSError as exc:
             return LockEvidence("unreadable", *observed, detail=f"flock:{exc.errno}")
         try:
@@ -298,6 +351,225 @@ def acquire_ownership_lock(path: str | os.PathLike[str], *, max_attempts: int = 
             raise
         os.close(fd)
     raise RuntimeError(f"ownership path did not stabilize after {max_attempts} attempts: {last_mismatch}")
+
+
+@contextmanager
+def _episode_record_guard(root: Path, spool_id: str):
+    """Serialize episode updates with every production spool writer."""
+    path = root / f"{spool_id}.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0), 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
+def _episode_rejection(actor: str, source: Optional[str], destination: str) -> str:
+    if (source, destination) in _EPISODE_EDGES:
+        return "illegal_actor"
+    return "illegal_transition"
+
+
+def _valid_cleanup(value) -> bool:
+    return (
+        isinstance(value, dict)
+        and value.get("provider_reaped") is True
+        and isinstance(value.get("adopted_children_reaped"), int)
+        and not isinstance(value.get("adopted_children_reaped"), bool)
+        and value["adopted_children_reaped"] >= 0
+        and bool(value.get("child_exit_observed_at"))
+        and bool(value.get("outcome"))
+    )
+
+
+def _facts_are_consistent(current: dict, facts: dict) -> bool:
+    for name, value in facts.items():
+        if name in current and current[name] != value:
+            return False
+    cleanup = facts.get("cleanup")
+    if cleanup is not None and not _valid_cleanup(cleanup):
+        return False
+    lock = facts.get("lock", current.get("lock"))
+    release = facts.get("release")
+    if release is not None:
+        if not isinstance(lock, dict) or not isinstance(release, dict):
+            return False
+        if (release.get("device"), release.get("inode")) != (lock.get("device"), lock.get("inode")):
+            return False
+        if release.get("proved_by") != "reconciler" or not release.get("released_at"):
+            return False
+    return True
+
+
+def transition_owner_episode(
+    root: str | os.PathLike[str],
+    spool_id: str,
+    *,
+    actor: str,
+    destination: str,
+    generation: int,
+    expected_revision: Optional[int],
+    facts: dict,
+    record_updates: Optional[dict] = None,
+    record_locked: bool = False,
+) -> EpisodeTransitionResult:
+    """Validate and durably publish one generation-scoped owner transition."""
+    root = Path(root)
+    spool_path = root / f"{spool_id}.json"
+    guard = nullcontext() if record_locked else _episode_record_guard(root, spool_id)
+    with guard:
+        try:
+            record = json.loads(spool_path.read_text())
+        except FileNotFoundError:
+            record = {"id": spool_id, "status": "pending", "created_at": _utc_now()}
+        current = record.get(OWNER_EPISODE_KEY)
+        source = current.get("phase") if isinstance(current, dict) else None
+
+        if current is not None and current.get("format") != OWNER_EPISODE_FORMAT:
+            return EpisodeTransitionResult(False, "unknown_episode_format", current)
+        if not isinstance(generation, int) or isinstance(generation, bool) or generation <= 0:
+            return EpisodeTransitionResult(False, "stale_generation", current)
+
+        reseed = source in {None, "released", "aborted"} and destination == "reserved"
+        if source is None:
+            expected_generation = 1
+        elif reseed:
+            expected_generation = current["generation"] + 1
+        else:
+            expected_generation = current["generation"]
+        if generation != expected_generation:
+            return EpisodeTransitionResult(False, "stale_generation", current)
+        if source is None:
+            if expected_revision is not None:
+                return EpisodeTransitionResult(False, "stale_revision", current)
+        elif expected_revision != current.get("revision"):
+            return EpisodeTransitionResult(False, "stale_revision", current)
+        required = _EPISODE_TRANSITIONS.get((actor, source, destination))
+        if required is None:
+            return EpisodeTransitionResult(False, _episode_rejection(actor, source, destination), current)
+        if not isinstance(facts, dict) or any(name not in facts for name in required):
+            return EpisodeTransitionResult(False, "missing_facts", current)
+
+        basis = {} if reseed else dict(current or {})
+        if not _facts_are_consistent(basis, facts):
+            return EpisodeTransitionResult(False, "contradictory_facts", current)
+
+        now = _utc_now()
+        if reseed:
+            episode = {
+                "format": OWNER_EPISODE_FORMAT,
+                "generation": generation,
+                "revision": 1,
+                "phase": "reserved",
+                "phase_times": {"reserved": now},
+            }
+            if current is not None:
+                episode["predecessor"] = {
+                    "generation": current.get("generation"),
+                    "revision": current.get("revision"),
+                    "phase": current.get("phase"),
+                }
+        else:
+            episode = basis
+            episode["revision"] = current["revision"] + 1
+            episode["phase"] = destination
+            episode.setdefault("phase_times", {})[destination] = now
+        episode.update(facts)
+        if record_updates:
+            record.update(record_updates)
+        record[OWNER_EPISODE_KEY] = episode
+        _atomic_json_write(spool_path, record)
+        return EpisodeTransitionResult(True, None, episode)
+
+
+def _episode_required_facts(episode: dict) -> tuple[str, ...]:
+    phase = episode.get("phase")
+    if phase == "reserved":
+        return ("starter", "watchdog") if episode.get("revision", 0) >= 2 else ("starter",)
+    if phase == "lock_bound":
+        return ("starter", "watchdog", "owner", "lock")
+    if phase == "accepted":
+        return ("starter", "watchdog", "owner", "lock", "provider", "provider_custody")
+    if phase in {"cleanup_proven", "released"}:
+        common = ("starter", "watchdog", "owner", "lock", "cleanup")
+        route = (
+            ("provider", "provider_custody")
+            if "provider" in episode or "provider_custody" in episode
+            else ("containment",)
+        )
+        return common + route + (("release",) if phase == "released" else ())
+    if phase == "aborted":
+        return ("starter", "watchdog", "failure") if episode.get("revision", 0) >= 3 else ("starter", "failure")
+    return ()
+
+
+def _episode_malformed_reason(episode) -> Optional[str]:
+    if not isinstance(episode, dict):
+        return "malformed_episode"
+    if episode.get("format") != OWNER_EPISODE_FORMAT:
+        return "unknown_episode_format"
+    for name in ("generation", "revision"):
+        value = episode.get(name)
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            return f"malformed_{name}"
+    phase = episode.get("phase")
+    if phase not in _EPISODE_PHASES:
+        return "malformed_phase"
+    times = episode.get("phase_times")
+    if not isinstance(times, dict) or phase not in times or not times:
+        return "malformed_phase_times"
+    missing = [name for name in _episode_required_facts(episode) if name not in episode]
+    if missing:
+        return f"missing_phase_fact:{missing[0]}"
+    if phase in {"cleanup_proven", "released"} and not _valid_cleanup(episode.get("cleanup")):
+        return "malformed_cleanup_fact"
+    lock = episode.get("lock")
+    release = episode.get("release")
+    if phase == "released" and not _facts_are_consistent({"lock": lock}, {"release": release}):
+        return "malformed_release_fact"
+    return None
+
+
+def classify_owner_episode(
+    record: dict,
+    lock: LockEvidence,
+    liveness: LivenessEvidence,
+) -> EpisodeClassification:
+    """Purely classify a spool from its episode and exact kernel evidence."""
+    episode = record.get(OWNER_EPISODE_KEY)
+    if episode is None:
+        if record.get("status") in {"pending", "running"}:
+            return EpisodeClassification("unhealthy", "live_record_missing_owner_episode")
+        return EpisodeClassification("retireable", "terminal_legacy_record")
+    malformed = _episode_malformed_reason(episode)
+    if malformed:
+        return EpisodeClassification("unhealthy", malformed)
+
+    phase = episode["phase"]
+    if phase == "reserved":
+        if lock.state != "absent_legacy":
+            return EpisodeClassification("unhealthy", "reserved_has_unexpected_lock")
+        if liveness.state == "dead":
+            return EpisodeClassification("retireable", "reserved_starter_dead")
+        return EpisodeClassification("active", "reservation_live_or_unverifiable")
+    if phase == "aborted":
+        if lock.state == "absent_legacy":
+            return EpisodeClassification("retireable", "reservation_aborted")
+        return EpisodeClassification("unhealthy", "aborted_has_unexpected_lock")
+    if lock.state in {"identity_mismatch", "unreadable"}:
+        return EpisodeClassification("unhealthy", f"ownership_{lock.state}")
+    if lock.state == "held":
+        return EpisodeClassification("active", "exact_ownership_inode_held")
+    if lock.state != "released":
+        return EpisodeClassification("unhealthy", "bound_episode_missing_exact_inode")
+    if phase in {"lock_bound", "accepted"}:
+        return EpisodeClassification("active", "released_without_cleanup_proof")
+    return EpisodeClassification("retireable", "cleanup_and_release_proven")
 
 
 def mailbox_path(root: str | os.PathLike[str], spool_id: str) -> Path:
@@ -406,6 +678,7 @@ def create_control_request(
     observer_namespace: Optional[NamespaceIdentity] = None,
     reason: Optional[str] = None,
     deadline: Optional[str] = None,
+    mailbox_locked: bool = False,
 ) -> ControlRequest:
     if kind not in {"cancel", "timeout", "drop"}:
         raise ValueError(f"unsupported control request kind: {kind}")
@@ -423,7 +696,8 @@ def create_control_request(
         reason=reason,
         deadline=deadline,
     )
-    with mailbox_guard(root, spool_id):
+    guard = nullcontext() if mailbox_locked else mailbox_guard(root, spool_id)
+    with guard:
         if _atomic_json_create(path, request.to_dict()):
             return request
         existing = ControlRequest.from_dict(json.loads(path.read_text()))
@@ -484,11 +758,7 @@ def write_control_receipt(
         accepted = generation_matches
     accepted = bool(accepted and generation_matches)
     cleanup_outcome = (
-        "accepted"
-        if accepted
-        else "rejected_stale_generation"
-        if not generation_matches
-        else rejection_outcome
+        "accepted" if accepted else "rejected_stale_generation" if not generation_matches else rejection_outcome
     )
     receipt = ControlReceipt(
         request_id=request.request_id,
@@ -500,6 +770,7 @@ def write_control_receipt(
     if _atomic_json_create(path, asdict(receipt)):
         return receipt
     return ControlReceipt.from_dict(json.loads(path.read_text()))
+
 
 def read_control_receipt(
     root: str | os.PathLike[str],
@@ -584,8 +855,33 @@ def reconcile_owner_episode(
 def active_spool_count(spools: Iterable[dict]) -> int:
     count = 0
     for spool in spools:
-        lifecycle = spool.get("lifecycle") or {}
-        if spool.get("status") in {"pending", "running"} or lifecycle.get("public_stop_state") == "stopping":
+        episode = spool.get(OWNER_EPISODE_KEY)
+        if isinstance(episode, dict) and episode.get("phase") == "reserved":
+            starter = episode.get("starter") or {}
+            try:
+                identity = ProcessIdentity(
+                    pid=starter["pid"],
+                    birth_token=starter["birth_token"],
+                    namespace=NamespaceIdentity.from_dict(starter["namespace"]),
+                    owner_generation=episode.get("generation", 0),
+                    child_pgid=None,
+                    lock_device=None,
+                    lock_inode=None,
+                    lock_created=False,
+                )
+                liveness = assess_process_liveness(identity)
+            except (KeyError, TypeError, ValueError):
+                liveness = LivenessEvidence("unverifiable", "malformed_starter")
+            lock = LockEvidence("absent_legacy")
+        elif isinstance(episode, dict):
+            phase = episode.get("phase")
+            lock = LockEvidence("released" if phase == "released" else "held")
+            liveness = LivenessEvidence("unverifiable", "capacity_without_store")
+        else:
+            lock = LockEvidence("absent_legacy")
+            liveness = LivenessEvidence("dead", "legacy_status")
+        classification = classify_owner_episode(spool, lock, liveness)
+        if classification.state != "retireable":
             count += 1
     return count
 
@@ -593,29 +889,77 @@ def active_spool_count(spools: Iterable[dict]) -> int:
 def retire_owner_artifacts(
     root: str | os.PathLike[str],
     spool_id: str,
-    identity: ProcessIdentity,
+    identity: Optional[ProcessIdentity],
 ) -> bool:
     """Retire a complete terminal artifact set under its recorded inode."""
     root = Path(root)
     lock_path = root / f"{spool_id}.process-owner"
+    try:
+        record = json.loads((root / f"{spool_id}.json").read_text())
+    except (FileNotFoundError, OSError, json.JSONDecodeError, TypeError):
+        return False
+    episode = record.get(OWNER_EPISODE_KEY)
+    unbound_abort = (
+        isinstance(episode, dict)
+        and episode.get("format") == OWNER_EPISODE_FORMAT
+        and episode.get("phase") == "aborted"
+        and "lock" not in episode
+        and _episode_malformed_reason(episode) is None
+    )
+    if unbound_abort:
+        lock_fd = None
+        try:
+            try:
+                lock_fd = os.open(lock_path, os.O_RDWR | getattr(os, "O_CLOEXEC", 0))
+            except FileNotFoundError:
+                pass
+            if lock_fd is not None:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except (BlockingIOError, OSError):
+                    return False
+                try:
+                    descriptor = os.fstat(lock_fd)
+                    pathname = os.stat(lock_path)
+                except OSError:
+                    return False
+                if (descriptor.st_dev, descriptor.st_ino) != (pathname.st_dev, pathname.st_ino):
+                    return False
+            _remove_owner_artifact_set(root, spool_id, lock_path)
+        finally:
+            if lock_fd is not None:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+                os.close(lock_fd)
+        lock_path.unlink(missing_ok=True)
+        return True
+
+    if identity is None:
+        return False
     if probe_ownership_lock(lock_path, identity).state != "released":
         return False
     held = acquire_ownership_lock(lock_path)
     try:
         if (held.device, held.inode) != (identity.lock_device, identity.lock_inode):
             return False
-        for suffix in OWNER_ARTIFACT_SUFFIXES:
-            path = root / f"{spool_id}{suffix}"
-            if path == lock_path:
-                continue
-            if path.is_dir():
-                shutil.rmtree(path)
-            else:
-                path.unlink(missing_ok=True)
-        for suffix in (".json", ".stdout", ".stderr", ".exit", ".prompt"):
-            (root / f"{spool_id}{suffix}").unlink(missing_ok=True)
-        (root / "transcripts" / f"{spool_id}.txt").unlink(missing_ok=True)
+        _remove_owner_artifact_set(root, spool_id, lock_path)
     finally:
         held.close()
     lock_path.unlink()
     return True
+
+
+def _remove_owner_artifact_set(root: Path, spool_id: str, lock_path: Path) -> None:
+    for suffix in OWNER_ARTIFACT_SUFFIXES:
+        path = root / f"{spool_id}{suffix}"
+        if path == lock_path:
+            continue
+        if path.is_dir():
+            shutil.rmtree(path)
+        else:
+            path.unlink(missing_ok=True)
+    for suffix in (".json", ".stdout", ".stderr", ".exit", ".prompt"):
+        (root / f"{spool_id}{suffix}").unlink(missing_ok=True)
+    (root / "transcripts" / f"{spool_id}.txt").unlink(missing_ok=True)

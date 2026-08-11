@@ -11,11 +11,10 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from .namespace_owner import (
-    ProcessIdentity,
     _atomic_json_write,
     _utc_now,
-    capture_pid_namespace,
     read_proc_starttime,
+    transition_owner_episode,
 )
 from .namespace_owner_process import _set_subreaper
 from .namespace_owner_process import main as owner_main
@@ -101,85 +100,56 @@ def _record_preacceptance_failure(
     owner_generation: int,
     status: int,
 ) -> bool:
-    """Publish a complete terminal generation while holding its released inode."""
-    lock_path = store / f"{spool_id}.process-owner"
-    try:
-        fd = os.open(lock_path, os.O_RDWR | getattr(os, "O_CLOEXEC", 0))
-    except OSError:
+    """Abort only the exact never-bound reservation; never bind a pathname."""
+    spool_path = store / f"{spool_id}.json"
+    spool = _load(spool_path) or {}
+    episode = spool.get("owner_episode") or {}
+    if episode.get("generation") != owner_generation or episode.get("phase") != "reserved":
         return False
-    acquired = False
-    try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            acquired = True
-            descriptor = os.fstat(fd)
-            pathname = os.stat(lock_path)
-        except (BlockingIOError, OSError):
+    detail = "logical owner exited before binding"
+    result = transition_owner_episode(
+        store,
+        spool_id,
+        actor="watchdog",
+        destination="aborted",
+        generation=owner_generation,
+        expected_revision=episode.get("revision"),
+        facts={
+            "failure": {
+                "kind": "owner_preacceptance_failure",
+                "detail": detail,
+                "observed_at": _utc_now(),
+                "owner_pid": owner_pid,
+                "owner_birth_token": owner_birth_token,
+                "owner_signal": os.WTERMSIG(status) if os.WIFSIGNALED(status) else None,
+                "owner_exit_code": os.WEXITSTATUS(status) if os.WIFEXITED(status) else None,
+            }
+        },
+    )
+    if not result.accepted:
+        return False
+    with _record_guard(store, spool_id):
+        current = _load(spool_path) or {}
+        current_episode = current.get("owner_episode") or {}
+        if current_episode.get("generation") != owner_generation or current_episode.get("phase") != "aborted":
             return False
-        if (descriptor.st_dev, descriptor.st_ino) != (pathname.st_dev, pathname.st_ino):
-            return False
-
-        with _record_guard(store, spool_id):
-            spool_path = store / f"{spool_id}.json"
-            spool = _load(spool_path)
-            if not spool or spool.get("status") not in {"pending", "running"}:
-                return False
-            if spool.get("replacement_starting") and spool.get("owner_generation") != owner_generation:
-                return False
-            identity = ProcessIdentity(
-                pid=owner_pid,
-                birth_token=owner_birth_token,
-                namespace=capture_pid_namespace(),
-                owner_generation=owner_generation,
-                child_pgid=None,
-                lock_device=descriptor.st_dev,
-                lock_inode=descriptor.st_ino,
-                lock_created=True,
-            )
-            _atomic_json_write(store / f"{spool_id}.owner-identity", identity.to_dict())
-            _atomic_json_write(
-                store / f"{spool_id}.owner-exit",
-                {
-                    "owner_pid": owner_pid,
-                    "owner_generation": owner_generation,
-                    "provider_pid": None,
-                    "provider_exit_code": None,
-                    "provider_reaped": True,
-                    "adopted_children_reaped": 0,
-                    "cleanup_outcome": "preacceptance_failure",
-                    "owner_crashed": True,
-                    "watchdog_contained": True,
-                    "owner_signal": os.WTERMSIG(status) if os.WIFSIGNALED(status) else None,
-                    "owner_exit_code": os.WEXITSTATUS(status) if os.WIFEXITED(status) else None,
-                    "observed_at": _utc_now(),
-                },
-            )
-            spool.update(
-                {
-                    "status": "error",
-                    "error": "Logical owner exited before identity publication",
-                    "error_kind": "owner_preacceptance_failure",
-                    "failed_owner_generation": owner_generation,
-                    "owner_generation": owner_generation,
-                    "completed_at": _utc_now(),
-                }
-            )
-            spool.pop("replacement_starting", None)
-            spool.pop("replacement_owner_generation", None)
-            lifecycle = dict(spool.get("lifecycle") or {})
-            lifecycle.pop("public_stop_state", None)
-            lifecycle["transport_state"] = "reaped"
-            lifecycle["normalized_terminal_kind"] = "failed"
-            spool["lifecycle"] = lifecycle
-            _atomic_json_write(spool_path, spool)
-        return True
-    finally:
-        if acquired:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-            except OSError:
-                pass
-        os.close(fd)
+        current.update(
+            {
+                "status": "error",
+                "error": "Logical owner exited before identity publication",
+                "error_kind": "owner_preacceptance_failure",
+                "failed_owner_generation": owner_generation,
+                "owner_generation": owner_generation,
+                "completed_at": _utc_now(),
+            }
+        )
+        lifecycle = dict(current.get("lifecycle") or {})
+        lifecycle.pop("public_stop_state", None)
+        lifecycle["transport_state"] = "reaped"
+        lifecycle["normalized_terminal_kind"] = "failed"
+        current["lifecycle"] = lifecycle
+        _atomic_json_write(spool_path, current)
+    return True
 
 
 def _record_owner_crash(
@@ -191,23 +161,18 @@ def _record_owner_crash(
     status: int,
     contained: bool,
 ) -> None:
-    identity_path = store / f"{spool_id}.owner-identity"
     process_path = store / f"{spool_id}.process-identity"
     exit_path = store / f"{spool_id}.owner-exit"
-    identity = _load(identity_path)
     process = _load(process_path) or {}
     existing_exit = _load(exit_path)
     owner_signal = os.WTERMSIG(status) if os.WIFSIGNALED(status) else None
     owner_exit_code = os.WEXITSTATUS(status) if os.WIFEXITED(status) else None
 
-    if (
-        identity is None
-        or identity.get("pid") != owner_pid
-        or identity.get("owner_generation") != owner_generation
-    ):
-        # The stable ownership inode may exist, but no running identity was
-        # accepted and no provider was published.  This is the one owner crash
-        # phase that can be classified as a prelaunch failure immediately.
+    spool = _load(store / f"{spool_id}.json") or {}
+    episode = spool.get("owner_episode") or {}
+    if episode.get("generation") != owner_generation:
+        return
+    if episode.get("phase") == "reserved":
         _record_preacceptance_failure(
             store,
             spool_id,
@@ -217,6 +182,41 @@ def _record_owner_crash(
             status,
         )
         return
+
+    if episode.get("phase") in {"lock_bound", "accepted"}:
+        observed_at = _utc_now()
+        lifecycle = dict(spool.get("lifecycle") or {})
+        lifecycle["public_stop_state"] = "stopping"
+        transition_owner_episode(
+            store,
+            spool_id,
+            actor="watchdog",
+            destination="cleanup_proven",
+            generation=owner_generation,
+            expected_revision=episode.get("revision"),
+            facts={
+                "containment": {
+                    "contained": contained,
+                    "adopted_children_reaped": 0,
+                    "observed_at": observed_at,
+                },
+                "cleanup": {
+                    "outcome": "watchdog_contained" if contained else "descendants_survived",
+                    "provider_reaped": contained,
+                    "adopted_children_reaped": 0,
+                    "child_exit_observed_at": observed_at,
+                    "provider_exit_code": None,
+                },
+                "failure": {
+                    "kind": "owner_crash",
+                    "detail": "logical owner crashed",
+                    "observed_at": observed_at,
+                    "owner_signal": owner_signal,
+                    "owner_exit_code": owner_exit_code,
+                },
+            },
+            record_updates={"lifecycle": lifecycle},
+        )
 
     generation = owner_generation
     if existing_exit and existing_exit.get("owner_generation") == generation:
