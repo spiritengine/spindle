@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import select
@@ -12,7 +13,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -23,6 +24,7 @@ from spindle.namespace_owner import (
     ProcessIdentity,
     active_spool_count,
     create_control_request,
+    iter_control_requests,
     probe_ownership_lock,
     read_control_receipt,
     reconcile_owner_episode,
@@ -129,6 +131,7 @@ def owner_case(namespace_owner_env, fake_provider_factory, process_ledger):
         mode="cooperative",
         *,
         timeout=None,
+        deadline=None,
         pause_checkpoint=None,
         controlled_clock_fd=None,
         extra_provider_args=(),
@@ -142,6 +145,8 @@ def owner_case(namespace_owner_env, fake_provider_factory, process_ledger):
             "created_at": datetime.now().isoformat(),
             "timeout": timeout,
         }
+        if deadline is not None:
+            spool["wall_deadline_at"] = deadline
         (store / f"{spool_id}.json").write_text(json.dumps(spool))
         provider = fake_provider_factory(mode)
         ready_read, ready_write = os.pipe()
@@ -161,6 +166,8 @@ def owner_case(namespace_owner_env, fake_provider_factory, process_ledger):
         ]
         if timeout is not None:
             args.extend(["--timeout", str(timeout)])
+        if deadline is not None:
+            args.extend(["--deadline", str(deadline)])
         if pause_checkpoint is not None:
             checkpoint_controller, checkpoint_owner = socket.socketpair()
             pass_fds.append(checkpoint_owner.fileno())
@@ -254,6 +261,15 @@ def test_s2_s_own_03_immediate_provider_exit_is_observed_without_registration_ra
     assert owner.process.poll() == 0
 
 
+def test_provider_exit_70_is_not_reclassified_as_owner_crash(owner_case):
+    owner = owner_case("exit-70")
+    evidence = owner.wait_exit()
+    assert evidence["provider_exit_code"] == 70
+    assert "owner_crashed" not in evidence
+    assert "owner_crashed_after_cleanup" not in evidence
+    assert owner.process.returncode == 70
+
+
 def test_s2_s_own_04_launcher_thread_exit_does_not_trigger_provider_pdeath(owner_case):
     holder = []
 
@@ -318,6 +334,85 @@ def test_s2_s_ctl_04_stubborn_child_remains_slot_counted_until_resolution(owner_
     owner.checkpoint.sendall(b"continue\n")
     owner.wait_terminal()
     assert owner.receipt(request.request_id).forced_cleanup_completed_at
+
+
+@pytest.mark.parametrize("later_kind", ["cancel", "timeout", "drop"])
+def test_overlapping_requests_receive_superseded_receipts(owner_case, later_kind):
+    owner = owner_case("ignore-term", pause_checkpoint="control_observed_before_ack")
+    winner = owner.request("cancel")
+    checkpoint = json.loads(owner.checkpoint.recv(4096).decode())
+    assert checkpoint["name"] == "control_observed_before_ack"
+    later = owner.request(later_kind)
+    owner.checkpoint.sendall(b"continue\n")
+    owner.wait_terminal()
+
+    winning_receipt = owner.receipt(winner.request_id)
+    superseded = owner.receipt(later.request_id)
+    assert winning_receipt.owner_acknowledged_at
+    assert winning_receipt.cleanup_outcome == "cleaned"
+    assert superseded.owner_acknowledged_at is None
+    assert superseded.cleanup_outcome == "rejected_superseded"
+
+
+@pytest.mark.parametrize(
+    ("checkpoint", "provider_survives"),
+    [
+        ("control_observed_before_ack", True),
+        ("after_term_before_kill", True),
+        ("before_terminal_publish", False),
+    ],
+)
+def test_stop_boundaries_reverify_exact_ownership_inode(owner_case, checkpoint, provider_survives):
+    owner = owner_case("ignore-term", pause_checkpoint=checkpoint)
+    request = owner.request()
+    observed = json.loads(owner.checkpoint.recv(4096).decode())
+    assert observed["name"] == checkpoint
+
+    old = owner.lock_path.stat()
+    owner.lock_path.unlink()
+    owner.lock_path.touch(mode=0o600)
+    contender = os.open(owner.lock_path, os.O_RDWR)
+    try:
+        fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        owner.checkpoint.sendall(b"continue\n")
+        unhealthy = wait_until(
+            lambda: (
+                spool
+                if (spool := owner.spool())
+                and spool.get("lifecycle", {}).get("ownership_state") == "identity_mismatch"
+                else None
+            )
+        )
+        assert unhealthy["status"] == "running"
+        assert owner.lock_path.stat().st_ino != old.st_ino
+        assert Path(f"/proc/{owner.ready['provider_pid']}").exists() is provider_survives
+        if checkpoint == "control_observed_before_ack":
+            assert owner.receipt(request.request_id) is None
+        else:
+            assert owner.receipt(request.request_id).owner_acknowledged_at
+    finally:
+        fcntl.flock(contender, fcntl.LOCK_UN)
+        os.close(contender)
+
+
+def test_owner_reverifies_exact_inode_before_release(owner_case):
+    owner = owner_case("ignore-term", pause_checkpoint="before_lock_release")
+    owner.request()
+    observed = json.loads(owner.checkpoint.recv(4096).decode())
+    assert observed["name"] == "before_lock_release"
+    assert owner.spool()["status"] == "error"
+
+    owner.lock_path.unlink()
+    owner.lock_path.touch(mode=0o600)
+    contender = os.open(owner.lock_path, os.O_RDWR)
+    try:
+        fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        owner.checkpoint.sendall(b"continue\n")
+        owner.process.wait(timeout=5)
+        assert owner.spool()["lifecycle"]["ownership_state"] == "identity_mismatch"
+    finally:
+        fcntl.flock(contender, fcntl.LOCK_UN)
+        os.close(contender)
 
 
 def test_s2_s_own_05_setsid_descendant_is_cleaned_and_never_inherits_custody(owner_case):
@@ -420,6 +515,34 @@ def test_s2_s_time_01_owner_self_timeout_uses_control_and_reaps_before_terminal(
     assert receipt.owner_acknowledged_at
     assert receipt.forced_cleanup_completed_at
     assert receipt.child_exit_observed_at
+
+
+def test_restarted_owner_preserves_future_absolute_deadline(owner_case, owner_clock):
+    _current, advance, owner_clock_socket = owner_clock
+    deadline = (datetime.now(timezone.utc) + timedelta(seconds=30)).isoformat()
+    owner = owner_case(
+        "ignore-term",
+        timeout=100,
+        deadline=deadline,
+        controlled_clock_fd=owner_clock_socket.fileno(),
+    )
+    time.sleep(0.1)
+    assert list(iter_control_requests(owner.store, owner.spool_id)) == []
+    assert owner.spool()["wall_deadline_at"] == deadline
+    advance(31)
+    assert owner.wait_terminal()["status"] == "timeout"
+
+
+def test_restarted_owner_turns_overdue_deadline_into_durable_timeout(owner_case):
+    deadline = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+    owner = owner_case("ignore-term", timeout=100, deadline=deadline)
+    terminal = owner.wait_terminal()
+    requests = list(iter_control_requests(owner.store, owner.spool_id))
+    assert terminal["status"] == "timeout"
+    assert len(requests) == 1
+    assert requests[0].kind == "timeout"
+    assert requests[0].deadline == deadline
+    assert owner.receipt(requests[0].request_id).cleanup_outcome == "cleaned"
 
 
 def test_s2_s_mig_01_legacy_terminal_spools_remain_readable(tmp_path):

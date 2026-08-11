@@ -14,6 +14,7 @@ import subprocess
 import sys
 import time
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -25,6 +26,7 @@ from .namespace_owner import (
     capture_pid_namespace,
     create_control_request,
     iter_control_requests,
+    mailbox_guard,
     parse_proc_stat_starttime,
     read_control_receipt,
     update_control_receipt,
@@ -130,6 +132,7 @@ class LogicalOwner:
         self.checkpoints = Checkpoints(args.checkpoint_fd, args.pause_checkpoint, self.generation)
         self.clock = OwnerClock(args.clock_fd)
         self.adopted_reaped = 0
+        self.wall_deadline_at: Optional[str] = args.deadline
 
     def _await_launch_barrier(self) -> bool:
         fd = self.args.launch_barrier_fd
@@ -196,6 +199,31 @@ class LogicalOwner:
             self.generation = previous + 1
             self.checkpoints.generation = self.generation
 
+    def _ensure_wall_deadline(self) -> None:
+        """Persist one UTC deadline and reuse it across replacement owners."""
+        if self.args.timeout is None:
+            return
+        with self._spool_record_guard():
+            spool = self._read_spool()
+            deadline = spool.get("wall_deadline_at") or self.wall_deadline_at
+            if deadline is None:
+                deadline = (datetime.now(timezone.utc) + timedelta(seconds=self.args.timeout)).isoformat()
+            self.wall_deadline_at = deadline
+            if spool.get("wall_deadline_at") != deadline:
+                spool["wall_deadline_at"] = deadline
+                self._write_spool_unlocked(spool)
+
+    def _remaining_wall_budget(self) -> Optional[float]:
+        if not self.wall_deadline_at:
+            return None
+        try:
+            deadline = datetime.fromisoformat(self.wall_deadline_at)
+        except (TypeError, ValueError):
+            return 0.0
+        if deadline.tzinfo is None:
+            deadline = deadline.replace(tzinfo=timezone.utc)
+        return max(0.0, (deadline.astimezone(timezone.utc) - datetime.now(timezone.utc)).total_seconds())
+
     def _publish_owner_identity(self) -> ProcessIdentity:
         namespace = capture_pid_namespace()
         identity = ProcessIdentity(
@@ -215,11 +243,29 @@ class LogicalOwner:
 
     def _verify_lock(self) -> bool:
         if not os.access(self.lock_path, os.R_OK | os.W_OK):
-            self._set_lifecycle(ownership_state="unreadable")
+            if self.lock_path.exists():
+                self._set_lifecycle(ownership_state="unreadable")
+            else:
+                self._set_lifecycle(
+                    ownership_state="identity_mismatch",
+                    recorded_lock_device=self.lock.device,
+                    recorded_lock_inode=self.lock.inode,
+                    observed_lock_device=None,
+                    observed_lock_inode=None,
+                )
             return False
         try:
             descriptor = os.fstat(self.lock.fd)
             pathname = os.stat(self.lock_path)
+        except FileNotFoundError:
+            self._set_lifecycle(
+                ownership_state="identity_mismatch",
+                recorded_lock_device=self.lock.device,
+                recorded_lock_inode=self.lock.inode,
+                observed_lock_device=None,
+                observed_lock_inode=None,
+            )
+            return False
         except OSError:
             self._set_lifecycle(ownership_state="unreadable")
             return False
@@ -234,7 +280,7 @@ class LogicalOwner:
             )
             return False
         lifecycle = (self._read_spool().get("lifecycle") or {})
-        if lifecycle.get("ownership_state") == "unreadable":
+        if lifecycle.get("ownership_state") in {"unreadable", "identity_mismatch"}:
             self._set_lifecycle(ownership_state="held")
         return True
 
@@ -294,6 +340,7 @@ class LogicalOwner:
             spool.update(
                 {
                     "status": "running",
+                    "pid": os.getpid(),
                     "owner_pid": os.getpid(),
                     "provider_pid": self.provider.pid,
                     "provider_process_group_id": self.provider_pgid,
@@ -307,6 +354,7 @@ class LogicalOwner:
                 }
             )
             spool.pop("replacement_starting", None)
+            spool.pop("replacement_owner_generation", None)
             self._write_spool_unlocked(spool)
         if self.args.ready_fd is not None:
             ready = {
@@ -369,6 +417,8 @@ class LogicalOwner:
                 return True
             time.sleep(0.01)
         children = [pid for pid in self._direct_children() if self.provider is None or pid != self.provider.pid]
+        if children and not self._verify_lock():
+            return False
         for pid in children:
             try:
                 os.kill(pid, signal.SIGKILL)
@@ -398,30 +448,39 @@ class LogicalOwner:
         except OSError:
             return False
 
-    def _signal_provider_group(self, sig: int) -> None:
+    def _signal_provider_group(self, sig: int) -> bool:
+        if not self._verify_lock():
+            return False
         if self.provider_pgid is None:
-            return
+            return True
         if self.provider is not None and self.provider.poll() is None:
             try:
                 if _starttime(self.provider.pid) != self.provider_birth:
                     raise RuntimeError("provider PID identity changed before signal")
             except FileNotFoundError:
-                return
+                return True
         try:
             os.killpg(self.provider_pgid, sig)
         except ProcessLookupError:
             pass
+        return True
 
-    def _finish_provider(self) -> int:
+    def _finish_provider(self) -> Optional[int]:
         if self.provider is None:
             return 127
         try:
             return self.provider.wait(timeout=1)
         except subprocess.TimeoutExpired:
-            self._signal_provider_group(signal.SIGKILL)
-            return self.provider.wait(timeout=1)
+            if not self._signal_provider_group(signal.SIGKILL):
+                return None
+            try:
+                return self.provider.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                return None
 
-    def _write_exit_evidence(self, returncode: int, *, cleanup_outcome: str) -> None:
+    def _write_exit_evidence(self, returncode: int, *, cleanup_outcome: str) -> bool:
+        if not self._verify_lock():
+            return False
         legacy_code = 128 - returncode if returncode < 0 else returncode
         _atomic_json_write(
             self.owner_exit_path,
@@ -447,21 +506,76 @@ class LogicalOwner:
             os.fsync(directory_fd)
         finally:
             os.close(directory_fd)
+        return True
+
+    def _next_current_request(self):
+        """Return the next current-generation request and reject stale siblings."""
+        with mailbox_guard(self.store, self.spool_id):
+            for request in iter_control_requests(self.store, self.spool_id):
+                if read_control_receipt(self.store, self.spool_id, request.request_id) is not None:
+                    continue
+                if request.owner_generation != self.generation:
+                    if not self._verify_lock():
+                        return None
+                    write_control_receipt(
+                        self.store,
+                        self.spool_id,
+                        request,
+                        current_generation=self.generation,
+                        accepted=False,
+                    )
+                    continue
+                return request
+        return None
+
+    def _settle_other_requests_unlocked(self, accepted_request_id: str) -> bool:
+        """Give every durable non-winning request its generation-scoped receipt."""
+        if not self._verify_lock():
+            return False
+        for request in iter_control_requests(self.store, self.spool_id):
+            if request.request_id == accepted_request_id:
+                continue
+            if read_control_receipt(self.store, self.spool_id, request.request_id) is not None:
+                continue
+            write_control_receipt(
+                self.store,
+                self.spool_id,
+                request,
+                current_generation=self.generation,
+                accepted=False,
+            )
+        return True
+
+    def _settle_other_requests(self, accepted_request_id: str) -> bool:
+        with mailbox_guard(self.store, self.spool_id):
+            return self._settle_other_requests_unlocked(accepted_request_id)
 
     def _handle_request(self, request) -> int:
         self.checkpoints.reach("control_observed_before_ack", self.provider.pid)
-        receipt = write_control_receipt(
-            self.store,
-            self.spool_id,
-            request,
-            current_generation=self.generation,
-        )
+        if not self._verify_lock():
+            return -2
+        with mailbox_guard(self.store, self.spool_id):
+            receipt = write_control_receipt(
+                self.store,
+                self.spool_id,
+                request,
+                current_generation=self.generation,
+                accepted=True,
+            )
+            if not self._settle_other_requests_unlocked(request.request_id):
+                return -2
         if receipt.owner_acknowledged_at is None:
             return -1
+        if not self._verify_lock():
+            return -2
         self._set_lifecycle(public_stop_state="stopping", desired_terminal_kind=request.desired_terminal_kind)
         self.checkpoints.reach("control_ack_durable", self.provider.pid)
+        if not self._verify_lock():
+            return -2
         attempted_at = _utc_now()
         acknowledged = self._send_provider_cancel()
+        if not self._verify_lock():
+            return -2
         update_control_receipt(
             self.store,
             self.spool_id,
@@ -473,23 +587,31 @@ class LogicalOwner:
         forced_completed = None
         if not self._wait_provider(0.25):
             forced_started = _utc_now()
+            if not self._verify_lock():
+                return -2
             update_control_receipt(
                 self.store,
                 self.spool_id,
                 request.request_id,
                 forced_cleanup_started_at=forced_started,
             )
-            self._signal_provider_group(signal.SIGTERM)
+            if not self._signal_provider_group(signal.SIGTERM):
+                return -2
             if not self._wait_provider(0.2):
                 self.checkpoints.reach("after_term_before_kill", self.provider.pid)
-                self._signal_provider_group(signal.SIGKILL)
+                if not self._signal_provider_group(signal.SIGKILL):
+                    return -2
         returncode = self._finish_provider()
+        if returncode is None:
+            return -2
         descendants_clean = self._settle_descendants(force=True)
         if forced_started is None and not descendants_clean:
             forced_started = _utc_now()
         if forced_started is not None:
             forced_completed = _utc_now()
         child_exit = _utc_now()
+        if not self._verify_lock():
+            return -2
         update_control_receipt(
             self.store,
             self.spool_id,
@@ -500,8 +622,14 @@ class LogicalOwner:
             child_exit_observed_at=child_exit,
             cleanup_outcome="cleaned" if descendants_clean else "descendants_survived",
         )
-        self._write_exit_evidence(returncode, cleanup_outcome="stopped")
+        if not self._settle_other_requests(request.request_id):
+            return -2
+        if not self._write_exit_evidence(returncode, cleanup_outcome="stopped"):
+            return -2
         self.checkpoints.reach("cleanup_receipt_durable", self.provider.pid)
+        self.checkpoints.reach("before_terminal_publish", self.provider.pid)
+        if not self._verify_lock():
+            return -2
         with self._spool_record_guard():
             spool = self._read_spool()
             lifecycle = dict(spool.get("lifecycle") or {})
@@ -519,8 +647,9 @@ class LogicalOwner:
                 f"Timeout after {spool.get('timeout')}s" if spool["status"] == "timeout" else "Cancelled"
             )
             spool["completed_at"] = _utc_now()
-            self.checkpoints.reach("before_terminal_publish", self.provider.pid)
             self._write_spool_unlocked(spool)
+        if not self._settle_other_requests(request.request_id):
+            return -2
         return 0
 
     def run(self) -> int:
@@ -529,6 +658,7 @@ class LogicalOwner:
         _set_subreaper()
         self.lock = acquire_ownership_lock(self.lock_path)
         self._allocate_generation()
+        self._ensure_wall_deadline()
         self.checkpoints.reach("identity_lock_acquired")
         self._publish_owner_identity()
         self.checkpoints.reach("identity_published")
@@ -537,6 +667,10 @@ class LogicalOwner:
         # visible; sampling the epoch afterward would move the deadline by
         # that advance and leave the owner waiting forever at a frozen clock.
         started = self.clock.monotonic()
+        remaining_wall_budget = self._remaining_wall_budget()
+        monotonic_budget = self.args.timeout
+        if monotonic_budget is not None and remaining_wall_budget is not None:
+            monotonic_budget = min(float(self.args.timeout), remaining_wall_budget)
         self._spawn_provider()
         accepted_request = None
         result = 0
@@ -546,12 +680,9 @@ class LogicalOwner:
                     time.sleep(self.args.poll_interval)
                     continue
                 if accepted_request is None:
-                    for request in iter_control_requests(self.store, self.spool_id):
-                        if read_control_receipt(self.store, self.spool_id, request.request_id) is None:
-                            accepted_request = request
-                            break
+                    accepted_request = self._next_current_request()
                 if accepted_request is None and self.args.timeout is not None:
-                    if self.clock.monotonic() - started >= self.args.timeout:
+                    if self.clock.monotonic() - started >= monotonic_budget:
                         accepted_request = create_control_request(
                             self.store,
                             self.spool_id,
@@ -559,6 +690,8 @@ class LogicalOwner:
                             self.generation,
                             "logical-owner",
                             observer_namespace=capture_pid_namespace(),
+                            reason="durable wall deadline elapsed",
+                            deadline=self.wall_deadline_at,
                         )
                 if accepted_request is not None:
                     result = self._handle_request(accepted_request)
@@ -568,7 +701,9 @@ class LogicalOwner:
                 if self._provider_exited():
                     returncode = self._finish_provider()
                     self._settle_descendants(force=False)
-                    self._write_exit_evidence(returncode, cleanup_outcome="natural_exit")
+                    if returncode is None or not self._write_exit_evidence(returncode, cleanup_outcome="natural_exit"):
+                        time.sleep(self.args.poll_interval)
+                        continue
                     result = returncode
                     break
                 time.sleep(self.args.poll_interval)
@@ -578,8 +713,12 @@ class LogicalOwner:
                 self.provider_pidfd = None
             if self.control is not None:
                 self.control.close()
-            self.checkpoints.reach("before_lock_release", self.provider.pid if self.provider else None)
-            self.lock.close()
+            with mailbox_guard(self.store, self.spool_id):
+                if accepted_request is not None:
+                    self._settle_other_requests_unlocked(accepted_request.request_id)
+                self.checkpoints.reach("before_lock_release", self.provider.pid if self.provider else None)
+                self._verify_lock()
+                self.lock.close()
         return result
 
 
@@ -594,6 +733,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pause-checkpoint")
     parser.add_argument("--clock-fd", type=int)
     parser.add_argument("--timeout", type=float)
+    parser.add_argument("--deadline")
     parser.add_argument("--poll-interval", type=float, default=0.02)
     parser.add_argument("--cwd", default=os.getcwd())
     parser.add_argument("--stdin-path")

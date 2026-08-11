@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import errno
 import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -217,6 +219,38 @@ def test_s2_u_ctl_02_requests_are_idempotent_and_generation_scoped(tmp_path):
     assert stale.request_id == first.request_id
 
 
+def test_duplicate_request_writers_are_atomic_and_conflicts_fail(tmp_path):
+    request_id = "concurrent-request"
+    barrier = threading.Barrier(2)
+
+    def publish(kind):
+        barrier.wait(timeout=2)
+        return create_control_request(tmp_path, "spool-a", kind, 3, "writer", request_id=request_id)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(publish, kind) for kind in ("cancel", "timeout")]
+        outcomes = []
+        errors = []
+        for future in futures:
+            try:
+                outcomes.append(future.result(timeout=3))
+            except ValueError as exc:
+                errors.append(str(exc))
+
+    assert len(outcomes) == len(errors) == 1
+    assert "different payload" in errors[0]
+    stored = list(iter_control_requests(tmp_path, "spool-a"))
+    assert stored == outcomes
+
+
+def test_every_owner_exit_code_is_disjoint_from_watchdog_crash_channel():
+    from spindle.owner_watchdog import _owner_process_crashed
+
+    for exit_code in range(256):
+        assert _owner_process_crashed(exit_code << 8, exception_reported=False) is False
+        assert _owner_process_crashed(exit_code << 8, exception_reported=True) is True
+
+
 @pytest.mark.parametrize(
     "lock,liveness,exit_evidence,legacy,result",
     [
@@ -361,6 +395,60 @@ def test_owner_exit_evidence_is_scoped_to_current_generation(tmp_path):
     )
     assert spindle._owner_exit_evidence(spool_id, 1) == (True, True)
     assert spindle._owner_exit_evidence(spool_id, 2) == (False, False)
+
+
+@pytest.mark.parametrize(
+    ("lock_state", "artifact"),
+    [("identity_mismatch", "missing-current"), ("identity_mismatch", "replaced"), ("unreadable", "unreadable")],
+)
+def test_store_health_authority_blocks_launch_doctor_and_recovers(tmp_path, monkeypatch, lock_state, artifact):
+    spool_id = f"unhealthy-{artifact}"
+    monkeypatch.setattr(spindle, "SPINDLE_DIR", tmp_path)
+    spindle._write_spool(spool_id, {"id": spool_id, "status": "running"})
+    repaired = {"value": False}
+    recorded_identity = ProcessIdentity(
+        pid=os.getpid(),
+        birth_token="test",
+        namespace=capture_pid_namespace(),
+        owner_generation=1,
+        child_pgid=None,
+        lock_device=11,
+        lock_inode=12,
+        lock_created=True,
+    )
+
+    def reconcile(_spool):
+        state = "active" if repaired["value"] else "store_unhealthy"
+        observed = (22, 33) if artifact == "replaced" else (None, None)
+        return spindle.ReconciliationResult(
+            state,
+            "exact_ownership_inode_held" if repaired["value"] else f"ownership_{lock_state}",
+            LivenessEvidence("alive", "pidfd_live"),
+            LockEvidence("held" if repaired["value"] else lock_state, *observed, detail=artifact),
+        )
+
+    monkeypatch.setattr(spindle, "_ensure_store_supervisor_locked", lambda: (True, None))
+    monkeypatch.setattr(spindle, "_reconcile_spool_ownership", reconcile)
+    monkeypatch.setattr(spindle, "_read_current_owner_identity", lambda _spool_id: recorded_identity)
+
+    success, error = spindle._try_reserve_slot_and_create("rejected")
+    assert success is False
+    assert f"ownership_{lock_state}" in error
+    assert "recorded=11:12" in error
+    assert f"observed={'22:33' if artifact == 'replaced' else 'None:None'}" in error
+    assert not spindle._get_spool_path("rejected").exists()
+    assert spindle._count_running() == 1
+    diagnosis = spindle._doctor_storage_check()
+    assert diagnosis["status"] == "fail"
+    assert diagnosis["data"]["ownership_failures"][0]["spool_id"] == spool_id
+    assert "recorded=11:12" in diagnosis["lines"][0]
+    assert any("repair" in line for line in diagnosis["lines"])
+
+    repaired["value"] = True
+    success, error = spindle._try_reserve_slot_and_create("accepted")
+    assert (success, error) == (True, None)
+    assert spindle._doctor_storage_check()["status"] == "ok"
+    assert spindle._count_running() == 2
 
 
 def test_s2_u_slot_01_pending_running_and_stopping_count_as_active():

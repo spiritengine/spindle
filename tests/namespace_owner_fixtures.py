@@ -12,7 +12,6 @@ import stat
 import subprocess
 import sys
 import threading
-import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -66,6 +65,7 @@ def fake_provider_factory(namespace_owner_env):
             "print(f'ready {os.getpid()} {os.getpgrp()}', flush=True)\n"
             "if MODE == 'immediate-exit': raise SystemExit(0)\n"
             "if MODE == 'silent-exit': raise SystemExit(17)\n"
+            "if MODE.startswith('exit-'): raise SystemExit(int(MODE.split('-', 1)[1]))\n"
             "if MODE == 'record-launch':\n"
             "    targets = []\n"
             "    for item in Path('/proc/self/fd').iterdir():\n"
@@ -332,13 +332,13 @@ class WatchdogOwnerHandle:
 
     @property
     def owner_pid(self):
+        if self.initial_checkpoint:
+            return self.initial_checkpoint["owner_pid"]
+        if self.ready.get("owner_pid"):
+            return self.ready["owner_pid"]
         try:
             return json.loads((self.store / f"{self.spool_id}.owner-identity").read_text())["pid"]
         except FileNotFoundError:
-            if self.initial_checkpoint:
-                return self.initial_checkpoint["owner_pid"]
-            if self.ready.get("owner_pid"):
-                return self.ready["owner_pid"]
             raise
 
     @property
@@ -380,6 +380,9 @@ def watchdog_owner_case(namespace_owner_env, fake_provider_factory, process_ledg
         pause_checkpoint=None,
         disable_pdeathsig=False,
         timeout=None,
+        generation=1,
+        spool_id=None,
+        spool_overrides=None,
         controlled_clock_fd=None,
         store_kind="bridge_schema1",
     ):
@@ -389,7 +392,7 @@ def watchdog_owner_case(namespace_owner_env, fake_provider_factory, process_ledg
             else namespace_owner_env["home"] / "spools-v2"
         )
         store.mkdir(parents=True, exist_ok=True)
-        spool_id = f"stage4-{len(handles)}"
+        spool_id = spool_id or f"stage4-{len(handles)}"
         spool = {
             "id": spool_id,
             "status": "pending",
@@ -397,6 +400,8 @@ def watchdog_owner_case(namespace_owner_env, fake_provider_factory, process_ledg
             "timeout": timeout,
             "spool_schema_version": 1 if store_kind == "bridge_schema1" else 2,
         }
+        if spool_overrides:
+            spool.update(spool_overrides)
         (store / f"{spool_id}.json").write_text(json.dumps(spool))
         provider = fake_provider_factory(mode)
         ready_read, ready_write = os.pipe()
@@ -408,6 +413,8 @@ def watchdog_owner_case(namespace_owner_env, fake_provider_factory, process_ledg
             str(store),
             "--spool-id",
             spool_id,
+            "--generation",
+            str(generation),
             "--ready-fd",
             str(ready_write),
         ]

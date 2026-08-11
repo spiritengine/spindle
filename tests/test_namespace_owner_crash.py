@@ -10,7 +10,12 @@ from pathlib import Path
 from unittest.mock import patch
 
 import spindle
-from spindle.namespace_owner import iter_control_requests, read_control_receipt
+from spindle.namespace_owner import (
+    ProcessIdentity,
+    capture_pid_namespace,
+    iter_control_requests,
+    read_control_receipt,
+)
 
 
 def wait_until(predicate, timeout=8):
@@ -176,6 +181,56 @@ def test_s2_c_own_02_crash_before_identity_publication_is_prelaunch_failure(
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     finally:
         os.close(fd)
+
+
+def test_same_id_replacement_crash_and_cancel_use_new_generation_without_slot_leak(
+    watchdog_owner_case,
+    namespace_owner_env,
+):
+    store = namespace_owner_env["store"]
+    spool_id = "same-id-replacement"
+    stale_identity = ProcessIdentity(
+        pid=os.getpid(),
+        birth_token=spindle._process_start_time(os.getpid()),
+        namespace=capture_pid_namespace(),
+        owner_generation=1,
+        child_pgid=None,
+        lock_device=1,
+        lock_inode=1,
+        lock_created=True,
+    )
+    (store / f"{spool_id}.owner-identity").write_text(json.dumps(stale_identity.to_dict()))
+    owner = watchdog_owner_case(
+        "healthy-turn",
+        pause_checkpoint="identity_lock_acquired",
+        disable_pdeathsig=True,
+        generation=2,
+        spool_id=spool_id,
+        spool_overrides={
+            "status": "running",
+            "owner_generation": 2,
+            "replacement_starting": True,
+            "replacement_owner_generation": 2,
+        },
+    )
+    checkpoint = owner.receive_checkpoint()
+    assert checkpoint["owner_generation"] == 2
+
+    with patch("spindle.SPINDLE_DIR", store):
+        message = spindle._spin_drop_locked(spool_id)
+    assert "Cancellation requested" in message
+    request = list(iter_control_requests(store, spool_id))[0]
+    assert request.owner_generation == 2
+
+    owner.kill_owner()
+    spool = owner.spool()
+    assert spool["status"] == "error"
+    assert spool["error_kind"] == "owner_preacceptance_failure"
+    assert spool["failed_owner_generation"] == 2
+    assert "replacement_starting" not in spool
+    assert read_control_receipt(store, spool_id, request.request_id) is None
+    with patch("spindle.SPINDLE_DIR", store):
+        assert spindle._count_running() == 0
 
 
 def test_s2_c_own_03_owner_crash_contains_setsid_escaped_descendant(

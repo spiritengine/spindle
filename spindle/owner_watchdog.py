@@ -81,36 +81,60 @@ def _load(path: Path) -> dict | None:
         return None
 
 
-def _record_owner_crash(store: Path, spool_id: str, owner_pid: int, status: int, contained: bool) -> None:
+def _record_preacceptance_failure(store: Path, spool_id: str, owner_generation: int) -> None:
+    with _record_guard(store, spool_id):
+        spool_path = store / f"{spool_id}.json"
+        spool = _load(spool_path)
+        if not spool or spool.get("status") not in {"pending", "running"}:
+            return
+        if spool.get("replacement_starting") and spool.get("owner_generation") != owner_generation:
+            return
+        spool.update(
+            {
+                "status": "error",
+                "error": "Logical owner exited before identity publication",
+                "error_kind": "owner_preacceptance_failure",
+                "failed_owner_generation": owner_generation,
+                "completed_at": _utc_now(),
+            }
+        )
+        spool.pop("replacement_starting", None)
+        spool.pop("replacement_owner_generation", None)
+        lifecycle = dict(spool.get("lifecycle") or {})
+        lifecycle.pop("public_stop_state", None)
+        spool["lifecycle"] = lifecycle
+        _atomic_json_write(spool_path, spool)
+
+
+def _record_owner_crash(
+    store: Path,
+    spool_id: str,
+    owner_pid: int,
+    owner_generation: int,
+    status: int,
+    contained: bool,
+) -> None:
     identity_path = store / f"{spool_id}.owner-identity"
     process_path = store / f"{spool_id}.process-identity"
     exit_path = store / f"{spool_id}.owner-exit"
-    spool_path = store / f"{spool_id}.json"
     identity = _load(identity_path)
     process = _load(process_path) or {}
     existing_exit = _load(exit_path)
     owner_signal = os.WTERMSIG(status) if os.WIFSIGNALED(status) else None
     owner_exit_code = os.WEXITSTATUS(status) if os.WIFEXITED(status) else None
 
-    if identity is None:
+    if (
+        identity is None
+        or identity.get("pid") != owner_pid
+        or identity.get("owner_generation") != owner_generation
+    ):
         # The stable ownership inode may exist, but no running identity was
         # accepted and no provider was published.  This is the one owner crash
         # phase that can be classified as a prelaunch failure immediately.
-        with _record_guard(store, spool_id):
-            spool = _load(spool_path)
-            if spool and spool.get("status") == "pending":
-                spool.update(
-                    {
-                        "status": "error",
-                        "error": "Logical owner exited before identity publication",
-                        "error_kind": "owner_preacceptance_failure",
-                        "completed_at": _utc_now(),
-                    }
-                )
-                _atomic_json_write(spool_path, spool)
+        _record_preacceptance_failure(store, spool_id, owner_generation)
         return
 
-    generation = identity.get("owner_generation")
+    generation = owner_generation
     if existing_exit and existing_exit.get("owner_generation") == generation:
         evidence = dict(existing_exit)
         evidence.update(
@@ -140,6 +164,11 @@ def _record_owner_crash(store: Path, spool_id: str, owner_pid: int, status: int,
     _atomic_json_write(exit_path, evidence)
 
 
+def _owner_process_crashed(status: int, *, exception_reported: bool) -> bool:
+    """Keep ordinary owner return codes disjoint from the crash channel."""
+    return os.WIFSIGNALED(status) or exception_reported
+
+
 def main(argv=None) -> int:
     """Fork the logical owner below a longer-lived containment subreaper."""
     _set_subreaper()
@@ -151,19 +180,31 @@ def main(argv=None) -> int:
     raw = list(sys.argv[1:] if args is None else args)
     store = Path(raw[raw.index("--store") + 1]).resolve()
     spool_id = raw[raw.index("--spool-id") + 1]
+    owner_generation = int(raw[raw.index("--generation") + 1]) if "--generation" in raw else 1
+    error_read, error_write = os.pipe()
     owner_pid = os.fork()
     if owner_pid == 0:
+        os.close(error_read)
         try:
             code = owner_main(raw)
-        except BaseException:
-            os._exit(70)
+        except BaseException as exc:
+            try:
+                os.write(error_write, repr(exc).encode(errors="replace")[:4096])
+            except OSError:
+                pass
+            os._exit(1)
+        finally:
+            os.close(error_write)
         os._exit(int(code) & 0xFF)
 
+    os.close(error_write)
     _waited, status = os.waitpid(owner_pid, 0)
-    crashed = os.WIFSIGNALED(status) or (os.WIFEXITED(status) and os.WEXITSTATUS(status) == 70)
+    exception_reported = bool(os.read(error_read, 4096))
+    os.close(error_read)
+    crashed = _owner_process_crashed(status, exception_reported=exception_reported)
     if crashed:
         contained = _contain_adopted_descendants()
-        _record_owner_crash(store, spool_id, owner_pid, status, contained)
+        _record_owner_crash(store, spool_id, owner_pid, owner_generation, status, contained)
     else:
         # A normal owner drains its own adopted children.  Reap anything which
         # crossed the parent boundary during the final exit instructions.

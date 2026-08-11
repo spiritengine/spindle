@@ -914,8 +914,10 @@ class TestClaudePermissionCommandShape:
         assert wrapped[0][1:] == (shard, str(worktree))
         assert "--permission-mode" in wrapped[0][0]
         assert spawned == [(failing_id, ["wrapped-fallback"], str(worktree))]
-        assert saved["pid"] == 808080
-        assert saved["process_start_time"] == "new-birth-token"
+        assert saved["watchdog_pid"] == 808080
+        assert saved["watchdog_start_time"] == "new-birth-token"
+        assert "pid" not in saved
+        assert saved["replacement_starting"] is True
 
     def test_expired_session_fallback_never_signals_reused_pid(self, tmp_path):
         session_id = "expired-reused-session"
@@ -2439,8 +2441,10 @@ class TestExitCodeCapture:
             assert all(not target.startswith("pipe:") for target in json.loads(fds.read_text()))
             spool = _read_spool(spool_id)
             identity = json.loads(spindle._get_owner_identity_path(spool_id).read_text())
+            assert spool["pid"] == spool["owner_pid"]
             assert spool["owner_pid"] == identity["pid"]
             assert spool["owner_pid"] != watchdog_pid
+            assert spool["watchdog_pid"] == watchdog_pid
             assert handle.pid == watchdog_pid
             lock_target = str(spindle._get_owner_lock_path(spool_id))
             assert lock_target not in json.loads(fds.read_text())
@@ -2505,6 +2509,8 @@ class TestCancellationTermination:
             assert spindle._is_pid_alive(provider_pid) is False
             assert _read_spool(spool_id)["status"] == "error"
             assert watchdog_pid != running["owner_pid"]
+            assert running["pid"] == running["owner_pid"]
+            assert running["watchdog_pid"] == watchdog_pid
             identity = json.loads(spindle._get_owner_identity_path(spool_id).read_text())
             assert identity["pid"] == running["owner_pid"]
 
@@ -2698,7 +2704,9 @@ class TestCancellationTermination:
             saved = _read_spool(spool_id)
 
         old_proc.poll.assert_called_once_with()
-        assert saved["pid"] == 626262
+        assert saved["watchdog_pid"] == 626262
+        assert "pid" not in saved
+        assert saved["replacement_starting"] is True
         assert saved["used_transcript_fallback"] is True
 
     def test_drop_lock_contention_returns_bounded_error(self, tmp_path):
@@ -4240,7 +4248,9 @@ class TestGeminiHarness:
             assert "gemini" in spool["tags"]
             assert "test" in spool["tags"]
             assert spool["status"] == "pending"
-            assert spool["owner_pid"] == 12345
+            assert spool["watchdog_pid"] == 12345
+            assert spool["pid"] is None
+            assert "owner_pid" not in spool
 
     def test_gemini_spin_builds_correct_command(self, tmp_path):
         """Gemini spin should build the correct CLI command."""
@@ -4771,7 +4781,9 @@ class TestKimiHarness:
             assert "kimi" in spool["tags"]
             assert "test" in spool["tags"]
             assert spool["status"] == "pending"
-            assert spool["owner_pid"] == 12345
+            assert spool["watchdog_pid"] == 12345
+            assert spool["pid"] is None
+            assert "owner_pid" not in spool
             # Kimi generates session_id upfront
             assert spool["session_id"] is not None
             assert len(spool["session_id"]) == 36  # UUID length

@@ -15,6 +15,7 @@ import select
 import shutil
 import tempfile
 import uuid
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -308,6 +309,49 @@ def _atomic_json_write(path: Path, value: dict) -> None:
             pass
 
 
+def _atomic_json_create(path: Path, value: dict) -> bool:
+    """Durably publish *value* at *path* only when the pathname is absent."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w") as stream:
+            json.dump(value, stream, sort_keys=True, separators=(",", ":"))
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            return False
+        directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+        return True
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+@contextmanager
+def mailbox_guard(root: str | os.PathLike[str], spool_id: str):
+    """Serialize request publication with the owner's final arbitration pass."""
+    path = Path(root) / f"{spool_id}.journal-guard"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0), 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
 @dataclass(frozen=True)
 class ControlRequest:
     request_id: str
@@ -350,8 +394,6 @@ def create_control_request(
         raise ValueError(f"unsupported control request kind: {kind}")
     request_id = request_id or uuid.uuid4().hex
     path = mailbox_path(root, spool_id) / f"{request_id}.request"
-    if path.exists():
-        return ControlRequest.from_dict(json.loads(path.read_text()))
     request = ControlRequest(
         request_id=request_id,
         kind=kind,
@@ -364,8 +406,19 @@ def create_control_request(
         reason=reason,
         deadline=deadline,
     )
-    _atomic_json_write(path, request.to_dict())
-    return request
+    with mailbox_guard(root, spool_id):
+        if _atomic_json_create(path, request.to_dict()):
+            return request
+        existing = ControlRequest.from_dict(json.loads(path.read_text()))
+        expected = request.to_dict()
+        observed = existing.to_dict()
+        # The first durable publication owns its timestamp. Reusing the ID is
+        # idempotent only when every caller-controlled field agrees.
+        expected.pop("requested_at", None)
+        observed.pop("requested_at", None)
+        if observed != expected:
+            raise ValueError(f"control request ID {request_id!r} already has a different payload")
+        return existing
 
 
 def iter_control_requests(root: str | os.PathLike[str], spool_id: str) -> Iterable[ControlRequest]:
@@ -402,21 +455,34 @@ def write_control_receipt(
     request: ControlRequest,
     *,
     current_generation: int,
+    accepted: Optional[bool] = None,
+    rejection_outcome: str = "rejected_superseded",
     **facts,
 ) -> ControlReceipt:
     path = mailbox_path(root, spool_id) / f"{request.request_id}.receipt"
     if path.exists():
         return ControlReceipt.from_dict(json.loads(path.read_text()))
-    accepted = request.owner_generation == current_generation
+    generation_matches = request.owner_generation == current_generation
+    if accepted is None:
+        accepted = generation_matches
+    accepted = bool(accepted and generation_matches)
+    cleanup_outcome = (
+        "accepted"
+        if accepted
+        else "rejected_stale_generation"
+        if not generation_matches
+        else rejection_outcome
+    )
     receipt = ControlReceipt(
         request_id=request.request_id,
         owner_generation=request.owner_generation,
         owner_acknowledged_at=_utc_now() if accepted else None,
-        cleanup_outcome="accepted" if accepted else "rejected_stale_generation",
+        cleanup_outcome=cleanup_outcome,
         **facts,
     )
-    _atomic_json_write(path, asdict(receipt))
-    return receipt
+    if _atomic_json_create(path, asdict(receipt)):
+        return receipt
+    return ControlReceipt.from_dict(json.loads(path.read_text()))
 
 def read_control_receipt(
     root: str | os.PathLike[str],

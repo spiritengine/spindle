@@ -2217,6 +2217,39 @@ def _count_running() -> int:
     return sum(1 for s in _list_spools() if s.get("status") in ("running", "pending", "stopping"))
 
 
+def _next_owner_generation(spool_id: str) -> int:
+    generations = [0]
+    spool = _read_spool(spool_id) or {}
+    try:
+        generations.append(int(spool.get("owner_generation") or 0))
+    except (TypeError, ValueError):
+        pass
+    try:
+        identity = json.loads(_get_owner_identity_path(spool_id).read_text())
+        generations.append(int(identity.get("owner_generation") or 0))
+    except (FileNotFoundError, OSError, json.JSONDecodeError, TypeError, ValueError):
+        pass
+    return max(generations) + 1
+
+
+def _ensure_spool_wall_deadline(spool: dict) -> Optional[str]:
+    """Persist one absolute timeout budget before the owner is launched."""
+    timeout = spool.get("timeout")
+    if timeout is None:
+        return None
+    if spool.get("wall_deadline_at"):
+        return spool["wall_deadline_at"]
+    deadline = datetime.now(timezone.utc) + timedelta(seconds=float(timeout))
+    spool["wall_deadline_at"] = deadline.isoformat()
+    return spool["wall_deadline_at"]
+
+
+def _store_health_failure_text(item: dict) -> str:
+    recorded = f"{item['recorded_device']}:{item['recorded_inode']}"
+    observed = f"{item['observed_device']}:{item['observed_inode']}"
+    return f"{item['spool_id']}: {item['reason']} (recorded={recorded}, observed={observed})"
+
+
 def _spools_idle() -> bool:
     """Finalize any finished-but-unmarked spools, then report whether the queue
     is empty (no running or pending spools). Uses gated maintenance so that both
@@ -2264,6 +2297,10 @@ def _try_reserve_slot_and_create(
         if not compatible:
             return False, error
         with _concurrency_lock():
+            unhealthy = _store_health_failures()
+            if unhealthy:
+                detail = "; ".join(_store_health_failure_text(item) for item in unhealthy)
+                return False, f"Error: Spool store unhealthy; repair ownership artifacts before launch ({detail})"
             running_count = _count_running()
             if running_count >= MAX_CONCURRENT:
                 return False, f"Error: Max {MAX_CONCURRENT} concurrent spools. Wait for some to complete."
@@ -2304,6 +2341,8 @@ def _prepare_pending_spool_for_spawn(spool: dict) -> bool:
             for key in ("launcher_pid", "launcher_start_time", "launcher_namespace"):
                 if key in current:
                     spool.setdefault(key, current[key])
+            spool.setdefault("owner_generation", _next_owner_generation(spool_id))
+            _ensure_spool_wall_deadline(spool)
             _write_spool(spool_id, spool)
             return True
 
@@ -2374,17 +2413,17 @@ def _record_pre_spawn_failure(
 
 
 def _publish_spawned_process(spool_id: str, pid: int) -> bool:
-    """Publish the owner PID, then release it to create full running identity."""
+    """Publish the watchdog PID, then release it to create logical-owner identity."""
     published = False
     try:
         with _spool_lock(spool_id) as acquired:
             current = _read_spool(spool_id) if acquired else None
             if current and current.get("status") == "pending":
-                current["pid"] = pid
-                current["owner_pid"] = pid
+                current["watchdog_pid"] = pid
                 process_start_time = _process_start_time(pid)
                 if process_start_time is not None:
-                    current["process_start_time"] = process_start_time
+                    current["watchdog_start_time"] = process_start_time
+                current["watchdog_namespace"] = capture_pid_namespace().to_dict()
                 current.pop("launcher_pid", None)
                 current.pop("launcher_start_time", None)
                 current.pop("launcher_namespace", None)
@@ -2777,9 +2816,9 @@ def _reconcile_spool_ownership(spool: dict) -> ReconciliationResult:
         )
 
     if spool.get("status") == "pending":
-        launcher_pid = spool.get("launcher_pid")
-        launcher_birth = spool.get("launcher_start_time")
-        launcher_namespace = spool.get("launcher_namespace")
+        launcher_pid = spool.get("launcher_pid") or spool.get("watchdog_pid")
+        launcher_birth = spool.get("launcher_start_time") or spool.get("watchdog_start_time")
+        launcher_namespace = spool.get("launcher_namespace") or spool.get("watchdog_namespace")
         if not launcher_pid:
             return ReconciliationResult(
                 "terminalizable",
@@ -2806,7 +2845,8 @@ def _reconcile_spool_ownership(spool: dict) -> ReconciliationResult:
         )
         liveness = assess_process_liveness(identity)
         state = "active" if liveness.state == "alive" else "terminalizable" if liveness.state == "dead" else "unverifiable"
-        return ReconciliationResult(state, f"pending_launcher_{liveness.reason}", liveness, missing)
+        role = "watchdog" if spool.get("watchdog_pid") else "launcher"
+        return ReconciliationResult(state, f"pending_{role}_{liveness.reason}", liveness, missing)
 
     if spool_id:
         identity_path = _get_owner_identity_path(spool_id)
@@ -2868,6 +2908,34 @@ def _reconcile_spool_ownership(spool: dict) -> ReconciliationResult:
     )
 
 
+def _store_health_failures() -> list[dict]:
+    """Return every ownership defect which makes new store mutation unsafe."""
+    failures = []
+    for spool in _list_spools():
+        spool_id = spool.get("id")
+        if not spool_id:
+            continue
+        if spool.get("status") not in {"pending", "running"} and not _get_owner_identity_path(spool_id).exists():
+            continue
+        result = _reconcile_spool_ownership(spool)
+        if result.state != "store_unhealthy":
+            continue
+        identity = _read_current_owner_identity(spool_id)
+        failures.append(
+            {
+                "spool_id": spool_id,
+                "reason": result.reason,
+                "lock_state": result.lock.state,
+                "detail": result.lock.detail,
+                "recorded_device": identity.lock_device if identity is not None else None,
+                "recorded_inode": identity.lock_inode if identity is not None else None,
+                "observed_device": result.lock.observed_device,
+                "observed_inode": result.lock.observed_inode,
+            }
+        )
+    return failures
+
+
 def _request_owner_stop_locked(spool: dict, kind: str, requested_by: str) -> tuple[Optional[object], Optional[str]]:
     """Publish a mailbox request while the caller holds the spool lock."""
     result = _reconcile_spool_ownership(spool)
@@ -2886,6 +2954,7 @@ def _request_owner_stop_locked(spool: dict, kind: str, requested_by: str) -> tup
         requested_by,
         observer_namespace=capture_pid_namespace(),
         reason=f"{kind} requested by {requested_by}",
+        deadline=spool.get("wall_deadline_at") if kind == "timeout" else None,
     )
     lifecycle = dict(spool.get("lifecycle") or {})
     lifecycle.update(
@@ -4158,6 +4227,29 @@ def _handle_expired_session_locked(spool_id: str, spool: dict) -> bool:
 
     spawned = False
     started = False
+    replacement_generation = _next_owner_generation(spool_id)
+    spool["status"] = "running"
+    spool["completed_at"] = None
+    spool["owner_generation"] = replacement_generation
+    spool["replacement_starting"] = True
+    spool["replacement_owner_generation"] = replacement_generation
+    spool.pop("pid", None)
+    spool.pop("owner_pid", None)
+    spool.pop("provider_pid", None)
+    spool.pop("provider_process_group_id", None)
+    spool.pop("error", None)
+    spool.pop("expired_session_replacement_requested", None)
+    lifecycle = dict(spool.get("lifecycle") or {})
+    lifecycle.pop("public_stop_state", None)
+    lifecycle.pop("desired_terminal_kind", None)
+    lifecycle.pop("control_request_id", None)
+    lifecycle.pop("normalized_terminal_kind", None)
+    spool["lifecycle"] = lifecycle
+    _ensure_spool_wall_deadline(spool)
+    spool["claude_protocol"] = claude_protocol
+    _get_output_path(spool_id).write_text("")
+    _get_stderr_path(spool_id).write_text("")
+    _write_spool(spool_id, spool)
     try:
         if spawn_stdin is not None:
             new_pid = _spawn_detached(spool_id, cmd, fallback_cwd, spawn_env, stdin_path=spawn_stdin)
@@ -4165,38 +4257,31 @@ def _handle_expired_session_locked(spool_id: str, spool: dict) -> bool:
             new_pid = _spawn_detached(spool_id, cmd, fallback_cwd, spawn_env)
         spawned = True
 
-        # Update spool with new PID and mark as using transcript fallback
-        spool["pid"] = new_pid
+        # The launcher owns the watchdog handle; compatibility ``pid`` is
+        # published later by the logical owner itself.
+        spool["watchdog_pid"] = new_pid
         process_start_time = _process_start_time(new_pid)
         if process_start_time is not None:
-            spool["process_start_time"] = process_start_time
+            spool["watchdog_start_time"] = process_start_time
         else:
-            spool.pop("process_start_time", None)
+            spool.pop("watchdog_start_time", None)
+        spool["watchdog_namespace"] = capture_pid_namespace().to_dict()
         if shard_info:
             spool["shard"] = shard_info
         spool["used_transcript_fallback"] = True
         spool["transcript_injected_at"] = datetime.now().isoformat()
-        spool["status"] = "running"
-        spool["completed_at"] = None
-        spool["replacement_starting"] = True
-        spool.pop("error", None)
-        spool.pop("expired_session_replacement_requested", None)
-        lifecycle = dict(spool.get("lifecycle") or {})
-        lifecycle.pop("public_stop_state", None)
-        lifecycle.pop("desired_terminal_kind", None)
-        lifecycle.pop("control_request_id", None)
-        lifecycle.pop("normalized_terminal_kind", None)
-        spool["lifecycle"] = lifecycle
-        # The retried process's output replaces this spool's stdout capture, so
-        # the finalizer must parse it under the protocol it was launched with.
-        spool["claude_protocol"] = claude_protocol
-        _get_output_path(spool_id).write_text("")
-        _get_stderr_path(spool_id).write_text("")
         _write_spool(spool_id, spool)
 
         started = True
         return True
-    except Exception:
+    except Exception as exc:
+        spool["status"] = "error"
+        spool["error"] = f"replacement spawn failed: {exc}"
+        spool["error_kind"] = "owner_preacceptance_failure"
+        spool["completed_at"] = datetime.now().isoformat()
+        spool.pop("replacement_starting", None)
+        spool.pop("replacement_owner_generation", None)
+        _write_spool(spool_id, spool)
         return False
     finally:
         if spawned:
@@ -4414,6 +4499,10 @@ def _spawn_detached(
     if not resolved_executable or not os.access(resolved_executable, os.X_OK):
         raise FileNotFoundError(f"executable not found or not runnable: {executable}")
 
+    spool = _read_spool(spool_id) or {}
+    spool.setdefault("owner_generation", _next_owner_generation(spool_id))
+    _ensure_spool_wall_deadline(spool)
+    _write_spool(spool_id, spool)
     barrier_read_fd, barrier_write_fd = os.pipe()
     owner_cmd = [
         sys.executable,
@@ -4422,15 +4511,19 @@ def _spawn_detached(
         str(SPINDLE_DIR),
         "--spool-id",
         spool_id,
+        "--generation",
+        str(spool["owner_generation"]),
         "--launch-barrier-fd",
         str(barrier_read_fd),
         "--cwd",
         cwd,
     ]
-    spool = _read_spool(spool_id) or {}
     timeout = spool.get("timeout")
     if timeout is not None:
         owner_cmd.extend(["--timeout", str(timeout)])
+    deadline = spool.get("wall_deadline_at")
+    if deadline is not None:
+        owner_cmd.extend(["--deadline", str(deadline)])
     if stdin_path is not None:
         owner_cmd.extend(["--stdin-path", str(stdin_path)])
     owner_cmd.extend([
@@ -4459,6 +4552,12 @@ def _spawn_detached(
     # authoritative after a restart when this in-memory handle no longer exists.
     _PROC_HANDLES[spool_id] = proc
     _SPAWN_BARRIERS[spool_id] = barrier_write_fd
+    spool["watchdog_pid"] = proc.pid
+    watchdog_start = _process_start_time(proc.pid)
+    if watchdog_start is not None:
+        spool["watchdog_start_time"] = watchdog_start
+    spool["watchdog_namespace"] = capture_pid_namespace().to_dict()
+    _write_spool(spool_id, spool)
     return proc.pid
 
 
@@ -9763,6 +9862,22 @@ def _doctor_storage_check() -> dict:
             pass
 
     count = sum(1 for path in store.glob("*.json") if not path.name.startswith("."))
+    unhealthy = _store_health_failures()
+    if unhealthy:
+        lines = [
+            _store_health_failure_text(item)
+            for item in unhealthy
+        ]
+        lines.append("repair the recorded ownership pathname/inode or permissions, then rerun `spindle doctor`")
+        return _doctor_result(
+            "storage",
+            "fail",
+            f"{store} has {len(unhealthy)} unhealthy ownership artifact(s)",
+            lines,
+            spool_dir=str(store),
+            spools=count,
+            ownership_failures=unhealthy,
+        )
     return _doctor_result(
         "storage",
         "ok",
