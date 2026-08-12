@@ -10,6 +10,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 import spindle
 from spindle.namespace_owner import (
     ProcessIdentity,
@@ -126,25 +128,41 @@ def test_s2_c_ctl_02_owner_crash_after_ack_before_cleanup_is_indeterminate(
     assert terminal["error"] != "Cancelled"
 
 
+@pytest.mark.parametrize(
+    ("request_kind", "expected_status", "expected_error", "expected_terminal"),
+    (
+        ("cancel", "error", "Cancelled", "cancelled"),
+        ("drop", "error", "Cancelled", "cancelled"),
+        ("timeout", "timeout", "Timeout after 100s", "timeout"),
+    ),
+)
 def test_s2_c_ctl_03_crash_after_cleanup_receipt_recovers_requested_terminal(
     watchdog_owner_case,
+    request_kind,
+    expected_status,
+    expected_error,
+    expected_terminal,
 ):
     owner = watchdog_owner_case(
         "ignore-term",
-        pause_checkpoint="cleanup_receipt_durable",
+        pause_checkpoint="cleanup_receipt_child_exit_durable",
         disable_pdeathsig=True,
+        timeout=100,
     )
-    request = _public_cancel(owner)
-    assert owner.receive_checkpoint()["name"] == "cleanup_receipt_durable"
+    request = _public_cancel(owner) if request_kind == "drop" else owner.request(request_kind)
+    assert owner.receive_checkpoint()["name"] == "cleanup_receipt_child_exit_durable"
     receipt = read_control_receipt(owner.store, owner.spool_id, request.request_id)
     assert receipt.owner_acknowledged_at
     assert receipt.child_exit_observed_at
     assert receipt.cleanup_outcome == "cleaned"
     assert _provider_gone(owner)
+    assert owner.spool()["owner_episode"]["phase"] == "accepted"
+    assert not (owner.store / f"{owner.spool_id}.owner-exit").exists()
     owner.kill_owner()
     terminal = _finalize_after_crash(owner)
-    assert terminal["error"] == "Cancelled"
-    assert terminal["lifecycle"]["normalized_terminal_kind"] == "cancelled"
+    assert terminal["status"] == expected_status
+    assert terminal["error"] == expected_error
+    assert terminal["lifecycle"]["normalized_terminal_kind"] == expected_terminal
     assert terminal["lifecycle"]["owner_crashed_after_cleanup"] is True
 
 

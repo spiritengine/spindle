@@ -3700,6 +3700,25 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
             owner_exit = None
         owner_generation = (spool.get("owner_episode") or {}).get("generation") or spool.get("owner_generation")
         episode_failure = ((spool.get("owner_episode") or {}).get("failure") or {}).get("kind")
+        if episode_failure == "deadline_expired_before_provider_start":
+            lifecycle = dict(spool.get("lifecycle") or {})
+            lifecycle.pop("public_stop_state", None)
+            lifecycle.update(
+                {
+                    "ownership_state": "released",
+                    "transport_state": "reaped",
+                    "normalized_terminal_kind": "timeout",
+                }
+            )
+            spool["lifecycle"] = lifecycle
+            spool["status"] = "timeout"
+            spool["error"] = f"Timeout after {spool.get('timeout')}s"
+            spool["error_kind"] = "deadline_expired_before_provider_start"
+            spool["result"] = None
+            spool["completed_at"] = datetime.now().isoformat()
+            _write_spool(spool_id, spool)
+            return True
+
         if (
             owner_exit
             and owner_exit.get("owner_generation") == owner_generation
@@ -3711,9 +3730,15 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
         ) or episode_failure == "watchdog_parent_loss":
             recovered_request = None
             recovered_receipt = None
-            if owner_exit and owner_exit.get("owner_crashed_after_cleanup"):
+            winning_request = (spool.get("owner_episode") or {}).get("winning_request") or {}
+            winning_request_id = winning_request.get("request_id")
+            if winning_request_id:
                 for request in iter_control_requests(SPINDLE_DIR, spool_id):
-                    if request.owner_generation != owner_generation:
+                    if (
+                        request.owner_generation != owner_generation
+                        or request.request_id != winning_request_id
+                        or request.desired_terminal_kind != winning_request.get("desired_terminal_kind")
+                    ):
                         continue
                     receipt = read_control_receipt(SPINDLE_DIR, spool_id, request.request_id)
                     if (

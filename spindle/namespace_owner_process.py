@@ -232,6 +232,74 @@ class LogicalOwner:
             },
         )
 
+    def _settle_deadline_expiry_after_binding(self) -> bool:
+        """Prove a bound generation timed out without ever starting a provider."""
+        if not self._verify_lock():
+            return False
+        observed_at = _utc_now()
+        cleanup = {
+            "outcome": "deadline_expired_before_provider_start",
+            "provider_reaped": True,
+            "adopted_children_reaped": 0,
+            "child_exit_observed_at": observed_at,
+            "provider_exit_code": None,
+        }
+        failure = {
+            "kind": "deadline_expired_before_provider_start",
+            "detail": "inherited deadline expired after logical owner binding and before provider start",
+            "observed_at": observed_at,
+        }
+        if self.episode_mode:
+            episode = self._read_spool().get("owner_episode") or {}
+            settled = transition_owner_episode(
+                self.store,
+                self.spool_id,
+                actor="owner",
+                destination="cleanup_proven",
+                generation=self.generation,
+                expected_revision=episode.get("revision"),
+                facts={
+                    "containment": {
+                        "contained": True,
+                        "adopted_children_reaped": 0,
+                        "observed_at": observed_at,
+                    },
+                    "cleanup": cleanup,
+                    "failure": failure,
+                },
+            )
+            if not settled.accepted:
+                return False
+        else:
+            spool = self._read_spool()
+            lifecycle = {
+                **(spool.get("lifecycle") or {}),
+                "ownership_state": "held",
+                "transport_state": "reaped",
+                "normalized_terminal_kind": "timeout",
+            }
+            self._update_spool(
+                status="timeout",
+                error=f"Timeout after {spool.get('timeout')}s",
+                error_kind="deadline_expired_before_provider_start",
+                completed_at=observed_at,
+                lifecycle=lifecycle,
+            )
+        _atomic_json_write(
+            self.owner_exit_path,
+            {
+                "owner_pid": os.getpid(),
+                "owner_generation": self.generation,
+                "provider_pid": None,
+                "provider_exit_code": None,
+                "provider_reaped": True,
+                "adopted_children_reaped": 0,
+                "cleanup_outcome": cleanup["outcome"],
+                "observed_at": observed_at,
+            },
+        )
+        return True
+
     def _contain_after_watchdog_loss(self) -> bool:
         """Take over containment, publish proof, and leave no live descendants."""
         returncode = None
@@ -458,7 +526,12 @@ class LogicalOwner:
             self._set_lifecycle(ownership_state="held")
         return True
 
-    def _spawn_provider(self) -> None:
+    def _spawn_provider(
+        self,
+        *,
+        started: Optional[float] = None,
+        monotonic_budget: Optional[float] = None,
+    ) -> Optional[int]:
         owner_end, child_end = socket.socketpair()
         owner_end.set_inheritable(False)
         child_end.set_inheritable(True)
@@ -470,10 +543,19 @@ class LogicalOwner:
         stdin_stream = open(self.args.stdin_path, "r") if self.args.stdin_path else subprocess.DEVNULL
         try:
             with open(self.stdout_path, "w") as stdout, open(self.stderr_path, "w") as stderr:
+                self.checkpoints.reach("before_provider_start_checks")
                 if not self._watchdog_alive():
-                    raise RuntimeError("containment watchdog exited before provider start")
-                if self._deadline_expired():
-                    raise RuntimeError("inherited deadline expired before provider start")
+                    self._contain_after_watchdog_loss_until_proven()
+                    return 125
+                monotonic_expired = (
+                    started is not None
+                    and monotonic_budget is not None
+                    and self.clock.monotonic() - started >= monotonic_budget
+                )
+                if self._deadline_expired() or monotonic_expired:
+                    if not self._settle_deadline_expiry_after_binding():
+                        raise RuntimeError("could not durably settle inherited deadline before provider start")
+                    return 124
                 self.provider = subprocess.Popen(
                     self.args.command,
                     cwd=self.args.cwd,
@@ -489,6 +571,8 @@ class LogicalOwner:
             child_end.close()
             if stdin_stream is not subprocess.DEVNULL:
                 stdin_stream.close()
+            if self.provider is None:
+                owner_end.close()
         self.control = owner_end
         self.control.setblocking(False)
         self.provider_pgid = self.provider.pid
@@ -594,6 +678,7 @@ class LogicalOwner:
                 else:
                     time.sleep(0.01)
         self.checkpoints.reach("provider_ready", self.provider.pid)
+        return None
 
     def _provider_exited(self) -> bool:
         if self.provider is None:
@@ -887,6 +972,7 @@ class LogicalOwner:
             child_exit_observed_at=child_exit,
             cleanup_outcome="cleaned" if descendants_clean else "descendants_survived",
         )
+        self.checkpoints.reach("cleanup_receipt_child_exit_durable", self.provider.pid)
         if not self._settle_other_requests(request.request_id):
             return -2
         if not self._write_exit_evidence(returncode, cleanup_outcome="stopped"):
@@ -970,7 +1056,15 @@ class LogicalOwner:
         if not self._watchdog_alive():
             self._contain_after_watchdog_loss_until_proven()
             return 125
-        self._spawn_provider()
+        prestart_result = self._spawn_provider(started=started, monotonic_budget=monotonic_budget)
+        if prestart_result is not None:
+            self.checkpoints.reach("before_lock_release")
+            self._verify_lock()
+            self.lock.close()
+            if getattr(self.args, "watchdog_fd", None) is not None:
+                os.close(self.args.watchdog_fd)
+                self.args.watchdog_fd = None
+            return prestart_result
         accepted_request = None
         natural_exit_settled = False
         natural_cleanup = None

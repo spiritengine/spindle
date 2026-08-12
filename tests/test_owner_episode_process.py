@@ -153,6 +153,88 @@ def test_crash_after_cleanup_proven_keeps_the_proven_phase_and_recovers_its_term
     assert terminal["lifecycle"]["normalized_terminal_kind"] == "cancelled"
 
 
+def test_deadline_crossing_after_binding_settles_timeout_without_starting_provider(
+    watchdog_owner_case,
+    owner_clock,
+):
+    _current, advance, clock_fd = owner_clock
+    owner = watchdog_owner_case(
+        "record-launch",
+        timeout=100,
+        controlled_clock_fd=clock_fd.fileno(),
+        pause_checkpoint="before_provider_start_checks",
+    )
+    checkpoint = owner.receive_checkpoint()
+    assert checkpoint["name"] == "before_provider_start_checks"
+    assert checkpoint["provider_pid"] is None
+    assert _episode(owner)["phase"] == "lock_bound"
+
+    advance(101)
+    owner.resume()
+    assert owner.process.wait(timeout=8) == 124
+
+    proven = _episode(owner)
+    assert proven["phase"] == "cleanup_proven"
+    assert proven["deadline"] == owner.spool()["wall_deadline_at"]
+    assert proven["failure"]["kind"] == "deadline_expired_before_provider_start"
+    assert proven["cleanup"]["outcome"] == "deadline_expired_before_provider_start"
+    assert proven["cleanup"]["provider_reaped"] is True
+    assert not (owner.store / f"{owner.spool_id}.launch-record").exists()
+    evidence = json.loads((owner.store / f"{owner.spool_id}.owner-exit").read_text())
+    assert evidence["owner_generation"] == proven["generation"]
+    assert evidence["cleanup_outcome"] == "deadline_expired_before_provider_start"
+    assert list(iter_control_requests(owner.store, owner.spool_id)) == []
+
+    # Later transport evidence cannot downgrade the episode's already durable
+    # pre-start timeout proof.
+    evidence["owner_crashed"] = True
+    (owner.store / f"{owner.spool_id}.owner-exit").write_text(json.dumps(evidence))
+
+    terminal = _finalize(owner)
+    assert terminal["status"] == "timeout"
+    assert terminal["error_kind"] == "deadline_expired_before_provider_start"
+    assert terminal["lifecycle"]["normalized_terminal_kind"] == "timeout"
+
+
+def test_watchdog_loss_at_provider_start_boundary_uses_owner_containment_authority(
+    watchdog_owner_case,
+):
+    owner = watchdog_owner_case(
+        "record-launch",
+        pause_checkpoint="before_provider_start_checks",
+    )
+    checkpoint = owner.receive_checkpoint()
+    assert checkpoint["name"] == "before_provider_start_checks"
+    assert checkpoint["provider_pid"] is None
+    owner_pid = checkpoint["owner_pid"]
+    assert _episode(owner)["phase"] == "lock_bound"
+
+    owner.process.kill()
+    assert owner.process.wait(timeout=8) == -9
+    owner.resume()
+    for _attempt in range(400):
+        if _episode(owner)["phase"] == "cleanup_proven":
+            break
+        select.select([], [], [], 0.02)
+    else:
+        pytest.fail("owner did not publish watchdog-loss cleanup proof")
+
+    proven = _episode(owner)
+    assert proven["failure"]["kind"] == "watchdog_parent_loss"
+    assert proven["cleanup"]["provider_reaped"] is True
+    assert not (owner.store / f"{owner.spool_id}.launch-record").exists()
+    for _attempt in range(400):
+        if not Path(f"/proc/{owner_pid}").exists():
+            break
+        select.select([], [], [], 0.02)
+    else:
+        pytest.fail("logical owner did not exit after proving watchdog-loss containment")
+
+    terminal = _finalize(owner)
+    assert terminal["lifecycle"]["normalized_terminal_kind"] == "indeterminate"
+    assert terminal["lifecycle"]["watchdog_parent_lost"] is True
+
+
 def test_owner_unlocks_at_cleanup_proven_and_reconciliation_alone_persists_release(watchdog_owner_case):
     owner = watchdog_owner_case("immediate-exit")
     owner.process.wait(timeout=8)

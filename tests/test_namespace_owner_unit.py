@@ -346,7 +346,7 @@ def test_natural_exit_retries_descendant_cleanup_before_evidence_or_release(tmp_
     owner._ensure_wall_deadline = lambda: None
     owner._remaining_wall_budget = lambda: None
     owner._publish_owner_identity = lambda: None
-    owner._spawn_provider = lambda: None
+    owner._spawn_provider = lambda **_kwargs: None
     owner._verify_lock = lambda: True
     owner._next_current_request = lambda: None
     owner._provider_exited = lambda: True
@@ -416,13 +416,16 @@ def test_owner_rechecks_inherited_deadline_immediately_before_provider_popen(tmp
     owner.stderr_path = tmp_path / "deadline-before-provider.stderr"
     owner.wall_deadline_at = "2026-08-11T00:00:00+00:00"
     owner._remaining_wall_budget = lambda: 0.0
+    owner.checkpoints = SimpleNamespace(reach=lambda *_args: None)
+    owner._settle_deadline_expiry_after_binding = lambda: True
+    owner.provider = None
+    owner.clock = SimpleNamespace(monotonic=lambda: 0.0)
     monkeypatch.setattr(
         "spindle.namespace_owner_process.subprocess.Popen",
         lambda *_args, **_kwargs: pytest.fail("provider executed after inherited deadline"),
     )
 
-    with pytest.raises(RuntimeError, match="deadline expired before provider start"):
-        owner._spawn_provider()
+    assert owner._spawn_provider() == 124
 
 
 def test_owner_does_not_exit_after_watchdog_loss_until_containment_is_proven(monkeypatch):
