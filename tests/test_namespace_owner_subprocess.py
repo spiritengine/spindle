@@ -92,12 +92,7 @@ class OwnerHandle:
 
     def wait_terminal(self):
         return wait_until(
-            lambda: (
-                value
-                if (value := self.spool())
-                and value.get("status") not in {"pending", "running"}
-                else None
-            ),
+            lambda: value if (value := self.spool()) and value.get("status") not in {"pending", "running"} else None,
             timeout=8,
         )
 
@@ -136,6 +131,7 @@ def owner_case(namespace_owner_env, fake_provider_factory, process_ledger):
         controlled_clock_fd=None,
         extra_provider_args=(),
         extra_env=None,
+        expect_ready=True,
     ):
         spool_id = f"owner-{len(handles)}"
         store = namespace_owner_env["store"]
@@ -208,7 +204,12 @@ def owner_case(namespace_owner_env, fake_provider_factory, process_ledger):
             stderr = proc.stderr.read() if proc.poll() is not None else ""
             raise AssertionError(f"owner did not become ready: {stderr}")
         with os.fdopen(ready_read) as stream:
-            ready = json.loads(stream.readline())
+            line = stream.readline()
+            if expect_ready:
+                ready = json.loads(line)
+            else:
+                assert line == "", "provider unexpectedly reached readiness"
+                ready = {}
         handle = OwnerHandle(proc, store, spool_id, ready, 1, checkpoint_controller)
         handles.append(handle)
         return handle
@@ -330,7 +331,12 @@ def test_s2_s_ctl_04_stubborn_child_remains_slot_counted_until_resolution(owner_
     assert spool["status"] == "running"
     assert spool["lifecycle"]["public_stop_state"] == "stopping"
     assert active_spool_count([spool]) == 1
-    assert probe_ownership_lock(owner.lock_path, ProcessIdentity.from_dict(json.loads(owner.owner_identity_path.read_text()))).state == "held"
+    assert (
+        probe_ownership_lock(
+            owner.lock_path, ProcessIdentity.from_dict(json.loads(owner.owner_identity_path.read_text()))
+        ).state
+        == "held"
+    )
     owner.checkpoint.sendall(b"continue\n")
     owner.wait_terminal()
     assert owner.receipt(request.request_id).forced_cleanup_completed_at
@@ -378,8 +384,7 @@ def test_stop_boundaries_reverify_exact_ownership_inode(owner_case, checkpoint, 
         unhealthy = wait_until(
             lambda: (
                 spool
-                if (spool := owner.spool())
-                and spool.get("lifecycle", {}).get("ownership_state") == "identity_mismatch"
+                if (spool := owner.spool()) and spool.get("lifecycle", {}).get("ownership_state") == "identity_mismatch"
                 else None
             )
         )
@@ -437,7 +442,9 @@ def test_s2_s_own_06_one_sigchld_drains_all_reapable_descendants(owner_case):
     owner = owner_case("fork-burst")
     evidence = owner.wait_exit()
     assert evidence["adopted_children_reaped"] >= 6
-    assert not list(Path(f"/proc/{owner.process.pid}/task").glob("*/children")) if owner.process.poll() is None else True
+    assert (
+        not list(Path(f"/proc/{owner.process.pid}/task").glob("*/children")) if owner.process.poll() is None else True
+    )
 
 
 def test_s2_s_lock_01_held_lock_survives_live_reconciliation(owner_case):
@@ -460,8 +467,7 @@ def test_s2_s_lock_02_unlinked_and_replaced_held_lock_makes_store_unhealthy(owne
     spool = wait_until(
         lambda: (
             value
-            if (value := owner.spool())
-            and value.get("lifecycle", {}).get("ownership_state") == "identity_mismatch"
+            if (value := owner.spool()) and value.get("lifecycle", {}).get("ownership_state") == "identity_mismatch"
             else None
         )
     )
@@ -557,21 +563,27 @@ def test_restarted_owner_preserves_future_absolute_deadline(owner_case, owner_cl
 
 def test_restarted_owner_turns_overdue_deadline_into_durable_timeout(owner_case):
     deadline = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
-    owner = owner_case("ignore-term", timeout=100, deadline=deadline)
+    owner = owner_case("record-launch", timeout=100, deadline=deadline, expect_ready=False)
+    assert owner.process.wait(timeout=8) == 124
     terminal = owner.wait_terminal()
     requests = list(iter_control_requests(owner.store, owner.spool_id))
     assert terminal["status"] == "timeout"
-    assert len(requests) == 1
-    assert requests[0].kind == "timeout"
-    assert requests[0].deadline == deadline
-    assert owner.receipt(requests[0].request_id).cleanup_outcome == "cleaned"
+    assert requests == []
+    assert terminal["wall_deadline_at"] == deadline
+    assert terminal["error_kind"] == "deadline_expired_before_provider_start"
+    assert not (owner.store / f"{owner.spool_id}.launch-record").exists()
+    evidence = json.loads(owner.owner_exit_path.read_text())
+    assert evidence["owner_generation"] == owner.generation
+    assert evidence["cleanup_outcome"] == "deadline_expired_before_provider_start"
 
 
 def test_s2_s_mig_01_legacy_terminal_spools_remain_readable(tmp_path):
     with pytest.MonkeyPatch.context() as monkeypatch:
         monkeypatch.setattr(spindle, "SPINDLE_DIR", tmp_path)
         (tmp_path / "legacy.json").write_text(
-            json.dumps({"id": "legacy", "status": "complete", "result": "old result", "created_at": datetime.now().isoformat()})
+            json.dumps(
+                {"id": "legacy", "status": "complete", "result": "old result", "created_at": datetime.now().isoformat()}
+            )
         )
         assert spindle._read_spool("legacy")["result"] == "old result"
         assert [item["id"] for item in spindle._list_spools()] == ["legacy"]

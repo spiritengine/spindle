@@ -170,20 +170,26 @@ def _record_owner_crash(
 
     spool = _load(store / f"{spool_id}.json") or {}
     episode = spool.get("owner_episode") or {}
-    if episode.get("generation") != owner_generation:
-        return
-    if episode.get("phase") == "reserved":
-        _record_preacceptance_failure(
-            store,
-            spool_id,
-            owner_pid,
-            owner_birth_token,
-            owner_generation,
-            status,
-        )
+    if episode:
+        if episode.get("generation") != owner_generation:
+            return
+        if episode.get("phase") == "reserved":
+            _record_preacceptance_failure(
+                store,
+                spool_id,
+                owner_pid,
+                owner_birth_token,
+                owner_generation,
+                status,
+            )
+            return
+    elif spool.get("owner_generation") != owner_generation or process.get("owner_generation") != owner_generation:
+        # Direct/internal compatibility owners deliberately have no episode.
+        # Retain the same generation guard using their durable flat/process
+        # mirrors, then publish the legacy evidence reconciliation consumes.
         return
 
-    if episode.get("phase") in {"lock_bound", "accepted"}:
+    if episode and episode.get("phase") in {"lock_bound", "accepted"}:
         observed_at = _utc_now()
         lifecycle = dict(spool.get("lifecycle") or {})
         lifecycle["public_stop_state"] = "stopping"
@@ -266,9 +272,13 @@ def main(argv=None) -> int:
     spool_id = raw[raw.index("--spool-id") + 1]
     owner_generation = int(raw[raw.index("--generation") + 1]) if "--generation" in raw else 1
     error_read, error_write = os.pipe()
+    watchdog_read, watchdog_write = os.pipe()
     owner_pid = os.fork()
     if owner_pid == 0:
         os.close(error_read)
+        os.close(watchdog_write)
+        delimiter = raw.index("--") if "--" in raw else len(raw)
+        raw[delimiter:delimiter] = ["--watchdog-fd", str(watchdog_read)]
         try:
             code = owner_main(raw)
         except BaseException as exc:
@@ -282,6 +292,7 @@ def main(argv=None) -> int:
         os._exit(int(code) & 0xFF)
 
     os.close(error_write)
+    os.close(watchdog_read)
     try:
         owner_birth_token = read_proc_starttime(owner_pid)
     except OSError:
@@ -290,7 +301,10 @@ def main(argv=None) -> int:
         # fails closed on any later PID reuse while still allowing ESRCH pidfd
         # evidence to prove this reaped generation dead.
         owner_birth_token = "unavailable"
-    _waited, status = os.waitpid(owner_pid, 0)
+    try:
+        _waited, status = os.waitpid(owner_pid, 0)
+    finally:
+        os.close(watchdog_write)
     exception_reported = bool(os.read(error_read, 4096))
     os.close(error_read)
     crashed = _owner_process_crashed(status, exception_reported=exception_reported)

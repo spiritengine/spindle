@@ -166,7 +166,9 @@ def test_s2_u_lock_04_missing_current_and_replaced_inode_are_identity_mismatch(
 def test_s2_u_lock_05_open_errors_are_unreadable(tmp_path, monkeypatch, process_identity_record):
     path = tmp_path / "unreadable.process-owner"
     path.touch()
-    monkeypatch.setattr(os, "open", lambda *_args, **_kwargs: (_ for _ in ()).throw(PermissionError(errno.EACCES, "no")))
+    monkeypatch.setattr(
+        os, "open", lambda *_args, **_kwargs: (_ for _ in ()).throw(PermissionError(errno.EACCES, "no"))
+    )
     assert probe_ownership_lock(path, process_identity_record()).state == "unreadable"
 
 
@@ -395,6 +397,51 @@ def test_watchdog_retries_after_first_descendant_confirmation_deadline(monkeypat
     assert calls == ["pass", "pass"]
 
 
+def test_owner_rechecks_inherited_deadline_immediately_before_provider_popen(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from spindle.namespace_owner_process import LogicalOwner
+
+    owner = object.__new__(LogicalOwner)
+    owner.args = SimpleNamespace(
+        watchdog_fd=None,
+        stdin_path=None,
+        command=["provider-must-not-run"],
+        cwd=str(tmp_path),
+        disable_pdeathsig=True,
+    )
+    owner.store = tmp_path
+    owner.spool_id = "deadline-before-provider"
+    owner.stdout_path = tmp_path / "deadline-before-provider.stdout"
+    owner.stderr_path = tmp_path / "deadline-before-provider.stderr"
+    owner.wall_deadline_at = "2026-08-11T00:00:00+00:00"
+    owner._remaining_wall_budget = lambda: 0.0
+    monkeypatch.setattr(
+        "spindle.namespace_owner_process.subprocess.Popen",
+        lambda *_args, **_kwargs: pytest.fail("provider executed after inherited deadline"),
+    )
+
+    with pytest.raises(RuntimeError, match="deadline expired before provider start"):
+        owner._spawn_provider()
+
+
+def test_owner_does_not_exit_after_watchdog_loss_until_containment_is_proven(monkeypatch):
+    from types import SimpleNamespace
+
+    from spindle.namespace_owner_process import LogicalOwner
+
+    owner = object.__new__(LogicalOwner)
+    owner.args = SimpleNamespace(poll_interval=0)
+    outcomes = iter((False, False, True))
+    attempts = []
+    owner._contain_after_watchdog_loss = lambda: attempts.append("contain") or next(outcomes)
+    monkeypatch.setattr("spindle.namespace_owner_process.time.sleep", lambda _seconds: None)
+
+    owner._contain_after_watchdog_loss_until_proven()
+
+    assert attempts == ["contain", "contain", "contain"]
+
+
 @pytest.mark.parametrize(
     "lock,liveness,exit_evidence,legacy,result",
     [
@@ -404,7 +451,13 @@ def test_watchdog_retries_after_first_descendant_confirmation_deadline(monkeypat
         (LockEvidence("released", 1, 2), LivenessEvidence("dead", "pidfd_exited"), False, None, "unverifiable"),
         (LockEvidence("unreadable"), LivenessEvidence("alive", "pidfd_live"), False, None, "store_unhealthy"),
         (LockEvidence("identity_mismatch"), LivenessEvidence("dead", "pidfd_exited"), True, None, "store_unhealthy"),
-        (LockEvidence("absent_legacy"), LivenessEvidence("unverifiable", "namespace_mismatch"), False, None, "unverifiable"),
+        (
+            LockEvidence("absent_legacy"),
+            LivenessEvidence("unverifiable", "namespace_mismatch"),
+            False,
+            None,
+            "unverifiable",
+        ),
         (
             LockEvidence("absent_legacy"),
             LivenessEvidence("dead", "pidfd_exited"),

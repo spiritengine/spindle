@@ -3549,11 +3549,11 @@ def _cleanup_old_spools() -> None:
                 if created >= cutoff:
                     continue
                 owner_identity = _read_current_owner_identity(spool_id)
-                episode = data.get("owner_episode") or {}
-                if episode.get("phase") == "aborted":
+                if "owner_episode" in data:
                     if _reconcile_spool_ownership(data).state != "terminalizable":
                         continue
-                    retire_owner_artifacts(SPINDLE_DIR, spool_id, owner_identity)
+                    episode_identity = _episode_process_identity(data.get("owner_episode") or {}, "owner")
+                    retire_owner_artifacts(SPINDLE_DIR, spool_id, episode_identity)
                     continue
                 if owner_identity is not None:
                     if _reconcile_spool_ownership(data).state != "terminalizable":
@@ -3699,14 +3699,19 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
         except (FileNotFoundError, OSError, json.JSONDecodeError, TypeError):
             owner_exit = None
         owner_generation = (spool.get("owner_episode") or {}).get("generation") or spool.get("owner_generation")
+        episode_failure = ((spool.get("owner_episode") or {}).get("failure") or {}).get("kind")
         if (
             owner_exit
             and owner_exit.get("owner_generation") == owner_generation
-            and (owner_exit.get("owner_crashed") or owner_exit.get("owner_crashed_after_cleanup"))
-        ):
+            and (
+                owner_exit.get("owner_crashed")
+                or owner_exit.get("owner_crashed_after_cleanup")
+                or owner_exit.get("watchdog_parent_lost")
+            )
+        ) or episode_failure == "watchdog_parent_loss":
             recovered_request = None
             recovered_receipt = None
-            if owner_exit.get("owner_crashed_after_cleanup"):
+            if owner_exit and owner_exit.get("owner_crashed_after_cleanup"):
                 for request in iter_control_requests(SPINDLE_DIR, spool_id):
                     if request.owner_generation != owner_generation:
                         continue
@@ -3734,14 +3739,22 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
                 spool["status"] = "timeout" if terminal_kind == "timeout" else "error"
                 spool["error"] = f"Timeout after {spool.get('timeout')}s" if terminal_kind == "timeout" else "Cancelled"
             else:
+                watchdog_parent_lost = episode_failure == "watchdog_parent_loss" or bool(
+                    owner_exit and owner_exit.get("watchdog_parent_lost")
+                )
                 lifecycle.update(
                     {
                         "normalized_terminal_kind": "indeterminate",
-                        "owner_crashed": True,
+                        "watchdog_parent_lost": watchdog_parent_lost,
+                        "owner_crashed": not watchdog_parent_lost,
                     }
                 )
                 spool["status"] = "error"
-                spool["error"] = "Logical owner exited before terminal publication"
+                spool["error"] = (
+                    "Containment watchdog exited before terminal publication"
+                    if watchdog_parent_lost
+                    else "Logical owner exited before terminal publication"
+                )
                 spool["error_kind"] = "owner_transport_loss"
                 spool["result"] = None
             spool["lifecycle"] = lifecycle
@@ -4559,6 +4572,17 @@ def _handle_expired_session_locked(spool_id: str, spool: dict) -> bool:
     spool = _read_spool(spool_id) or spool
     predecessor = spool.get("owner_episode") or {}
     predecessor_deadline = predecessor.get("deadline") or spool.get("wall_deadline_at")
+    if _absolute_deadline_expired(predecessor_deadline) is True:
+        if predecessor.get("phase") != "released":
+            return False
+        spool.pop("expired_session_replacement_requested", None)
+        spool["expired_session_replacement_skipped"] = {
+            "reason": "inherited_deadline_expired",
+            "deadline": predecessor_deadline,
+            "observed_at": datetime.now(timezone.utc).isoformat(),
+        }
+        _write_spool(spool_id, spool)
+        return True
     if predecessor:
         replacement_generation = predecessor.get("generation", 0) + 1
         reserve_facts = {"starter": _process_fact(os.getpid())}
@@ -4668,8 +4692,7 @@ def _spool_elapsed_seconds(spool: dict) -> Optional[float]:
     return (now - created).total_seconds()
 
 
-def _owner_episode_deadline_expired(spool: dict) -> Optional[bool]:
-    deadline = (spool.get("owner_episode") or {}).get("deadline")
+def _absolute_deadline_expired(deadline: Optional[str]) -> Optional[bool]:
     if deadline is None:
         return None
     try:
@@ -4679,6 +4702,10 @@ def _owner_episode_deadline_expired(spool: dict) -> Optional[bool]:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return datetime.now(timezone.utc) >= parsed.astimezone(timezone.utc)
+
+
+def _owner_episode_deadline_expired(spool: dict) -> Optional[bool]:
+    return _absolute_deadline_expired((spool.get("owner_episode") or {}).get("deadline"))
 
 
 def _reconcile_spool_step(spool_id: str) -> bool:

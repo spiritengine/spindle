@@ -10,7 +10,11 @@ the namespace-safe shared owner primitive.
    mandatory. It is the owner's longer-lived parent and a Linux child
    subreaper. The owner still opens provider pidfds immediately and arms
    PDEATHSIG with an immediate `getppid()` re-check as a secondary net.
-   Ownership and terminal authority never depend on PDEATHSIG.
+   Ownership and terminal authority never depend on PDEATHSIG. A watchdog-held
+   lease pipe lets the owner detect watchdog-parent loss, take over descendant
+   containment, publish cleanup proof, and exit. This covers ordered watchdog
+   loss followed by owner loss after that detection; simultaneous unobservable
+   double `SIGKILL` is not claimed.
 2. Descendant guarantee: the owner reaps descendants while healthy. If it
    crashes, the watchdog adopts, kills, and reaps the provider plus descendants
    reparented through it, including a `setsid` escape, before publishing crash
@@ -65,8 +69,11 @@ the namespace-safe shared owner primitive.
     deadline as a durable timeout request, but still requires ownership and
     cleanup evidence before terminalization. An expired-session replacement
     inherits that deadline and does not reserve or launch a new generation once
-    it is overdue. If predecessor cleanup already accepted a stop request, that
-    first request retains its terminal provenance rather than being rewritten.
+    it is overdue. Eligibility is revalidated from the exact predecessor under
+    serialization immediately before reservation, and the owner checks again
+    immediately before provider start. If predecessor cleanup already accepted
+    a stop request, that first request retains its terminal provenance rather
+    than being rewritten.
 15. Store repair: unreadable/replaced/missing-current ownership paths make the
     store unhealthy and reject launches. Diagnosis belongs in `doctor`;
     repair is an explicit operator action which validates the complete artifact
@@ -84,7 +91,9 @@ the namespace-safe shared owner primitive.
     requires acquisition and verification of its recorded released inode before
     deletion. A valid aborted episode that never bound an inode instead acquires
     and revalidates any harmless physical lock pathname without trusting a stale
-    identity mirror, then retires the same complete set.
+    identity mirror, then retires the same complete set. The presence of an
+    episode always selects this authority path; a missing optional
+    `.owner-identity` mirror never permits legacy or partial cleanup.
 19. Provider cancellation interface: one narrow callback returns attempted,
     acknowledged, terminal-observed, or unsupported with timestamps. It neither
     parses provider events nor reduces lifecycle state.

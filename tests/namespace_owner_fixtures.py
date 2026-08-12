@@ -62,13 +62,16 @@ def fake_provider_factory(namespace_owner_env):
             "SPOOL_ID = os.environ['SPINDLE_OWNER_SPOOL_ID']\n"
             "CONTROL_FD = int(os.environ['SPINDLE_PROVIDER_CONTROL_FD'])\n"
             "control = socket.socket(fileno=CONTROL_FD)\n"
-            "if MODE == 'setsid-grandchild':\n"
+            "if MODE in {'setsid-grandchild', 'setsid-grandchild-causal'}:\n"
             "    child = os.fork()\n"
             "    if child == 0:\n"
             "        os.setsid()\n"
             "        signal.signal(signal.SIGTERM, lambda *_: None)\n"
             "        while True: time.sleep(0.05)\n"
             "    (STORE / f'{SPOOL_ID}.descendant-pid').write_text(str(child))\n"
+            "    if MODE == 'setsid-grandchild-causal':\n"
+            "        with (STORE / f'{SPOOL_ID}.descendant-ready').open('w') as ready:\n"
+            "            ready.write(f'{child}\\n')\n"
             "print(f'ready {os.getpid()} {os.getpgrp()}', flush=True)\n"
             "if MODE == 'immediate-exit': raise SystemExit(0)\n"
             "if MODE == 'silent-exit': raise SystemExit(17)\n"
@@ -464,9 +467,7 @@ def watchdog_owner_case(namespace_owner_env, fake_provider_factory, process_ledg
         if pause_checkpoint:
             checkpoint_controller, checkpoint_owner = socket.socketpair()
             pass_fds.append(checkpoint_owner.fileno())
-            args.extend(
-                ["--checkpoint-fd", str(checkpoint_owner.fileno()), "--pause-checkpoint", pause_checkpoint]
-            )
+            args.extend(["--checkpoint-fd", str(checkpoint_owner.fileno()), "--pause-checkpoint", pause_checkpoint])
         else:
             checkpoint_owner = None
         if controlled_clock_fd is not None:

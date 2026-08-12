@@ -320,9 +320,7 @@ def test_first_reserve_refuses_a_supplied_revision(episode_api, episode_store):
     spool_id = "first-reserve"
     _seed(episode_store, spool_id, ABSENT)
 
-    result = _transition(
-        episode_api, episode_store, spool_id, "launcher", ABSENT, "reserved", expected_revision=1
-    )
+    result = _transition(episode_api, episode_store, spool_id, "launcher", ABSENT, "reserved", expected_revision=1)
 
     assert (result.accepted, result.rejection) == (False, "stale_revision")
     assert episode_store.read(spool_id).get(EPISODE_KEY) is None
@@ -403,7 +401,10 @@ def test_concurrent_transitions_settle_on_one_revision(episode_api, episode_stor
         )
 
     with ThreadPoolExecutor(max_workers=2) as pool:
-        results = [future.result(timeout=10) for future in [pool.submit(publish, "cleanup_proven"), pool.submit(publish, "accepted")]]
+        results = [
+            future.result(timeout=10)
+            for future in [pool.submit(publish, "cleanup_proven"), pool.submit(publish, "accepted")]
+        ]
 
     accepted = [result for result in results if result.accepted]
     rejected = [result for result in results if not result.accepted]
@@ -813,6 +814,88 @@ def test_replacement_spawn_reserves_instead_of_restoring_a_stale_episode(episode
     stored = episode_store.episode(spool_id)
     assert stored is not None, "the replacement dropped the episode"
     assert (stored["generation"], stored["phase"]) == (proven["generation"] + 1, "reserved")
+
+
+def test_replacement_revalidates_inherited_deadline_after_transcript_barrier(
+    episode_store,
+    monkeypatch,
+    tmp_path,
+):
+    spool_id = "writer-replacement-deadline-race"
+    source_id = "writer-replacement-deadline-source"
+    inherited_deadline = "2026-08-11T00:01:00+00:00"
+    proven = make_episode(
+        "released",
+        generation=3,
+        deadline=inherited_deadline,
+        winning_request={"request_id": "first", "kind": "cancel", "desired_terminal_kind": "cancelled"},
+        acknowledgement={"acknowledged_at": "2026-08-11T00:00:04+00:00"},
+    )
+    episode_store.write(
+        spool_id,
+        status="error",
+        episode=proven,
+        session_id="deadline-race-session",
+        prompt="spin: continue",
+        working_dir=str(tmp_path),
+        expired_session_replacement_requested=True,
+        error="Cancelled",
+        lifecycle={"normalized_terminal_kind": "cancelled"},
+    )
+    episode_store.write(source_id, status="complete", session_id="deadline-race-session")
+    transcript = spindle._get_transcript_path(source_id)
+    transcript.parent.mkdir(parents=True, exist_ok=True)
+    transcript.write_text("prior transcript")
+
+    entered = threading.Event()
+    resume = threading.Event()
+    expired = {"value": False}
+    checked = []
+    real_build = spindle._build_transcript_continuation_prompt
+
+    def deadline_check(value):
+        checked.append(value)
+        return expired["value"]
+
+    def blocked_build(*args, **kwargs):
+        entered.set()
+        assert resume.wait(timeout=5), "deadline barrier was not released"
+        return real_build(*args, **kwargs)
+
+    monkeypatch.setattr(spindle, "_absolute_deadline_expired", deadline_check)
+    monkeypatch.setattr(spindle, "_build_transcript_continuation_prompt", blocked_build)
+    monkeypatch.setattr(
+        spindle,
+        "_reconcile_spool_ownership",
+        lambda spool: spindle.ReconciliationResult(
+            "terminalizable",
+            "episode_released",
+            LivenessEvidence("dead", "pidfd_exited"),
+            LockEvidence("released", 64, 987),
+        ),
+    )
+    monkeypatch.setattr(spindle, "_spawn_detached", lambda *_args, **_kwargs: pytest.fail("expired work spawned"))
+
+    results = []
+    worker = threading.Thread(
+        target=lambda: results.append(spindle._handle_expired_session_locked(spool_id, episode_store.read(spool_id)))
+    )
+    worker.start()
+    assert entered.wait(timeout=5), "transcript preparation did not reach its causal barrier"
+    expired["value"] = True
+    resume.set()
+    worker.join(timeout=5)
+    assert not worker.is_alive()
+    assert results == [True]
+
+    stored = episode_store.read(spool_id)
+    assert checked == [inherited_deadline, inherited_deadline]
+    assert stored[EPISODE_KEY] == proven
+    assert stored["status"] == "error"
+    assert stored["error"] == "Cancelled"
+    assert stored["lifecycle"]["normalized_terminal_kind"] == "cancelled"
+    assert stored["expired_session_replacement_skipped"]["deadline"] == inherited_deadline
+    assert "replacement_starting" not in stored
 
 
 def test_pre_spawn_failure_aborts_the_reservation_it_finalizes(episode_store):

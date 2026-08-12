@@ -55,8 +55,10 @@ TRANSITION_TABLE = (
     ("launcher", "aborted", "reserved", ("starter",)),
     ("launcher", "reserved", "reserved", ("watchdog",)),
     ("launcher", "reserved", "aborted", ("failure",)),
+    ("owner", "reserved", "aborted", ("failure",)),
     ("owner", "reserved", "lock_bound", ("owner", "lock")),
     ("owner", "lock_bound", "lock_bound", ("failure",)),
+    ("owner", "lock_bound", "cleanup_proven", ("containment", "cleanup")),
     ("owner", "lock_bound", "accepted", ("provider", "provider_custody")),
     ("owner", "accepted", "accepted", ("winning_request", "acknowledgement")),
     ("owner", "accepted", "cleanup_proven", ("cleanup",)),
@@ -110,7 +112,11 @@ CLEANUP = {
     "provider_exit_code": 0,
 }
 CONTAINMENT = {"contained": True, "adopted_children_reaped": 2, "observed_at": "2026-08-11T00:00:05+00:00"}
-FAILURE = {"kind": "owner_preacceptance_failure", "detail": "owner exited before binding", "observed_at": "2026-08-11T00:00:02+00:00"}
+FAILURE = {
+    "kind": "owner_preacceptance_failure",
+    "detail": "owner exited before binding",
+    "observed_at": "2026-08-11T00:00:02+00:00",
+}
 RELEASE = {"device": 64, "inode": 987, "proved_by": "reconciler", "released_at": "2026-08-11T00:00:06+00:00"}
 
 FACT_LITERALS = {
@@ -223,9 +229,7 @@ def make_episode(
         "generation": generation,
         "revision": path_revision if revision is None else revision,
         "phase": phase,
-        "phase_times": {
-            name: "2026-08-11T00:00:00+00:00" for name in _phase_history(phase, phase_facts)
-        },
+        "phase_times": {name: "2026-08-11T00:00:00+00:00" for name in _phase_history(phase, phase_facts)},
     }
     episode.update(facts_for(*phase_facts))
     if deadline is not None:

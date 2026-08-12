@@ -136,6 +136,152 @@ class LogicalOwner:
         self.wall_deadline_at: Optional[str] = args.deadline
         self.episode_mode = False
 
+    def _watchdog_alive(self) -> bool:
+        """Whether the mandatory containment parent still holds its lease FD."""
+        fd = getattr(self.args, "watchdog_fd", None)
+        if fd is None:
+            return True
+        poller = select.poll()
+        poller.register(fd, select.POLLIN | select.POLLHUP | select.POLLERR)
+        return not bool(poller.poll(0))
+
+    def _deadline_expired(self) -> bool:
+        return getattr(self, "wall_deadline_at", None) is not None and self._remaining_wall_budget() <= 0
+
+    def _watchdog_loss_facts(self, *, provider_exit_code: Optional[int]) -> tuple[dict, dict, dict]:
+        observed_at = _utc_now()
+        cleanup = {
+            "outcome": "watchdog_parent_lost_contained",
+            "provider_reaped": True,
+            "adopted_children_reaped": self.adopted_reaped,
+            "child_exit_observed_at": observed_at,
+            "provider_exit_code": provider_exit_code,
+        }
+        containment = {
+            "contained": True,
+            "adopted_children_reaped": self.adopted_reaped,
+            "observed_at": observed_at,
+        }
+        failure = {
+            "kind": "watchdog_parent_loss",
+            "detail": "logical owner detected containment watchdog exit",
+            "observed_at": observed_at,
+        }
+        return cleanup, containment, failure
+
+    def _abort_for_watchdog_loss_before_binding(self) -> None:
+        episode = self._read_spool().get("owner_episode") or {}
+        if not self.episode_mode or episode.get("phase") != "reserved":
+            return
+        _cleanup, _containment, failure = self._watchdog_loss_facts(provider_exit_code=None)
+        transition_owner_episode(
+            self.store,
+            self.spool_id,
+            actor="owner",
+            destination="aborted",
+            generation=self.generation,
+            expected_revision=episode.get("revision"),
+            facts={"failure": failure},
+        )
+
+    def _settle_deadline_expiry_before_binding(self) -> None:
+        observed_at = _utc_now()
+        failure = {
+            "kind": "deadline_expired_before_provider_start",
+            "detail": "inherited deadline expired before logical owner binding",
+            "observed_at": observed_at,
+        }
+        lifecycle = {
+            **(self._read_spool().get("lifecycle") or {}),
+            "ownership_state": "released",
+            "transport_state": "reaped",
+            "normalized_terminal_kind": "timeout",
+        }
+        updates = {
+            "status": "timeout",
+            "error": f"Timeout after {self._read_spool().get('timeout')}s",
+            "error_kind": "deadline_expired_before_provider_start",
+            "completed_at": observed_at,
+            "lifecycle": lifecycle,
+        }
+        if self.episode_mode:
+            episode = self._read_spool().get("owner_episode") or {}
+            transition_owner_episode(
+                self.store,
+                self.spool_id,
+                actor="owner",
+                destination="aborted",
+                generation=self.generation,
+                expected_revision=episode.get("revision"),
+                facts={"failure": failure},
+                record_updates=updates,
+            )
+        else:
+            self._update_spool(**updates)
+        _atomic_json_write(
+            self.owner_exit_path,
+            {
+                "owner_pid": os.getpid(),
+                "owner_generation": self.generation,
+                "provider_pid": None,
+                "provider_exit_code": None,
+                "provider_reaped": True,
+                "adopted_children_reaped": 0,
+                "cleanup_outcome": "deadline_expired_before_provider_start",
+                "observed_at": observed_at,
+            },
+        )
+
+    def _contain_after_watchdog_loss(self) -> bool:
+        """Take over containment, publish proof, and leave no live descendants."""
+        returncode = None
+        if self.provider is not None:
+            if not self._signal_provider_group(signal.SIGKILL):
+                return False
+            returncode = self._finish_provider()
+            if returncode is None:
+                return False
+        while not self._settle_descendants(force=True):
+            if not self._verify_lock():
+                return False
+            time.sleep(self.args.poll_interval)
+        provider_exit_code = None if returncode is None else 128 - returncode if returncode < 0 else returncode
+        cleanup, containment, failure = self._watchdog_loss_facts(provider_exit_code=provider_exit_code)
+        if not self._verify_lock():
+            return False
+        if self.episode_mode:
+            episode = self._read_spool().get("owner_episode") or {}
+            result = transition_owner_episode(
+                self.store,
+                self.spool_id,
+                actor="owner",
+                destination="cleanup_proven",
+                generation=self.generation,
+                expected_revision=episode.get("revision"),
+                facts={"cleanup": cleanup, "containment": containment, "failure": failure},
+            )
+            if not result.accepted:
+                return False
+        evidence = {
+            "owner_pid": os.getpid(),
+            "owner_generation": self.generation,
+            "provider_pid": self.provider.pid if self.provider else None,
+            "provider_exit_code": provider_exit_code,
+            "provider_reaped": True,
+            "adopted_children_reaped": self.adopted_reaped,
+            "cleanup_outcome": cleanup["outcome"],
+            "watchdog_parent_lost": True,
+            "observed_at": cleanup["child_exit_observed_at"],
+        }
+        _atomic_json_write(self.owner_exit_path, evidence)
+        self.checkpoints.reach("watchdog_loss_cleanup_proven", self.provider.pid if self.provider else None)
+        return True
+
+    def _contain_after_watchdog_loss_until_proven(self) -> None:
+        """Never abandon the owner role after its watchdog lease is lost."""
+        while not self._contain_after_watchdog_loss():
+            time.sleep(self.args.poll_interval)
+
     def _await_launch_barrier(self) -> bool:
         fd = self.args.launch_barrier_fd
         if fd is None:
@@ -324,6 +470,10 @@ class LogicalOwner:
         stdin_stream = open(self.args.stdin_path, "r") if self.args.stdin_path else subprocess.DEVNULL
         try:
             with open(self.stdout_path, "w") as stdout, open(self.stderr_path, "w") as stderr:
+                if not self._watchdog_alive():
+                    raise RuntimeError("containment watchdog exited before provider start")
+                if self._deadline_expired():
+                    raise RuntimeError("inherited deadline expired before provider start")
                 self.provider = subprocess.Popen(
                     self.args.command,
                     cwd=self.args.cwd,
@@ -795,6 +945,12 @@ class LogicalOwner:
         self.episode_mode = (
             isinstance(self._read_spool().get("owner_episode"), dict) if hasattr(self, "spool_path") else False
         )
+        if not self._watchdog_alive():
+            self._abort_for_watchdog_loss_before_binding()
+            return 125
+        if self._deadline_expired():
+            self._settle_deadline_expiry_before_binding()
+            return 124
         _set_subreaper()
         self.lock = acquire_ownership_lock(self.lock_path)
         self._allocate_generation()
@@ -811,6 +967,9 @@ class LogicalOwner:
         monotonic_budget = self.args.timeout
         if monotonic_budget is not None and remaining_wall_budget is not None:
             monotonic_budget = min(float(self.args.timeout), remaining_wall_budget)
+        if not self._watchdog_alive():
+            self._contain_after_watchdog_loss_until_proven()
+            return 125
         self._spawn_provider()
         accepted_request = None
         natural_exit_settled = False
@@ -821,6 +980,10 @@ class LogicalOwner:
                 if not self._verify_lock():
                     time.sleep(self.args.poll_interval)
                     continue
+                if not self._watchdog_alive():
+                    self._contain_after_watchdog_loss_until_proven()
+                    result = 125
+                    break
                 if accepted_request is None:
                     accepted_request = self._next_current_request()
                 if accepted_request is None and self.args.timeout is not None:
@@ -891,6 +1054,9 @@ class LogicalOwner:
                 self.checkpoints.reach("before_lock_release", self.provider.pid if self.provider else None)
                 self._verify_lock()
                 self.lock.close()
+            if getattr(self.args, "watchdog_fd", None) is not None:
+                os.close(self.args.watchdog_fd)
+                self.args.watchdog_fd = None
         return result
 
 
@@ -904,6 +1070,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--checkpoint-fd", type=int)
     parser.add_argument("--pause-checkpoint")
     parser.add_argument("--clock-fd", type=int)
+    parser.add_argument("--watchdog-fd", type=int)
     parser.add_argument("--timeout", type=float)
     parser.add_argument("--deadline")
     parser.add_argument("--poll-interval", type=float, default=0.02)

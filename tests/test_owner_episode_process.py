@@ -9,6 +9,10 @@ from __future__ import annotations
 
 import json
 import multiprocessing
+import os
+import select
+import signal
+import sys
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -183,6 +187,91 @@ def test_owner_crash_contains_a_setsid_descendant_and_records_it_in_the_episode(
     assert contained["cleanup"]["provider_reaped"] is True
 
 
+def test_watchdog_loss_makes_owner_contain_before_a_later_owner_death(
+    watchdog_owner_case,
+    namespace_owner_env,
+):
+    spool_id = "watchdog-first-death"
+    store = namespace_owner_env["store"]
+    descendant_ready = store / f"{spool_id}.descendant-ready"
+    os.mkfifo(descendant_ready)
+    owner = watchdog_owner_case(
+        "setsid-grandchild-causal",
+        pause_checkpoint="watchdog_loss_cleanup_proven",
+        disable_pdeathsig=True,
+        spool_id=spool_id,
+    )
+    owner_pid = owner.owner_pid
+    provider_pid = owner.provider_pid
+    with descendant_ready.open() as stream:
+        descendant_pid = int(stream.readline())
+    owner_pidfd = os.pidfd_open(owner_pid)
+    try:
+        owner.process.kill()
+        owner.process.wait(timeout=8)
+        checkpoint = owner.receive_checkpoint()
+        assert checkpoint["name"] == "watchdog_loss_cleanup_proven"
+        assert not Path(f"/proc/{provider_pid}").exists()
+        assert not Path(f"/proc/{descendant_pid}").exists()
+        proven = _episode(owner)
+        assert proven["phase"] == "cleanup_proven"
+        assert proven["failure"]["kind"] == "watchdog_parent_loss"
+        assert proven["containment"]["contained"] is True
+
+        os.kill(owner_pid, signal.SIGKILL)
+        poller = select.poll()
+        poller.register(owner_pidfd, select.POLLIN | select.POLLHUP | select.POLLERR)
+        assert poller.poll(8000), "owner did not exit after the second causal kill"
+    finally:
+        os.close(owner_pidfd)
+
+    terminal = _finalize(owner)
+    assert terminal["owner_episode"]["phase"] == "released"
+    assert terminal["lifecycle"]["normalized_terminal_kind"] == "indeterminate"
+    assert terminal["lifecycle"]["watchdog_parent_lost"] is True
+    assert _capacity(owner) == 0
+
+
+def test_direct_compatibility_owner_crash_publishes_generation_matched_legacy_evidence(tmp_path):
+    spool_id = "legacy-direct-crash"
+    ready_fifo = tmp_path / "provider-ready"
+    os.mkfifo(ready_fifo)
+    provider = [
+        sys.executable,
+        "-c",
+        "import signal,sys; open(sys.argv[1], 'w').write('ready\\n'); signal.pause()",
+        str(ready_fifo),
+    ]
+    with patch("spindle.SPINDLE_DIR", tmp_path):
+        spindle._write_spool(
+            spool_id,
+            {"id": spool_id, "status": "pending", "created_at": datetime.now().isoformat()},
+        )
+        spindle._spawn_detached(spool_id, provider, str(tmp_path))
+        spindle._finish_spawn_barrier(spool_id, start=True)
+        watchdog = spindle._PROC_HANDLES[spool_id]
+        try:
+            with ready_fifo.open() as stream:
+                assert stream.readline() == "ready\n"
+            running = spindle._read_spool(spool_id)
+            assert "owner_episode" not in running
+            os.kill(running["owner_pid"], signal.SIGKILL)
+            assert watchdog.wait(timeout=8) == 137
+
+            evidence = json.loads(spindle._get_owner_exit_path(spool_id).read_text())
+            assert evidence["owner_generation"] == running["owner_generation"]
+            assert evidence["provider_reaped"] is True
+            assert evidence["cleanup_outcome"] == "watchdog_contained"
+            assert spindle._reconcile_spool_ownership(spindle._read_spool(spool_id)).state == "terminalizable"
+            assert spindle._check_and_finalize_spool(spool_id) is True
+            assert spindle._read_spool(spool_id)["status"] != "running"
+            assert spindle._count_running() == 0
+        finally:
+            if watchdog.poll() is None:
+                watchdog.kill()
+                watchdog.wait(timeout=8)
+
+
 # --- stale generation from a real watchdog ----------------------------------
 
 
@@ -227,9 +316,7 @@ def test_synchronous_spawn_failure_aborts_the_reserved_episode(episode_store, tm
     assert spindle._count_running() == 0
 
 
-def test_synchronous_replacement_spawn_failure_aborts_the_replacement_generation(
-    episode_store, monkeypatch, tmp_path
-):
+def test_synchronous_replacement_spawn_failure_aborts_the_replacement_generation(episode_store, monkeypatch, tmp_path):
     spool_id = "sync-replacement-failure"
     source_id = "sync-replacement-source"
     proven = make_episode("released", generation=3)
@@ -338,9 +425,7 @@ def _start_final_sweep_case(watchdog_owner_case, caller, tmp_path, checkpoint):
         spool_overrides=overrides,
     )
     if caller == "expired_session":
-        (owner.store / f"{spool_id}.stderr").write_text(
-            "No conversation found with session ID: expired-session"
-        )
+        (owner.store / f"{spool_id}.stderr").write_text("No conversation found with session ID: expired-session")
     return owner
 
 
@@ -471,7 +556,9 @@ def test_foreign_namespace_observer_classifies_the_episode_without_mutating_it(
 ):
     owner = watchdog_owner_case("healthy-turn")
     before = (owner.store / f"{owner.spool_id}.json").read_bytes()
-    source = OBSERVER_PROLOGUE + r"""
+    source = (
+        OBSERVER_PROLOGUE
+        + r"""
 from spindle.namespace_owner import (
     NamespaceIdentity,
     ProcessIdentity,
@@ -508,6 +595,7 @@ print(json.dumps({
     "unchanged": before == record_path.read_bytes(),
 }))
 """
+    )
 
     observed = foreign_pid_namespace(owner.store, source, owner.spool_id)
 
