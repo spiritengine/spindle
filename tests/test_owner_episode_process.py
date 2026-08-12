@@ -61,6 +61,25 @@ def _finalize(owner) -> dict:
     return owner.spool()
 
 
+def _reconcile_through_production(owner, entrypoint: str) -> dict:
+    with patch("spindle.SPINDLE_DIR", owner.store):
+        if entrypoint == "recovery_pass":
+            assert spindle._recovery_pass() == []
+        else:
+            assert entrypoint == "supervisor_step"
+            assert spindle._reconcile_spool_step(owner.spool_id) is False
+    return owner.spool()
+
+
+def _assert_terminal_projection_is_idempotent(owner, terminal: dict) -> None:
+    record_path = owner.store / f"{owner.spool_id}.json"
+    before_bytes = record_path.read_bytes()
+    with patch("spindle.SPINDLE_DIR", owner.store):
+        assert spindle._check_and_finalize_spool(owner.spool_id) is True
+    assert record_path.read_bytes() == before_bytes
+    assert owner.spool() == terminal
+
+
 def _capacity(owner) -> int:
     with patch("spindle.SPINDLE_DIR", owner.store):
         return spindle._count_running()
@@ -151,11 +170,14 @@ def test_crash_after_cleanup_proven_keeps_the_proven_phase_and_recovers_its_term
     assert terminal[EPISODE_KEY]["phase"] == "released"
     assert terminal["error"] == "Cancelled"
     assert terminal["lifecycle"]["normalized_terminal_kind"] == "cancelled"
+    _assert_terminal_projection_is_idempotent(owner, terminal)
 
 
+@pytest.mark.parametrize("production_entrypoint", ["recovery_pass", "supervisor_step"])
 def test_deadline_crossing_after_binding_settles_timeout_without_starting_provider(
     watchdog_owner_case,
     owner_clock,
+    production_entrypoint,
 ):
     _current, advance, clock_fd = owner_clock
     owner = watchdog_owner_case(
@@ -190,14 +212,19 @@ def test_deadline_crossing_after_binding_settles_timeout_without_starting_provid
     evidence["owner_crashed"] = True
     (owner.store / f"{owner.spool_id}.owner-exit").write_text(json.dumps(evidence))
 
-    terminal = _finalize(owner)
+    assert owner.spool()["status"] == "pending"
+    terminal = _reconcile_through_production(owner, production_entrypoint)
+    assert terminal[EPISODE_KEY]["phase"] == "released"
     assert terminal["status"] == "timeout"
     assert terminal["error_kind"] == "deadline_expired_before_provider_start"
     assert terminal["lifecycle"]["normalized_terminal_kind"] == "timeout"
+    _assert_terminal_projection_is_idempotent(owner, terminal)
 
 
+@pytest.mark.parametrize("production_entrypoint", ["recovery_pass", "supervisor_step"])
 def test_watchdog_loss_at_provider_start_boundary_uses_owner_containment_authority(
     watchdog_owner_case,
+    production_entrypoint,
 ):
     owner = watchdog_owner_case(
         "record-launch",
@@ -230,7 +257,11 @@ def test_watchdog_loss_at_provider_start_boundary_uses_owner_containment_authori
     else:
         pytest.fail("logical owner did not exit after proving watchdog-loss containment")
 
-    terminal = _finalize(owner)
+    assert owner.spool()["status"] == "pending"
+    terminal = _reconcile_through_production(owner, production_entrypoint)
+    assert terminal[EPISODE_KEY]["phase"] == "released"
+    assert terminal["status"] == "error"
+    assert terminal["error_kind"] == "owner_transport_loss"
     assert terminal["lifecycle"]["normalized_terminal_kind"] == "indeterminate"
     assert terminal["lifecycle"]["watchdog_parent_lost"] is True
 
@@ -252,6 +283,7 @@ def test_owner_unlocks_at_cleanup_proven_and_reconciliation_alone_persists_relea
     with patch("spindle.SPINDLE_DIR", owner.store):
         assert spindle._check_and_finalize_spool(owner.spool_id) is True
     assert _episode(owner)["revision"] == released["revision"], "release was persisted twice"
+    _assert_terminal_projection_is_idempotent(owner, terminal)
 
 
 def test_owner_crash_contains_a_setsid_descendant_and_records_it_in_the_episode(watchdog_owner_case):

@@ -16,6 +16,7 @@ import spindle
 from spindle.namespace_owner import (
     ProcessIdentity,
     capture_pid_namespace,
+    create_control_request,
     iter_control_requests,
     read_control_receipt,
 )
@@ -164,6 +165,40 @@ def test_s2_c_ctl_03_crash_after_cleanup_receipt_recovers_requested_terminal(
     assert terminal["error"] == expected_error
     assert terminal["lifecycle"]["normalized_terminal_kind"] == expected_terminal
     assert terminal["lifecycle"]["owner_crashed_after_cleanup"] is True
+
+
+def test_recovery_settles_late_same_generation_request_after_winning_cleanup_receipt(
+    watchdog_owner_case,
+):
+    owner = watchdog_owner_case(
+        "ignore-term",
+        pause_checkpoint="cleanup_receipt_child_exit_durable",
+        disable_pdeathsig=True,
+        timeout=100,
+        generation=2,
+    )
+    winner = owner.request("cancel")
+    assert owner.receive_checkpoint()["name"] == "cleanup_receipt_child_exit_durable"
+    late_timeout = owner.request("timeout")
+    stale = create_control_request(owner.store, owner.spool_id, "drop", 1, "stale-stage4-test")
+    assert read_control_receipt(owner.store, owner.spool_id, late_timeout.request_id) is None
+    assert read_control_receipt(owner.store, owner.spool_id, stale.request_id) is None
+
+    owner.kill_owner()
+    terminal = _finalize_after_crash(owner)
+
+    assert terminal["status"] == "error"
+    assert terminal["error"] == "Cancelled"
+    assert terminal["lifecycle"]["normalized_terminal_kind"] == "cancelled"
+    assert read_control_receipt(owner.store, owner.spool_id, winner.request_id).cleanup_outcome == "cleaned"
+    superseded = read_control_receipt(owner.store, owner.spool_id, late_timeout.request_id)
+    assert superseded is not None
+    assert superseded.owner_acknowledged_at is None
+    assert superseded.cleanup_outcome == "rejected_superseded"
+    stale_receipt = read_control_receipt(owner.store, owner.spool_id, stale.request_id)
+    assert stale_receipt is not None
+    assert stale_receipt.owner_acknowledged_at is None
+    assert stale_receipt.cleanup_outcome == "rejected_stale_generation"
 
 
 def test_s2_c_arm_01_fork_parent_death_race_does_not_orphan_provider(

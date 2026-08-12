@@ -963,6 +963,26 @@ def test_finalization_persists_release_from_cleanup_proven(episode_store):
     assert record["status"] != "running"
 
 
+def test_finalization_projects_a_released_episode_when_public_terminal_is_missing(episode_store):
+    spool_id = "writer-released-before-projection"
+    episode = make_episode("released", generation=2)
+    episode_store.bind_lock(spool_id, episode)
+    episode_store.write(
+        spool_id,
+        status="running",
+        episode=episode,
+        owner_generation=2,
+        completed_at=None,
+    )
+
+    assert spindle._check_and_finalize_spool(spool_id) is True
+
+    record = episode_store.read(spool_id)
+    assert record[EPISODE_KEY] == episode
+    assert record["status"] not in {"pending", "running"}
+    assert record["completed_at"]
+
+
 def _advance_episode_during(monkeypatch, episode_store, spool_id, advanced):
     def cleanup(*_args, **_kwargs):
         record = episode_store.read(spool_id)

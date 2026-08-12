@@ -95,6 +95,7 @@ from .namespace_owner import (  # noqa: E402
     reconcile_owner_episode,
     retire_owner_artifacts,
     transition_owner_episode,
+    write_control_receipt,
 )
 
 mcp = FastMCP("spindle")
@@ -3630,6 +3631,35 @@ def _spool_has_complete_output(spool: dict, stdout_path: Path, stderr_path: Path
     return False
 
 
+def _settle_recovered_episode_requests(spool_id: str, episode: dict) -> None:
+    """Finish generation-scoped provenance after the winning owner is gone.
+
+    The caller holds the spool lock. Public admission must acquire that same
+    lock before publishing, so the request set cannot grow underneath this
+    pass; taking the mailbox lock here would invert the mailbox-then-spool
+    order used by admission.
+    """
+    if episode.get("phase") != "released":
+        return
+    winning_request = episode.get("winning_request") or {}
+    winning_request_id = winning_request.get("request_id")
+    generation = episode.get("generation")
+    if not winning_request_id or not generation:
+        return
+    for request in iter_control_requests(SPINDLE_DIR, spool_id):
+        if request.request_id == winning_request_id:
+            continue
+        if read_control_receipt(SPINDLE_DIR, spool_id, request.request_id) is not None:
+            continue
+        write_control_receipt(
+            SPINDLE_DIR,
+            spool_id,
+            request,
+            current_generation=generation,
+            accepted=False,
+        )
+
+
 def _check_and_finalize_spool(spool_id: str) -> bool:
     """
     Check if a spool's process has finished and finalize it.
@@ -3648,6 +3678,12 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
         spool = _read_spool(spool_id)
         episode = (spool or {}).get("owner_episode") or {}
         if not spool:
+            return True
+        if (
+            episode.get("phase") == "released"
+            and spool.get("status") not in {"pending", "running"}
+            and spool.get("completed_at")
+        ):
             return True
         if spool.get("status") != "running" and episode.get("phase") not in {"cleanup_proven", "released"}:
             return True  # Already done
@@ -3693,6 +3729,9 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
                 spool = _read_spool(spool_id) or spool
             finally:
                 held.close()
+
+        episode = spool.get("owner_episode") or {}
+        _settle_recovered_episode_requests(spool_id, episode)
 
         try:
             owner_exit = json.loads(_get_owner_exit_path(spool_id).read_text())
@@ -4268,6 +4307,16 @@ def _reconcile_pending_spool(spool_id: str) -> bool:
         return False
 
 
+def _pending_episode_requires_finalization(spool: dict) -> bool:
+    """Let terminal owner authority outrank the compatibility pending mirror."""
+    episode = spool.get("owner_episode")
+    return (
+        isinstance(episode, dict)
+        and episode.get("phase") in {"cleanup_proven", "released"}
+        and _reconcile_spool_ownership(spool).state == "terminalizable"
+    )
+
+
 def _recovery_pass() -> list:
     """Reconcile every active spool; return the IDs that still need a monitor.
 
@@ -4281,7 +4330,10 @@ def _recovery_pass() -> list:
             if not _check_and_finalize_spool(spool["id"]):
                 needs_monitor.append(spool["id"])
         elif spool.get("status") == "pending":
-            if _reconcile_pending_spool(spool["id"]):
+            if _pending_episode_requires_finalization(spool):
+                if not _check_and_finalize_spool(spool["id"]):
+                    needs_monitor.append(spool["id"])
+            elif _reconcile_pending_spool(spool["id"]):
                 needs_monitor.append(spool["id"])
     return needs_monitor
 
@@ -4739,6 +4791,8 @@ def _reconcile_spool_step(spool_id: str) -> bool:
     if not spool:
         return False
     if spool.get("status") == "pending":
+        if _pending_episode_requires_finalization(spool):
+            return not _check_and_finalize_spool(spool_id)
         return _reconcile_pending_spool(spool_id)
     if spool.get("status") != "running":
         if spool.get("expired_session_replacement_requested"):
