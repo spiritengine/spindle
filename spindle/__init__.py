@@ -1181,13 +1181,20 @@ def _preserve_failed_spool_shard(spool: dict) -> bool:
     if spool.get("status") not in {"error", "timeout"} or not spool.get("shard_created_by_spool"):
         return False
     shard_info = spool.get("shard") or {}
+    changed = (
+        shard_info.get("startup_failure_preserved") is not True
+        or spool.get("shard_cleanup_preserved") is not True
+        or spool.get("shard_cleanup_preserved_reason") != "automatic cleanup disabled after agent failure"
+        or "shard_cleanup_pending" in spool
+        or "shard_cleanup_pending_reason" in spool
+    )
     shard_info["startup_failure_preserved"] = True
     spool["shard"] = shard_info
     spool["shard_cleanup_preserved"] = True
     spool["shard_cleanup_preserved_reason"] = "automatic cleanup disabled after agent failure"
     spool.pop("shard_cleanup_pending", None)
     spool.pop("shard_cleanup_pending_reason", None)
-    return True
+    return changed
 
 
 def _clear_preserved_spool_shard(spool: dict) -> None:
@@ -3660,6 +3667,22 @@ def _settle_recovered_episode_requests(spool_id: str, episode: dict) -> None:
         )
 
 
+def _post_terminal_bookkeeping(spool_id: str, spool: dict) -> None:
+    """Finish idempotent bookkeeping after durable terminal projection.
+
+    The caller holds the spool lock and has already published all terminal
+    facts.  This helper may add only failed-shard recovery metadata; provider
+    parsing, transcripts, and lifecycle projection remain the caller's work.
+    Process-handle removal is naturally one-shot, and an already preserved
+    shard causes no second record write.
+    """
+    try:
+        if _preserve_failed_spool_shard(spool):
+            _write_spool(spool_id, spool)
+    finally:
+        _pop_and_reap_process_handle(spool_id)
+
+
 def _check_and_finalize_spool(spool_id: str) -> bool:
     """
     Check if a spool's process has finished and finalize it.
@@ -3756,6 +3779,7 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
             spool["result"] = None
             spool["completed_at"] = datetime.now().isoformat()
             _write_spool(spool_id, spool)
+            _post_terminal_bookkeeping(spool_id, spool)
             return True
 
         if (
@@ -3824,6 +3848,7 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
             spool["lifecycle"] = lifecycle
             spool["completed_at"] = datetime.now().isoformat()
             _write_spool(spool_id, spool)
+            _post_terminal_bookkeeping(spool_id, spool)
             return True
 
         episode = spool.get("owner_episode") or {}
@@ -3846,6 +3871,7 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
                 spool["error"] = f"Timeout after {spool.get('timeout')}s" if terminal_kind == "timeout" else "Cancelled"
                 spool["completed_at"] = datetime.now().isoformat()
                 _write_spool(spool_id, spool)
+                _post_terminal_bookkeeping(spool_id, spool)
                 return True
 
         proc = _PROC_HANDLES.get(spool_id)
@@ -3876,12 +3902,9 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
         # poll() returns None if the process hasn't actually exited yet (e.g.
         # output is complete but the CLI lingers); that's fine - exit_code stays
         # unknown for that case. None when there's no handle (orphan recovery).
-        proc = _PROC_HANDLES.pop(spool_id, None)
         exit_code = observed_exit_code
         if exit_code is None:
             exit_code = _read_exit_code(spool_id)
-        if proc is not None and proc.poll() is None:
-            _reap_process_handle_later(proc)
         if exit_code is not None:
             spool["exit_code"] = exit_code
         # Suffix for the "no output" fallbacks so a silent failure reports the
@@ -4187,11 +4210,7 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
             except IOError:
                 pass  # Non-critical, continue
 
-        # A provider can fail after work has already landed in ignored files.
-        # Preserve every newly created failed shard for explicit inspection; no
-        # automatic Git cleanup is race-free here.
-        _preserve_failed_spool_shard(spool)
-        _write_spool(spool_id, spool)
+        _post_terminal_bookkeeping(spool_id, spool)
 
         return True
 

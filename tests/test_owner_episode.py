@@ -983,6 +983,125 @@ def test_finalization_projects_a_released_episode_when_public_terminal_is_missin
     assert record["completed_at"]
 
 
+@pytest.mark.parametrize(
+    ("origin", "request_kind", "terminal_kind", "failure_kind", "owner_exit_kind"),
+    [
+        ("cancel", "cancel", "cancelled", None, None),
+        ("drop", "drop", "cancelled", None, None),
+        ("timeout", "timeout", "timeout", None, None),
+        ("pre-popen-deadline", None, "timeout", "deadline_expired_before_provider_start", None),
+        ("owner-transport-loss", None, "indeterminate", None, "owner_crashed"),
+        ("watchdog-transport-loss", None, "indeterminate", "watchdog_parent_loss", None),
+        ("natural-provider-failure", None, None, None, None),
+    ],
+)
+def test_every_terminal_origin_runs_idempotent_post_terminal_bookkeeping(
+    episode_store,
+    monkeypatch,
+    tmp_path,
+    origin,
+    request_kind,
+    terminal_kind,
+    failure_kind,
+    owner_exit_kind,
+):
+    spool_id = f"terminal-bookkeeping-{origin}"
+    natural = origin == "natural-provider-failure"
+    episode = None
+    if not natural:
+        path = "before_acceptance" if failure_kind else "after_acceptance"
+        overrides = {}
+        if request_kind:
+            overrides.update(
+                winning_request={
+                    "request_id": f"{origin}-request",
+                    "kind": request_kind,
+                    "desired_terminal_kind": terminal_kind,
+                },
+                acknowledgement={"acknowledged_at": "2026-08-11T00:00:04+00:00"},
+            )
+        if failure_kind:
+            overrides["failure"] = {
+                "kind": failure_kind,
+                "detail": origin,
+                "observed_at": "2026-08-11T00:00:05+00:00",
+            }
+        episode = make_episode("released", generation=3, path=path, **overrides)
+        episode_store.bind_lock(spool_id, episode)
+
+    worktree = tmp_path / f"{spool_id}-worktree"
+    worktree.mkdir()
+    record_fields = {
+        "pid": 999999999,
+        "timeout": 17,
+        "harness": "codex",
+        "shard": {"worktree_path": str(worktree), "branch_name": f"shard-{spool_id}"},
+        "shard_created_by_spool": True,
+    }
+    if episode:
+        record_fields["owner_generation"] = 3
+    episode_store.write(spool_id, status="running", episode=episode, **record_fields)
+    if natural:
+        monkeypatch.setattr(
+            spindle,
+            "_reconcile_spool_ownership",
+            lambda _spool: SimpleNamespace(state="terminalizable"),
+        )
+    if owner_exit_kind:
+        (episode_store.root / f"{spool_id}.owner-exit").write_text(
+            json.dumps({"owner_generation": 3, owner_exit_kind: True})
+        )
+
+    provider_stream = "\n".join(
+        [
+            json.dumps({"type": "thread.started", "thread_id": "natural-session"}),
+            json.dumps({"type": "turn.failed", "error": {"message": "provider failed"}}),
+        ]
+    )
+    spindle._get_output_path(spool_id).write_text(provider_stream)
+    spindle._get_exit_path(spool_id).write_text("1\n")
+
+    class LiveWatchdogHandle:
+        def poll(self):
+            return None
+
+    handle = LiveWatchdogHandle()
+    spindle._PROC_HANDLES[spool_id] = handle
+    bookkeeping_calls = []
+    reap_calls = []
+    real_bookkeeping = spindle._post_terminal_bookkeeping
+
+    def record_bookkeeping(bookkeeping_spool_id, spool):
+        bookkeeping_calls.append(bookkeeping_spool_id)
+        real_bookkeeping(bookkeeping_spool_id, spool)
+
+    monkeypatch.setattr(spindle, "_post_terminal_bookkeeping", record_bookkeeping)
+    monkeypatch.setattr(spindle, "_reap_process_handle_later", reap_calls.append)
+
+    assert spindle._check_and_finalize_spool(spool_id) is True
+
+    terminal = episode_store.read(spool_id)
+    assert terminal["status"] in {"error", "timeout"}
+    assert terminal["shard_cleanup_preserved"] is True
+    assert terminal["shard"]["startup_failure_preserved"] is True
+    assert spool_id not in spindle._PROC_HANDLES
+    assert bookkeeping_calls == [spool_id]
+    assert reap_calls == [handle]
+    if natural:
+        assert terminal["error"] == "provider failed"
+        assert spindle._get_transcript_path(spool_id).read_text() == provider_stream
+    else:
+        assert terminal["lifecycle"]["normalized_terminal_kind"] == terminal_kind
+        assert not spindle._get_transcript_path(spool_id).exists()
+        assert "session_id" not in terminal
+
+    terminal_bytes = episode_store.spool_path(spool_id).read_bytes()
+    assert spindle._check_and_finalize_spool(spool_id) is True
+    assert episode_store.spool_path(spool_id).read_bytes() == terminal_bytes
+    assert bookkeeping_calls == [spool_id]
+    assert reap_calls == [handle]
+
+
 def _advance_episode_during(monkeypatch, episode_store, spool_id, advanced):
     def cleanup(*_args, **_kwargs):
         record = episode_store.read(spool_id)
