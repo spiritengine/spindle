@@ -27,7 +27,7 @@ spool_id = spin(
     harness="codex",  # Use Codex instead of Claude Code
     permission="full",  # Mapped to sandbox policy
     timeout=300,  # Optional, seconds
-    tags="csv,utils"  # Optional, comma-separated tags
+    tags="csv,utils",  # Optional, comma-separated tags
 )
 ```
 
@@ -63,10 +63,7 @@ result = unspool(spool_id)
 Continue an existing session with a new message. Automatically detects whether the session uses Claude Code or Codex.
 
 ```python
-spool_id = respin(
-    session_id="abc-123-def",
-    prompt="Now add tests for that function"
-)
+spool_id = respin(session_id="abc-123-def", prompt="Now add tests for that function")
 result = unspool(spool_id)
 ```
 
@@ -134,7 +131,7 @@ Codex spools:
 spool_id = spin(
     prompt="Create a Python function to validate email addresses using regex",
     working_dir="/home/user/myproject",
-    harness="codex"
+    harness="codex",
 )
 
 # Check status (auto-detects harness)
@@ -146,10 +143,7 @@ result = unspool(spool_id)
 
 # Continue the conversation (auto-detects harness)
 session_id = "extracted-from-previous-result"
-spool_id2 = respin(
-    session_id=session_id,
-    prompt="Add unit tests for that email validator"
-)
+spool_id2 = respin(session_id=session_id, prompt="Add unit tests for that email validator")
 
 result2 = unspool(spool_id2)
 ```
@@ -188,18 +182,14 @@ To test the Codex harness:
 2. Use the MCP tools via a client:
    ```python
    # Via MCP client
-   result = await call_tool("spin", {
-       "prompt": "Write hello world in Python",
-       "working_dir": "/tmp/test",
-       "harness": "codex"
-   })
+   result = await call_tool(
+       "spin", {"prompt": "Write hello world in Python", "working_dir": "/tmp/test", "harness": "codex"}
+   )
    ```
 
 3. Check spool status (auto-detects harness):
    ```python
-   result = await call_tool("unspool", {
-       "spool_id": "codex-abc12345"
-   })
+   result = await call_tool("unspool", {"spool_id": "codex-abc12345"})
    ```
 
 ## Troubleshooting
