@@ -21,12 +21,7 @@ from unittest.mock import patch
 import pytest
 
 import spindle
-from spindle.namespace_owner import (
-    LivenessEvidence,
-    LockEvidence,
-    iter_control_requests,
-    read_control_receipt,
-)
+from spindle.namespace_owner import iter_control_requests, read_control_receipt
 from tests.owner_episode_fixtures import EPISODE_KEY, make_episode
 
 OBSERVER_PROLOGUE = r"""
@@ -430,46 +425,6 @@ def test_synchronous_spawn_failure_aborts_the_reserved_episode(episode_store, tm
     assert spindle._count_running() == 0
 
 
-def test_synchronous_replacement_spawn_failure_aborts_the_replacement_generation(episode_store, monkeypatch, tmp_path):
-    spool_id = "sync-replacement-failure"
-    source_id = "sync-replacement-source"
-    proven = make_episode("released", generation=3)
-    episode_store.write(
-        spool_id,
-        status="running",
-        episode=proven,
-        session_id="session-y",
-        prompt="spin: continue",
-        working_dir=str(tmp_path),
-    )
-    episode_store.write(source_id, status="complete", session_id="session-y")
-    transcript = spindle._get_transcript_path(source_id)
-    transcript.parent.mkdir(parents=True, exist_ok=True)
-    transcript.write_text("prior transcript")
-
-    def refuse(*_args, **_kwargs):
-        raise RuntimeError("boom")
-
-    monkeypatch.setattr(spindle, "_spawn_detached", refuse)
-    monkeypatch.setattr(
-        spindle,
-        "_reconcile_spool_ownership",
-        lambda spool: spindle.ReconciliationResult(
-            "terminalizable",
-            "episode_released",
-            LivenessEvidence("dead", "pidfd_exited"),
-            LockEvidence("released", 64, 987),
-        ),
-    )
-
-    assert spindle._handle_expired_session_locked(spool_id, episode_store.read(spool_id)) is False
-
-    stored = episode_store.episode(spool_id)
-    assert stored is not None, "the failed replacement dropped the episode"
-    assert (stored["phase"], stored["generation"]) == ("aborted", proven["generation"] + 1)
-    assert spindle._count_running() == 0
-
-
 # --- mirrors and admission against a live owner -----------------------------
 
 
@@ -514,7 +469,7 @@ def test_admitted_request_is_recorded_in_the_episode_and_settled(watchdog_owner_
     assert terminal["lifecycle"]["normalized_terminal_kind"] == "cancelled"
 
 
-FINAL_SWEEP_CALLERS = ("drop", "timeout", "expired_session", "shard_abandon")
+FINAL_SWEEP_CALLERS = ("drop", "timeout", "shard_abandon")
 EXPIRED_TIMEOUT_DEADLINE = datetime(2000, 1, 1, tzinfo=timezone.utc).isoformat()
 FUTURE_LEGACY_TIMEOUT_DEADLINE = datetime(2100, 1, 1, tzinfo=timezone.utc).isoformat()
 
@@ -524,8 +479,6 @@ def _start_final_sweep_case(watchdog_owner_case, caller, tmp_path, checkpoint):
     overrides = {"prompt": "work"}
     if caller == "timeout":
         overrides["wall_deadline_at"] = FUTURE_LEGACY_TIMEOUT_DEADLINE
-    elif caller == "expired_session":
-        overrides["session_id"] = "expired-session"
     elif caller == "shard_abandon":
         worktree = tmp_path / spool_id / "worktree"
         worktree.mkdir(parents=True)
@@ -538,8 +491,6 @@ def _start_final_sweep_case(watchdog_owner_case, caller, tmp_path, checkpoint):
         timeout=100 if caller == "timeout" else None,
         spool_overrides=overrides,
     )
-    if caller == "expired_session":
-        (owner.store / f"{spool_id}.stderr").write_text("No conversation found with session ID: expired-session")
     return owner
 
 

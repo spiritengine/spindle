@@ -67,13 +67,12 @@ the namespace-safe shared owner primitive.
 14. Wall time: persist an absolute UTC deadline. A live owner measures elapsed
     execution with monotonic time. Restart/reboot recovery treats an overdue
     deadline as a durable timeout request, but still requires ownership and
-    cleanup evidence before terminalization. An expired-session replacement
-    inherits that deadline and does not reserve or launch a new generation once
-    it is overdue. Eligibility is revalidated from the exact predecessor under
-    serialization immediately before reservation, and the owner checks again
-    immediately before provider start. If predecessor cleanup already accepted
-    a stop request, that first request retains its terminal provenance rather
-    than being rewritten.
+    cleanup evidence before terminalization. If cleanup already accepted a stop
+    request, that first request retains its terminal provenance rather than
+    being rewritten. An unavailable or expired upstream provider session is not
+    replaced automatically: its respin remains terminal with the provider's
+    failure, and its saved transcript remains available for manual reconstruction
+    in a separate conversation (finding-20260814-5ckx).
 15. Store repair: unreadable/replaced/missing-current ownership paths make the
     store unhealthy and reject launches. Diagnosis belongs in `doctor`;
     repair is an explicit operator action which validates the complete artifact
@@ -167,8 +166,8 @@ the namespace-safe shared owner primitive.
     block capacity. Retireable cleanup and valid unbound aborts do not, except
     that foreign namespace refusal retains capacity until an authorized
     same-namespace observer reconciles the record.
-32. Control admission: a public drop, cancel, timeout, expired-session action,
-    or shard abandonment may publish a request only for an `accepted` current
+32. Control admission: a public drop, cancel, timeout, or shard abandonment may
+    publish a request only for an `accepted` current
     episode whose exact recorded inode is held. Admission takes the mailbox
     guard before the spool lock. A refusal creates no request or receipt.
 33. Pre-bind abort: an aborted reservation with no authoritative lock fact may

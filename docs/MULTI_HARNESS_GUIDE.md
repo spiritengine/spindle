@@ -275,8 +275,8 @@ All harnesses support session continuity through `respin()`:
 
 **Claude Code:**
 - Uses `--resume <session_id>` flag
-- Falls back to transcript injection if session expired
-- Maintains full conversation context
+- Reports the provider error if the upstream session is unavailable or expired
+- Keeps the saved transcript available for manual reconstruction in a new conversation
 
 **Codex:**
 - Uses `codex resume <session_id>` command
@@ -626,7 +626,9 @@ If `respin()` fails:
    harness = spool.get("harness", "claude-code")
    ```
 
-3. **Claude Code:** Falls back to transcript injection automatically
+3. **Claude Code:** An unavailable or expired upstream session terminates the respin with
+   the provider error; use the saved transcript to reconstruct context manually in a new
+   conversation
 4. **Codex:** Session ID must be valid from previous `codex exec --json` output
 5. **Gemini:** Uses `gemini --resume <session_id>`
 6. **Kimi:** Uses explicit UUID session ID from spool metadata

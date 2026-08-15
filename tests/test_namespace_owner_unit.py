@@ -495,7 +495,6 @@ def test_s2_u_rec_01_reconciliation_precedence_matrix(lock, liveness, exit_evide
         "spool_grep",
         "spin_wait",
         "pending_recovery",
-        "expired_replacement",
         "retention",
         "timeout",
         "drop",
@@ -532,19 +531,6 @@ def test_s2_u_rec_02_every_pid_sensitive_caller_uses_reconciliation(
         )
     if caller == "timeout":
         spool["timeout"] = 1
-    if caller == "expired_replacement":
-        spool["session_id"] = "session-expired"
-        source = {
-            "id": "rec-expired-source",
-            "status": "complete",
-            "session_id": "session-expired",
-            "created_at": old,
-        }
-        spindle._write_spool(source["id"], source)
-        transcript = spindle._get_transcript_path(source["id"])
-        transcript.parent.mkdir(parents=True, exist_ok=True)
-        transcript.write_text("prior transcript")
-
     spindle._write_spool(spool_id, spool)
     record_path = spindle._get_spool_path(spool_id)
     before = record_path.read_bytes()
@@ -569,8 +555,6 @@ def test_s2_u_rec_02_every_pid_sensitive_caller_uses_reconciliation(
         assert "Still pending" in spindle._spin_wait_sync(spool_id, timeout=-1)
     elif caller == "pending_recovery":
         assert spindle._reconcile_pending_spool(spool_id) is True
-    elif caller == "expired_replacement":
-        assert spindle._handle_expired_session(spool_id, spool) is False
     elif caller == "retention":
         spindle._cleanup_old_spools()
     elif caller == "drop":

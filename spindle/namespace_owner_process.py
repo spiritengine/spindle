@@ -191,19 +191,6 @@ class LogicalOwner:
             "detail": "inherited deadline expired before logical owner binding",
             "observed_at": observed_at,
         }
-        lifecycle = {
-            **(self._read_spool().get("lifecycle") or {}),
-            "ownership_state": "released",
-            "transport_state": "reaped",
-            "normalized_terminal_kind": "timeout",
-        }
-        updates = {
-            "status": "timeout",
-            "error": f"Timeout after {self._read_spool().get('timeout')}s",
-            "error_kind": "deadline_expired_before_provider_start",
-            "completed_at": observed_at,
-            "lifecycle": lifecycle,
-        }
         if self.episode_mode:
             episode = self._read_spool().get("owner_episode") or {}
             transition_owner_episode(
@@ -214,9 +201,21 @@ class LogicalOwner:
                 generation=self.generation,
                 expected_revision=episode.get("revision"),
                 facts={"failure": failure},
-                record_updates=updates,
             )
         else:
+            lifecycle = {
+                **(self._read_spool().get("lifecycle") or {}),
+                "ownership_state": "released",
+                "transport_state": "reaped",
+                "normalized_terminal_kind": "timeout",
+            }
+            updates = {
+                "status": "timeout",
+                "error": f"Timeout after {self._read_spool().get('timeout')}s",
+                "error_kind": "deadline_expired_before_provider_start",
+                "completed_at": observed_at,
+                "lifecycle": lifecycle,
+            }
             self._update_spool(**updates)
         _atomic_json_write(
             self.owner_exit_path,
@@ -418,7 +417,7 @@ class LogicalOwner:
             self.checkpoints.generation = self.generation
 
     def _ensure_wall_deadline(self) -> None:
-        """Persist one UTC deadline and reuse it across replacement owners."""
+        """Persist one UTC deadline and reuse it across owner recovery."""
         episode = self._read_spool().get("owner_episode") or {}
         if episode:
             self.wall_deadline_at = episode.get("deadline")
@@ -640,8 +639,6 @@ class LogicalOwner:
                     },
                 }
             )
-            spool.pop("replacement_starting", None)
-            spool.pop("replacement_owner_generation", None)
             self._write_spool_unlocked(spool)
         if self.args.ready_fd is not None:
             ready = {

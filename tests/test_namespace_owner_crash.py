@@ -6,20 +6,13 @@ import fcntl
 import json
 import os
 import time
-from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
 import spindle
-from spindle.namespace_owner import (
-    ProcessIdentity,
-    capture_pid_namespace,
-    create_control_request,
-    iter_control_requests,
-    read_control_receipt,
-)
+from spindle.namespace_owner import create_control_request, iter_control_requests, read_control_receipt
 
 
 def wait_until(predicate, timeout=8):
@@ -108,7 +101,7 @@ def test_s2_c_ctl_01_owner_crash_before_control_ack_preserves_unacked_request(
     assert terminal["error_kind"] == "owner_transport_loss"
 
 
-def test_s2_c_ctl_02_owner_crash_after_ack_before_cleanup_is_indeterminate(
+def test_s2_c_ctl_02_watchdog_cleanup_preserves_the_acknowledged_terminal(
     watchdog_owner_case,
 ):
     owner = watchdog_owner_case(
@@ -125,8 +118,12 @@ def test_s2_c_ctl_02_owner_crash_after_ack_before_cleanup_is_indeterminate(
     owner.kill_owner()
     assert wait_until(lambda: _provider_gone(owner))
     terminal = _finalize_after_crash(owner)
-    assert terminal["lifecycle"]["normalized_terminal_kind"] == "indeterminate"
-    assert terminal["error"] != "Cancelled"
+    assert terminal["lifecycle"]["normalized_terminal_kind"] == "cancelled"
+    assert terminal["lifecycle"]["owner_crashed_after_cleanup"] is True
+    assert terminal["error"] == "Cancelled"
+    settled = read_control_receipt(owner.store, owner.spool_id, request.request_id)
+    assert settled.child_exit_observed_at == terminal["owner_episode"]["cleanup"]["child_exit_observed_at"]
+    assert settled.cleanup_outcome == "cleaned"
 
 
 @pytest.mark.parametrize(
@@ -245,71 +242,6 @@ def test_s2_c_own_02_crash_before_identity_publication_is_prelaunch_failure(
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     finally:
         os.close(fd)
-
-
-def test_same_id_replacement_crash_and_cancel_use_new_generation_without_slot_leak(
-    watchdog_owner_case,
-    namespace_owner_env,
-):
-    store = namespace_owner_env["store"]
-    spool_id = "same-id-replacement"
-    stale_identity = ProcessIdentity(
-        pid=os.getpid(),
-        birth_token=spindle._process_start_time(os.getpid()),
-        namespace=capture_pid_namespace(),
-        owner_generation=1,
-        child_pgid=None,
-        lock_device=1,
-        lock_inode=1,
-        lock_created=True,
-    )
-    (store / f"{spool_id}.owner-identity").write_text(json.dumps(stale_identity.to_dict()))
-    owner = watchdog_owner_case(
-        "healthy-turn",
-        pause_checkpoint="identity_lock_acquired",
-        disable_pdeathsig=True,
-        generation=2,
-        spool_id=spool_id,
-        spool_overrides={
-            "status": "running",
-            "created_at": (datetime.now() - timedelta(days=2)).isoformat(),
-            "owner_generation": 2,
-            "replacement_starting": True,
-            "replacement_owner_generation": 2,
-        },
-    )
-    checkpoint = owner.receive_checkpoint()
-    assert checkpoint["owner_generation"] == 2
-    reserved = owner.spool()["owner_episode"]
-    assert (reserved["generation"], reserved["phase"]) == (2, "reserved")
-
-    with patch("spindle.SPINDLE_DIR", store):
-        message = spindle._spin_drop_locked(spool_id)
-    assert "not accepting control (reserved)" in message
-    assert list(iter_control_requests(store, spool_id)) == []
-    mailbox = store / f"{spool_id}.control-mailbox"
-    assert not list(mailbox.glob("*.request"))
-    assert not list(mailbox.glob("*.receipt"))
-
-    owner.kill_owner()
-    spool = owner.spool()
-    assert spool["status"] == "error"
-    assert spool["error_kind"] == "owner_preacceptance_failure"
-    episode = spool["owner_episode"]
-    assert (episode["generation"], episode["phase"]) == (2, "aborted")
-    assert episode["failure"]
-    assert "lock" not in episode
-    identity_path = store / f"{spool_id}.owner-identity"
-    assert json.loads(identity_path.read_text()) == stale_identity.to_dict()
-    assert not (store / f"{spool_id}.owner-exit").exists()
-    with patch("spindle.SPINDLE_DIR", store):
-        assert spindle._reconcile_spool_ownership(spool).state == "terminalizable"
-        assert spindle._spool_blocks_destructive_action(spool) is False
-        assert spindle._count_running() == 0
-        spindle._cleanup_old_spools()
-        assert not (store / f"{spool_id}.json").exists()
-        assert not (store / f"{spool_id}.process-owner").exists()
-        assert not (store / f"{spool_id}.owner-identity").exists()
 
 
 def test_s2_c_own_03_owner_crash_contains_setsid_escaped_descendant(

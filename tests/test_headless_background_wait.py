@@ -30,7 +30,6 @@ from spindle import (
     _get_exit_path,
     _get_output_path,
     _get_transcript_path,
-    _handle_expired_session,
     _read_spool,
     _respin_sync,
     _sanitize_claude_transcript,
@@ -1011,61 +1010,6 @@ class TestRespinParkedRecovery:
         }
         _, cmd, _, _ = self._respin(tmp_path, clean, transcript_events=None)
         assert cmd[cmd.index("--disallowedTools") + 1] == "Monitor,ScheduleWakeup"
-
-
-# --- expired-session fallback shares the sanitized renderer ------------------
-
-
-class TestExpiredSessionSanitized:
-    def test_expired_fallback_prompt_is_sanitized_and_notes_abandoned_tasks(self, tmp_path):
-        with patch("spindle.SPINDLE_DIR", tmp_path):
-            _write_spool(
-                "exp-orig-s",
-                {
-                    "id": "exp-orig-s",
-                    "status": "complete",
-                    "session_id": "sess-exp-s",
-                    "harness": "claude-code",
-                    "permission": "careful",
-                    "allowed_tools": None,
-                    "working_dir": str(tmp_path),
-                    "created_at": datetime.now().isoformat(),
-                },
-            )
-            tpath = _get_transcript_path("exp-orig-s")
-            tpath.parent.mkdir(parents=True, exist_ok=True)
-            tpath.write_text(
-                json.dumps(
-                    [
-                        assistant_text_event("Earlier analysis."),
-                        monitor_arm_event("deadtask"),
-                        notification_event("deadtask", "stopped"),
-                        result_event(PARKED_STUB),
-                    ]
-                )
-            )
-            failing = {
-                "id": "exp-fail-s",
-                "status": "running",
-                "session_id": "sess-exp-s",
-                "prompt": "Continue sess-exp-s: pick it back up",
-                "working_dir": str(tmp_path),
-                "pid": None,
-            }
-            captured = {}
-
-            def fake_spawn(spool_id, cmd, cwd, env=None):
-                captured["cmd"] = cmd
-                return 1
-
-            with patch("spindle._spawn_detached", side_effect=fake_spawn):
-                assert _handle_expired_session("exp-fail-s", failing) is True
-
-        cmd = captured["cmd"]
-        prompt_arg = cmd[cmd.index("-p") + 1]
-        assert "task-notification" not in prompt_arg
-        assert "Earlier analysis." in prompt_arg
-        assert prompt_arg.rstrip().endswith("pick it back up")
 
 
 # --- fake-Claude stream-json end-to-end --------------------------------------

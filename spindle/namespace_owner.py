@@ -418,6 +418,7 @@ def transition_owner_episode(
     expected_revision: Optional[int],
     facts: dict,
     record_updates: Optional[dict] = None,
+    record_deletes: Iterable[str] = (),
     record_locked: bool = False,
 ) -> EpisodeTransitionResult:
     """Validate and durably publish one generation-scoped owner transition."""
@@ -482,6 +483,10 @@ def transition_owner_episode(
             episode["phase"] = destination
             episode.setdefault("phase_times", {})[destination] = now
         episode.update(facts)
+        for name in record_deletes:
+            if not isinstance(name, str) or name == OWNER_EPISODE_KEY:
+                raise ValueError(f"invalid owner episode record deletion: {name!r}")
+            record.pop(name, None)
         if record_updates:
             record.update(record_updates)
         record[OWNER_EPISODE_KEY] = episode
@@ -720,7 +725,13 @@ def iter_control_requests(root: str | os.PathLike[str], spool_id: str) -> Iterab
         return ()
     requests = []
     for path in sorted(mailbox.glob("*.request")):
-        requests.append(ControlRequest.from_dict(json.loads(path.read_text())))
+        try:
+            requests.append(ControlRequest.from_dict(json.loads(path.read_text())))
+        except (FileNotFoundError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+            # Mailboxes survive rolling upgrades and interrupted atomic writes.
+            # One entry without a usable request identity has no duty we can
+            # settle, but it must not hide valid siblings in the same mailbox.
+            continue
     return tuple(requests)
 
 
@@ -750,6 +761,7 @@ def write_control_receipt(
     current_generation: int,
     accepted: Optional[bool] = None,
     rejection_outcome: str = "rejected_superseded",
+    owner_acknowledged_at: Optional[str] = None,
     **facts,
 ) -> ControlReceipt:
     path = mailbox_path(root, spool_id) / f"{request.request_id}.receipt"
@@ -765,7 +777,7 @@ def write_control_receipt(
     receipt = ControlReceipt(
         request_id=request.request_id,
         owner_generation=request.owner_generation,
-        owner_acknowledged_at=_utc_now() if accepted else None,
+        owner_acknowledged_at=(owner_acknowledged_at or _utc_now()) if accepted else None,
         cleanup_outcome=cleanup_outcome,
         **facts,
     )

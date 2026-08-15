@@ -83,7 +83,6 @@ from .namespace_owner import (  # noqa: E402
     NamespaceIdentity,
     ProcessIdentity,
     ReconciliationResult,
-    acquire_ownership_lock,
     assess_process_liveness,
     capture_pid_namespace,
     classify_owner_episode,
@@ -96,6 +95,15 @@ from .namespace_owner import (  # noqa: E402
     retire_owner_artifacts,
     transition_owner_episode,
     write_control_receipt,
+)
+from .namespace_owner import (  # noqa: E402
+    acquire_ownership_lock as acquire_ownership_lock,
+)
+
+# Re-exported for the convergence applicator, which reaches every mailbox writer
+# through this module so one patch point covers them all.
+from .namespace_owner import (  # noqa: E402
+    update_control_receipt as update_control_receipt,
 )
 
 mcp = FastMCP("spindle")
@@ -281,7 +289,11 @@ SPOOL_SCHEMA_VERSION = 1
 SUPPORTED_SUPERVISOR_PROTOCOL_RANGE = (SUPERVISOR_PROTOCOL_VERSION, SUPERVISOR_PROTOCOL_VERSION)
 READABLE_SPOOL_SCHEMAS = (SPOOL_SCHEMA_VERSION,)
 WRITABLE_SPOOL_SCHEMA = SPOOL_SCHEMA_VERSION
-SUPERVISOR_CAPABILITIES = ("supervisor-compatibility-ranges", "owner-episode-v1")
+SUPERVISOR_CAPABILITIES = (
+    "supervisor-compatibility-ranges",
+    "owner-episode-v1",
+    "owner-convergence-v1",
+)
 REQUIRED_SUPERVISOR_CAPABILITIES = frozenset(SUPERVISOR_CAPABILITIES)
 SUPERVISOR_IMPORT_GUARD = "_SPINDLE_STORE_SUPERVISOR"
 SUPERVISOR_POLL_INTERVAL = float(os.environ.get("SPINDLE_SUPERVISOR_POLL_INTERVAL", "0.5"))
@@ -1602,8 +1614,10 @@ def _supervisor_compatibility_error(record: Optional[dict]) -> Optional[str]:
 
     negotiation_fields = _SUPERVISOR_NEGOTIATION_FIELDS.intersection(record)
     if not negotiation_fields:
-        # A live pre-bridge supervisor has only the scalar handshake. Preserve
-        # its exact v1 semantics until schema-1 work is drained in a later slice.
+        # A scalar-only owner cannot prove that it understands convergence's
+        # sole-applicator and rollback duties.  Preserve the precise scalar
+        # protocol/schema diagnostics, then refuse even an otherwise-current
+        # scalar owner because capability absence is incompatibility.
         protocol = record.get("supervisor_protocol_version")
         schema = record.get("spool_schema_version")
         if protocol != SUPERVISOR_PROTOCOL_VERSION:
@@ -1616,7 +1630,11 @@ def _supervisor_compatibility_error(record: Optional[dict]) -> Optional[str]:
                 "active spool schema is incompatible "
                 f"({_compatibility_owner(record)}; owner={schema!r}, launcher={SPOOL_SCHEMA_VERSION})"
             )
-        return None
+        return (
+            "active store supervisor capabilities are incompatible "
+            f"({_compatibility_owner(record)}; owner_capabilities=[] "
+            f"launcher_requires_capabilities={sorted(REQUIRED_SUPERVISOR_CAPABILITIES)})"
+        )
 
     if negotiation_fields != _SUPERVISOR_NEGOTIATION_FIELDS:
         missing = sorted(_SUPERVISOR_NEGOTIATION_FIELDS - negotiation_fields)
@@ -1717,7 +1735,7 @@ def _reap_supervisor_handle_later(proc: "subprocess.Popen", store: Path) -> None
             proc.wait()
         except (ChildProcessError, OSError):
             return
-        if SPINDLE_DIR.resolve() != store.resolve() or _count_running() == 0:
+        if SPINDLE_DIR.resolve() != store.resolve() or not _store_supervision_required():
             return
         try:
             _ensure_store_supervisor()
@@ -1725,6 +1743,23 @@ def _reap_supervisor_handle_later(proc: "subprocess.Popen", store: Path) -> None
             logger.exception("spindle: failed to reclaim store supervisor after child exit")
 
     threading.Thread(target=wait_and_maybe_reclaim, daemon=True).start()
+
+
+def _store_supervision_required() -> bool:
+    """Whether active work or a durable terminal duty still needs an owner."""
+    if _count_running():
+        return True
+    from .owner_episode_convergence import discoverable_duties_outstanding
+
+    for spool in _list_spools():
+        try:
+            if discoverable_duties_outstanding(spool.get("id", ""), spool):
+                return True
+        except Exception:
+            # An unreadable record or mailbox is not evidence that its durable
+            # duty disappeared. Keep ownership so a later pass can retry it.
+            return True
+    return False
 
 
 def _ensure_store_supervisor_locked() -> tuple[bool, Optional[str]]:
@@ -2090,14 +2125,11 @@ def _profile_spawn_env(
 ) -> Tuple[Optional[Dict[str, str]], Optional[str], list, bool]:
     """Reconstruct a profile spool's child spawn env, model, and extra args.
 
-    Every profile spawn path — the fresh spin, ``_respin_sync``,
-    ``spool_retry``, and ``_handle_expired_session``'s transcript fallback —
-    routes through here so the alt endpoint / key / model / extra_args are
-    rebuilt identically at every spawn. Before this helper existed, two of
-    those four paths read the (deliberately secret-stripped) persisted env and
-    silently ran the profile spool against the default api.anthropic.com
-    endpoint; centralizing the reconstruction keeps a future spawn path from
-    regressing the same way.
+    Every profile spawn path — the fresh spin, ``_respin_sync``, and
+    ``spool_retry`` — routes through here so the alt endpoint, key, model, and
+    extra args are rebuilt identically. Centralizing the reconstruction keeps
+    a future spawn path from reading the deliberately secret-stripped persisted
+    environment and silently using the default endpoint.
 
     The profile is re-resolved fresh on every call: ``${ENV}`` and ``op://``
     secrets are re-expanded (so rotated keys take effect) into ``spawn_env``,
@@ -2312,8 +2344,15 @@ def _owner_episode_observation(spool: dict) -> tuple[LockEvidence, LivenessEvide
         watchdog = _episode_process_identity(episode, "watchdog")
         if watchdog is not None:
             watchdog_liveness = assess_process_liveness(watchdog)
-            if watchdog_liveness.state == "alive":
-                return LockEvidence("absent_legacy"), watchdog_liveness
+            if watchdog_liveness.state == "unverifiable" and (
+                watchdog_liveness.reason == "identity_mismatch" or not isinstance(spool.get("lifecycle"), dict)
+            ):
+                starter = _episode_process_identity(episode, "starter")
+                if starter is not None:
+                    starter_liveness = assess_process_liveness(starter)
+                    if starter_liveness.state == "dead":
+                        return LockEvidence("absent_legacy"), starter_liveness
+            return LockEvidence("absent_legacy"), watchdog_liveness
         role = "starter"
     elif phase == "aborted":
         role = "starter"
@@ -2509,45 +2548,12 @@ def _record_pre_spawn_failure(
     error: str,
     spool_metadata: Optional[dict] = None,
 ) -> None:
-    """Finalize an unlaunched reservation without deleting a recovery winner."""
-    current = _read_spool(spool_id)
-    episode = (current or {}).get("owner_episode") or {}
-    if current and current.get("status") == "pending" and episode.get("phase") == "reserved":
-        transition_owner_episode(
-            SPINDLE_DIR,
-            spool_id,
-            actor="launcher",
-            destination="aborted",
-            generation=episode.get("generation"),
-            expected_revision=episode.get("revision"),
-            facts={
-                "failure": {
-                    "kind": "owner_preacceptance_failure",
-                    "detail": error,
-                    "observed_at": datetime.now(timezone.utc).isoformat(),
-                }
-            },
-        )
+    """Publish launcher failure evidence, then let convergence project it."""
     with _spool_lock(spool_id) as acquired:
         if not acquired:
             return
         current = _read_spool(spool_id)
         if not current:
-            return
-        if current.get("status") != "pending":
-            if spool_metadata and spool_metadata.get("shard_created_by_spool"):
-                for key in (
-                    "working_dir",
-                    "shard",
-                    "shard_created_by_spool",
-                    "shard_source_dir",
-                    "base_branch",
-                    "harness",
-                ):
-                    if key in spool_metadata:
-                        current[key] = spool_metadata[key]
-                _preserve_failed_spool_shard(current)
-                _write_spool(spool_id, current)
             return
         if spool_metadata:
             for key in (
@@ -2560,13 +2566,41 @@ def _record_pre_spawn_failure(
             ):
                 if key in spool_metadata:
                     current[key] = spool_metadata[key]
-        current["status"] = "error"
-        current["error"] = error
-        current["completed_at"] = datetime.now().isoformat()
         current.pop("launcher_pid", None)
         current.pop("launcher_start_time", None)
         _preserve_failed_spool_shard(current)
         _write_spool(spool_id, current)
+        episode = current.get("owner_episode") or {}
+        if current.get("status") == "pending" and episode.get("phase") == "reserved":
+            transition_owner_episode(
+                SPINDLE_DIR,
+                spool_id,
+                actor="launcher",
+                destination="aborted",
+                generation=episode.get("generation"),
+                expected_revision=episode.get("revision"),
+                facts={
+                    "failure": {
+                        "kind": "launcher_pre_spawn_failure",
+                        "detail": error,
+                        "observed_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                },
+                record_locked=True,
+            )
+    current = _read_spool(spool_id)
+    if current and "owner_episode" in current:
+        from .owner_episode_convergence import ObserverIdentity, converge_owner_episode
+
+        converge_owner_episode(spool_id, ObserverIdentity.for_this_process())
+    elif current and current.get("status") == "pending":
+        from .owner_episode_convergence import publish_record_updates
+
+        publish_record_updates(
+            spool_id,
+            current,
+            {"status": "error", "error": error, "completed_at": datetime.now().isoformat()},
+        )
 
 
 def _publish_spawned_process(spool_id: str, pid: int, *, record_locked: bool = False) -> bool:
@@ -2582,23 +2616,12 @@ def _publish_spawned_process(spool_id: str, pid: int, *, record_locked: bool = F
         with guard as acquired:
             current = _read_spool(spool_id) if acquired else None
             episode = (current or {}).get("owner_episode") or {}
-            if (
-                current
-                and current.get("status") in {"pending", "running"}
-                and not episode
-                and current.get("replacement_starting")
-            ):
-                current["watchdog_pid"] = pid
-                process_start_time = _process_start_time(pid)
-                if process_start_time is not None:
-                    current["watchdog_start_time"] = process_start_time
-                current["watchdog_namespace"] = capture_pid_namespace().to_dict()
-                current.pop("launcher_pid", None)
-                current.pop("launcher_start_time", None)
-                current.pop("launcher_namespace", None)
-                _write_spool(spool_id, current)
-                published = True
-                return True
+            launch_birth = _process_start_time(pid)
+            launch_fact = {
+                "pid": pid,
+                "birth_token": str(launch_birth) if launch_birth is not None else "unavailable",
+                "namespace": capture_pid_namespace().to_dict(),
+            }
             if current and current.get("status") in {"pending", "running"} and episode.get("phase") == "reserved":
                 published_episode = transition_owner_episode(
                     SPINDLE_DIR,
@@ -2607,7 +2630,7 @@ def _publish_spawned_process(spool_id: str, pid: int, *, record_locked: bool = F
                     destination="reserved",
                     generation=episode.get("generation"),
                     expected_revision=episode.get("revision"),
-                    facts={"watchdog": _process_fact(pid)},
+                    facts={"watchdog": launch_fact},
                     record_locked=True,
                 )
                 if published_episode.accepted:
@@ -2615,10 +2638,8 @@ def _publish_spawned_process(spool_id: str, pid: int, *, record_locked: bool = F
                     if not current or current.get("owner_episode", {}).get("generation") != episode.get("generation"):
                         return False
                     current["watchdog_pid"] = pid
-                    process_start_time = _process_start_time(pid)
-                    if process_start_time is not None:
-                        current["watchdog_start_time"] = process_start_time
-                    current["watchdog_namespace"] = capture_pid_namespace().to_dict()
+                    current["watchdog_start_time"] = launch_fact["birth_token"]
+                    current["watchdog_namespace"] = launch_fact["namespace"]
                     current.pop("launcher_pid", None)
                     current.pop("launcher_start_time", None)
                     current.pop("launcher_namespace", None)
@@ -2995,23 +3016,15 @@ def _reconcile_spool_ownership(spool: dict) -> ReconciliationResult:
     missing = LockEvidence("absent_legacy", detail="no_recorded_current_owner")
 
     if "owner_episode" in spool:
-        lock, liveness = _owner_episode_observation(spool)
-        classification = classify_owner_episode(spool, lock, liveness)
-        if classification.state == "active":
-            state = "stopping" if (spool.get("lifecycle") or {}).get("public_stop_state") == "stopping" else "active"
-        elif classification.state == "retireable":
-            state = "unverifiable" if _foreign_episode_retirement(spool, classification, liveness) else "terminalizable"
-        else:
-            state = "store_unhealthy"
-        return ReconciliationResult(state, classification.reason, liveness, lock)
+        from .owner_episode_convergence import ObserverIdentity, classify_owner_episode_record
 
-    if spool.get("replacement_starting"):
-        return ReconciliationResult(
-            "active",
-            "replacement_owner_starting",
-            LivenessEvidence("alive", "replacement_barrier_released"),
-            LockEvidence("held", detail="replacement_starting"),
+        meaning = classify_owner_episode_record(spool, ObserverIdentity.for_this_process())
+        state = (
+            "unverifiable"
+            if meaning.classification == "terminalizable" and not meaning.may_mutate
+            else meaning.classification
         )
+        return ReconciliationResult(state, meaning.reason, meaning.liveness, meaning.lock)
 
     if spool.get("status") == "pending":
         launcher_pid = spool.get("launcher_pid") or spool.get("watchdog_pid")
@@ -3223,8 +3236,9 @@ def _request_owner_stop(spool_id: str, kind: str, requested_by: str) -> tuple[Op
 
 
 def _spool_blocks_destructive_action(spool: dict) -> bool:
+    if "owner_episode" in spool:
+        return _reconcile_spool_ownership(spool).state != "terminalizable"
     if spool.get("status") in {"pending", "running"}:
-        _reconcile_spool_ownership(spool)
         return True
     if _get_owner_identity_path(spool.get("id", "")).exists() or spool.get("process_group_cleanup_warning"):
         return _reconcile_spool_ownership(spool).state != "terminalizable"
@@ -3431,12 +3445,18 @@ def _reap_process_handle_later(proc: "subprocess.Popen") -> None:
     threading.Thread(target=wait_for_exit, daemon=True).start()
 
 
-def _pop_and_reap_process_handle(spool_id: str) -> Optional[int]:
+_UNOBSERVED_PROCESS_EXIT = object()
+
+
+def _pop_and_reap_process_handle(spool_id: str, *, observed_exit=_UNOBSERVED_PROCESS_EXIT) -> Optional[int]:
     """Remove a stored process handle and ensure its child is eventually reaped."""
-    proc = _PROC_HANDLES.pop(spool_id, None)
+    proc = _PROC_HANDLES.get(spool_id)
     if proc is None:
         return None
-    exit_code = proc.poll()
+    exit_code = proc.poll() if observed_exit is _UNOBSERVED_PROCESS_EXIT else observed_exit
+    # Keep the only process-local reminder if polling raises; convergence will
+    # report the local error and retry this duty on its next observation.
+    _PROC_HANDLES.pop(spool_id, None)
     if exit_code is None:
         _reap_process_handle_later(proc)
     return exit_code
@@ -3560,6 +3580,18 @@ def _cleanup_old_spools() -> None:
                 if "owner_episode" in data:
                     if _reconcile_spool_ownership(data).state != "terminalizable":
                         continue
+                    # Retirement deletes the record, the mailbox and every
+                    # capture with it, so it consumes convergence rather than
+                    # terminality: a record whose obligation block still names
+                    # owed work is the only place that work is replayable from,
+                    # and startup recovery has not run yet on a fresh process.
+                    # A record that owes nothing - including a pre-convergence
+                    # terminal that never carried an obligation block - retires
+                    # exactly as it did before.
+                    from .owner_episode_convergence import discoverable_duties_outstanding
+
+                    if discoverable_duties_outstanding(spool_id, data):
+                        continue
                     episode_identity = _episode_process_identity(data.get("owner_episode") or {}, "owner")
                     retire_owner_artifacts(SPINDLE_DIR, spool_id, episode_identity)
                     continue
@@ -3673,546 +3705,73 @@ def _post_terminal_bookkeeping(spool_id: str, spool: dict) -> None:
     The caller holds the spool lock and has already published all terminal
     facts.  This helper may add only failed-shard recovery metadata; provider
     parsing, transcripts, and lifecycle projection remain the caller's work.
-    Process-handle removal is naturally one-shot, and an already preserved
-    shard causes no second record write.
+    An already preserved shard causes no second record write. Process-handle
+    observation belongs to the explicit convergence observer (or the legacy
+    caller) and therefore runs separately after this helper.
     """
-    try:
-        if _preserve_failed_spool_shard(spool):
-            _write_spool(spool_id, spool)
-    finally:
-        _pop_and_reap_process_handle(spool_id)
+    if _preserve_failed_spool_shard(spool):
+        _write_spool(spool_id, spool)
 
 
 def _check_and_finalize_spool(spool_id: str) -> bool:
-    """
-    Check if a spool's process has finished and finalize it.
-    Returns True if the spool was finalized, False if still running.
-
-    Uses file locking to prevent TOCTOU race conditions when multiple processes
-    attempt to finalize the same spool concurrently.
-    """
-    # Use non-blocking lock first for quick check without waiting
-    with _spool_lock(spool_id, blocking=False) as acquired:
-        if not acquired:
-            # Another process is finalizing this spool, treat as "still running"
-            # The other process will complete finalization
-            return False
-
-        spool = _read_spool(spool_id)
-        episode = (spool or {}).get("owner_episode") or {}
-        if not spool:
-            return True
-        if (
-            episode.get("phase") == "released"
-            and spool.get("status") not in {"pending", "running"}
-            and spool.get("completed_at")
-        ):
-            return True
-        if spool.get("status") != "running" and episode.get("phase") not in {"cleanup_proven", "released"}:
-            return True  # Already done
-
-        stdout_path = _get_output_path(spool_id)
-        stderr_path = _get_stderr_path(spool_id)
-
-        reconciliation = _reconcile_spool_ownership(spool)
-        if reconciliation.state != "terminalizable":
-            return False
-
-        if episode.get("phase") == "cleanup_proven":
-            recorded_lock = episode.get("lock") or {}
-            try:
-                held = acquire_ownership_lock(_get_owner_lock_path(spool_id))
-            except (BlockingIOError, OSError, RuntimeError):
-                return False
-            try:
-                if (held.device, held.inode) != (
-                    recorded_lock.get("device"),
-                    recorded_lock.get("inode"),
-                ):
-                    return False
-                released = transition_owner_episode(
-                    SPINDLE_DIR,
-                    spool_id,
-                    actor="reconciler",
-                    destination="released",
-                    generation=episode.get("generation"),
-                    expected_revision=episode.get("revision"),
-                    facts={
-                        "release": {
-                            "device": held.device,
-                            "inode": held.inode,
-                            "proved_by": "reconciler",
-                            "released_at": datetime.now(timezone.utc).isoformat(),
-                        }
-                    },
-                    record_locked=True,
-                )
-                if not released.accepted:
-                    return False
-                spool = _read_spool(spool_id) or spool
-            finally:
-                held.close()
-
-        episode = spool.get("owner_episode") or {}
-        _settle_recovered_episode_requests(spool_id, episode)
-
-        try:
-            owner_exit = json.loads(_get_owner_exit_path(spool_id).read_text())
-        except (FileNotFoundError, OSError, json.JSONDecodeError, TypeError):
-            owner_exit = None
-        owner_generation = (spool.get("owner_episode") or {}).get("generation") or spool.get("owner_generation")
-        episode_failure = ((spool.get("owner_episode") or {}).get("failure") or {}).get("kind")
-        if episode_failure == "deadline_expired_before_provider_start":
-            lifecycle = dict(spool.get("lifecycle") or {})
-            lifecycle.pop("public_stop_state", None)
-            lifecycle.update(
-                {
-                    "ownership_state": "released",
-                    "transport_state": "reaped",
-                    "normalized_terminal_kind": "timeout",
-                }
-            )
-            spool["lifecycle"] = lifecycle
-            spool["status"] = "timeout"
-            spool["error"] = f"Timeout after {spool.get('timeout')}s"
-            spool["error_kind"] = "deadline_expired_before_provider_start"
-            spool["result"] = None
-            spool["completed_at"] = datetime.now().isoformat()
-            _write_spool(spool_id, spool)
-            _post_terminal_bookkeeping(spool_id, spool)
-            return True
-
-        if (
-            owner_exit
-            and owner_exit.get("owner_generation") == owner_generation
-            and (
-                owner_exit.get("owner_crashed")
-                or owner_exit.get("owner_crashed_after_cleanup")
-                or owner_exit.get("watchdog_parent_lost")
-            )
-        ) or episode_failure == "watchdog_parent_loss":
-            recovered_request = None
-            recovered_receipt = None
-            winning_request = (spool.get("owner_episode") or {}).get("winning_request") or {}
-            winning_request_id = winning_request.get("request_id")
-            if winning_request_id:
-                for request in iter_control_requests(SPINDLE_DIR, spool_id):
-                    if (
-                        request.owner_generation != owner_generation
-                        or request.request_id != winning_request_id
-                        or request.desired_terminal_kind != winning_request.get("desired_terminal_kind")
-                    ):
-                        continue
-                    receipt = read_control_receipt(SPINDLE_DIR, spool_id, request.request_id)
-                    if (
-                        receipt is not None
-                        and receipt.owner_acknowledged_at
-                        and receipt.child_exit_observed_at
-                        and receipt.cleanup_outcome == "cleaned"
-                    ):
-                        recovered_request = request
-                        recovered_receipt = receipt
-                        break
-            lifecycle = dict(spool.get("lifecycle") or {})
-            lifecycle.pop("public_stop_state", None)
-            lifecycle.update({"ownership_state": "released", "transport_state": "lost"})
-            if recovered_request is not None and recovered_receipt is not None:
-                terminal_kind = recovered_request.desired_terminal_kind
-                lifecycle.update(
-                    {
-                        "normalized_terminal_kind": terminal_kind,
-                        "owner_crashed_after_cleanup": True,
-                    }
-                )
-                spool["status"] = "timeout" if terminal_kind == "timeout" else "error"
-                spool["error"] = f"Timeout after {spool.get('timeout')}s" if terminal_kind == "timeout" else "Cancelled"
-            else:
-                watchdog_parent_lost = episode_failure == "watchdog_parent_loss" or bool(
-                    owner_exit and owner_exit.get("watchdog_parent_lost")
-                )
-                lifecycle.update(
-                    {
-                        "normalized_terminal_kind": "indeterminate",
-                        "watchdog_parent_lost": watchdog_parent_lost,
-                        "owner_crashed": not watchdog_parent_lost,
-                    }
-                )
-                spool["status"] = "error"
-                spool["error"] = (
-                    "Containment watchdog exited before terminal publication"
-                    if watchdog_parent_lost
-                    else "Logical owner exited before terminal publication"
-                )
-                spool["error_kind"] = "owner_transport_loss"
-                spool["result"] = None
-            spool["lifecycle"] = lifecycle
-            spool["completed_at"] = datetime.now().isoformat()
-            _write_spool(spool_id, spool)
-            _post_terminal_bookkeeping(spool_id, spool)
-            return True
-
-        episode = spool.get("owner_episode") or {}
-        winning_request = episode.get("winning_request")
-        acknowledgement = episode.get("acknowledgement")
-        if isinstance(winning_request, dict) and isinstance(acknowledgement, dict):
-            terminal_kind = winning_request.get("desired_terminal_kind")
-            if terminal_kind in {"timeout", "cancelled"} and acknowledgement.get("acknowledged_at"):
-                lifecycle = dict(spool.get("lifecycle") or {})
-                lifecycle.pop("public_stop_state", None)
-                lifecycle.update(
-                    {
-                        "ownership_state": "released",
-                        "transport_state": "reaped",
-                        "normalized_terminal_kind": terminal_kind,
-                    }
-                )
-                spool["lifecycle"] = lifecycle
-                spool["status"] = "timeout" if terminal_kind == "timeout" else "error"
-                spool["error"] = f"Timeout after {spool.get('timeout')}s" if terminal_kind == "timeout" else "Cancelled"
-                spool["completed_at"] = datetime.now().isoformat()
-                _write_spool(spool_id, spool)
-                _post_terminal_bookkeeping(spool_id, spool)
-                return True
-
-        proc = _PROC_HANDLES.get(spool_id)
-        observed_exit_code = proc.poll() if proc is not None else None
-
-        # Process ownership is released with durable exit evidence; parse the
-        # provider captures without signaling or removing ownership artifacts.
-        # Re-read paths (they're the same but clearer for the finalization section)
-        stdout_path = _get_output_path(spool_id)
-        stderr_path = _get_stderr_path(spool_id)
-
-        stdout = ""
-        stderr = ""
-
-        if stdout_path.exists():
-            try:
-                stdout = stdout_path.read_text()
-            except IOError:
-                pass
-
-        if stderr_path.exists():
-            try:
-                stderr = stderr_path.read_text()
-            except IOError:
-                pass
-
-        # Capture (and reap) the child's exit code if we still hold its handle.
-        # poll() returns None if the process hasn't actually exited yet (e.g.
-        # output is complete but the CLI lingers); that's fine - exit_code stays
-        # unknown for that case. None when there's no handle (orphan recovery).
-        exit_code = observed_exit_code
-        if exit_code is None:
-            exit_code = _read_exit_code(spool_id)
-        if exit_code is not None:
-            spool["exit_code"] = exit_code
-        # Suffix for the "no output" fallbacks so a silent failure reports the
-        # code (distinguishes a kill/exec-failure from a clean but silent exit).
-        no_output = "Process exited with no output" + (f" (exit code {exit_code})" if exit_code is not None else "")
-
-        # Parse result based on harness type
-        harness_type = spool.get("harness", "claude-code")
-
-        if harness_type == "codex":
-            # Parse Codex newline-delimited JSON format
-            try:
-                if stdout.strip():
-                    # Store the agent's prose as the result, not the full event
-                    # stream (which is mostly captured command output). The raw
-                    # stream is preserved in the transcript. Fall back to stdout
-                    # if no agent messages were found, so nothing is dropped.
-                    extracted = _extract_codex_result(stdout)
-                    spool["result"] = extracted if extracted is not None else stdout
-
-                    codex_turn_state, _ = _codex_turn_state(stdout)
-                    codex_failure_message = _codex_failure_message(stdout)
-                    for line in stdout.strip().split("\n"):
-                        try:
-                            event = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
-                        if not isinstance(event, dict):
-                            continue
-                        if event.get("type") == "thread.started":
-                            spool["session_id"] = event.get("thread_id")
-                        elif event.get("type") == "turn.completed":
-                            usage = event.get("usage", {})
-                            if usage:
-                                spool["cost"] = usage
-
-                    if codex_failure_message:
-                        spool["status"] = "error"
-                        spool["error"] = codex_failure_message
-                    elif exit_code is None:
-                        spool["status"] = "error"
-                        spool["error"] = "Codex exit status unavailable"
-                    elif exit_code != 0:
-                        spool["status"] = "error"
-                        spool["error"] = stderr.strip()[:500] or f"Codex exited with code {exit_code}"
-                    elif codex_turn_state != "complete":
-                        spool["status"] = "error"
-                        spool["error"] = "Codex exited without a completed turn"
-                    else:
-                        spool["status"] = "complete"
-                elif stderr.strip():
-                    spool["status"] = "error"
-                    spool["error"] = stderr[:500]
-                else:
-                    spool["status"] = "error"
-                    spool["error"] = no_output
-            except Exception:
-                if stdout.strip():
-                    spool["result"] = stdout
-                    spool["status"] = "error"
-                    spool["error"] = stderr.strip()[:500] or (
-                        f"Codex exited with code {exit_code}"
-                        if exit_code not in (None, 0)
-                        else "Failed to parse Codex output"
-                    )
-                else:
-                    spool["status"] = "error"
-                    spool["error"] = "Failed to parse Codex output"
-
-        elif harness_type == "gemini":
-            # Gemini CLI: JSON output to stdout on success, error JSON to stderr
-            if stdout.strip():
-                try:
-                    data = json.loads(stdout)
-                    if isinstance(data, dict):
-                        spool["result"] = data.get("response", stdout)
-                        spool["session_id"] = data.get("session_id")
-                    else:
-                        # Valid JSON but not the expected object - keep raw output
-                        spool["result"] = stdout
-                    spool["status"] = "complete"
-                except json.JSONDecodeError:
-                    spool["result"] = stdout
-                    spool["status"] = "complete"
-            elif stderr.strip():
-                # Extract structured error from multi-line JSON in stderr
-                data = _extract_last_json_object(stderr)
-                if data and "error" in data:
-                    err = data["error"]
-                    error_msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
-                    if error_msg == "[object Object]":
-                        error_msg = _extract_gemini_stderr_error(stderr)
-                    spool["session_id"] = data.get("session_id")
-                    spool["status"] = "error"
-                    spool["error"] = error_msg
-                else:
-                    spool["status"] = "error"
-                    spool["error"] = stderr[:500]
-            else:
-                spool["status"] = "error"
-                spool["error"] = no_output
-
-        elif harness_type == "kimi":
-            # Kimi CLI: JSONL (stream-json) output, one event per line. Store the
-            # assistant's prose, not the raw stream (which embeds role:"tool"
-            # lines carrying full file/command output). The full stream is kept
-            # in the transcript. Fall back to raw stdout only if no assistant
-            # text was found, so nothing is silently dropped.
-            if stdout.strip():
-                result_text = _extract_kimi_result(stdout)
-                spool["result"] = result_text if result_text else stdout
-                spool["status"] = "complete"
-                # session_id already set when spool was created
-            elif stderr.strip():
-                # Kimi errors might be in stderr
-                spool["status"] = "error"
-                spool["error"] = stderr[:500]
-            else:
-                spool["status"] = "error"
-                spool["error"] = no_output
-
-        else:
-            # Claude Code: JSON object, JSON array of events, or (stream-driver
-            # spools) newline-delimited JSON events ending in the driver sentinel.
-            try:
-                if spool.get("claude_protocol") == CLAUDE_PROTOCOL_STREAM_V1:
-                    data = _claude_driver.parse_ndjson_events(stdout)
-                    if not data:
-                        raise json.JSONDecodeError("no parseable driver events", stdout, 0)
-                else:
-                    data = json.loads(stdout)
-                cc_result = _extract_cc_result(data)
-                if cc_result:
-                    spool["result"] = cc_result.get("result", stdout)
-                    spool["session_id"] = cc_result.get("session_id")
-                    spool["cost"] = cc_result.get("cost") or cc_result.get("total_cost_usd")
-                    spool["status"] = "complete"
-                    if cc_result.get("is_error"):
-                        spool["status"] = "error"
-                        spool["error"] = cc_result.get("result", "Unknown error")
-                    if cc_result.get("stop_reason") == "refusal":
-                        # A safety classifier declined the session (HTTP 200 +
-                        # stop_reason refusal, surfaced by the CLI as an API
-                        # Error). Not a task failure — the caller should re-route
-                        # or rephrase. Mark it distinctly so agents, triage, and
-                        # skein recognize it instead of an undifferentiated error.
-                        spool["status"] = "error"
-                        refusal_text = cc_result.get("result") or spool.get("error") or ""
-                        if not spool.get("error"):
-                            spool["error"] = refusal_text or "Model declined the request (safety refusal)"
-                        if _is_fable_gate(spool.get("model"), refusal_text):
-                            # Fable's bio/cyber gate specifically — categorize and
-                            # tag so orchestrators can route around it.
-                            spool["error_kind"] = "fable_gate"
-                            spool["gate_category"] = _refusal_category(data)
-                            tags = spool.get("tags") or []
-                            if "fable-gate" not in tags:
-                                tags.append("fable-gate")
-                            spool["tags"] = tags
-                        else:
-                            # Generic safety refusal from some other model — flag
-                            # it, but don't attribute it to Fable or advise a
-                            # re-route that may not help.
-                            spool["error_kind"] = "safety_refusal"
-                else:
-                    # Parsed JSON but no recognizable result structure
-                    spool["result"] = stdout
-                    spool["status"] = "complete"
-
-                # Driver sentinel subtype authority (fell round 1,
-                # finding-20260724-5evm): for stream-driver spools the sentinel
-                # is the driver's verdict on how the stream ended — presence
-                # alone only means "the stream is over". A no_result sentinel
-                # (claude died before any result) must not finalize as success,
-                # and a parked sentinel must park even when its unresolved list
-                # is empty (tasks that resolved only after the final result:
-                # the stored answer provably never accounted for them).
-                driver_stream = spool.get("claude_protocol") == CLAUDE_PROTOCOL_STREAM_V1
-                sentinel = _claude_driver.find_sentinel(data) if driver_stream else None
-                # A parked verdict must land even when Claude's last result was
-                # error-shaped (fell round 3, finding-20260724-sgoz): without
-                # error_kind=headless_background_wait, respin would --resume the
-                # parked session and replay the stale notification. Refusal
-                # classifications (fable_gate/safety_refusal) keep precedence —
-                # only kind-less states are eligible.
-                parked_eligible = spool.get("status") == "complete" or (
-                    spool.get("status") == "error" and not spool.get("error_kind")
-                )
-                if driver_stream and sentinel is None and cc_result is None:
-                    # The driver died before producing either a result or a
-                    # verdict (crash, SIGKILL). Raw stream stays as the result
-                    # for diagnostics, but this is never a completed spool.
-                    spool["status"] = "error"
-                    spool["error"] = (
-                        "Stream driver terminated without a result or a verdict "
-                        "(claude or the driver crashed mid-stream"
-                        + (f", exit code {exit_code}" if exit_code is not None else "")
-                        + ")"
-                        + (f"; stderr: {stderr.strip()[:300]}" if stderr.strip() else "")
-                    )
-                elif driver_stream and sentinel is not None:
-                    sentinel_subtype = sentinel.get("subtype")
-                    if sentinel_subtype == "no_result" and spool.get("status") == "complete":
-                        spool["status"] = "error"
-                        detail = sentinel.get("reason") or "claude exited without emitting a result event"
-                        exit_note = sentinel.get("claude_exit_code")
-                        spool["error"] = (
-                            f"Stream driver reported no result: {detail}"
-                            + (f" (claude exit code {exit_note})" if exit_note is not None else "")
-                            + (f"; stderr: {stderr.strip()[:300]}" if stderr.strip() else "")
-                        )
-                    elif sentinel_subtype == "parked" and parked_eligible:
-                        pending = [
-                            {"id": t.get("id"), "source": t.get("source")}
-                            for t in (sentinel.get("unresolved_tasks") or sentinel.get("stale_resolved_tasks") or [])
-                            if isinstance(t, dict)
-                        ] or [{"id": "unknown", "source": "unknown"}]
-                        ids = ", ".join(str(t["id"]) for t in pending)
-                        prior_error = spool.get("error")
-                        spool["status"] = "error"
-                        spool["error_kind"] = "headless_background_wait"
-                        spool["pending_background_tasks"] = pending
-                        spool["error"] = (
-                            f"Claude's headless turn ended without a result that accounts "
-                            f"for its background task(s) [{ids}] "
-                            f"({sentinel.get('reason') or 'driver reported the turn parked'}). "
-                            f"The stored result is not a completed answer. Use respin() to "
-                            f"continue — it will rebuild a clean session from the transcript."
-                            + (f" Original error: {prior_error[:300]}" if prior_error else "")
-                        )
-
-                # Parked-turn detection backstop, DRIVER STREAMS ONLY, for a
-                # driver that died without a sentinel (SIGTERM, crash). It is
-                # deliberately NOT applied to one-shot output (fell round 2,
-                # finding-20260724-xvo0): resolution events are structurally
-                # invisible there — measured against the live store, ~9% of
-                # all historical transcripts carry an armed-without-resolution
-                # signature while holding genuine final answers, so on that
-                # channel the signature is evidence of a normal backgrounded
-                # command, not a park. Driver streams carry both resolution
-                # channels, making the fold sound. A turn that ended with
-                # unresolved tasks — or whose tasks resolved only after its
-                # final result — did not finish; reuse status=error (no new
-                # status) and preserve the result text.
-                if (
-                    driver_stream
-                    and sentinel is None
-                    and isinstance(data, list)
-                    # Same eligibility as the parked-sentinel branch, evaluated
-                    # at execution time (the crash branch above may just have
-                    # set a kind-less error): an error-shaped final result must
-                    # not shield a parked stream from its metadata, or respin
-                    # would --resume it (fell round 4, finding-20260724-ja3l).
-                    and (
-                        spool.get("status") == "complete"
-                        or (spool.get("status") == "error" and not spool.get("error_kind"))
-                    )
-                ):
-                    task_state = _claude_driver.background_task_state(data)
-                    pending_src = task_state["unresolved"] or task_state["stale_resolved"]
-                    if pending_src:
-                        pending = [{"id": t.get("id"), "source": t.get("source")} for t in pending_src]
-                        ids = ", ".join(str(t["id"]) for t in pending)
-                        prior_error = spool.get("error")
-                        spool["status"] = "error"
-                        spool["error_kind"] = "headless_background_wait"
-                        spool["pending_background_tasks"] = pending
-                        spool["error"] = (
-                            f"Claude's headless turn ended without a result that "
-                            f"accounts for its background task(s) [{ids}], and the "
-                            f"stream driver terminated without a verdict. The stored "
-                            f"result is not a completed answer. Use respin() to "
-                            f"continue — it will rebuild a clean session from the "
-                            f"transcript." + (f" Original error: {prior_error[:300]}" if prior_error else "")
-                        )
-            except json.JSONDecodeError:
-                if stdout.strip():
-                    spool["result"] = stdout
-                    spool["status"] = "complete"
-                elif stderr.strip():
-                    spool["status"] = "error"
-                    spool["error"] = stderr[:500]
-                else:
-                    spool["status"] = "error"
-                    spool["error"] = no_output
-
-        spool["completed_at"] = datetime.now().isoformat()
-        if spool.get("status") == "complete":
-            spool.pop("error", None)
-        _write_spool(spool_id, spool)
-
-        # Save transcript for future respin if session_id exists
-        # This preserves conversation context even after CC cleans up sessions.
-        # Driver-protocol streams are saved even without a session_id: a spool
-        # that parked before any result has no session, and its transcript is
-        # the only material the rebuild-based respin recovery can work from
-        # (fell round 2, finding-20260724-xvo0).
-        if stdout and (spool.get("session_id") or spool.get("claude_protocol") == CLAUDE_PROTOCOL_STREAM_V1):
-            transcript_path = _get_transcript_path(spool_id)
-            transcript_path.parent.mkdir(parents=True, exist_ok=True)
-            try:
-                transcript_path.write_text(stdout)
-            except IOError:
-                pass  # Non-critical, continue
-
-        _post_terminal_bookkeeping(spool_id, spool)
-
+    """Delegate owner-episode meaning and terminal publication to convergence."""
+    spool = _read_spool(spool_id)
+    if spool is None:
         return True
+    if "owner_episode" not in spool:
+        # Legacy pending reservations were historically treated as already
+        # non-running by this poll helper; only a running legacy record owns a
+        # provider result that may be parsed here.
+        if spool.get("status") != "running":
+            return True
+        # The legacy finalizer reads the captures, parses them and writes the
+        # record; _write_spool renames through one fixed .tmp name per spool and
+        # _post_terminal_bookkeeping documents that its caller holds this lock.
+        # Two unserialized finalizers therefore race on that name and can each
+        # publish from a snapshot the other has already superseded. The episode
+        # path below takes the same lock inside convergence, so this is the only
+        # branch that needs it - and it is taken non-blocking, as it was before
+        # convergence, so a caller that already holds it never deadlocks and a
+        # concurrent finalizer is simply reported as still running.
+        with _spool_lock(spool_id, blocking=False) as acquired:
+            if not acquired:
+                return False
+            current = _read_spool(spool_id)
+            if current is None:
+                return True
+            if "owner_episode" in current:
+                # An owner published an episode between the unlocked read and
+                # this lock; convergence owns the record from the next pass.
+                return False
+            if current.get("status") != "running":
+                return True  # another finalizer won the race
+            reconciliation = _reconcile_spool_ownership(current)
+            if reconciliation.state != "terminalizable":
+                return False
+            from .owner_episode_convergence import finalize_legacy_spool
+
+            return finalize_legacy_spool(spool_id, current)
+    from .owner_episode_convergence import (
+        ObserverIdentity,
+        converge_owner_episode,
+        has_published_terminal,
+        obligations_outstanding,
+    )
+
+    # The poll hot path must not reacquire blocking capture guards after this
+    # applicator has reached its durable fixed point.  Status-only mixed-version
+    # records still need discovery, so only an applicator-owned terminal with no
+    # outstanding materialized duty qualifies.
+    if (
+        spool.get("terminal_origin")
+        and has_published_terminal(spool)
+        and not obligations_outstanding(spool)
+        and spool_id not in _PROC_HANDLES
+    ):
+        return True
+
+    result = converge_owner_episode(spool_id, ObserverIdentity.for_this_process())
+    return result.terminal_state in {"terminal_with_obligations_pending", "fully_converged"}
 
 
 def _recover_deterministic_shard(current: dict) -> None:
@@ -4294,36 +3853,46 @@ def _recover_deterministic_shard(current: dict) -> None:
 
 def _reconcile_pending_spool(spool_id: str) -> bool:
     """Run one bounded stale-reservation check; return whether it stays active."""
+    episode_record = False
     with _spool_lock(spool_id, blocking=False) as acquired:
         if not acquired:
             return True
         current = _read_spool(spool_id)
         if not current or current.get("status") != "pending":
             return False
-        if current.get("pid"):
-            return True
-        try:
-            created = datetime.fromisoformat(current["created_at"])
-        except (KeyError, TypeError, ValueError):
-            return True
-        now = datetime.now(timezone.utc) if created.tzinfo else datetime.now()
-        elapsed = (now - created).total_seconds()
-        if elapsed <= PENDING_SPAWN_TIMEOUT:
-            return True
-        reconciliation = _reconcile_spool_ownership(current)
-        if reconciliation.state in {"active", "unverifiable", "store_unhealthy"}:
-            return True
-        if elapsed <= PENDING_LAUNCH_TIMEOUT and reconciliation.state != "terminalizable":
-            return True
-        _recover_deterministic_shard(current)
-        current["status"] = "error"
-        current["error"] = "spawn timeout - never started"
-        current["completed_at"] = now.isoformat()
-        current.pop("launcher_pid", None)
-        current.pop("launcher_start_time", None)
-        _preserve_failed_spool_shard(current)
-        _write_spool(spool_id, current)
-        return False
+        if "owner_episode" in current:
+            before = dict(current)
+            _recover_deterministic_shard(current)
+            if current != before:
+                _write_spool(spool_id, current)
+            episode_record = True
+        if not episode_record:
+            if current.get("pid"):
+                return True
+            try:
+                created = datetime.fromisoformat(current["created_at"])
+            except (KeyError, TypeError, ValueError):
+                return True
+            now = datetime.now(timezone.utc) if created.tzinfo else datetime.now()
+            elapsed = (now - created).total_seconds()
+            if elapsed <= PENDING_SPAWN_TIMEOUT:
+                return True
+            reconciliation = _reconcile_spool_ownership(current)
+            if reconciliation.state in {"active", "unverifiable", "store_unhealthy"}:
+                return True
+            if elapsed <= PENDING_LAUNCH_TIMEOUT and reconciliation.state != "terminalizable":
+                return True
+            _recover_deterministic_shard(current)
+            current.pop("launcher_pid", None)
+            current.pop("launcher_start_time", None)
+            from .owner_episode_convergence import finalize_legacy_stale_reservation
+
+            finalize_legacy_stale_reservation(spool_id, current, now.isoformat())
+            return False
+    from .owner_episode_convergence import ObserverIdentity, converge_owner_episode
+
+    result = converge_owner_episode(spool_id, ObserverIdentity.for_this_process())
+    return result.terminal_state == "none"
 
 
 def _pending_episode_requires_finalization(spool: dict) -> bool:
@@ -4343,17 +3912,36 @@ def _recovery_pass() -> list:
     the control lock: _start_spool_monitor reacquires that lock and would
     deadlock if called from inside the held section.
     """
+    from .owner_episode_convergence import discoverable_duties_outstanding
+
     needs_monitor = []
+
+    def retain_after_reconciliation(spool_id: str, remains_active: bool) -> None:
+        # Reconciliation can atomically replace the active snapshot from this
+        # scan with a terminal record that carries a newly materialized duty.
+        # Its return value reports terminal publication, not duty completion,
+        # so decide supervision from the fresh durable record.
+        current = _read_spool(spool_id)
+        if remains_active or discoverable_duties_outstanding(spool_id, current):
+            needs_monitor.append(spool_id)
+
     for spool in _list_spools():
         if spool.get("status") == "running":
-            if not _check_and_finalize_spool(spool["id"]):
-                needs_monitor.append(spool["id"])
+            retain_after_reconciliation(spool["id"], not _check_and_finalize_spool(spool["id"]))
         elif spool.get("status") == "pending":
             if _pending_episode_requires_finalization(spool):
-                if not _check_and_finalize_spool(spool["id"]):
-                    needs_monitor.append(spool["id"])
-            elif _reconcile_pending_spool(spool["id"]):
-                needs_monitor.append(spool["id"])
+                remains_active = not _check_and_finalize_spool(spool["id"])
+            else:
+                remains_active = _reconcile_pending_spool(spool["id"])
+            retain_after_reconciliation(spool["id"], remains_active)
+        elif "owner_episode" in spool:
+            # Cleanup runs before this recovery pass. A terminal record it kept
+            # because convergence duties remain must be replayed here; limiting
+            # startup recovery to pending/running records would retain the duty
+            # forever without ever attempting it.
+            if discoverable_duties_outstanding(spool["id"], spool):
+                _check_and_finalize_spool(spool["id"])
+                retain_after_reconciliation(spool["id"], False)
     return needs_monitor
 
 
@@ -4462,10 +4050,9 @@ def _build_transcript_continuation_prompt(
 ) -> str:
     """Build the fresh-session prompt that continues a saved conversation.
 
-    Shared by the expired-session fallback and the parked-spool respin
-    recovery, so every transcript-rebuilt session gets the same sanitized
-    rendering and the same explicit statement that old background tasks are
-    dead — never a raw control block the model has to second-guess.
+    Parked-spool respin recovery gets a sanitized rendering and an explicit
+    statement that old background tasks are dead — never a raw control block
+    the model has to second-guess.
     """
     parts = [
         "Previous conversation transcript (sanitized: provider control notifications were removed):",
@@ -4492,290 +4079,6 @@ def _build_transcript_continuation_prompt(
         ]
     )
     return "\n".join(parts)
-
-
-def _handle_expired_session(spool_id: str, spool: dict) -> bool:
-    """Serialize transcript fallback with spool and shared-worktree transitions."""
-    snapshot = _read_spool(spool_id) or spool
-    expected_worktree = _spool_worktree_path(snapshot)
-    with _worktree_lock(expected_worktree, blocking=False) as worktree_acquired:
-        if not worktree_acquired:
-            return False
-        with _spool_lock(spool_id, blocking=False) as spool_acquired:
-            if not spool_acquired:
-                return False
-            current = _read_spool(spool_id)
-            if current is not None:
-                if _spool_worktree_path(current) != expected_worktree:
-                    return False
-                if current.get("status") != "running" and not current.get("expired_session_replacement_requested"):
-                    return True
-                spool = current
-            return _handle_expired_session_locked(spool_id, spool)
-
-
-def _handle_expired_session_locked(spool_id: str, spool: dict) -> bool:
-    """
-    Handle expired session by retrying with transcript injection.
-
-    Returns True if successfully retried, False otherwise.
-    """
-    # A respin and its source deliberately share a session id. Directory
-    # iteration order is not an ownership rule, so choose a different record
-    # that actually has the transcript needed for fallback.
-    original_spool = _find_spool_by_session(spool["session_id"])
-    if (
-        original_spool is None
-        or original_spool.get("id") == spool_id
-        or not _get_transcript_path(original_spool["id"]).exists()
-    ):
-        original_spool = next(
-            (
-                candidate
-                for candidate in _list_spools()
-                if candidate.get("id") != spool_id
-                and candidate.get("session_id") == spool.get("session_id")
-                and _get_transcript_path(candidate["id"]).exists()
-            ),
-            None,
-        )
-    if not original_spool:
-        return False
-
-    # Defense-in-depth: refuse a stored readonly/manual + shard spool before spawning, the
-    # same authoritative check _spin_sync/_respin_sync run at creation. Reachability is
-    # near-zero (creation rejects the pairing), but the transcript fallback below re-applies
-    # the tier via _claude_permission_mode, where a stored "manual+shard"/"readonly+shard"
-    # would resolve to bypassPermissions — so guard this chokepoint too instead of trusting an
-    # upstream check. Mark the spool error (loud, surfaced by unspool/spool_info) and stop.
-    orig_permission = original_spool.get("permission")
-    orig_use_shard = _permission_implies_shard(orig_permission) or bool(original_spool.get("shard"))
-    conflict = _readonly_shard_conflict_error(orig_permission, orig_use_shard)
-    if conflict:
-        logger.warning("spindle: expired-session fallback refused for %s: %s", spool_id, conflict)
-        spool["status"] = "error"
-        spool["error"] = f"Refused: {conflict}"
-        spool["completed_at"] = datetime.now().isoformat()
-        _write_spool(spool_id, spool)
-        return True
-
-    # Check for transcript
-    transcript_path = _get_transcript_path(original_spool["id"])
-    if not transcript_path.exists():
-        return False
-
-    # Replacement is allowed only after the prior owner has durably released
-    # custody with exit evidence. An observer never kills it to make room.
-    reconciliation = _reconcile_spool_ownership(spool)
-    if reconciliation.state != "terminalizable":
-        logger.error(
-            "spindle: cannot retry %s while its old ownership episode is %s",
-            spool_id,
-            reconciliation.state,
-        )
-        return False
-    _pop_and_reap_process_handle(spool_id)
-
-    # The predecessor's absolute budget governs the replacement too. If it
-    # expired while cleanup was completing, retain the already accepted stop
-    # and its terminal projection instead of reserving a new generation which
-    # could start provider work with no remaining budget.
-    if _owner_episode_deadline_expired(spool) is True:
-        if (spool.get("owner_episode") or {}).get("phase") != "released":
-            return False
-        spool.pop("expired_session_replacement_requested", None)
-        spool["expired_session_replacement_skipped"] = {
-            "reason": "inherited_deadline_expired",
-            "deadline": (spool.get("owner_episode") or {}).get("deadline"),
-            "observed_at": datetime.now(timezone.utc).isoformat(),
-        }
-        _write_spool(spool_id, spool)
-        return True
-
-    # Read transcript
-    try:
-        transcript = transcript_path.read_text()
-    except IOError:
-        return False
-
-    # Build new prompt with transcript context via the shared sanitized
-    # renderer: raw transcripts embed provider control blocks (task
-    # notifications and queued commands) that a resumed model reads as
-    # contradictory/injected input. Any background tasks recorded in the
-    # transcript died with the original process — say so explicitly.
-    context_prompt = _build_transcript_continuation_prompt(
-        transcript,
-        spool["prompt"].split(": ", 1)[-1],
-        abandoned_tasks=_transcript_unresolved_tasks(transcript),
-    )
-
-    # Spawn new process without --resume flag, with transcript as context.
-    #
-    # A bare `claude -p` (this transcript fallback) sets NEITHER --permission-mode
-    # NOR --allowedTools, so the resumed spool silently changes capability from the
-    # original spin — the same tier-drop as a bare `--resume`, surviving on the
-    # expiry path only. Re-apply the tier the original spool ran under, exactly as
-    # _respin_sync does: a careful resume stays auto, a readonly/manual resume keeps
-    # its allowlist. This fallback creates no shard, so there is no readonly+shard
-    # concern to guard against here.
-    orig_permission = original_spool.get("permission")
-    orig_allowed_tools = original_spool.get("allowed_tools")
-    cmd_flags = ["--permission-mode", _claude_permission_mode(orig_permission)]
-    if orig_allowed_tools:
-        cmd_flags.extend(["--allowedTools", orig_allowed_tools])
-
-    # Profile spools: rebuild the alt endpoint/key spawn env fresh and re-inject
-    # --model/extra_args so the transcript fallback hits the same endpoint as the
-    # original spin instead of the default api.anthropic.com. The recorded
-    # effective model lives on the original spool (the failing respin spool does
-    # not persist a model). caller_env (the only persisted env) is overlaid and
-    # remains the only env written to disk.
-    profile_name = spool.get("profile")
-    caller_env = spool.get("env")
-    spawn_env, eff_model, profile_extra_args, resolved = _profile_spawn_env(
-        profile_name, caller_env, model=original_spool.get("model")
-    )
-    if resolved:
-        if eff_model:
-            cmd_flags.extend(["--model", CLAUDE_MODEL_ALIASES.get(eff_model, eff_model)])
-        if profile_extra_args:
-            cmd_flags.extend(profile_extra_args)
-
-    # Transcript-context prompts can exceed the 128KiB per-argv limit — an
-    # oversized prompt is delivered by file (stdin for one-shot claude,
-    # --prompt-file for the driver) instead of argv.
-    try:
-        prompt_path = _prompt_file_if_oversized(spool_id, context_prompt)
-    except IOError:
-        return False
-
-    cmd, claude_protocol = _claude_headless_cmd(context_prompt, cmd_flags, prompt_path=prompt_path)
-    spawn_stdin = prompt_path if (prompt_path is not None and claude_protocol is None) else None
-
-    shard_info = spool.get("shard") or original_spool.get("shard")
-    fallback_cwd = spool.get("working_dir") or (shard_info or {}).get("worktree_path")
-    if shard_info:
-        cmd = _codex_bwrap_wrap(
-            cmd,
-            shard_info,
-            fallback_cwd,
-            process_env=_process_env(spawn_env),
-        )
-
-    spawned = False
-    barrier_finished = False
-    # The record on disk, not the caller's snapshot, owns the predecessor.
-    spool = _read_spool(spool_id) or spool
-    predecessor = spool.get("owner_episode") or {}
-    predecessor_deadline = predecessor.get("deadline") or spool.get("wall_deadline_at")
-    if _absolute_deadline_expired(predecessor_deadline) is True:
-        if predecessor.get("phase") != "released":
-            return False
-        spool.pop("expired_session_replacement_requested", None)
-        spool["expired_session_replacement_skipped"] = {
-            "reason": "inherited_deadline_expired",
-            "deadline": predecessor_deadline,
-            "observed_at": datetime.now(timezone.utc).isoformat(),
-        }
-        _write_spool(spool_id, spool)
-        return True
-    if predecessor:
-        replacement_generation = predecessor.get("generation", 0) + 1
-        reserve_facts = {"starter": _process_fact(os.getpid())}
-        if predecessor_deadline is not None:
-            reserve_facts["deadline"] = predecessor_deadline
-        reserved = transition_owner_episode(
-            SPINDLE_DIR,
-            spool_id,
-            actor="launcher",
-            destination="reserved",
-            generation=replacement_generation,
-            expected_revision=predecessor.get("revision"),
-            facts=reserve_facts,
-            record_locked=True,
-        )
-        if not reserved.accepted:
-            logger.error("spindle: cannot reserve replacement episode for %s: %s", spool_id, reserved.rejection)
-            return False
-        spool = _read_spool(spool_id) or spool
-    else:
-        replacement_generation = _next_owner_generation(spool_id)
-    spool["status"] = "running"
-    spool["completed_at"] = None
-    spool["owner_generation"] = replacement_generation
-    spool["replacement_starting"] = True
-    spool["replacement_owner_generation"] = replacement_generation
-    spool.pop("pid", None)
-    spool.pop("owner_pid", None)
-    spool.pop("provider_pid", None)
-    spool.pop("provider_process_group_id", None)
-    spool.pop("watchdog_pid", None)
-    spool.pop("watchdog_start_time", None)
-    spool.pop("watchdog_namespace", None)
-    spool.pop("error", None)
-    spool.pop("expired_session_replacement_requested", None)
-    lifecycle = dict(spool.get("lifecycle") or {})
-    lifecycle.pop("public_stop_state", None)
-    lifecycle.pop("desired_terminal_kind", None)
-    lifecycle.pop("control_request_id", None)
-    lifecycle.pop("normalized_terminal_kind", None)
-    spool["lifecycle"] = lifecycle
-    if predecessor_deadline is not None:
-        spool["wall_deadline_at"] = predecessor_deadline
-    spool["claude_protocol"] = claude_protocol
-    _get_output_path(spool_id).write_text("")
-    _get_stderr_path(spool_id).write_text("")
-    _write_spool(spool_id, spool)
-    try:
-        if spawn_stdin is not None:
-            new_pid = _spawn_detached(spool_id, cmd, fallback_cwd, spawn_env, stdin_path=spawn_stdin)
-        else:
-            new_pid = _spawn_detached(spool_id, cmd, fallback_cwd, spawn_env)
-        spawned = True
-
-        if not _publish_spawned_process(spool_id, new_pid, record_locked=True):
-            return False
-        barrier_finished = True
-        spool = _read_spool(spool_id) or spool
-        if shard_info:
-            spool["shard"] = shard_info
-        spool["used_transcript_fallback"] = True
-        spool["transcript_injected_at"] = datetime.now().isoformat()
-        _write_spool(spool_id, spool)
-
-        return True
-    except Exception as exc:
-        current = _read_spool(spool_id) or spool
-        episode = current.get("owner_episode") or {}
-        if episode.get("generation") == replacement_generation and episode.get("phase") == "reserved":
-            transition_owner_episode(
-                SPINDLE_DIR,
-                spool_id,
-                actor="launcher",
-                destination="aborted",
-                generation=replacement_generation,
-                expected_revision=episode.get("revision"),
-                facts={
-                    "failure": {
-                        "kind": "owner_preacceptance_failure",
-                        "detail": f"replacement spawn failed: {exc}",
-                        "observed_at": datetime.now(timezone.utc).isoformat(),
-                    }
-                },
-                record_locked=True,
-            )
-        current = _read_spool(spool_id) or current
-        current["status"] = "error"
-        current["error"] = f"replacement spawn failed: {exc}"
-        current["error_kind"] = "owner_preacceptance_failure"
-        current["completed_at"] = datetime.now().isoformat()
-        _write_spool(spool_id, current)
-        return False
-    finally:
-        if spawned and not barrier_finished:
-            _finish_spawn_barrier(spool_id, start=False)
-            if not barrier_finished:
-                _pop_and_reap_process_handle(spool_id)
 
 
 def _spool_elapsed_seconds(spool: dict) -> Optional[float]:
@@ -4809,52 +4112,40 @@ def _reconcile_spool_step(spool_id: str) -> bool:
     spool = _read_spool(spool_id)
     if not spool:
         return False
+    if "owner_episode" in spool:
+        episode = spool.get("owner_episode") or {}
+        if (
+            spool.get("status") == "pending"
+            and episode.get("phase") == "reserved"
+            and _reconcile_spool_ownership(spool).state == "terminalizable"
+        ):
+            with _spool_lock(spool_id) as acquired:
+                current = _read_spool(spool_id) if acquired else None
+                if current is not None:
+                    before = dict(current)
+                    _recover_deterministic_shard(current)
+                    if current != before:
+                        _write_spool(spool_id, current)
+        from .owner_episode_convergence import ObserverIdentity, converge_owner_episode
+
+        convergence = converge_owner_episode(spool_id, ObserverIdentity.for_this_process())
+        spool = _read_spool(spool_id) or spool
+        if convergence.terminal_state in {"terminal_with_obligations_pending", "fully_converged"}:
+            return False
+        if convergence.classification in {"unverifiable", "store_unhealthy"}:
+            return True
     if spool.get("status") == "pending":
         if _pending_episode_requires_finalization(spool):
             return not _check_and_finalize_spool(spool_id)
         return _reconcile_pending_spool(spool_id)
     if spool.get("status") != "running":
-        if spool.get("expired_session_replacement_requested"):
-            if _reconcile_spool_ownership(spool).state == "terminalizable" and _handle_expired_session(spool_id, spool):
-                current = _read_spool(spool_id)
-                return bool(current and current.get("status") in {"pending", "running"})
         return False
 
     reconciliation = _reconcile_spool_ownership(spool)
     if reconciliation.state == "terminalizable":
-        # A successful same-spool replacement stays running. The supervisor
-        # sees it again on the next pass instead of treating replacement as a
-        # terminal result.
-        if spool.get("session_id"):
-            stderr_path = _get_stderr_path(spool_id)
-            if stderr_path.exists():
-                try:
-                    if "No conversation found with session ID" in stderr_path.read_text():
-                        if _handle_expired_session(spool_id, spool):
-                            current = _read_spool(spool_id)
-                            return bool(current and current.get("status") in {"pending", "running"})
-                except IOError:
-                    pass
         return not _check_and_finalize_spool(spool_id)
     if reconciliation.state in {"unverifiable", "store_unhealthy"}:
         return True
-
-    if spool.get("session_id") and not spool.get("expired_session_replacement_requested"):
-        stderr_path = _get_stderr_path(spool_id)
-        try:
-            expired = stderr_path.exists() and "No conversation found with session ID" in stderr_path.read_text()
-        except IOError:
-            expired = False
-        if expired:
-            with _spool_lock(spool_id, blocking=False) as acquired:
-                if not acquired:
-                    return True
-                current = _read_spool(spool_id)
-                if current and current.get("status") == "running":
-                    current["expired_session_replacement_requested"] = True
-                    _write_spool(spool_id, current)
-            _request_owner_stop(spool_id, "cancel", "expired-session-recovery")
-            return True
 
     if spool.get("timeout"):
         deadline_expired = _owner_episode_deadline_expired(spool)
@@ -4904,16 +4195,22 @@ def _run_store_supervisor(store: str, lock_fd: int) -> None:
     _write_supervisor_record(_supervisor_identity(os.getpid(), started_at=started_at))
     idle_since: Optional[float] = None
     owned_fd = lock_fd
+    from .owner_episode_convergence import discoverable_duties_outstanding
+
     try:
         while True:
             any_active = False
             for spool in _list_spools():
-                if spool.get("status") not in {"pending", "running"} and not spool.get(
-                    "expired_session_replacement_requested"
-                ):
-                    continue
+                spool_id = spool["id"]
                 try:
-                    if _reconcile_spool_step(spool["id"]):
+                    duty_work = discoverable_duties_outstanding(spool_id, spool)
+                    if spool.get("status") not in {"pending", "running"} and not duty_work:
+                        continue
+                    if _reconcile_spool_step(spool_id):
+                        any_active = True
+                    elif discoverable_duties_outstanding(spool_id, _read_spool(spool_id)):
+                        # A transient durable-effect failure remains supervisor
+                        # work even though the public record is already terminal.
                         any_active = True
                 except Exception:
                     # One malformed legacy record must not kill ownership for
@@ -4931,7 +4228,7 @@ def _run_store_supervisor(store: str, lock_fd: int) -> None:
                 # its replacement; it can never reserve in the gap between the
                 # final empty scan and ownership release.
                 with _supervisor_control_lock():
-                    if _count_running() == 0:
+                    if not _store_supervision_required():
                         record = _supervisor_identity(os.getpid(), started_at=started_at)
                         record["retired_at"] = datetime.now().isoformat()
                         _write_supervisor_record(record)
@@ -6111,8 +5408,8 @@ def _respin_sync(handle: str, prompt: str, rebuild: bool = False) -> str:
                 _record_pre_spawn_failure(spool_id, f"could not write rebuild prompt: {exc}")
                 return f"Error: could not write rebuild prompt: {exc}"
         else:
-            # Try to resume with session_id first
-            # If that fails (session expired), fall back to transcript injection
+            # Ask the provider to resume the recorded session. If the provider
+            # no longer has it, this respin terminates with that honest error.
             effective_prompt = prompt
             cmd_flags = ["--resume", session_id]
 
@@ -6132,12 +5429,6 @@ def _respin_sync(handle: str, prompt: str, rebuild: bool = False) -> str:
 
         shard_info = original_spool.get("shard")
         cwd = original_spool.get("working_dir") or (shard_info or {}).get("worktree_path") or os.getcwd()
-
-        # Check if we have a transcript for this session
-        transcript_available = False
-        if original_spool:
-            transcript_path = _get_transcript_path(original_spool["id"])
-            transcript_available = transcript_path.exists()
 
         # The caller's explicit env is all that was persisted on the original
         # spool (profile secrets are never written to disk). It is what we
@@ -6213,7 +5504,6 @@ def _respin_sync(handle: str, prompt: str, rebuild: bool = False) -> str:
             "allowed_tools": orig_allowed_tools,
             "permission": orig_permission,
             "system_prompt": None,
-            "transcript_fallback_available": transcript_available,
             "env": caller_env,
             "profile": profile_name,
             "shard": shard_info,
@@ -6250,9 +5540,10 @@ async def respin(
     Returns immediately with spool_id.
 
     Auto-detects the harness (claude-code, codex, gemini, kimi) from the
-    original spool. For Claude Code sessions, falls back to transcript
-    injection if the session has expired. A Claude spool that parked waiting
-    on background tasks (error_kind=headless_background_wait) is not resumed —
+    original spool. An unavailable provider session produces a terminal respin
+    error; its saved transcript remains available for manual reconstruction in
+    a separate conversation. A Claude spool that parked waiting on background
+    tasks (error_kind=headless_background_wait) is not resumed —
     resume would replay a stale task notification into the model's context;
     instead a fresh session is rebuilt from the sanitized transcript with
     those tasks explicitly abandoned.
@@ -7890,11 +7181,6 @@ def _shard_abandon_locked(spool_id: str, keep_branch: bool, caller_cwd: str | No
     _pop_and_reap_process_handle(spool_id)
     spool.pop("process_group_cleanup_warning", None)
 
-    if spool.get("status") == "running":
-        spool["status"] = "error"
-        spool["error"] = "Shard abandoned"
-        spool["completed_at"] = datetime.now().isoformat()
-
     # Persist intent before removing the worktree or branch. If this process
     # exits inside cleanup, the spool still explains the missing/partial shard.
     cleanup_reason = "shard abandonment cleanup pending"
@@ -7916,9 +7202,6 @@ def _shard_abandon_locked(spool_id: str, keep_branch: bool, caller_cwd: str | No
         _write_spool(spool_id, spool)
         return f"Abandoned shard {spool_id}" + (" (branch kept)" if keep_branch else "")
     else:
-        spool["status"] = "error"
-        spool["error"] = "Shard abandonment failed during worktree cleanup"
-        spool["completed_at"] = datetime.now().isoformat()
         spool["shard"].pop("abandon_in_progress", None)
         spool["shard"].pop("abandon_in_progress_at", None)
         reason = "shard abandonment failed during worktree cleanup"
@@ -8361,25 +7644,39 @@ def _persist_codex_sandbox_refusal(
         spool = _read_spool(spool_id) if acquired else None
         if not acquired or (spool is not None and spool.get("status") != "error"):
             return f"Error: Spool {spool_id} was finalized before sandbox refusal was recorded"
-        spool = spool or {"id": spool_id, "status": "error"}
-        spool.update(
-            {
+        metadata = {
+            "session_id": session_id,
+            "sandbox": sandbox,
+            "permission": permission,
+            "codex_bin": codex_bin,
+            "codex_version": codex_version,
+            "sandbox_error": message,
+            "harness": "codex",
+            "tags": ["codex"],
+            "pid": None,
+        }
+        if spool is None:
+            # No record exists, so this refusal creates one and is its whole
+            # outcome.
+            spool = {"id": spool_id}
+            updates = {
+                **metadata,
+                "status": "error",
                 "result": None,
-                "session_id": session_id,
-                "sandbox": sandbox,
-                "permission": permission,
-                "codex_bin": codex_bin,
-                "codex_version": codex_version,
-                "sandbox_error": message,
                 "error": message,
-                "harness": "codex",
-                "tags": ["codex"],
-                "pid": None,
                 "created_at": now,
                 "completed_at": now,
             }
-        )
-        _write_spool(spool_id, spool)
+        else:
+            # _record_pre_spawn_failure already published this same message as
+            # the record's outcome - as episode failure evidence convergence
+            # projected, or as the legacy terminal. Only the sandbox metadata is
+            # still missing; republishing the outcome would move a completion
+            # time that is already settled.
+            updates = metadata
+        from .owner_episode_convergence import publish_record_updates
+
+        publish_record_updates(spool_id, spool, updates)
     return f"Error: {message} (spool {spool_id})"
 
 

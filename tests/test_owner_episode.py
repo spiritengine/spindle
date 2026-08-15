@@ -1,10 +1,8 @@
 """S2-E: the authoritative generation episode, its transitions and consumers.
 
-Every contract here is missing from production on purpose: the corrective RSP
-replaces independently updated replacement flags, sidecar interpretation and
-status-driven capacity with one durable episode, one guarded transition, one
-pure classifier and one exact-inode snapshot.  The tests state the target
-behaviour; the current tree fails them.
+The corrective RSP replaces independently updated ownership flags, sidecar
+interpretation and status-driven capacity with one durable episode, one guarded
+transition, one pure classifier and one exact-inode snapshot.
 """
 
 from __future__ import annotations
@@ -55,6 +53,7 @@ from tests.owner_episode_fixtures import (
 )
 
 EPISODE_CAPABILITY = "owner-episode-v1"
+CONVERGENCE_CAPABILITY = "owner-convergence-v1"
 
 
 def _row_id(row) -> str:
@@ -779,125 +778,6 @@ def test_normal_spawn_metadata_cannot_lower_a_newer_episode(episode_store):
     assert (stored["phase"], stored["revision"]) == ("lock_bound", current["revision"])
 
 
-def test_replacement_spawn_reserves_instead_of_restoring_a_stale_episode(episode_store, monkeypatch, tmp_path):
-    spool_id = "writer-replacement-spawn"
-    source_id = "writer-replacement-source"
-    proven = make_episode("released", generation=3)
-    episode_store.write(
-        spool_id,
-        status="running",
-        episode=proven,
-        session_id="session-x",
-        prompt="spin: continue",
-        working_dir=str(tmp_path),
-    )
-    episode_store.write(source_id, status="complete", session_id="session-x")
-    transcript = spindle._get_transcript_path(source_id)
-    transcript.parent.mkdir(parents=True, exist_ok=True)
-    transcript.write_text("prior transcript")
-    monkeypatch.setattr(spindle, "_spawn_detached", lambda *_args, **_kwargs: 424242)
-    monkeypatch.setattr(
-        spindle,
-        "_reconcile_spool_ownership",
-        lambda spool: spindle.ReconciliationResult(
-            "terminalizable",
-            "episode_released",
-            LivenessEvidence("dead", "pidfd_exited"),
-            LockEvidence("released", 64, 987),
-        ),
-    )
-    stale = dict(episode_store.read(spool_id))
-    stale[EPISODE_KEY] = make_episode("accepted", generation=3)
-
-    assert spindle._handle_expired_session_locked(spool_id, stale) is True
-
-    stored = episode_store.episode(spool_id)
-    assert stored is not None, "the replacement dropped the episode"
-    assert (stored["generation"], stored["phase"]) == (proven["generation"] + 1, "reserved")
-
-
-def test_replacement_revalidates_inherited_deadline_after_transcript_barrier(
-    episode_store,
-    monkeypatch,
-    tmp_path,
-):
-    spool_id = "writer-replacement-deadline-race"
-    source_id = "writer-replacement-deadline-source"
-    inherited_deadline = "2026-08-11T00:01:00+00:00"
-    proven = make_episode(
-        "released",
-        generation=3,
-        deadline=inherited_deadline,
-        winning_request={"request_id": "first", "kind": "cancel", "desired_terminal_kind": "cancelled"},
-        acknowledgement={"acknowledged_at": "2026-08-11T00:00:04+00:00"},
-    )
-    episode_store.write(
-        spool_id,
-        status="error",
-        episode=proven,
-        session_id="deadline-race-session",
-        prompt="spin: continue",
-        working_dir=str(tmp_path),
-        expired_session_replacement_requested=True,
-        error="Cancelled",
-        lifecycle={"normalized_terminal_kind": "cancelled"},
-    )
-    episode_store.write(source_id, status="complete", session_id="deadline-race-session")
-    transcript = spindle._get_transcript_path(source_id)
-    transcript.parent.mkdir(parents=True, exist_ok=True)
-    transcript.write_text("prior transcript")
-
-    entered = threading.Event()
-    resume = threading.Event()
-    expired = {"value": False}
-    checked = []
-    real_build = spindle._build_transcript_continuation_prompt
-
-    def deadline_check(value):
-        checked.append(value)
-        return expired["value"]
-
-    def blocked_build(*args, **kwargs):
-        entered.set()
-        assert resume.wait(timeout=5), "deadline barrier was not released"
-        return real_build(*args, **kwargs)
-
-    monkeypatch.setattr(spindle, "_absolute_deadline_expired", deadline_check)
-    monkeypatch.setattr(spindle, "_build_transcript_continuation_prompt", blocked_build)
-    monkeypatch.setattr(
-        spindle,
-        "_reconcile_spool_ownership",
-        lambda spool: spindle.ReconciliationResult(
-            "terminalizable",
-            "episode_released",
-            LivenessEvidence("dead", "pidfd_exited"),
-            LockEvidence("released", 64, 987),
-        ),
-    )
-    monkeypatch.setattr(spindle, "_spawn_detached", lambda *_args, **_kwargs: pytest.fail("expired work spawned"))
-
-    results = []
-    worker = threading.Thread(
-        target=lambda: results.append(spindle._handle_expired_session_locked(spool_id, episode_store.read(spool_id)))
-    )
-    worker.start()
-    assert entered.wait(timeout=5), "transcript preparation did not reach its causal barrier"
-    expired["value"] = True
-    resume.set()
-    worker.join(timeout=5)
-    assert not worker.is_alive()
-    assert results == [True]
-
-    stored = episode_store.read(spool_id)
-    assert checked == [inherited_deadline, inherited_deadline]
-    assert stored[EPISODE_KEY] == proven
-    assert stored["status"] == "error"
-    assert stored["error"] == "Cancelled"
-    assert stored["lifecycle"]["normalized_terminal_kind"] == "cancelled"
-    assert stored["expired_session_replacement_skipped"]["deadline"] == inherited_deadline
-    assert "replacement_starting" not in stored
-
-
 def test_pre_spawn_failure_aborts_the_reservation_it_finalizes(episode_store):
     spool_id = "writer-pre-spawn-failure"
     reserved = make_episode("reserved", generation=2, path="before_watchdog")
@@ -1117,6 +997,7 @@ def test_shard_abandon_preserves_an_episode_advanced_while_it_worked(episode_sto
     worktree = tmp_path / "repo" / "worktrees" / "shard"
     worktree.mkdir(parents=True)
     episode = make_episode("released", generation=2)
+    episode_store.bind_lock(spool_id, episode)
     episode_store.write(
         spool_id,
         status="error",
@@ -1125,6 +1006,7 @@ def test_shard_abandon_preserves_an_episode_advanced_while_it_worked(episode_sto
         working_dir=str(worktree),
     )
     advanced = make_episode("released", generation=2, revision=episode["revision"] + 1, retired=True)
+    episode_store.bind_lock(spool_id, advanced)
     _advance_episode_during(monkeypatch, episode_store, spool_id, advanced)
 
     message = spindle._shard_abandon_locked(spool_id, False, str(tmp_path))
@@ -1154,6 +1036,7 @@ def test_shard_merge_preserves_an_episode_advanced_while_it_worked(episode_store
         capture_output=True,
     )
     episode = make_episode("released", generation=2)
+    episode_store.bind_lock(spool_id, episode)
     episode_store.write(
         spool_id,
         status="complete",
@@ -1163,6 +1046,7 @@ def test_shard_merge_preserves_an_episode_advanced_while_it_worked(episode_store
         working_dir=str(worktree),
     )
     advanced = make_episode("released", generation=2, revision=episode["revision"] + 1, retired=True)
+    episode_store.bind_lock(spool_id, advanced)
     _advance_episode_during(monkeypatch, episode_store, spool_id, advanced)
 
     message = spindle._shard_merge_locked(spool_id, False, str(tmp_path))
@@ -1173,7 +1057,7 @@ def test_shard_merge_preserves_an_episode_advanced_while_it_worked(episode_store
 
 # --- 6. mailbox-then-spool control admission --------------------------------
 
-ADMISSION_CALLERS = ("drop", "timeout", "expired_session", "shard_abandon")
+ADMISSION_CALLERS = ("drop", "timeout", "shard_abandon")
 
 
 def _publish_owner_mirrors(episode_store, spool_id, episode):
@@ -1199,9 +1083,6 @@ def _admission_record(episode_store, caller, spool_id, phase, tmp_path, *, publi
         fields["owner_generation"] = episode["generation"]
     if caller == "timeout":
         fields["timeout"] = 1
-    if caller == "expired_session":
-        fields["session_id"] = "session-expired"
-        spindle._get_stderr_path(spool_id).write_text("No conversation found with session ID: session-expired")
     if caller == "shard_abandon":
         worktree = tmp_path / "repo" / "worktrees" / spool_id
         worktree.mkdir(parents=True)
@@ -1364,6 +1245,18 @@ def test_supervisor_protocol_requires_the_episode_capability():
     assert spindle.SUPPORTED_SUPERVISOR_PROTOCOL_RANGE == (2, 2)
     assert EPISODE_CAPABILITY in spindle.SUPERVISOR_CAPABILITIES
     assert EPISODE_CAPABILITY in spindle.REQUIRED_SUPERVISOR_CAPABILITIES
+    assert CONVERGENCE_CAPABILITY in spindle.SUPERVISOR_CAPABILITIES
+    assert CONVERGENCE_CAPABILITY in spindle.REQUIRED_SUPERVISOR_CAPABILITIES
+
+
+def test_pre_convergence_supervisor_is_incompatible_even_when_episode_aware():
+    record = spindle._supervisor_identity(os.getpid())
+    record["supervisor_capabilities"].remove(CONVERGENCE_CAPABILITY)
+
+    error = spindle._supervisor_compatibility_error(record)
+
+    assert error is not None
+    assert CONVERGENCE_CAPABILITY in error
 
 
 def test_pre_episode_and_episode_aware_supervisors_refuse_each_other():

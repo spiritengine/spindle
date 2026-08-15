@@ -18,7 +18,6 @@ import sys
 import textwrap
 import time
 import urllib.request
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -274,6 +273,7 @@ def test_concurrent_launchers_share_one_store_owner(supervisor_env):
     assert record["supervisor_capabilities"] == [
         "supervisor-compatibility-ranges",
         "owner-episode-v1",
+        "owner-convergence-v1",
     ]
     assert _pid_alive(record["pid"])
     terminal = [_wait_spool(store, spool_id, "complete") for spool_id in spool_ids]
@@ -508,9 +508,10 @@ def test_incompatible_owner_is_rejected_before_reservation(supervisor_env, proto
                 "supported_supervisor_protocol_range": {"min": 2, "max": 2},
                 "readable_spool_schemas": [1],
                 "writable_spool_schema": 1,
-                "supervisor_capabilities": ["supervisor-compatibility-ranges"],
+                "supervisor_capabilities": ["supervisor-compatibility-ranges", "owner-episode-v1"],
             },
-            "launcher_requires_capabilities=['owner-episode-v1', 'supervisor-compatibility-ranges']",
+            "launcher_requires_capabilities=['owner-convergence-v1', 'owner-episode-v1', "
+            "'supervisor-compatibility-ranges']",
         ),
         (
             {
@@ -520,6 +521,7 @@ def test_incompatible_owner_is_rejected_before_reservation(supervisor_env, proto
                 "supervisor_capabilities": [
                     "supervisor-compatibility-ranges",
                     "owner-episode-v1",
+                    "owner-convergence-v1",
                 ],
             },
             "owner_supported=1-1 launcher_required=2-2",
@@ -610,6 +612,7 @@ def test_compatible_foreign_package_identity_is_diagnostic_not_rejected(supervis
             "supervisor_capabilities": [
                 "supervisor-compatibility-ranges",
                 "owner-episode-v1",
+                "owner-convergence-v1",
             ],
         },
     )
@@ -945,6 +948,29 @@ def test_launcher_death_mid_skein_spawn_recovers_created_shard(supervisor_env, t
 
         spool = _wait_spool(store, spool_id, "error", timeout=10)
         expected_worktree = repo / "worktrees" / f"{spool_id}-20990101-001"
+        generation = spool["owner_episode"]["generation"]
+        preservation = spool["owner_convergence"]["obligations"]["failed_shard_preservation"]
+        assert preservation["kind"] == "failed_shard_preservation"
+        assert preservation["idempotency_key"] == f"{generation}/preserve_failed_shard"
+        assert preservation["intent"] == {
+            "owner_generation": generation,
+            "worktree_path": str(expected_worktree),
+            "reason": "automatic cleanup disabled after agent failure",
+        }
+        assert preservation["progress"] in {"pending", "complete"}
+
+        def preservation_complete():
+            record = _read_json(store / f"{spool_id}.json")
+            obligation = record["owner_convergence"]["obligations"]["failed_shard_preservation"]
+            if record.get("shard_cleanup_preserved") is True and obligation.get("progress") == "complete":
+                return record
+            return None
+
+        spool = _wait_for(
+            preservation_complete,
+            timeout=10,
+            description="failed shard preservation obligation completion",
+        )
         assert spool["shard"]["worktree_path"] == str(expected_worktree)
         assert spool["shard"]["branch_name"] == f"shard-{spool_id}-20990101-001"
         assert spool["shard"]["shard_id"] == expected_worktree.name
@@ -953,167 +979,6 @@ def test_launcher_death_mid_skein_spawn_recovers_created_shard(supervisor_env, t
         assert spool["shard_cleanup_preserved"] is True
     finally:
         release.touch()
-
-
-def test_expired_session_replacement_remains_owned_to_terminal(supervisor_env):
-    env, store, workdir = supervisor_env
-    count = store / "harness.count"
-    env["FAKE_HARNESS_MODE"] = "expire-once"
-    env["FAKE_HARNESS_COUNT"] = str(count)
-    original_id = "000-original"
-    (store / "transcripts").mkdir()
-    (store / f"{original_id}.json").write_text(
-        json.dumps(
-            {
-                "id": original_id,
-                "status": "complete",
-                "harness": "claude-code",
-                "session_id": "fake-session",
-                "working_dir": str(workdir),
-                "permission": "careful",
-                "allowed_tools": None,
-                "model": None,
-                "env": {
-                    "FAKE_HARNESS_MODE": "expire-once",
-                    "FAKE_HARNESS_COUNT": str(count),
-                },
-                "created_at": datetime.now().isoformat(),
-                "completed_at": datetime.now().isoformat(),
-            }
-        )
-    )
-    (store / "transcripts" / f"{original_id}.txt").write_text(
-        json.dumps(
-            {
-                "type": "result",
-                "subtype": "success",
-                "result": "old result",
-                "session_id": "fake-session",
-            }
-        )
-    )
-
-    respin = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            ("import spindle; print(spindle._respin_sync('fake-session', 'continue after expiry'), flush=True)"),
-        ],
-        cwd=REPO_ROOT,
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=10,
-    )
-    assert respin.returncode == 0, respin.stderr
-    spool_id = respin.stdout.strip().splitlines()[-1]
-    spool = _wait_spool(store, spool_id, "complete", timeout=8)
-    assert spool["used_transcript_fallback"] is True
-    assert spool["result"] == "durable result"
-    assert count.read_text() == "2"
-    assert spool["owner_episode"]["generation"] == 2
-    assert spool["owner_episode"]["phase"] == "released"
-    assert spool["watchdog_pid"] == spool["owner_episode"]["watchdog"]["pid"]
-    assert spool["watchdog_start_time"] == spool["owner_episode"]["watchdog"]["birth_token"]
-    assert spool["watchdog_namespace"] == spool["owner_episode"]["watchdog"]["namespace"]
-
-
-def test_expired_session_does_not_replace_after_inherited_deadline(supervisor_env):
-    env, store, workdir = supervisor_env
-    count = store / "harness.count"
-    expire_release = store / "expire.release"
-    env["FAKE_HARNESS_MODE"] = "expire-once"
-    env["FAKE_HARNESS_COUNT"] = str(count)
-    env["FAKE_HARNESS_IGNORE_TERM"] = "1"
-    env["FAKE_HARNESS_EXPIRE_RELEASE"] = str(expire_release)
-    original_id = "000-deadline-source"
-    (store / "transcripts").mkdir()
-    (store / f"{original_id}.json").write_text(
-        json.dumps(
-            {
-                "id": original_id,
-                "status": "complete",
-                "harness": "claude-code",
-                "session_id": "fake-session",
-                "working_dir": str(workdir),
-                "permission": "careful",
-                "allowed_tools": None,
-                "model": None,
-                "env": {
-                    "FAKE_HARNESS_MODE": "expire-once",
-                    "FAKE_HARNESS_COUNT": str(count),
-                    "FAKE_HARNESS_IGNORE_TERM": "1",
-                    "FAKE_HARNESS_EXPIRE_RELEASE": str(expire_release),
-                },
-                "created_at": datetime.now().isoformat(),
-                "completed_at": datetime.now().isoformat(),
-            }
-        )
-    )
-    (store / "transcripts" / f"{original_id}.txt").write_text(
-        json.dumps(
-            {
-                "type": "result",
-                "subtype": "success",
-                "result": "old result",
-                "session_id": "fake-session",
-            }
-        )
-    )
-
-    respin = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            "import spindle; print(spindle._respin_sync('fake-session', 'continue after expiry'), flush=True)",
-        ],
-        cwd=REPO_ROOT,
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=10,
-    )
-    assert respin.returncode == 0, respin.stderr
-    spool_id = respin.stdout.strip().splitlines()[-1]
-    _wait_for(
-        lambda: (
-            record
-            if (record := _read_json(store / f"{spool_id}.json")).get("owner_episode", {}).get("phase") == "accepted"
-            else None
-        ),
-        timeout=5,
-        description="accepted predecessor episode",
-    )
-    inherited_deadline = (datetime.now(timezone.utc) + timedelta(seconds=0.15)).isoformat()
-    lock_fd = os.open(store / f"{spool_id}.lock", os.O_RDWR)
-    try:
-        fcntl.flock(lock_fd, fcntl.LOCK_EX)
-        accepted = _read_json(store / f"{spool_id}.json")
-        accepted["owner_episode"]["deadline"] = inherited_deadline
-        accepted["wall_deadline_at"] = inherited_deadline
-        (store / f"{spool_id}.json").write_text(json.dumps(accepted))
-    finally:
-        os.close(lock_fd)
-    expire_release.touch()
-    _wait_spool(store, spool_id, "error", timeout=8)
-    skipped = _wait_for(
-        lambda: (
-            marker
-            if (marker := _read_json(store / f"{spool_id}.json")).get("expired_session_replacement_skipped")
-            else None
-        ),
-        timeout=5,
-        description="expired replacement refusal",
-    )
-
-    assert count.read_text() == "1"
-    assert skipped["owner_episode"]["generation"] == 1
-    assert skipped["owner_episode"]["phase"] == "released"
-    assert skipped["lifecycle"]["normalized_terminal_kind"] == "cancelled"
-    assert skipped["error"] == "Cancelled"
-    assert skipped["expired_session_replacement_skipped"]["reason"] == "inherited_deadline_expired"
-    assert skipped["expired_session_replacement_skipped"]["deadline"] == skipped["owner_episode"]["deadline"]
-    assert "expired_session_replacement_requested" not in skipped
 
 
 def _mcp_result_text(result) -> str:

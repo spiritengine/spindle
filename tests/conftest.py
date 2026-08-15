@@ -23,7 +23,11 @@ os.environ["SPINDLE_HOME"] = tempfile.mkdtemp(prefix="spindle-test-home-")
 import pytest  # noqa: E402, I001
 
 
-pytest_plugins = ["tests.namespace_owner_fixtures", "tests.owner_episode_fixtures"]
+pytest_plugins = [
+    "tests.namespace_owner_fixtures",
+    "tests.owner_episode_fixtures",
+    "tests.owner_convergence_fixtures",
+]
 
 
 def _snapshot(path: Path) -> frozenset:

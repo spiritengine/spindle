@@ -28,7 +28,7 @@ def test_store_layout_names_sibling_v2_but_activates_only_v1(tmp_path):
     assert not home.exists()
 
 
-def test_scalar_record_uses_exact_current_fallback():
+def test_scalar_record_cannot_prove_convergence_capability():
     current = {
         "pid": 123,
         "supervisor_protocol_version": 2,
@@ -36,7 +36,10 @@ def test_scalar_record_uses_exact_current_fallback():
         "future_diagnostic": {"ignored": True},
     }
 
-    assert spindle._supervisor_compatibility_error(current) is None
+    error = spindle._supervisor_compatibility_error(current)
+
+    assert error is not None
+    assert "owner-convergence-v1" in error
     assert "protocol is incompatible" in spindle._supervisor_compatibility_error(
         {**current, "supervisor_protocol_version": 1}
     )
@@ -54,6 +57,7 @@ def test_current_identity_is_truthful_and_rejected_by_pre_bridge_reader():
     assert record["supervisor_capabilities"] == [
         "supervisor-compatibility-ranges",
         "owner-episode-v1",
+        "owner-convergence-v1",
     ]
     assert not _pre_bridge_reader_accepts(record)
     assert spindle._supervisor_compatibility_error(record) is None
@@ -87,8 +91,9 @@ def test_complete_negotiation_replaces_scalar_equality():
         ),
         (
             "supervisor_capabilities",
-            ["supervisor-compatibility-ranges"],
-            "launcher_requires_capabilities=['owner-episode-v1', 'supervisor-compatibility-ranges']",
+            ["supervisor-compatibility-ranges", "owner-episode-v1"],
+            "launcher_requires_capabilities=['owner-convergence-v1', 'owner-episode-v1', "
+            "'supervisor-compatibility-ranges']",
         ),
     ],
 )

@@ -128,27 +128,6 @@ def _record_preacceptance_failure(
     )
     if not result.accepted:
         return False
-    with _record_guard(store, spool_id):
-        current = _load(spool_path) or {}
-        current_episode = current.get("owner_episode") or {}
-        if current_episode.get("generation") != owner_generation or current_episode.get("phase") != "aborted":
-            return False
-        current.update(
-            {
-                "status": "error",
-                "error": "Logical owner exited before identity publication",
-                "error_kind": "owner_preacceptance_failure",
-                "failed_owner_generation": owner_generation,
-                "owner_generation": owner_generation,
-                "completed_at": _utc_now(),
-            }
-        )
-        lifecycle = dict(current.get("lifecycle") or {})
-        lifecycle.pop("public_stop_state", None)
-        lifecycle["transport_state"] = "reaped"
-        lifecycle["normalized_terminal_kind"] = "failed"
-        current["lifecycle"] = lifecycle
-        _atomic_json_write(spool_path, current)
     return True
 
 
@@ -174,7 +153,7 @@ def _record_owner_crash(
         if episode.get("generation") != owner_generation:
             return
         if episode.get("phase") == "reserved":
-            _record_preacceptance_failure(
+            published = _record_preacceptance_failure(
                 store,
                 spool_id,
                 owner_pid,
@@ -182,6 +161,17 @@ def _record_owner_crash(
                 owner_generation,
                 status,
             )
+            if published:
+                # The watchdog remains an evidence producer.  Once that write
+                # is durable it may notify the sole applicator in this process;
+                # direct calls to _record_preacceptance_failure still publish
+                # evidence only.
+                import spindle
+
+                from .owner_episode_convergence import ObserverIdentity, converge_owner_episode
+
+                spindle.SPINDLE_DIR = store
+                converge_owner_episode(spool_id, ObserverIdentity.for_this_process())
             return
     elif spool.get("owner_generation") != owner_generation or process.get("owner_generation") != owner_generation:
         # Direct/internal compatibility owners deliberately have no episode.

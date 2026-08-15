@@ -61,7 +61,6 @@ from spindle import (
     _get_spool_path,
     _get_stderr_path,
     _get_transcript_path,
-    _handle_expired_session,
     _is_pid_alive,
     _is_review_tag,
     _kimi_bwrap_wrap,
@@ -776,224 +775,42 @@ class TestClaudePermissionCommandShape:
         assert cmd[cmd.index("--permission-mode") + 1] == "acceptEdits"
         assert cmd[cmd.index("--allowedTools") + 1] == PERMISSION_PROFILES["readonly"]
 
-    def test_expired_session_fallback_reemits_readonly_tier(self, tmp_path):
-        """The transcript-injection fallback (a claude --resume whose session expired)
-        must re-apply the original tier, not spawn a bare `claude -p`. A readonly
-        original keeps acceptEdits + its allowlist on the expiry path."""
-        _write_spool(
-            "exp-orig-ro",
-            {
-                "id": "exp-orig-ro",
-                "status": "complete",
-                "session_id": "sess-exp-ro",
-                "harness": "claude-code",
-                "permission": "readonly",
-                "allowed_tools": PERMISSION_PROFILES["readonly"],
-                "working_dir": str(tmp_path),
-                "created_at": datetime.now().isoformat(),
-            },
-        )
-        transcript = _get_transcript_path("exp-orig-ro")
-        transcript.parent.mkdir(parents=True, exist_ok=True)
-        transcript.write_text("prior transcript")
-        failing = {
-            "id": "exp-fail-ro",
-            "status": "running",
-            "session_id": "sess-exp-ro",
-            "prompt": "Continue sess-exp-ro: keep going",
-            "working_dir": str(tmp_path),
-            "pid": None,
-        }
-        captured = {}
+    def test_expired_provider_session_stays_terminal_and_preserves_source_transcript(self, tmp_path):
+        source_id = "expired-source"
+        respin_id = "expired-respin"
+        session_id = "expired-provider-session"
+        transcript = "saved source conversation\nwith reconstruction context\n"
 
-        def fake_spawn(spool_id, cmd, cwd, env=None):
-            captured["cmd"] = cmd
-            return 1
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            source_path = _get_transcript_path(source_id)
+            source_path.parent.mkdir(parents=True, exist_ok=True)
+            source_path.write_text(transcript)
+            _write_spool(
+                respin_id,
+                {
+                    "id": respin_id,
+                    "status": "running",
+                    "session_id": session_id,
+                    "harness": "claude-code",
+                    "created_at": datetime.now().isoformat(),
+                },
+            )
+            _get_stderr_path(respin_id).write_text(f"No conversation found with session ID: {session_id}")
+            _get_exit_path(respin_id).write_text("1\n")
 
-        with patch("spindle._reconcile_spool_ownership", return_value=MagicMock(state="terminalizable")):
-            with patch("spindle._spawn_detached", side_effect=fake_spawn):
-                assert _handle_expired_session("exp-fail-ro", failing) is True
+            terminalizable = MagicMock(state="terminalizable")
+            with patch("spindle._reconcile_spool_ownership", return_value=terminalizable):
+                with patch("spindle._spawn_detached", side_effect=AssertionError("must not replace session")):
+                    assert spindle._reconcile_spool_step(respin_id) is False
+                    terminal = _read_spool(respin_id)
+                    assert spindle._reconcile_spool_step(respin_id) is False
 
-        cmd = captured["cmd"]
-        assert cmd[cmd.index("--permission-mode") + 1] == "acceptEdits"
-        assert cmd[cmd.index("--allowedTools") + 1] == PERMISSION_PROFILES["readonly"]
-
-    def test_expired_session_fallback_reemits_careful_auto_no_allowlist(self, tmp_path):
-        """A careful original re-emits --permission-mode auto on the expiry fallback and,
-        having no allowlist, adds no --allowedTools."""
-        _write_spool(
-            "exp-orig-careful",
-            {
-                "id": "exp-orig-careful",
-                "status": "complete",
-                "session_id": "sess-exp-careful",
-                "harness": "claude-code",
-                "permission": "careful",
-                "allowed_tools": None,
-                "working_dir": str(tmp_path),
-                "created_at": datetime.now().isoformat(),
-            },
-        )
-        transcript = _get_transcript_path("exp-orig-careful")
-        transcript.parent.mkdir(parents=True, exist_ok=True)
-        transcript.write_text("prior transcript")
-        failing = {
-            "id": "exp-fail-careful",
-            "status": "running",
-            "session_id": "sess-exp-careful",
-            "prompt": "Continue sess-exp-careful: keep going",
-            "working_dir": str(tmp_path),
-            "pid": None,
-        }
-        captured = {}
-
-        def fake_spawn(spool_id, cmd, cwd, env=None):
-            captured["cmd"] = cmd
-            return 1
-
-        with patch("spindle._reconcile_spool_ownership", return_value=MagicMock(state="terminalizable")):
-            with patch("spindle._spawn_detached", side_effect=fake_spawn):
-                assert _handle_expired_session("exp-fail-careful", failing) is True
-
-        cmd = captured["cmd"]
-        assert cmd[cmd.index("--permission-mode") + 1] == "auto"
-        assert "--allowedTools" not in cmd
-
-    def test_expired_shard_fallback_keeps_wrapper_and_replaces_birth_token(self, tmp_path):
-        session_id = "expired-shard-session"
-        original_id = "expired-shard-original"
-        failing_id = "expired-shard-failing"
-        worktree = tmp_path / "worktrees" / "expired-shard"
-        worktree.mkdir(parents=True)
-        shard = {"worktree_path": str(worktree), "branch_name": "shard-expired-shard"}
-        original = {
-            "id": original_id,
-            "status": "complete",
-            "session_id": session_id,
-            "harness": "claude-code",
-            "permission": "careful+shard",
-            "allowed_tools": None,
-            "working_dir": str(worktree),
-            "shard": shard,
-        }
-        failing = {
-            "id": failing_id,
-            "status": "running",
-            "session_id": session_id,
-            "prompt": f"Continue {session_id}: keep going",
-            "working_dir": str(worktree),
-            "shard": shard,
-            "pid": 797979,
-            "process_start_time": "old-birth-token",
-        }
-        wrapped = []
-        spawned = []
-
-        def wrap(cmd, shard_info, cwd, **kwargs):
-            wrapped.append((list(cmd), shard_info, cwd))
-            return ["wrapped-fallback"]
-
-        def spawn(spawn_id, cmd, cwd, env=None):
-            spawned.append((spawn_id, list(cmd), cwd))
-            return 808080
-
-        with patch("spindle.SPINDLE_DIR", tmp_path / "spools"):
-            _write_spool(original_id, original)
-            _write_spool(failing_id, failing)
-            transcript = _get_transcript_path(original_id)
-            transcript.parent.mkdir(parents=True, exist_ok=True)
-            transcript.write_text("prior transcript")
-            with patch("spindle._find_spool_by_session", return_value=original):
-                with patch("spindle._reconcile_spool_ownership", return_value=MagicMock(state="terminalizable")):
-                    with patch("spindle._codex_bwrap_wrap", side_effect=wrap):
-                        with patch("spindle._spawn_detached", side_effect=spawn):
-                            with patch("spindle._process_start_time", return_value="new-birth-token"):
-                                assert _handle_expired_session(failing_id, failing) is True
-            saved = _read_spool(failing_id)
-
-        assert wrapped[0][1:] == (shard, str(worktree))
-        assert "--permission-mode" in wrapped[0][0]
-        assert spawned == [(failing_id, ["wrapped-fallback"], str(worktree))]
-        assert saved["watchdog_pid"] == 808080
-        assert saved["watchdog_start_time"] == "new-birth-token"
-        assert "pid" not in saved
-        assert saved["replacement_starting"] is True
-
-    def test_expired_session_fallback_never_signals_reused_pid(self, tmp_path):
-        session_id = "expired-reused-session"
-        original_id = "expired-reused-original"
-        failing_id = "expired-reused-failing"
-        original = {
-            "id": original_id,
-            "status": "complete",
-            "session_id": session_id,
-            "harness": "claude-code",
-            "permission": "careful",
-            "working_dir": str(tmp_path),
-        }
-        failing = {
-            "id": failing_id,
-            "status": "running",
-            "session_id": session_id,
-            "prompt": f"Continue {session_id}: work",
-            "working_dir": str(tmp_path),
-            "pid": 929292,
-            "process_start_time": "original-birth",
-        }
-        with patch("spindle.SPINDLE_DIR", tmp_path / "spools"):
-            _write_spool(original_id, original)
-            _write_spool(failing_id, failing)
-            transcript = _get_transcript_path(original_id)
-            transcript.parent.mkdir(parents=True, exist_ok=True)
-            transcript.write_text("prior transcript")
-            with patch("spindle._find_spool_by_session", return_value=original):
-                with patch("spindle._is_pid_alive", return_value=True):
-                    with patch("spindle._process_start_time", return_value="reused-birth"):
-                        with patch("spindle._terminate_process_group") as terminate:
-                            with patch("spindle._spawn_detached") as spawn:
-                                assert _handle_expired_session(failing_id, failing) is False
-
-        terminate.assert_not_called()
-        spawn.assert_not_called()
-
-    def test_expired_session_fallback_refuses_stored_manual_shard(self, tmp_path):
-        """Finding C: a stored readonly/manual + shard spool reaching the transcript
-        fallback is refused before spawning — it must not launch with bypassPermissions
-        via _claude_permission_mode. The failing spool is marked error, not retried.
-        The transcript is present, so a missing guard would spawn (and trip the guard
-        below) rather than silently bail."""
-        _write_spool(
-            "exp-orig-ms",
-            {
-                "id": "exp-orig-ms",
-                "status": "complete",
-                "session_id": "sess-exp-ms",
-                "harness": "claude-code",
-                "permission": "manual+shard",
-                "allowed_tools": PERMISSION_PROFILES["readonly"],
-                "shard": {"worktree_path": str(tmp_path), "shard_id": "sh"},
-                "working_dir": str(tmp_path),
-                "created_at": datetime.now().isoformat(),
-            },
-        )
-        transcript = _get_transcript_path("exp-orig-ms")
-        transcript.parent.mkdir(parents=True, exist_ok=True)
-        transcript.write_text("prior transcript")
-        failing = {
-            "id": "exp-fail-ms",
-            "status": "running",
-            "session_id": "sess-exp-ms",
-            "prompt": "Continue sess-exp-ms: keep going",
-            "working_dir": str(tmp_path),
-            "pid": None,
-        }
-
-        with patch("spindle._spawn_detached", side_effect=AssertionError("must not launch")):
-            assert _handle_expired_session("exp-fail-ms", failing) is True
-
-        refused = _read_spool("exp-fail-ms")
-        assert refused["status"] == "error"
-        assert "no write tools" in refused["error"]
+            assert _read_spool(respin_id) == terminal
+            assert terminal["status"] == "error"
+            assert terminal["error"] == f"No conversation found with session ID: {session_id}"
+            assert "expired_session_replacement_requested" not in terminal
+            assert "used_transcript_fallback" not in terminal
+            assert source_path.read_text() == transcript
 
     @pytest.mark.parametrize(
         "permission,shard_flag",
@@ -2448,9 +2265,7 @@ class TestExitCodeCapture:
             assert handle.pid == watchdog_pid
             lock_target = str(spindle._get_owner_lock_path(spool_id))
             assert lock_target not in json.loads(fds.read_text())
-            spindle.create_control_request(
-                spindle.SPINDLE_DIR, spool_id, "cancel", spool["owner_generation"], "test"
-            )
+            spindle.create_control_request(spindle.SPINDLE_DIR, spool_id, "cancel", spool["owner_generation"], "test")
         finally:
             current = _read_spool(spool_id)
             if current and current.get("owner_generation") and handle.poll() is None:
@@ -2542,11 +2357,11 @@ class TestCancellationTermination:
             _get_exit_path(spool_id).write_text("0\n")
             with patch("spindle._reconcile_spool_ownership", return_value=MagicMock(state="active")):
                 with patch("spindle.create_control_request", side_effect=request_while_finalizer_races):
-                        if tool_path == "sync":
-                            result = spindle._spin_drop_sync(spool_id)
-                        else:
-                            drop_tool = spindle.spin_drop.fn if hasattr(spindle.spin_drop, "fn") else spindle.spin_drop
-                            result = asyncio.run(drop_tool(spool_id))
+                    if tool_path == "sync":
+                        result = spindle._spin_drop_sync(spool_id)
+                    else:
+                        drop_tool = spindle.spin_drop.fn if hasattr(spindle.spin_drop, "fn") else spindle.spin_drop
+                        result = asyncio.run(drop_tool(spool_id))
             saved = _read_spool(spool_id)
 
         assert result.startswith(f"Cancellation requested for spool {spool_id}")
@@ -2574,7 +2389,7 @@ class TestCancellationTermination:
             _get_output_path(spool_id).write_text("partial output")
             with patch("spindle._reconcile_spool_ownership", return_value=MagicMock(state="active")):
                 with patch("spindle._terminate_process_group", side_effect=AssertionError("observer signal")):
-                        result = spindle._spin_drop_sync(spool_id)
+                    result = spindle._spin_drop_sync(spool_id)
             saved = _read_spool(spool_id)
             capture_preserved = _get_output_path(spool_id).exists()
             assert _count_running() == 1
@@ -2599,115 +2414,13 @@ class TestCancellationTermination:
             )
             with patch("spindle._reconcile_spool_ownership", return_value=MagicMock(state="unverifiable")):
                 with patch("spindle._terminate_process_group") as terminate:
-                        result = spindle._spin_drop_sync(spool_id)
+                    result = spindle._spin_drop_sync(spool_id)
             saved = _read_spool(spool_id)
 
         terminate.assert_not_called()
         assert result.startswith(f"Error: Cannot cancel spool {spool_id}: ownership unverifiable")
         assert saved["status"] == "running"
         assert "process_group_cleanup_warning" not in saved
-
-    def test_expired_session_fallback_cannot_resurrect_cancelled_spool(self, tmp_path):
-        spool_id = "fallback-cancel-race"
-        original = {
-            "id": "fallback-original",
-            "status": "complete",
-            "session_id": "fallback-session",
-            "permission": "careful",
-        }
-        failing = {
-            "id": spool_id,
-            "status": "running",
-            "session_id": "fallback-session",
-            "prompt": "Continue fallback-session: work",
-            "working_dir": str(tmp_path),
-            "pid": None,
-            "owner_generation": 1,
-        }
-        transcript = tmp_path / "transcript.txt"
-        transcript.write_text("prior context")
-        spawn_started = threading.Event()
-        allow_spawn = threading.Event()
-        fallback_result = []
-        cancel_result = []
-        reconciliation_state = {"state": "terminalizable"}
-
-        def blocked_spawn(*args, **kwargs):
-            spawn_started.set()
-            assert allow_spawn.wait(timeout=5)
-            reconciliation_state["state"] = "active"
-            return 474747
-
-        with patch("spindle.SPINDLE_DIR", tmp_path / "spools"):
-            _write_spool(spool_id, failing)
-            with patch("spindle._find_spool_by_session", return_value=original):
-                with patch("spindle._get_transcript_path", return_value=transcript):
-                    with patch("spindle._spawn_detached", side_effect=blocked_spawn):
-                        with patch(
-                            "spindle._reconcile_spool_ownership",
-                            side_effect=lambda _spool: MagicMock(state=reconciliation_state["state"]),
-                        ):
-                            fallback = threading.Thread(
-                                target=lambda: fallback_result.append(_handle_expired_session(spool_id, failing))
-                            )
-                            fallback.start()
-                            assert spawn_started.wait(timeout=5)
-                            cancel = threading.Thread(
-                                target=lambda: cancel_result.append(spindle._spin_drop_sync(spool_id))
-                            )
-                            cancel.start()
-                            allow_spawn.set()
-                            fallback.join(timeout=5)
-                            cancel.join(timeout=5)
-            saved = _read_spool(spool_id)
-
-        assert not fallback.is_alive()
-        assert not cancel.is_alive()
-        assert fallback_result == [True]
-        assert cancel_result[0].startswith(f"Cancellation requested for spool {spool_id}")
-        assert saved["status"] == "running"
-        assert saved["lifecycle"]["public_stop_state"] == "stopping"
-
-    def test_expired_session_fallback_reaps_old_handle_before_replacement(self, tmp_path):
-        spool_id = "fallback-handle-replacement"
-        original = {
-            "id": "fallback-original-handle",
-            "status": "complete",
-            "session_id": "fallback-handle-session",
-            "permission": "careful",
-        }
-        failing = {
-            "id": spool_id,
-            "status": "running",
-            "session_id": "fallback-handle-session",
-            "prompt": "Continue fallback-handle-session: work",
-            "working_dir": str(tmp_path),
-            "pid": 616161,
-        }
-        transcript = tmp_path / "transcript-handle.txt"
-        transcript.write_text("prior context")
-        old_proc = MagicMock()
-        old_proc.poll.return_value = 0
-
-        def replacement_spawn(*args, **kwargs):
-            assert spool_id not in spindle._PROC_HANDLES
-            return 626262
-
-        with patch("spindle.SPINDLE_DIR", tmp_path / "spools"):
-            spindle._PROC_HANDLES[spool_id] = old_proc
-            _write_spool(spool_id, failing)
-            with patch("spindle._find_spool_by_session", return_value=original):
-                with patch("spindle._get_transcript_path", return_value=transcript):
-                    with patch("spindle._reconcile_spool_ownership", return_value=MagicMock(state="terminalizable")):
-                        with patch("spindle._spawn_detached", side_effect=replacement_spawn):
-                            assert _handle_expired_session(spool_id, failing) is True
-            saved = _read_spool(spool_id)
-
-        old_proc.poll.assert_called_once_with()
-        assert saved["watchdog_pid"] == 626262
-        assert "pid" not in saved
-        assert saved["replacement_starting"] is True
-        assert saved["used_transcript_fallback"] is True
 
     def test_drop_lock_contention_returns_bounded_error(self, tmp_path):
         spool_id = "cancel-lock-contention"
@@ -9652,9 +9365,7 @@ class TestReviewTagTimeout:
 
     def test_terminalizable_completed_output_is_parsed_without_signaling(self, tmp_path):
         spool_id = "test-timeout-completed-output"
-        stream = json.dumps(
-            {"type": "result", "subtype": "success", "result": "done", "session_id": "session-timeout"}
-        )
+        stream = json.dumps({"type": "result", "subtype": "success", "result": "done", "session_id": "session-timeout"})
         spool = {
             "id": spool_id,
             "status": "running",
@@ -11006,8 +10717,7 @@ class TestProfiles:
             _profile_spawn_env("bad", None, strict=True)
 
     def test_all_profile_spawn_paths_route_through_helper(self, profiles_root, tmp_path, monkeypatch):
-        """spin, respin, retry, and the expired-session fallback all reconstruct
-        the profile spawn env through the one shared helper."""
+        """Spin, respin, and retry reconstruct profile spawn env through one helper."""
         monkeypatch.setenv("ALT_KEY", "k")
         _make_profile(
             profiles_root,
@@ -11018,7 +10728,6 @@ class TestProfiles:
         def fake_spawn(spool_id, cmd, cwd, env=None):
             return 1
 
-        # Distinct originals per path so _find_spool_by_session stays unambiguous.
         _write_spool(
             "route-respin",
             {
@@ -11049,34 +10758,6 @@ class TestProfiles:
                 "created_at": datetime.now().isoformat(),
             },
         )
-        _write_spool(
-            "route-exp-orig",
-            {
-                "id": "route-exp-orig",
-                "status": "complete",
-                "session_id": "sess-exp-route",
-                "model": "big",
-                "profile": "alt",
-                "env": None,
-                "working_dir": str(tmp_path),
-                "harness": "claude-code",
-                "created_at": datetime.now().isoformat(),
-            },
-        )
-        exp_transcript = _get_transcript_path("route-exp-orig")
-        exp_transcript.parent.mkdir(parents=True, exist_ok=True)
-        exp_transcript.write_text("prior transcript")
-        failing = {
-            "id": "route-exp-fail",
-            "status": "running",
-            "session_id": "sess-exp-route",
-            "prompt": "Continue sess-exp-route: keep going",
-            "profile": "alt",
-            "env": None,
-            "working_dir": str(tmp_path),
-            "pid": None,
-        }
-
         wrapped = MagicMock(side_effect=_profile_spawn_env)
         with patch("spindle._profile_spawn_env", wrapped):
             with patch("spindle._spawn_detached", side_effect=fake_spawn):
@@ -11084,17 +10765,12 @@ class TestProfiles:
                     asyncio.run(self._spin()("x", harness="alt", working_dir=str(tmp_path)))  # 1. spin
                     _respin_sync("sess-respin", "again")  # 2. respin
                     asyncio.run(spool_retry.fn("route-retry"))  # 3. retry
-                    with patch(
-                        "spindle._reconcile_spool_ownership",
-                        return_value=MagicMock(state="terminalizable"),
-                    ):
-                        assert _handle_expired_session("route-exp-fail", failing) is True  # 4. expired
 
         called_profiles = [c.args[0] for c in wrapped.call_args_list]
         # Every path asked the helper to reconstruct the "alt" profile spawn env.
-        assert called_profiles.count("alt") == 4
+        assert called_profiles.count("alt") == 3
 
-    # --- retry / expired-session profile re-resolution --------------------
+    # --- retry profile re-resolution --------------------------------------
 
     def test_retry_reresolves_profile_secret_not_persisted(self, profiles_root, tmp_path, monkeypatch):
         """Retrying a profile spool re-resolves the alt endpoint/key/model/extra_args
@@ -11189,125 +10865,6 @@ class TestProfiles:
 
         assert captured["env"] == {"SOME_VAR": "v"}
         assert "ANTHROPIC_BASE_URL" not in captured["env"]
-
-    def test_expired_session_reresolves_profile_secret_not_persisted(self, profiles_root, tmp_path, monkeypatch):
-        """The transcript-fallback respin of a profile spool rebuilds the alt
-        endpoint/key/model rather than running against the default endpoint."""
-        sentinel = "SENTINEL-EXPIRED-b71c"
-        monkeypatch.setenv("ALT_KEY", sentinel)
-        _make_profile(
-            profiles_root,
-            "alt",
-            {
-                "base_url": "https://api.example.com/anthropic",
-                "api_key": "${ALT_KEY}",
-                "extra_args": ["--verbose"],
-                "model": "big",
-            },
-        )
-        # The original (resumable) spool carries the effective model + profile.
-        _write_spool(
-            "exp-orig",
-            {
-                "id": "exp-orig",
-                "status": "complete",
-                "session_id": "sess-exp",
-                "model": "big",
-                "profile": "alt",
-                "env": {"CALLER_TAG": "from-caller"},
-                "working_dir": str(tmp_path),
-                "harness": "claude-code",
-                "created_at": datetime.now().isoformat(),
-            },
-        )
-        transcript = _get_transcript_path("exp-orig")
-        transcript.parent.mkdir(parents=True, exist_ok=True)
-        transcript.write_text("prior conversation")
-
-        # The failing respin spool (session expired) carries the caller env + profile.
-        failing = {
-            "id": "exp-fail",
-            "status": "running",
-            "session_id": "sess-exp",
-            "prompt": "Continue sess-exp: keep going",
-            "profile": "alt",
-            "env": {"CALLER_TAG": "from-caller"},
-            "working_dir": str(tmp_path),
-            "pid": None,
-        }
-        captured = {}
-
-        def fake_spawn(spool_id, cmd, cwd, env=None):
-            captured["env"] = env
-            captured["cmd"] = cmd
-            return 7777
-
-        with patch("spindle._spawn_detached", side_effect=fake_spawn):
-            with patch(
-                "spindle._reconcile_spool_ownership",
-                return_value=MagicMock(state="terminalizable"),
-            ):
-                assert _handle_expired_session("exp-fail", failing) is True
-
-        # The fallback spawn hits the alt endpoint with the re-resolved key.
-        env = captured["env"]
-        assert env["ANTHROPIC_BASE_URL"] == "https://api.example.com/anthropic"
-        assert env["ANTHROPIC_API_KEY"] == sentinel
-        assert env["CALLER_TAG"] == "from-caller"
-        cmd = captured["cmd"]
-        # Re-injected recorded model + extra_args; no --resume on a transcript fallback.
-        assert "--model" in cmd and cmd[cmd.index("--model") + 1] == "big"
-        assert "--verbose" in cmd
-        assert "--resume" not in cmd
-
-        # The fallback never persists the secret on the spool record.
-        assert sentinel not in _get_spool_path("exp-fail").read_text()
-
-    def test_expired_session_non_profile_unchanged(self, tmp_path):
-        """A non-profile expired-session fallback keeps the stored env and adds no --model."""
-        _write_spool(
-            "exp-orig2",
-            {
-                "id": "exp-orig2",
-                "status": "complete",
-                "session_id": "sess-exp2",
-                "model": "opus",
-                "profile": None,
-                "env": {"SOME_VAR": "v"},
-                "working_dir": str(tmp_path),
-                "harness": "claude-code",
-                "created_at": datetime.now().isoformat(),
-            },
-        )
-        transcript = _get_transcript_path("exp-orig2")
-        transcript.parent.mkdir(parents=True, exist_ok=True)
-        transcript.write_text("prior")
-        failing = {
-            "id": "exp-fail2",
-            "status": "running",
-            "session_id": "sess-exp2",
-            "prompt": "Continue sess-exp2: go",
-            "profile": None,
-            "env": {"SOME_VAR": "v"},
-            "working_dir": str(tmp_path),
-            "pid": None,
-        }
-        captured = {}
-
-        def fake_spawn(spool_id, cmd, cwd, env=None):
-            captured["env"] = env
-            captured["cmd"] = cmd
-            return 1
-
-        with patch("spindle._spawn_detached", side_effect=fake_spawn):
-            with patch(
-                "spindle._reconcile_spool_ownership",
-                return_value=MagicMock(state="terminalizable"),
-            ):
-                assert _handle_expired_session("exp-fail2", failing) is True
-
-        assert captured["env"] == {"SOME_VAR": "v"}
-        assert "--model" not in captured["cmd"]
 
     # --- malformed profile fields -----------------------------------------
 
