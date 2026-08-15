@@ -118,7 +118,7 @@ spin(
     prompt="Your task",
     harness="codex",
     model="gpt-5.5",  # Explicit model
-    working_dir="/path/to/project"
+    working_dir="/path/to/project",
 )
 ```
 
@@ -143,11 +143,7 @@ See `spin_harnesses()` for the full alias list.
 
 ```python
 # Minimal example
-spool_id = spin(
-    prompt="Add error handling to process_data()",
-    harness="codex",
-    working_dir="/path/to/project"
-)
+spool_id = spin(prompt="Add error handling to process_data()", harness="codex", working_dir="/path/to/project")
 
 # Check result
 result = unspool(spool_id)
@@ -163,48 +159,31 @@ spin(
     prompt="Analyze the code for security issues",
     harness="codex",
     working_dir="/path/to/project",
-    permission="readonly"
+    permission="readonly",
 )
 
 # Full access for complex changes
-spin(
-    prompt="Refactor the authentication module",
-    harness="codex",
-    working_dir="/path/to/project",
-    permission="full"
-)
+spin(prompt="Refactor the authentication module", harness="codex", working_dir="/path/to/project", permission="full")
 ```
 
 ### Session Continuity
 
 ```python
 # Initial task
-spool_id = spin(
-    prompt="Create a user model",
-    harness="codex",
-    working_dir="/path/to/project"
-)
+spool_id = spin(prompt="Create a user model", harness="codex", working_dir="/path/to/project")
 
 result = unspool(spool_id)
 session_id = result["session_id"]
 
 # Continue the conversation
-spool_id2 = respin(
-    session_id,
-    "Add validation methods to the user model"
-)
+spool_id2 = respin(session_id, "Add validation methods to the user model")
 ```
 
 ### With Timeout
 
 ```python
 # Auto-kill after 60 seconds if stuck
-spin(
-    prompt="Quick fix task",
-    harness="codex",
-    working_dir="/path/to/project",
-    timeout=60
-)
+spin(prompt="Quick fix task", harness="codex", working_dir="/path/to/project", timeout=60)
 ```
 
 ## Performance Characteristics
@@ -223,10 +202,7 @@ For parallel batch work, Codex's speed provides higher throughput:
 ```python
 # Launch 10 tasks - all start within seconds
 tasks = ["Task 1", "Task 2", ..., "Task 10"]
-spool_ids = [
-    spin(task, harness="codex", working_dir="/app")
-    for task in tasks
-]
+spool_ids = [spin(task, harness="codex", working_dir="/app") for task in tasks]
 
 # Process as they complete
 for result in spin_wait(",".join(spool_ids), mode="yield"):
@@ -364,6 +340,7 @@ Check Spindle logs for Codex command execution:
 
 ```python
 import logging
+
 logging.basicConfig(level=logging.DEBUG)
 ```
 
@@ -457,12 +434,7 @@ spin("task", harness="codex")
 ### 2. Use Tags for Organization
 
 ```python
-spin(
-    "task",
-    harness="codex",
-    working_dir="/app",
-    tags="quick-fix,frontend,priority-high"
-)
+spin("task", harness="codex", working_dir="/app", tags="quick-fix,frontend,priority-high")
 
 # Filter later
 spool_search("quick-fix")
@@ -480,12 +452,7 @@ spin("simple task", harness="codex", working_dir="/app", timeout=60)
 ```python
 # Rapid iteration loop
 for attempt in range(3):
-    spool_id = spin(
-        f"Attempt {attempt}: optimize function",
-        harness="codex",
-        working_dir="/app",
-        timeout=30
-    )
+    spool_id = spin(f"Attempt {attempt}: optimize function", harness="codex", working_dir="/app", timeout=30)
     result = unspool(spool_id)
     if "success" in result:
         break

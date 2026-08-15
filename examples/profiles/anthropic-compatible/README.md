@@ -77,8 +77,7 @@ export EXAMPLE_API_KEY="sk-..."        # your provider key
 Then spin with the profile name as the harness:
 
 ```python
-spool_id = spin("Summarize this module", harness="anthropic-compatible",
-                 working_dir="/path/to/project")
+spool_id = spin("Summarize this module", harness="anthropic-compatible", working_dir="/path/to/project")
 spool_id = spin("Quick pass", harness="anthropic-compatible", model="fast")  # uses model_aliases
 ```
 

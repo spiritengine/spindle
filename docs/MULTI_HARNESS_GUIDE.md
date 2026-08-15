@@ -70,11 +70,7 @@ The Codex harness prioritizes speed over depth. Ideal for:
 
 **Usage:**
 ```python
-spin(
-    prompt="Add error handling to process_data()",
-    harness="codex",
-    working_dir="/path/to/project"
-)
+spin(prompt="Add error handling to process_data()", harness="codex", working_dir="/path/to/project")
 ```
 
 **Important:** Codex requires `working_dir` to be specified. Claude Code can infer it from the current session.
@@ -90,11 +86,7 @@ The Gemini harness uses Google's Gemini CLI in headless mode. It's a full agent 
 
 **Usage:**
 ```python
-spin(
-    prompt="Summarize this codebase",
-    harness="gemini",
-    working_dir="/path/to/project"
-)
+spin(prompt="Summarize this codebase", harness="gemini", working_dir="/path/to/project")
 ```
 
 **Model aliases:**
@@ -137,11 +129,7 @@ Bubblewrap is therefore required for normal Kimi use.
 
 **Usage:**
 ```python
-spin(
-    prompt="Analyze this bug and suggest a fix",
-    harness="kimi",
-    working_dir="/path/to/project"
-)
+spin(prompt="Analyze this bug and suggest a fix", harness="kimi", working_dir="/path/to/project")
 ```
 
 **Model aliases:**
@@ -172,11 +160,7 @@ Spawn an agent with any harness:
 spool_id = spin("Complex refactoring task")
 
 # Codex
-spool_id = spin(
-    prompt="Quick edit task",
-    harness="codex",
-    working_dir="/path/to/project"
-)
+spool_id = spin(prompt="Quick edit task", harness="codex", working_dir="/path/to/project")
 ```
 
 **Common parameters (work with all harnesses):**
@@ -662,24 +646,17 @@ Planned improvements to the harness system:
 
 ```python
 # Complex analysis with Claude
-analysis_id = spin(
-    "Analyze the caching strategy and recommend improvements",
-    permission="readonly"
-)
+analysis_id = spin("Analyze the caching strategy and recommend improvements", permission="readonly")
 
 # Quick prototype with Codex
-prototype_id = spin(
-    "Create a basic LRU cache implementation",
-    harness="codex",
-    working_dir="/path/to/project"
-)
+prototype_id = spin("Create a basic LRU cache implementation", harness="codex", working_dir="/path/to/project")
 
 # Quick research with Gemini
 research_id = spin(
     "What caching libraries exist for Python? Summarize the top 3.",
     harness="gemini",
     working_dir="/path/to/project",
-    model="flash"
+    model="flash",
 )
 
 # Deep reasoning with Kimi
@@ -687,7 +664,7 @@ review_id = spin(
     "Review the LRU cache for edge cases and thread safety issues",
     harness="kimi",
     working_dir="/path/to/project",
-    model="thinking"
+    model="thinking",
 )
 
 # Wait for all
@@ -695,10 +672,7 @@ results = spin_wait(f"{analysis_id},{prototype_id},{research_id},{review_id}", m
 
 # Continue with Claude based on analysis
 session = _read_spool(analysis_id)["session_id"]
-implementation_id = respin(
-    session,
-    "Implement your recommendation using the prototype as a starting point"
-)
+implementation_id = respin(session, "Implement your recommendation using the prototype as a starting point")
 ```
 
 ### Parallel Quick Edits
@@ -712,10 +686,7 @@ tasks = [
     # ... more quick tasks
 ]
 
-spool_ids = [
-    spin(task, harness="codex", working_dir="/app")
-    for task in tasks
-]
+spool_ids = [spin(task, harness="codex", working_dir="/app") for task in tasks]
 
 # Process results as they complete (yield mode)
 for result in spin_wait(",".join(spool_ids), mode="yield"):
@@ -726,12 +697,7 @@ for result in spin_wait(",".join(spool_ids), mode="yield"):
 
 ```python
 # Try fast harness first
-spool_id = spin(
-    "Implement user authentication",
-    harness="codex",
-    working_dir="/app",
-    timeout=60
-)
+spool_id = spin("Implement user authentication", harness="codex", working_dir="/app", timeout=60)
 
 result = unspool(spool_id)
 
@@ -739,7 +705,7 @@ result = unspool(spool_id)
 if result.get("status") == "error" or result.get("status") == "timeout":
     spool_id = spin(
         "Implement user authentication with proper error handling and tests",
-        permission="shard"  # Isolated worktree for safety
+        permission="shard",  # Isolated worktree for safety
     )
 ```
 
