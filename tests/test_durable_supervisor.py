@@ -18,7 +18,6 @@ import sys
 import textwrap
 import time
 import urllib.request
-from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -106,11 +105,15 @@ def _write_fake_claude(bin_dir: Path) -> Path:
 
             mode = os.environ.get("FAKE_HARNESS_MODE", "success")
             delay = float(os.environ.get("FAKE_HARNESS_DELAY", "0"))
-            if mode == "ignore-term":
+            if mode == "ignore-term" or os.environ.get("FAKE_HARNESS_IGNORE_TERM") == "1":
                 signal.signal(signal.SIGTERM, signal.SIG_IGN)
             if delay:
                 time.sleep(delay)
             if mode == "expire-once" and count == 1:
+                expire_release = os.environ.get("FAKE_HARNESS_EXPIRE_RELEASE")
+                if expire_release:
+                    while not Path(expire_release).exists():
+                        time.sleep(0.01)
                 print("No conversation found with session ID fake-session", file=sys.stderr, flush=True)
                 while True:
                     time.sleep(1)
@@ -262,12 +265,16 @@ def test_concurrent_launchers_share_one_store_owner(supervisor_env):
         description="supervisor owner record",
     )
 
-    assert record["supervisor_protocol_version"] == 1
+    assert record["supervisor_protocol_version"] == 2
     assert record["spool_schema_version"] == 1
-    assert record["supported_supervisor_protocol_range"] == {"min": 1, "max": 1}
+    assert record["supported_supervisor_protocol_range"] == {"min": 2, "max": 2}
     assert record["readable_spool_schemas"] == [1]
     assert record["writable_spool_schema"] == 1
-    assert record["supervisor_capabilities"] == ["supervisor-compatibility-ranges"]
+    assert record["supervisor_capabilities"] == [
+        "supervisor-compatibility-ranges",
+        "owner-episode-v1",
+        "owner-convergence-v1",
+    ]
     assert _pid_alive(record["pid"])
     terminal = [_wait_spool(store, spool_id, "complete") for spool_id in spool_ids]
     assert {spool["result"] for spool in terminal} == {"durable result"}
@@ -366,6 +373,74 @@ def test_abandoned_minimal_reservation_is_terminalized(supervisor_env):
     assert spool.get("pid") is None
 
 
+def test_published_watchdog_keeps_reservation_live_after_starter_exit(supervisor_env):
+    env, store, _ = supervisor_env
+    spool_id = "published-watchdog"
+    watchdog = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], env=env)
+    launcher = textwrap.dedent(
+        f"""
+        import spindle
+        from spindle.namespace_owner import transition_owner_episode
+
+        ok, error = spindle._try_reserve_slot_and_create({spool_id!r})
+        assert ok, error
+        record = spindle._read_spool({spool_id!r})
+        episode = record["owner_episode"]
+        published = transition_owner_episode(
+            spindle.SPINDLE_DIR,
+            {spool_id!r},
+            actor="launcher",
+            destination="reserved",
+            generation=episode["generation"],
+            expected_revision=episode["revision"],
+            facts={{"watchdog": spindle._process_fact({watchdog.pid})}},
+        )
+        assert published.accepted, published.rejection
+        with spindle._spool_lock({spool_id!r}) as acquired:
+            assert acquired
+            record = spindle._read_spool({spool_id!r})
+            record["created_at"] = "2020-01-01T00:00:00"
+            spindle._write_spool({spool_id!r}, record)
+        """
+    )
+    try:
+        launched = subprocess.run(
+            [sys.executable, "-c", launcher],
+            cwd=REPO_ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert launched.returncode == 0, launched.stderr
+
+        probe_env = dict(env)
+        probe_env["_SPINDLE_STORE_SUPERVISOR"] = "1"
+        probe = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    f"import json, spindle; active = spindle._reconcile_pending_spool({spool_id!r}); "
+                    f"print(json.dumps([active, spindle._read_spool({spool_id!r})['status']]))"
+                ),
+            ],
+            cwd=REPO_ROOT,
+            env=probe_env,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert probe.returncode == 0, probe.stderr
+        assert json.loads(probe.stdout) == [True, "pending"]
+    finally:
+        watchdog.terminate()
+        watchdog.wait(timeout=5)
+
+    spool = _wait_spool(store, spool_id, "error", timeout=5)
+    assert "spawn timeout" in spool["error"]
+
+
 def _start_supervisor_lock_holder(
     env: dict[str, str],
     store: Path,
@@ -404,7 +479,7 @@ def _start_supervisor_lock_holder(
     return proc, stop
 
 
-@pytest.mark.parametrize(("protocol", "schema"), [(999, 1), (1, 999)])
+@pytest.mark.parametrize(("protocol", "schema"), [(999, 1), (2, 999)])
 def test_incompatible_owner_is_rejected_before_reservation(supervisor_env, protocol: int, schema: int):
     env, store, workdir = supervisor_env
     holder, stop = _start_supervisor_lock_holder(
@@ -430,21 +505,26 @@ def test_incompatible_owner_is_rejected_before_reservation(supervisor_env, proto
     [
         (
             {
-                "supported_supervisor_protocol_range": {"min": 2, "max": 3},
+                "supported_supervisor_protocol_range": {"min": 2, "max": 2},
                 "readable_spool_schemas": [1],
                 "writable_spool_schema": 1,
-                "supervisor_capabilities": ["supervisor-compatibility-ranges"],
+                "supervisor_capabilities": ["supervisor-compatibility-ranges", "owner-episode-v1"],
             },
-            "owner_supported=2-3 launcher_required=1-1",
+            "launcher_requires_capabilities=['owner-convergence-v1', 'owner-episode-v1', "
+            "'supervisor-compatibility-ranges']",
         ),
         (
             {
                 "supported_supervisor_protocol_range": {"min": 1, "max": 1},
                 "readable_spool_schemas": [1],
                 "writable_spool_schema": 1,
-                "supervisor_capabilities": [],
+                "supervisor_capabilities": [
+                    "supervisor-compatibility-ranges",
+                    "owner-episode-v1",
+                    "owner-convergence-v1",
+                ],
             },
-            "launcher_requires_capabilities=['supervisor-compatibility-ranges']",
+            "owner_supported=1-1 launcher_required=2-2",
         ),
     ],
 )
@@ -463,7 +543,7 @@ def test_incompatible_bridge_owner_is_rejected_before_reservation_and_monitor(
     holder, stop = _start_supervisor_lock_holder(
         env,
         store,
-        protocol=1,
+        protocol=2,
         schema=1,
         package="/foreign/spindle",
         record_updates=record_updates,
@@ -522,9 +602,19 @@ def test_compatible_foreign_package_identity_is_diagnostic_not_rejected(supervis
     holder, stop = _start_supervisor_lock_holder(
         env,
         store,
-        protocol=1,
+        protocol=2,
         schema=1,
         package="/foreign/spindle",
+        record_updates={
+            "supported_supervisor_protocol_range": {"min": 2, "max": 2},
+            "readable_spool_schemas": [1],
+            "writable_spool_schema": 1,
+            "supervisor_capabilities": [
+                "supervisor-compatibility-ranges",
+                "owner-episode-v1",
+                "owner-convergence-v1",
+            ],
+        },
     )
     try:
         cli = _spin_cli(env, workdir)
@@ -858,6 +948,29 @@ def test_launcher_death_mid_skein_spawn_recovers_created_shard(supervisor_env, t
 
         spool = _wait_spool(store, spool_id, "error", timeout=10)
         expected_worktree = repo / "worktrees" / f"{spool_id}-20990101-001"
+        generation = spool["owner_episode"]["generation"]
+        preservation = spool["owner_convergence"]["obligations"]["failed_shard_preservation"]
+        assert preservation["kind"] == "failed_shard_preservation"
+        assert preservation["idempotency_key"] == f"{generation}/preserve_failed_shard"
+        assert preservation["intent"] == {
+            "owner_generation": generation,
+            "worktree_path": str(expected_worktree),
+            "reason": "automatic cleanup disabled after agent failure",
+        }
+        assert preservation["progress"] in {"pending", "complete"}
+
+        def preservation_complete():
+            record = _read_json(store / f"{spool_id}.json")
+            obligation = record["owner_convergence"]["obligations"]["failed_shard_preservation"]
+            if record.get("shard_cleanup_preserved") is True and obligation.get("progress") == "complete":
+                return record
+            return None
+
+        spool = _wait_for(
+            preservation_complete,
+            timeout=10,
+            description="failed shard preservation obligation completion",
+        )
         assert spool["shard"]["worktree_path"] == str(expected_worktree)
         assert spool["shard"]["branch_name"] == f"shard-{spool_id}-20990101-001"
         assert spool["shard"]["shard_id"] == expected_worktree.name
@@ -866,64 +979,6 @@ def test_launcher_death_mid_skein_spawn_recovers_created_shard(supervisor_env, t
         assert spool["shard_cleanup_preserved"] is True
     finally:
         release.touch()
-
-
-def test_expired_session_replacement_remains_owned_to_terminal(supervisor_env):
-    env, store, workdir = supervisor_env
-    count = store / "harness.count"
-    env["FAKE_HARNESS_MODE"] = "expire-once"
-    env["FAKE_HARNESS_COUNT"] = str(count)
-    original_id = "000-original"
-    (store / "transcripts").mkdir()
-    (store / f"{original_id}.json").write_text(
-        json.dumps(
-            {
-                "id": original_id,
-                "status": "complete",
-                "harness": "claude-code",
-                "session_id": "fake-session",
-                "working_dir": str(workdir),
-                "permission": "careful",
-                "allowed_tools": None,
-                "model": None,
-                "env": {
-                    "FAKE_HARNESS_MODE": "expire-once",
-                    "FAKE_HARNESS_COUNT": str(count),
-                },
-                "created_at": datetime.now().isoformat(),
-                "completed_at": datetime.now().isoformat(),
-            }
-        )
-    )
-    (store / "transcripts" / f"{original_id}.txt").write_text(
-        json.dumps(
-            {
-                "type": "result",
-                "subtype": "success",
-                "result": "old result",
-                "session_id": "fake-session",
-            }
-        )
-    )
-
-    respin = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            ("import spindle; print(spindle._respin_sync('fake-session', 'continue after expiry'), flush=True)"),
-        ],
-        cwd=REPO_ROOT,
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=10,
-    )
-    assert respin.returncode == 0, respin.stderr
-    spool_id = respin.stdout.strip().splitlines()[-1]
-    spool = _wait_spool(store, spool_id, "complete", timeout=8)
-    assert spool["used_transcript_fallback"] is True
-    assert spool["result"] == "durable result"
-    assert count.read_text() == "2"
 
 
 def _mcp_result_text(result) -> str:

@@ -15,7 +15,7 @@ MCP server for multi-harness AI agent delegation. Spawn background agents (Claud
 - **Permission profiles** - Control what tools child agents can use (readonly, careful, full)
 - **Shard isolation** - Run agents in sandboxed git worktrees to prevent conflicts
 - **Model selection** - Route tasks to different models per-agent
-- **Session continuity** - Resume conversations with child agents (auto-recovers expired sessions)
+- **Session continuity** - Resume conversations while the upstream provider session remains available; saved transcripts remain available for manual reconstruction when it does not
 - **Rich querying** - Search, filter, peek at running output, export results
 - **`spindle doctor`** - One command to check the install: versions, paths, spool store, detected harnesses, and an optional live read-only smoke
 
@@ -240,7 +240,8 @@ result = unspool(spool_id)  # includes session_id
 new_id = respin(session_id, "Follow up question")
 ```
 
-If the session has expired on Claude's end, respin automatically falls back to transcript injection to recreate context.
+If Claude reports that the provider session is unavailable or expired, the respin terminates with that provider error.
+The saved transcript remains available for manual reconstruction in a new conversation.
 
 ### Cancel running work
 

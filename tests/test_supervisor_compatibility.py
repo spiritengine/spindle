@@ -28,31 +28,38 @@ def test_store_layout_names_sibling_v2_but_activates_only_v1(tmp_path):
     assert not home.exists()
 
 
-def test_legacy_scalar_v1_record_uses_exact_fallback():
-    legacy = {
+def test_scalar_record_cannot_prove_convergence_capability():
+    current = {
         "pid": 123,
-        "supervisor_protocol_version": 1,
+        "supervisor_protocol_version": 2,
         "spool_schema_version": 1,
         "future_diagnostic": {"ignored": True},
     }
 
-    assert spindle._supervisor_compatibility_error(legacy) is None
+    error = spindle._supervisor_compatibility_error(current)
+
+    assert error is not None
+    assert "owner-convergence-v1" in error
     assert "protocol is incompatible" in spindle._supervisor_compatibility_error(
-        {**legacy, "supervisor_protocol_version": 2}
+        {**current, "supervisor_protocol_version": 1}
     )
-    assert "schema is incompatible" in spindle._supervisor_compatibility_error({**legacy, "spool_schema_version": 2})
+    assert "schema is incompatible" in spindle._supervisor_compatibility_error({**current, "spool_schema_version": 2})
 
 
-def test_bridge_identity_is_truthful_and_accepted_by_pre_bridge_reader():
+def test_current_identity_is_truthful_and_rejected_by_pre_bridge_reader():
     record = spindle._supervisor_identity(123)
 
-    assert record["supervisor_protocol_version"] == 1
+    assert record["supervisor_protocol_version"] == 2
     assert record["spool_schema_version"] == 1
-    assert record["supported_supervisor_protocol_range"] == {"min": 1, "max": 1}
+    assert record["supported_supervisor_protocol_range"] == {"min": 2, "max": 2}
     assert record["readable_spool_schemas"] == [1]
     assert record["writable_spool_schema"] == 1
-    assert record["supervisor_capabilities"] == ["supervisor-compatibility-ranges"]
-    assert _pre_bridge_reader_accepts(record)
+    assert record["supervisor_capabilities"] == [
+        "supervisor-compatibility-ranges",
+        "owner-episode-v1",
+        "owner-convergence-v1",
+    ]
+    assert not _pre_bridge_reader_accepts(record)
     assert spindle._supervisor_compatibility_error(record) is None
 
 
@@ -69,8 +76,8 @@ def test_complete_negotiation_replaces_scalar_equality():
     [
         (
             "supported_supervisor_protocol_range",
-            {"min": 2, "max": 3},
-            "owner_supported=2-3 launcher_required=1-1",
+            {"min": 3, "max": 4},
+            "owner_supported=3-4 launcher_required=2-2",
         ),
         (
             "readable_spool_schemas",
@@ -84,8 +91,9 @@ def test_complete_negotiation_replaces_scalar_equality():
         ),
         (
             "supervisor_capabilities",
-            [],
-            "launcher_requires_capabilities=['supervisor-compatibility-ranges']",
+            ["supervisor-compatibility-ranges", "owner-episode-v1"],
+            "launcher_requires_capabilities=['owner-convergence-v1', 'owner-episode-v1', "
+            "'supervisor-compatibility-ranges']",
         ),
     ],
 )
@@ -171,7 +179,7 @@ def test_maintenance_gate_blocks_live_incompatible_or_silent_owner(monkeypatch, 
         (store / ".supervisor.json").write_text(json.dumps(record))
         assert spindle._live_owner_blocks_store_maintenance() is False
 
-        record["supported_supervisor_protocol_range"] = {"min": 2, "max": 3}
+        record["supported_supervisor_protocol_range"] = {"min": 3, "max": 4}
         (store / ".supervisor.json").write_text(json.dumps(record))
         assert spindle._live_owner_blocks_store_maintenance() is True
     finally:
@@ -239,7 +247,7 @@ def test_store_maintenance_refused_only_while_incompatible_owner_lives(monkeypat
     monkeypatch.setattr(spindle, "_cleanup_old_spools", lambda: ran.append("cleanup"))
     monkeypatch.setattr(spindle, "_recovery_pass", lambda: ran.append("pass") or [])
     record = spindle._supervisor_identity(os.getpid())
-    record["supported_supervisor_protocol_range"] = {"min": 2, "max": 3}
+    record["supported_supervisor_protocol_range"] = {"min": 3, "max": 4}
     (store / ".supervisor.json").write_text(json.dumps(record))
     lock_fd = os.open(store / ".supervisor.lock", os.O_CREAT | os.O_RDWR)
     fcntl.flock(lock_fd, fcntl.LOCK_EX)

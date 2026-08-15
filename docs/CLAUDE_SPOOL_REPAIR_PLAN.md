@@ -159,10 +159,10 @@ descriptors. Set an internal environment guard before it imports `spindle`; the 
 skips module-load cleanup/recovery, which otherwise runs before an entry-point body can
 intervene. The supervisor imports the full package once per store, not once per spool.
 
-Refactor the current monitor loop into one reconciliation step. A same-spool process
-replacement, including expired-session transcript fallback, must update the spool's
-capture generation and remain owned; it must not interpret successful replacement as a
-reason to stop supervising the still-running spool.
+Refactor the current monitor loop into one reconciliation step. If a provider session is
+unavailable, the failed respin remains terminal and its saved transcript remains available
+for manual reconstruction in a separate conversation; no same-spool process replacement is
+started (scope decision finding-20260814-5ckx).
 
 Tests may replace the supervisor launcher through an internal injected helper. Subprocess
 tests pass an explicit temporary store path. Do not add a public production switch that
@@ -219,11 +219,14 @@ This prevents a stale telemetry write from restoring `status: running` over canc
 timeout, or finalization. Terminal finalization must preserve an already indexed
 `session_id` when a later result omits or nulls it.
 
-Every same-spool relaunch atomically increments `capture_generation`, resets the byte
-offset and event/tool state, moves the old session ID to `prior_session_id`, and clears the
-current `session_id` until the replacement stream identifies itself. A defensive file-size
-check also resets the reader when a capture is truncated unexpectedly. The supervisor
-continues reconciling the replacement instead of exiting.
+When resume reports that the provider session is unavailable or expired, finalize that
+respin with the provider error and do not relaunch the spool. Terminal publication must
+preserve the existing `capture_generation`, complete-line byte offset, `last_activity_at`,
+`last_event_type`, `active_tools`, and `session_id`; it must not reset, move, or clear that
+telemetry. Preserve the saved capture and transcript under the normal retention policy so
+their session evidence can be used to reconstruct context manually in a new conversation.
+A defensive file-size check still resets the incremental reader when an active capture is
+truncated unexpectedly.
 
 Expose the fields through `spools` and `peek`. When a running spool has not emitted a
 displayable line, `peek` should still report its protocol, session ID if known, and most
@@ -245,8 +248,7 @@ Extend `drop` with an optional human reason. Record:
 - the last indexed activity and active tools already present in the spool;
 - whether process-group termination was verified.
 
-Split finalization into a lock-owning wrapper and a lock-free body, following the existing
-locked-helper pattern used by expired-session recovery. While `drop` holds the spool lock,
+Split finalization into a lock-owning wrapper and a lock-free body. While `drop` holds the spool lock,
 call the lock-free body to reconcile a spool that has already published a terminal stream
 sentinel or whose recorded process and exit-status file are terminal. If finalization
 wins, return the terminal result and do not relabel it as cancelled. Do not recursively
@@ -373,8 +375,10 @@ terminal error.
 - Assert the incremental reader does not duplicate events after restart or offset
   recovery.
 - Replay two parallel tool calls and resolve them independently.
-- Relaunch one spool after a nonzero offset; assert atomic generation reset, replacement
-  session discovery, no stale active tools, and continued supervisor ownership.
+- Make resume return an unavailable-session provider error for a spool with a nonzero
+  capture generation and offset plus populated event, tool, and session telemetry. Assert
+  terminal failure without relaunch, no telemetry reset, and preservation of the saved
+  transcript and session evidence for manual reconstruction in a new conversation.
 - Race telemetry with drop, timeout, and finalization; assert no terminal state can return
   to `running`.
 - Assert a terminal result without a session ID does not erase the earlier indexed ID.
@@ -460,6 +464,6 @@ campaign and receives a two-family Fell before merge.
 - Supported auto-mode classifier denials are visible without being automatically
   misclassified as incomplete.
 - No telemetry or cancellation race can restore a terminal spool to `running`.
-- Same-spool fallback resets capture telemetry and remains supervised through the
-  replacement process.
+- An unavailable or expired provider session leaves the respin terminal with the
+  provider error and preserves its saved transcript for manual reconstruction.
 - No existing permission profile, shard decision, or authority level changes.

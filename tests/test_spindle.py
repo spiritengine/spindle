@@ -61,7 +61,6 @@ from spindle import (
     _get_spool_path,
     _get_stderr_path,
     _get_transcript_path,
-    _handle_expired_session,
     _is_pid_alive,
     _is_review_tag,
     _kimi_bwrap_wrap,
@@ -76,7 +75,7 @@ from spindle import (
     _profile_spawn_env,
     _read_spool,
     _readonly_shard_conflict_error,
-    _recover_orphans,
+    _recovery_pass,
     _refusal_category,
     _resolve_permission,
     _resolve_profile_overrides,
@@ -776,221 +775,42 @@ class TestClaudePermissionCommandShape:
         assert cmd[cmd.index("--permission-mode") + 1] == "acceptEdits"
         assert cmd[cmd.index("--allowedTools") + 1] == PERMISSION_PROFILES["readonly"]
 
-    def test_expired_session_fallback_reemits_readonly_tier(self, tmp_path):
-        """The transcript-injection fallback (a claude --resume whose session expired)
-        must re-apply the original tier, not spawn a bare `claude -p`. A readonly
-        original keeps acceptEdits + its allowlist on the expiry path."""
-        _write_spool(
-            "exp-orig-ro",
-            {
-                "id": "exp-orig-ro",
-                "status": "complete",
-                "session_id": "sess-exp-ro",
-                "harness": "claude-code",
-                "permission": "readonly",
-                "allowed_tools": PERMISSION_PROFILES["readonly"],
-                "working_dir": str(tmp_path),
-                "created_at": datetime.now().isoformat(),
-            },
-        )
-        transcript = _get_transcript_path("exp-orig-ro")
-        transcript.parent.mkdir(parents=True, exist_ok=True)
-        transcript.write_text("prior transcript")
-        failing = {
-            "id": "exp-fail-ro",
-            "status": "running",
-            "session_id": "sess-exp-ro",
-            "prompt": "Continue sess-exp-ro: keep going",
-            "working_dir": str(tmp_path),
-            "pid": None,
-        }
-        captured = {}
+    def test_expired_provider_session_stays_terminal_and_preserves_source_transcript(self, tmp_path):
+        source_id = "expired-source"
+        respin_id = "expired-respin"
+        session_id = "expired-provider-session"
+        transcript = "saved source conversation\nwith reconstruction context\n"
 
-        def fake_spawn(spool_id, cmd, cwd, env=None):
-            captured["cmd"] = cmd
-            return 1
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            source_path = _get_transcript_path(source_id)
+            source_path.parent.mkdir(parents=True, exist_ok=True)
+            source_path.write_text(transcript)
+            _write_spool(
+                respin_id,
+                {
+                    "id": respin_id,
+                    "status": "running",
+                    "session_id": session_id,
+                    "harness": "claude-code",
+                    "created_at": datetime.now().isoformat(),
+                },
+            )
+            _get_stderr_path(respin_id).write_text(f"No conversation found with session ID: {session_id}")
+            _get_exit_path(respin_id).write_text("1\n")
 
-        with patch("spindle._spawn_detached", side_effect=fake_spawn):
-            assert _handle_expired_session("exp-fail-ro", failing) is True
+            terminalizable = MagicMock(state="terminalizable")
+            with patch("spindle._reconcile_spool_ownership", return_value=terminalizable):
+                with patch("spindle._spawn_detached", side_effect=AssertionError("must not replace session")):
+                    assert spindle._reconcile_spool_step(respin_id) is False
+                    terminal = _read_spool(respin_id)
+                    assert spindle._reconcile_spool_step(respin_id) is False
 
-        cmd = captured["cmd"]
-        assert cmd[cmd.index("--permission-mode") + 1] == "acceptEdits"
-        assert cmd[cmd.index("--allowedTools") + 1] == PERMISSION_PROFILES["readonly"]
-
-    def test_expired_session_fallback_reemits_careful_auto_no_allowlist(self, tmp_path):
-        """A careful original re-emits --permission-mode auto on the expiry fallback and,
-        having no allowlist, adds no --allowedTools."""
-        _write_spool(
-            "exp-orig-careful",
-            {
-                "id": "exp-orig-careful",
-                "status": "complete",
-                "session_id": "sess-exp-careful",
-                "harness": "claude-code",
-                "permission": "careful",
-                "allowed_tools": None,
-                "working_dir": str(tmp_path),
-                "created_at": datetime.now().isoformat(),
-            },
-        )
-        transcript = _get_transcript_path("exp-orig-careful")
-        transcript.parent.mkdir(parents=True, exist_ok=True)
-        transcript.write_text("prior transcript")
-        failing = {
-            "id": "exp-fail-careful",
-            "status": "running",
-            "session_id": "sess-exp-careful",
-            "prompt": "Continue sess-exp-careful: keep going",
-            "working_dir": str(tmp_path),
-            "pid": None,
-        }
-        captured = {}
-
-        def fake_spawn(spool_id, cmd, cwd, env=None):
-            captured["cmd"] = cmd
-            return 1
-
-        with patch("spindle._spawn_detached", side_effect=fake_spawn):
-            assert _handle_expired_session("exp-fail-careful", failing) is True
-
-        cmd = captured["cmd"]
-        assert cmd[cmd.index("--permission-mode") + 1] == "auto"
-        assert "--allowedTools" not in cmd
-
-    def test_expired_shard_fallback_keeps_wrapper_and_replaces_birth_token(self, tmp_path):
-        session_id = "expired-shard-session"
-        original_id = "expired-shard-original"
-        failing_id = "expired-shard-failing"
-        worktree = tmp_path / "worktrees" / "expired-shard"
-        worktree.mkdir(parents=True)
-        shard = {"worktree_path": str(worktree), "branch_name": "shard-expired-shard"}
-        original = {
-            "id": original_id,
-            "status": "complete",
-            "session_id": session_id,
-            "harness": "claude-code",
-            "permission": "careful+shard",
-            "allowed_tools": None,
-            "working_dir": str(worktree),
-            "shard": shard,
-        }
-        failing = {
-            "id": failing_id,
-            "status": "running",
-            "session_id": session_id,
-            "prompt": f"Continue {session_id}: keep going",
-            "working_dir": str(worktree),
-            "shard": shard,
-            "pid": 797979,
-            "process_start_time": "old-birth-token",
-        }
-        wrapped = []
-        spawned = []
-
-        def wrap(cmd, shard_info, cwd, **kwargs):
-            wrapped.append((list(cmd), shard_info, cwd))
-            return ["wrapped-fallback"]
-
-        def spawn(spawn_id, cmd, cwd, env=None):
-            spawned.append((spawn_id, list(cmd), cwd))
-            return 808080
-
-        with patch("spindle.SPINDLE_DIR", tmp_path / "spools"):
-            _write_spool(original_id, original)
-            _write_spool(failing_id, failing)
-            transcript = _get_transcript_path(original_id)
-            transcript.parent.mkdir(parents=True, exist_ok=True)
-            transcript.write_text("prior transcript")
-            with patch("spindle._find_spool_by_session", return_value=original):
-                with patch("spindle._is_pid_alive", return_value=False):
-                    with patch("spindle._is_process_group_alive", return_value=False):
-                        with patch("spindle._codex_bwrap_wrap", side_effect=wrap):
-                            with patch("spindle._spawn_detached", side_effect=spawn):
-                                with patch("spindle._process_start_time", return_value="new-birth-token"):
-                                    assert _handle_expired_session(failing_id, failing) is True
-            saved = _read_spool(failing_id)
-
-        assert wrapped[0][1:] == (shard, str(worktree))
-        assert "--permission-mode" in wrapped[0][0]
-        assert spawned == [(failing_id, ["wrapped-fallback"], str(worktree))]
-        assert saved["pid"] == 808080
-        assert saved["process_start_time"] == "new-birth-token"
-
-    def test_expired_session_fallback_never_signals_reused_pid(self, tmp_path):
-        session_id = "expired-reused-session"
-        original_id = "expired-reused-original"
-        failing_id = "expired-reused-failing"
-        original = {
-            "id": original_id,
-            "status": "complete",
-            "session_id": session_id,
-            "harness": "claude-code",
-            "permission": "careful",
-            "working_dir": str(tmp_path),
-        }
-        failing = {
-            "id": failing_id,
-            "status": "running",
-            "session_id": session_id,
-            "prompt": f"Continue {session_id}: work",
-            "working_dir": str(tmp_path),
-            "pid": 929292,
-            "process_start_time": "original-birth",
-        }
-        with patch("spindle.SPINDLE_DIR", tmp_path / "spools"):
-            _write_spool(original_id, original)
-            _write_spool(failing_id, failing)
-            transcript = _get_transcript_path(original_id)
-            transcript.parent.mkdir(parents=True, exist_ok=True)
-            transcript.write_text("prior transcript")
-            with patch("spindle._find_spool_by_session", return_value=original):
-                with patch("spindle._is_pid_alive", return_value=True):
-                    with patch("spindle._process_start_time", return_value="reused-birth"):
-                        with patch("spindle._terminate_process_group") as terminate:
-                            with patch("spindle._spawn_detached") as spawn:
-                                assert _handle_expired_session(failing_id, failing) is False
-
-        terminate.assert_not_called()
-        spawn.assert_not_called()
-
-    def test_expired_session_fallback_refuses_stored_manual_shard(self, tmp_path):
-        """Finding C: a stored readonly/manual + shard spool reaching the transcript
-        fallback is refused before spawning — it must not launch with bypassPermissions
-        via _claude_permission_mode. The failing spool is marked error, not retried.
-        The transcript is present, so a missing guard would spawn (and trip the guard
-        below) rather than silently bail."""
-        _write_spool(
-            "exp-orig-ms",
-            {
-                "id": "exp-orig-ms",
-                "status": "complete",
-                "session_id": "sess-exp-ms",
-                "harness": "claude-code",
-                "permission": "manual+shard",
-                "allowed_tools": PERMISSION_PROFILES["readonly"],
-                "shard": {"worktree_path": str(tmp_path), "shard_id": "sh"},
-                "working_dir": str(tmp_path),
-                "created_at": datetime.now().isoformat(),
-            },
-        )
-        transcript = _get_transcript_path("exp-orig-ms")
-        transcript.parent.mkdir(parents=True, exist_ok=True)
-        transcript.write_text("prior transcript")
-        failing = {
-            "id": "exp-fail-ms",
-            "status": "running",
-            "session_id": "sess-exp-ms",
-            "prompt": "Continue sess-exp-ms: keep going",
-            "working_dir": str(tmp_path),
-            "pid": None,
-        }
-
-        with patch("spindle._spawn_detached", side_effect=AssertionError("must not launch")):
-            assert _handle_expired_session("exp-fail-ms", failing) is True
-
-        refused = _read_spool("exp-fail-ms")
-        assert refused["status"] == "error"
-        assert "no write tools" in refused["error"]
+            assert _read_spool(respin_id) == terminal
+            assert terminal["status"] == "error"
+            assert terminal["error"] == f"No conversation found with session ID: {session_id}"
+            assert "expired_session_replacement_requested" not in terminal
+            assert "used_transcript_fallback" not in terminal
+            assert source_path.read_text() == transcript
 
     @pytest.mark.parametrize(
         "permission,shard_flag",
@@ -1333,6 +1153,12 @@ class TestSingleSpoolGrep:
 
 
 class TestCodexResultExtraction:
+    @pytest.fixture(autouse=True)
+    def released_owner(self):
+        """Result parsing starts only after unified ownership reconciliation."""
+        with patch("spindle._reconcile_spool_ownership", return_value=MagicMock(state="terminalizable")):
+            yield
+
     """Codex results should store the agent's prose, not the raw event stream."""
 
     def _git_shard(self, tmp_path):
@@ -1575,7 +1401,8 @@ class TestCodexResultExtraction:
                 },
             )
             _get_output_path(spool_id).write_text(stream)
-            assert _check_and_finalize_spool(spool_id) is False
+            with patch("spindle._reconcile_spool_ownership", return_value=MagicMock(state="active")):
+                assert _check_and_finalize_spool(spool_id) is False
             assert _read_spool(spool_id)["status"] == "running"
 
     def test_finalize_waits_for_process_exit_after_completed_event(self, tmp_path):
@@ -1597,7 +1424,8 @@ class TestCodexResultExtraction:
                 },
             )
             _get_output_path(spool_id).write_text(stream)
-            assert _check_and_finalize_spool(spool_id) is False
+            with patch("spindle._reconcile_spool_ownership", return_value=MagicMock(state="active")):
+                assert _check_and_finalize_spool(spool_id) is False
             assert _read_spool(spool_id)["status"] == "running"
             assert spindle._PROC_HANDLES.pop(spool_id) is live_proc
 
@@ -1765,7 +1593,7 @@ class TestCodexResultExtraction:
             except ProcessLookupError:
                 pass
 
-    def test_finalize_terminalizes_and_preserves_failed_shard_when_group_survives_kill(self, tmp_path):
+    def test_finalize_after_owner_cleanup_never_signals_and_preserves_failed_shard(self, tmp_path):
         spool_id = "codex-live-group"
         stream = json.dumps({"type": "turn.failed", "error": {"message": "provider failed"}})
         with patch("spindle.SPINDLE_DIR", tmp_path):
@@ -1784,22 +1612,16 @@ class TestCodexResultExtraction:
                 },
             )
             _get_output_path(spool_id).write_text(stream)
-            with patch("spindle._is_process_group_alive", return_value=True):
-                with patch("spindle._spool_process_group_identity_matches", return_value=True):
-                    with patch("spindle._terminate_process_group", return_value=False) as terminate:
-                        with patch("spindle._cleanup_shard") as cleanup:
-                            assert _check_and_finalize_spool(spool_id) is True
-            terminate.assert_called_once()
-            assert terminate.call_args.args == (999999999, 0.5)
-            assert callable(terminate.call_args.kwargs["identity_check"])
+            with patch("spindle._terminate_process_group", side_effect=AssertionError("observer signal")) as terminate:
+                with patch("spindle._cleanup_shard") as cleanup:
+                    assert _check_and_finalize_spool(spool_id) is True
+            terminate.assert_not_called()
             cleanup.assert_not_called()
             saved = _read_spool(spool_id)
             assert saved["status"] == "error"
             assert saved["error"] == "provider failed"
             assert saved["shard_cleanup_preserved"] is True
-            assert saved["process_group_cleanup_warning"] == (
-                "Process group survived TERM and KILL after agent completion"
-            )
+            assert "process_group_cleanup_warning" not in saved
             assert _get_output_path(spool_id).exists()
 
     def test_finalize_never_signals_reused_pid(self, tmp_path):
@@ -1819,17 +1641,14 @@ class TestCodexResultExtraction:
                 },
             )
             _get_output_path(spool_id).write_text(stream)
-            with patch("spindle._is_process_group_alive", return_value=True):
-                with patch("spindle._process_start_time", return_value="reused-birth"):
-                    with patch("spindle._terminate_process_group") as terminate:
-                        assert _check_and_finalize_spool(spool_id) is True
+            with patch("spindle._reconcile_spool_ownership", return_value=MagicMock(state="unverifiable")):
+                with patch("spindle._terminate_process_group") as terminate:
+                    assert _check_and_finalize_spool(spool_id) is False
             saved = _read_spool(spool_id)
 
         terminate.assert_not_called()
-        assert saved["status"] == "error"
-        assert saved["process_group_cleanup_warning"] == (
-            "Process group identity could not be verified after agent completion"
-        )
+        assert saved["status"] == "running"
+        assert "process_group_cleanup_warning" not in saved
 
     @pytest.mark.parametrize(
         "other_spool",
@@ -2106,6 +1925,11 @@ class TestCodexResultExtraction:
 
 
 class TestKimiResultExtraction:
+    @pytest.fixture(autouse=True)
+    def released_owner(self):
+        with patch("spindle._reconcile_spool_ownership", return_value=MagicMock(state="terminalizable")):
+            yield
+
     """Kimi results should store the assistant's prose, not the raw JSONL stream.
 
     The stream embeds role:"tool" lines with full file/command output, and the
@@ -2247,6 +2071,11 @@ class TestStoreIsolation:
 
 
 class TestExitCodeCapture:
+    @pytest.fixture(autouse=True)
+    def released_owner(self):
+        with patch("spindle._reconcile_spool_ownership", return_value=MagicMock(state="terminalizable")):
+            yield
+
     """Finalization captures the child's exit code via the process handle."""
 
     class _FakeProc:
@@ -2296,7 +2125,7 @@ class TestExitCodeCapture:
             assert spool["error"] == "Process exited with no output"
             assert "exit_code" not in spool
 
-    def test_finalize_drains_descendants_after_group_leader_exits(self, tmp_path):
+    def test_finalize_after_released_owner_never_signals_descendants(self, tmp_path):
         sid = "codex-descendant-still-running"
         stream = json.dumps({"type": "turn.completed", "usage": {}})
         with patch("spindle.SPINDLE_DIR", tmp_path):
@@ -2314,15 +2143,11 @@ class TestExitCodeCapture:
             )
             _get_output_path(sid).write_text(stream)
 
-            with patch("spindle._is_process_group_alive", return_value=True):
-                with patch("spindle._spool_process_group_identity_matches", return_value=True):
-                    with patch("spindle._terminate_process_group", return_value=True) as terminate:
-                        assert _check_and_finalize_spool(sid) is True
-            terminate.assert_called_once()
-            assert terminate.call_args.args == (454545, 0.5)
-            assert callable(terminate.call_args.kwargs["identity_check"])
+            with patch("spindle._terminate_process_group", side_effect=AssertionError("observer signal")) as terminate:
+                assert _check_and_finalize_spool(sid) is True
+            terminate.assert_not_called()
             assert _read_spool(sid)["status"] == "complete"
-            assert not _get_output_path(sid).exists()
+            assert _get_output_path(sid).exists()
 
     def test_complete_output_gives_live_cli_bounded_shutdown_grace(self, tmp_path):
         sid = "claude-live-shutdown"
@@ -2345,25 +2170,18 @@ class TestExitCodeCapture:
                 },
             )
             _get_output_path(sid).write_text(stream)
-            with patch("spindle._is_process_group_alive", return_value=True):
-                with patch("spindle._terminate_process_group", return_value=True) as terminate:
+            with patch("spindle._terminate_process_group", side_effect=AssertionError("observer signal")) as terminate:
+                with patch("spindle._reconcile_spool_ownership", return_value=MagicMock(state="active")):
                     assert _check_and_finalize_spool(sid) is False
                     first = _read_spool(sid)
                     assert first["status"] == "running"
-                    assert first["output_complete_detected_at"]
+                    assert "output_complete_detected_at" not in first
                     terminate.assert_not_called()
-
-                    first["output_complete_detected_at"] = (
-                        datetime.now() - timedelta(seconds=spindle.OUTPUT_COMPLETION_GRACE_SECONDS + 1)
-                    ).isoformat()
-                    _write_spool(sid, first)
-                    assert _check_and_finalize_spool(sid) is True
+                assert _check_and_finalize_spool(sid) is True
 
             saved = _read_spool(sid)
 
-        terminate.assert_called_once()
-        assert terminate.call_args.args == (565656, 0.5)
-        assert callable(terminate.call_args.kwargs["identity_check"])
+        terminate.assert_not_called()
         assert saved["status"] == "complete"
         assert saved["result"] == "done"
         assert saved["session_id"] == "session-live"
@@ -2401,12 +2219,10 @@ class TestExitCodeCapture:
             spool["process_start_time"] = spindle._process_start_time(pid)
             _write_spool(sid, spool)
             assert spindle._PROC_HANDLES[sid].wait(timeout=5) == 0
-            assert spindle._is_process_group_alive(pid) is True
 
             assert _check_and_finalize_spool(sid) is True
             saved = _read_spool(sid)
 
-        assert spindle._is_process_group_alive(pid) is False
         assert saved["status"] == "complete"
         assert saved["exit_code"] == 0
         assert saved["result"].strip() == stream
@@ -2426,29 +2242,43 @@ class TestExitCodeCapture:
             "if path.name.isdigit() and path.exists()])); "
             f"Path({str(ready)!r}).touch(); time.sleep(30)"
         )
-        pid = spindle._spawn_detached(
+        watchdog_pid = spindle._spawn_detached(
             spool_id,
             [sys.executable, "-c", child],
             str(tmp_path),
         )
-        handle = spindle._PROC_HANDLES.pop(spool_id)
         spindle._finish_spawn_barrier(spool_id, start=True)
+        handle = spindle._PROC_HANDLES.pop(spool_id)
         try:
             deadline = time.monotonic() + 5
             while not ready.exists() and time.monotonic() < deadline:
                 time.sleep(0.02)
             assert ready.exists()
 
-            # This is the supervisor's post-restart view: no local Popen handle
-            # and no Linux /proc birth token persisted on the spool.
-            spool = {"id": spool_id, "pid": pid}
-            assert spindle._spool_process_group_identity_matches(spool) is True
             assert all(not target.startswith("pipe:") for target in json.loads(fds.read_text()))
+            spool = _read_spool(spool_id)
+            identity = json.loads(spindle._get_owner_identity_path(spool_id).read_text())
+            assert spool["pid"] == spool["owner_pid"]
+            assert spool["owner_pid"] == identity["pid"]
+            assert spool["owner_pid"] != watchdog_pid
+            assert spool["watchdog_pid"] == watchdog_pid
+            assert handle.pid == watchdog_pid
+            lock_target = str(spindle._get_owner_lock_path(spool_id))
+            assert lock_target not in json.loads(fds.read_text())
+            spindle.create_control_request(spindle.SPINDLE_DIR, spool_id, "cancel", spool["owner_generation"], "test")
         finally:
-            spindle._terminate_process_group(pid, 0.2)
+            current = _read_spool(spool_id)
+            if current and current.get("owner_generation") and handle.poll() is None:
+                spindle.create_control_request(
+                    spindle.SPINDLE_DIR,
+                    spool_id,
+                    "cancel",
+                    current["owner_generation"],
+                    "test-cleanup",
+                )
             handle.wait(timeout=5)
 
-        assert spindle._spool_process_group_identity_matches(spool) is False
+        assert spindle._get_owner_lock_path(spool_id).exists()
 
     def test_child_environment_strips_supervisor_import_guard(self, monkeypatch):
         guard = spindle.SUPERVISOR_IMPORT_GUARD
@@ -2461,47 +2291,54 @@ class TestExitCodeCapture:
 class TestCancellationTermination:
     @pytest.mark.parametrize("tool_path", ["sync", "async"])
     def test_drop_escalates_and_does_not_leave_sigterm_ignoring_group(self, tmp_path, tool_path):
-        proc = subprocess.Popen(
-            ["/bin/sh", "-c", 'trap "" TERM; while :; do sleep 1; done'],
-            start_new_session=True,
-        )
         spool_id = f"cancel-{tool_path}"
-        try:
-            time.sleep(0.2)
-            with patch("spindle.SPINDLE_DIR", tmp_path):
-                _write_spool(
-                    spool_id,
-                    {
-                        "id": spool_id,
-                        "status": "running",
-                        "pid": proc.pid,
-                        "process_start_time": spindle._process_start_time(proc.pid),
-                        "created_at": datetime.now().isoformat(),
-                    },
-                )
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool(
+                spool_id,
+                {"id": spool_id, "status": "pending", "created_at": datetime.now().isoformat()},
+            )
+            watchdog_pid = spindle._spawn_detached(
+                spool_id,
+                ["/bin/sh", "-c", 'trap "" TERM; while :; do sleep 1; done'],
+                str(tmp_path),
+            )
+            spindle._finish_spawn_barrier(spool_id, start=True)
+            owner = spindle._PROC_HANDLES.pop(spool_id)
+            deadline = time.monotonic() + 5
+            while (_read_spool(spool_id) or {}).get("status") != "running" and time.monotonic() < deadline:
+                time.sleep(0.02)
+            running = _read_spool(spool_id)
+            provider_pid = running["provider_pid"]
+            try:
                 if tool_path == "sync":
                     result = spindle._spin_drop_sync(spool_id)
                 else:
                     drop_tool = spindle.spin_drop.fn if hasattr(spindle.spin_drop, "fn") else spindle.spin_drop
                     result = asyncio.run(drop_tool(spool_id))
-
-                assert result == f"Dropped spool {spool_id}"
-                assert spindle._is_process_group_alive(proc.pid) is False
-                assert _read_spool(spool_id)["status"] == "error"
-        finally:
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+                assert result.startswith(f"Cancellation requested for spool {spool_id}")
+                owner.wait(timeout=5)
+            finally:
+                if owner.poll() is None:
+                    owner.kill()
+                    owner.wait(timeout=5)
+            assert spindle._is_pid_alive(provider_pid) is False
+            assert _read_spool(spool_id)["status"] == "error"
+            assert watchdog_pid != running["owner_pid"]
+            assert running["pid"] == running["owner_pid"]
+            assert running["watchdog_pid"] == watchdog_pid
+            identity = json.loads(spindle._get_owner_identity_path(spool_id).read_text())
+            assert identity["pid"] == running["owner_pid"]
 
     @pytest.mark.parametrize("tool_path", ["sync", "async"])
     def test_drop_lock_prevents_finalizer_from_overwriting_terminal_state(self, tmp_path, tool_path):
         spool_id = f"cancel-finalize-race-{tool_path}"
         finalize_attempts = []
 
-        def terminate_while_finalizer_races(pid, grace, **kwargs):
+        real_create_request = spindle.create_control_request
+
+        def request_while_finalizer_races(*args, **kwargs):
             finalize_attempts.append(_check_and_finalize_spool(spool_id))
-            return True
+            return real_create_request(*args, **kwargs)
 
         with patch("spindle.SPINDLE_DIR", tmp_path):
             _write_spool(
@@ -2512,28 +2349,28 @@ class TestCancellationTermination:
                     "harness": "codex",
                     "prompt": "x",
                     "pid": 464646,
+                    "owner_generation": 1,
                     "created_at": datetime.now().isoformat(),
                 },
             )
             _get_output_path(spool_id).write_text(json.dumps({"type": "turn.completed", "usage": {}}))
             _get_exit_path(spool_id).write_text("0\n")
-            with patch("spindle._spool_process_group_identity_matches", return_value=True):
-                with patch("spindle._spool_process_group_is_alive", return_value=True):
-                    with patch("spindle._terminate_process_group", side_effect=terminate_while_finalizer_races):
-                        if tool_path == "sync":
-                            result = spindle._spin_drop_sync(spool_id)
-                        else:
-                            drop_tool = spindle.spin_drop.fn if hasattr(spindle.spin_drop, "fn") else spindle.spin_drop
-                            result = asyncio.run(drop_tool(spool_id))
+            with patch("spindle._reconcile_spool_ownership", return_value=MagicMock(state="active")):
+                with patch("spindle.create_control_request", side_effect=request_while_finalizer_races):
+                    if tool_path == "sync":
+                        result = spindle._spin_drop_sync(spool_id)
+                    else:
+                        drop_tool = spindle.spin_drop.fn if hasattr(spindle.spin_drop, "fn") else spindle.spin_drop
+                        result = asyncio.run(drop_tool(spool_id))
             saved = _read_spool(spool_id)
 
-        assert result == f"Dropped spool {spool_id}"
+        assert result.startswith(f"Cancellation requested for spool {spool_id}")
         assert finalize_attempts == [False]
-        assert saved["status"] == "error"
-        assert saved["error"] == "Cancelled by user"
+        assert saved["status"] == "running"
+        assert saved["lifecycle"]["public_stop_state"] == "stopping"
         assert "result" not in saved
 
-    def test_drop_terminalizes_when_process_group_survives_kill(self, tmp_path):
+    def test_drop_keeps_stubborn_owner_slot_counted_until_owner_resolution(self, tmp_path):
         spool_id = "cancel-stubborn-group"
         shard = {"worktree_path": str(tmp_path / "worktree")}
         with patch("spindle.SPINDLE_DIR", tmp_path):
@@ -2543,24 +2380,23 @@ class TestCancellationTermination:
                     "id": spool_id,
                     "status": "running",
                     "pid": 575757,
+                    "owner_generation": 2,
                     "created_at": datetime.now().isoformat(),
                     "shard": shard,
                     "shard_created_by_spool": True,
                 },
             )
             _get_output_path(spool_id).write_text("partial output")
-            with patch("spindle._spool_process_group_is_alive", return_value=True):
-                with patch("spindle._spool_process_group_identity_matches", return_value=True):
-                    with patch("spindle._terminate_process_group", return_value=False):
-                        result = spindle._spin_drop_sync(spool_id)
+            with patch("spindle._reconcile_spool_ownership", return_value=MagicMock(state="active")):
+                with patch("spindle._terminate_process_group", side_effect=AssertionError("observer signal")):
+                    result = spindle._spin_drop_sync(spool_id)
             saved = _read_spool(spool_id)
             capture_preserved = _get_output_path(spool_id).exists()
+            assert _count_running() == 1
 
-        assert result == f"Dropped spool {spool_id} (warning: process group may still be alive)"
-        assert saved["status"] == "error"
-        assert saved["error"] == "Cancelled by user"
-        assert saved["shard_cleanup_preserved"] is True
-        assert saved["process_group_cleanup_warning"] == ("Process group survived TERM and KILL after cancellation")
+        assert result.startswith(f"Cancellation requested for spool {spool_id}")
+        assert saved["status"] == "running"
+        assert saved["lifecycle"]["public_stop_state"] == "stopping"
         assert capture_preserved is True
 
     def test_drop_never_signals_reused_pid(self, tmp_path):
@@ -2576,113 +2412,15 @@ class TestCancellationTermination:
                     "created_at": datetime.now().isoformat(),
                 },
             )
-            with patch("spindle._is_pid_alive", return_value=True):
-                with patch("spindle._process_start_time", return_value="reused-birth"):
-                    with patch("spindle._terminate_process_group") as terminate:
-                        result = spindle._spin_drop_sync(spool_id)
+            with patch("spindle._reconcile_spool_ownership", return_value=MagicMock(state="unverifiable")):
+                with patch("spindle._terminate_process_group") as terminate:
+                    result = spindle._spin_drop_sync(spool_id)
             saved = _read_spool(spool_id)
 
         terminate.assert_not_called()
-        assert result == f"Dropped spool {spool_id} (warning: process group may still be alive)"
-        assert saved["status"] == "error"
-        assert saved["process_group_cleanup_warning"] == (
-            "Process group identity could not be verified after cancellation"
-        )
-
-    def test_expired_session_fallback_cannot_resurrect_cancelled_spool(self, tmp_path):
-        spool_id = "fallback-cancel-race"
-        original = {
-            "id": "fallback-original",
-            "status": "complete",
-            "session_id": "fallback-session",
-            "permission": "careful",
-        }
-        failing = {
-            "id": spool_id,
-            "status": "running",
-            "session_id": "fallback-session",
-            "prompt": "Continue fallback-session: work",
-            "working_dir": str(tmp_path),
-            "pid": None,
-        }
-        transcript = tmp_path / "transcript.txt"
-        transcript.write_text("prior context")
-        spawn_started = threading.Event()
-        allow_spawn = threading.Event()
-        fallback_result = []
-        cancel_result = []
-
-        def blocked_spawn(*args, **kwargs):
-            spawn_started.set()
-            assert allow_spawn.wait(timeout=5)
-            return 474747
-
-        with patch("spindle.SPINDLE_DIR", tmp_path / "spools"):
-            _write_spool(spool_id, failing)
-            with patch("spindle._find_spool_by_session", return_value=original):
-                with patch("spindle._get_transcript_path", return_value=transcript):
-                    with patch("spindle._spawn_detached", side_effect=blocked_spawn):
-                        with patch("spindle._terminate_process_group", return_value=True):
-                            fallback = threading.Thread(
-                                target=lambda: fallback_result.append(_handle_expired_session(spool_id, failing))
-                            )
-                            fallback.start()
-                            assert spawn_started.wait(timeout=5)
-                            cancel = threading.Thread(
-                                target=lambda: cancel_result.append(spindle._spin_drop_sync(spool_id))
-                            )
-                            cancel.start()
-                            allow_spawn.set()
-                            fallback.join(timeout=5)
-                            cancel.join(timeout=5)
-            saved = _read_spool(spool_id)
-
-        assert not fallback.is_alive()
-        assert not cancel.is_alive()
-        assert fallback_result == [True]
-        assert cancel_result == [f"Dropped spool {spool_id}"]
-        assert saved["status"] == "error"
-        assert saved["error"] == "Cancelled by user"
-
-    def test_expired_session_fallback_reaps_old_handle_before_replacement(self, tmp_path):
-        spool_id = "fallback-handle-replacement"
-        original = {
-            "id": "fallback-original-handle",
-            "status": "complete",
-            "session_id": "fallback-handle-session",
-            "permission": "careful",
-        }
-        failing = {
-            "id": spool_id,
-            "status": "running",
-            "session_id": "fallback-handle-session",
-            "prompt": "Continue fallback-handle-session: work",
-            "working_dir": str(tmp_path),
-            "pid": 616161,
-        }
-        transcript = tmp_path / "transcript-handle.txt"
-        transcript.write_text("prior context")
-        old_proc = MagicMock()
-        old_proc.poll.return_value = 0
-
-        def replacement_spawn(*args, **kwargs):
-            assert spool_id not in spindle._PROC_HANDLES
-            return 626262
-
-        with patch("spindle.SPINDLE_DIR", tmp_path / "spools"):
-            spindle._PROC_HANDLES[spool_id] = old_proc
-            _write_spool(spool_id, failing)
-            with patch("spindle._find_spool_by_session", return_value=original):
-                with patch("spindle._get_transcript_path", return_value=transcript):
-                    with patch("spindle._is_pid_alive", return_value=False):
-                        with patch("spindle._is_process_group_alive", return_value=False):
-                            with patch("spindle._spawn_detached", side_effect=replacement_spawn):
-                                assert _handle_expired_session(spool_id, failing) is True
-            saved = _read_spool(spool_id)
-
-        old_proc.poll.assert_called_once_with()
-        assert saved["pid"] == 626262
-        assert saved["used_transcript_fallback"] is True
+        assert result.startswith(f"Error: Cannot cancel spool {spool_id}: ownership unverifiable")
+        assert saved["status"] == "running"
+        assert "process_group_cleanup_warning" not in saved
 
     def test_drop_lock_contention_returns_bounded_error(self, tmp_path):
         spool_id = "cancel-lock-contention"
@@ -2714,6 +2452,11 @@ class TestFableGateRefusal:
     to re-route to another model — so it must be distinguishable from a generic
     error for agents, triage, and skein.
     """
+
+    @pytest.fixture(autouse=True)
+    def released_owner(self):
+        with patch("spindle._reconcile_spool_ownership", return_value=MagicMock(state="terminalizable")):
+            yield
 
     @staticmethod
     def _cc_refusal_stream(category, message="API Error: Fable 5 has safety measures ...", is_error=True):
@@ -3127,7 +2870,7 @@ class TestWaitUntilIdle:
         assert si.call_count == 3
         assert sl.call_count == 2  # slept after each non-idle check
 
-    def test_spools_idle_finalizes_dead_running_spool(self, tmp_path):
+    def test_spools_idle_keeps_unverifiable_legacy_running_spool_slot_counted(self, tmp_path):
         with patch("spindle.SPINDLE_DIR", tmp_path):
             _write_spool(
                 "d1",
@@ -3139,9 +2882,8 @@ class TestWaitUntilIdle:
                     "created_at": datetime.now().isoformat(),
                 },
             )
-            # dead pid, no output -> finalize flips it off "running" -> idle
-            assert spindle._spools_idle() is True
-            assert _read_spool("d1")["status"] != "running"
+            assert spindle._spools_idle() is False
+            assert _read_spool("d1")["status"] == "running"
 
     def test_spools_idle_false_when_pending(self, tmp_path):
         with patch("spindle.SPINDLE_DIR", tmp_path):
@@ -3158,7 +2900,7 @@ class TestWaitUntilIdle:
 
     def test_spools_idle_clears_stuck_pending(self, tmp_path):
         # A pending spool that never got a PID and aged past the spawn timeout
-        # must not wedge the drain - _recover_orphans times it out.
+        # must not wedge the drain - the gated recovery pass times it out.
         old = (datetime.now() - timedelta(seconds=spindle.PENDING_SPAWN_TIMEOUT + 10)).isoformat()
         with patch("spindle.SPINDLE_DIR", tmp_path):
             _write_spool(
@@ -3262,7 +3004,7 @@ class TestOrphanedLockSweep:
             assert _read_spool(spool_id) is not None
             assert _get_output_path(spool_id).read_text() == "startup diagnostics"
 
-            _recover_orphans()
+            _recovery_pass()
 
             recovered = _read_spool(spool_id)
             assert recovered["status"] == "error"
@@ -3286,17 +3028,15 @@ class TestOrphanedLockSweep:
             )
             _get_output_path(spool_id).write_text("still open")
             _get_stderr_path(spool_id).write_text("diagnostic")
-            with patch("spindle._is_pid_alive", return_value=False):
-                with patch("spindle._is_process_group_alive", return_value=True):
-                    spindle._cleanup_old_spools()
+            with patch("spindle._reconcile_spool_ownership", return_value=MagicMock(state="active")):
+                spindle._cleanup_old_spools()
 
             assert _read_spool(spool_id) is not None
             assert _get_output_path(spool_id).read_text() == "still open"
             assert _get_stderr_path(spool_id).read_text() == "diagnostic"
 
-            with patch("spindle._is_pid_alive", return_value=False):
-                with patch("spindle._is_process_group_alive", return_value=False):
-                    spindle._cleanup_old_spools()
+            with patch("spindle._reconcile_spool_ownership", return_value=MagicMock(state="terminalizable")):
+                spindle._cleanup_old_spools()
 
             assert _read_spool(spool_id) is None
             assert not _get_output_path(spool_id).exists()
@@ -3417,30 +3157,20 @@ class TestOrphanedLockSweep:
                 },
             )
             abandon = shard_abandon.fn if hasattr(shard_abandon, "fn") else shard_abandon
-            with patch("spindle._is_pid_alive", return_value=True):
+            with patch("spindle._reconcile_spool_ownership", return_value=MagicMock(state="unverifiable")):
                 with patch("spindle._terminate_process_group") as terminate:
                     with patch("spindle._cleanup_shard") as cleanup:
                         result = asyncio.run(abandon(spool_id, caller_cwd=str(tmp_path / "outside")))
 
-        assert result == f"Error: Could not verify process identity for spool {spool_id}; shard preserved"
+        assert result.startswith(f"Error: Cannot abandon active spool {spool_id}: ownership unverifiable")
         terminate.assert_not_called()
         cleanup.assert_not_called()
 
-    def test_running_shard_abandon_serializes_finalizer_and_reaps_handle(self, tmp_path):
+    def test_running_shard_abandon_requests_owner_cleanup_before_destructive_work(self, tmp_path):
         spool_id = "running-abandon-race"
         worktree = tmp_path / "worktrees" / "running-abandon-race"
         worktree.mkdir(parents=True)
-        proc = MagicMock()
-        proc.pid = 636363
-        proc.poll.return_value = -15
-        finalize_attempts = []
-
-        def cleanup_while_finalizer_races(*args, **kwargs):
-            finalize_attempts.append(_check_and_finalize_spool(spool_id))
-            return True
-
         with patch("spindle.SPINDLE_DIR", tmp_path / "spools"):
-            spindle._PROC_HANDLES[spool_id] = proc
             _write_spool(
                 spool_id,
                 {
@@ -3448,6 +3178,7 @@ class TestOrphanedLockSweep:
                     "status": "running",
                     "created_at": datetime.now().isoformat(),
                     "pid": 636363,
+                    "owner_generation": 3,
                     "shard": {
                         "worktree_path": str(worktree),
                         "branch_name": "shard-running-abandon-race",
@@ -3455,20 +3186,18 @@ class TestOrphanedLockSweep:
                 },
             )
             abandon = shard_abandon.fn if hasattr(shard_abandon, "fn") else shard_abandon
-            with patch("spindle._is_pid_alive", return_value=True):
-                with patch("spindle._spool_process_group_identity_matches", return_value=True):
-                    with patch("spindle._terminate_process_group", return_value=True):
-                        with patch("spindle._cleanup_shard", side_effect=cleanup_while_finalizer_races):
-                            result = asyncio.run(abandon(spool_id, caller_cwd=str(tmp_path / "outside")))
+            with patch("spindle._reconcile_spool_ownership", return_value=MagicMock(state="active")):
+                with patch("spindle._terminate_process_group") as terminate:
+                    with patch("spindle._cleanup_shard") as cleanup:
+                        result = asyncio.run(abandon(spool_id, caller_cwd=str(tmp_path / "outside")))
             saved = _read_spool(spool_id)
 
-        assert result == f"Abandoned shard {spool_id}"
-        assert finalize_attempts == [False]
-        assert spool_id not in spindle._PROC_HANDLES
-        proc.poll.assert_called_once_with()
-        assert saved["status"] == "error"
-        assert saved["error"] == "Shard abandoned"
-        assert saved["shard"]["abandoned"] is True
+        assert result.startswith(f"Error: Cancellation requested for spool {spool_id}")
+        terminate.assert_not_called()
+        cleanup.assert_not_called()
+        assert saved["status"] == "running"
+        assert saved["lifecycle"]["public_stop_state"] == "stopping"
+        assert "abandoned" not in saved["shard"]
 
 
 class TestProcessUtils:
@@ -3751,6 +3480,34 @@ class TestSpoolLocking:
                     assert second is True
 
 
+def _write_released_owner_evidence(root: Path, spool_id: str, *, pid: int = 999_999_999, exit_code: int = 0):
+    lock_path = root / f"{spool_id}.process-owner"
+    lock_path.touch()
+    info = lock_path.stat()
+    identity = spindle.ProcessIdentity(
+        pid=pid,
+        birth_token="test-owner-birth",
+        namespace=spindle.capture_pid_namespace(),
+        owner_generation=1,
+        child_pgid=None,
+        lock_device=info.st_dev,
+        lock_inode=info.st_ino,
+        lock_created=True,
+    )
+    (root / f"{spool_id}.owner-identity").write_text(json.dumps(identity.to_dict()))
+    (root / f"{spool_id}.owner-exit").write_text(
+        json.dumps(
+            {
+                "owner_generation": 1,
+                "provider_exit_code": exit_code,
+                "provider_reaped": True,
+                "cleanup_outcome": "natural_exit",
+            }
+        )
+    )
+    (root / f"{spool_id}.exit").write_text(f"{exit_code}\n")
+
+
 def _finalize_worker(tmp_path_str: str, spool_id: str, result_queue):
     """Worker function for concurrent finalization test."""
     import spindle
@@ -3787,6 +3544,7 @@ class TestConcurrentFinalization:
         # Create stdout output file so it can finalize
         stdout_path = tmp_path / f"{spool_id}.stdout"
         stdout_path.write_text(json.dumps({"result": "test result"}))
+        _write_released_owner_evidence(tmp_path, spool_id)
 
         # Spawn two processes to finalize concurrently
         result_queue = multiprocessing.Queue()
@@ -4202,7 +3960,10 @@ class TestGeminiHarness:
             assert spool["timeout"] == 60
             assert "gemini" in spool["tags"]
             assert "test" in spool["tags"]
-            assert spool["status"] == "running"
+            assert spool["status"] == "pending"
+            assert spool["watchdog_pid"] == 12345
+            assert spool["pid"] is None
+            assert "owner_pid" not in spool
 
     def test_gemini_spin_builds_correct_command(self, tmp_path):
         """Gemini spin should build the correct CLI command."""
@@ -4732,7 +4493,10 @@ class TestKimiHarness:
             assert spool["timeout"] == 60
             assert "kimi" in spool["tags"]
             assert "test" in spool["tags"]
-            assert spool["status"] == "running"
+            assert spool["status"] == "pending"
+            assert spool["watchdog_pid"] == 12345
+            assert spool["pid"] is None
+            assert "owner_pid" not in spool
             # Kimi generates session_id upfront
             assert spool["session_id"] is not None
             assert len(spool["session_id"]) == 36  # UUID length
@@ -6519,8 +6283,8 @@ class TestSpawnFailureRecovery:
             cleanup.assert_not_called()
 
 
-class TestRecoverOrphansPending:
-    """Test that _recover_orphans cleans up stale pending spools."""
+class TestRecoveryPassPending:
+    """Test that the gated recovery pass cleans up stale pending spools."""
 
     def test_stale_pending_spool_marked_error(self, tmp_path):
         """Pending spool with no PID older than timeout should be marked error."""
@@ -6539,7 +6303,7 @@ class TestRecoverOrphansPending:
                 },
             )
 
-            _recover_orphans()
+            _recovery_pass()
 
             spool = _read_spool("stale1")
             assert spool["status"] == "error"
@@ -6571,12 +6335,12 @@ class TestRecoverOrphansPending:
                 },
             )
             with patch("spindle._preserve_failed_spool_shard", side_effect=assert_locked):
-                _recover_orphans()
+                _recovery_pass()
 
             assert lock_attempts == [False]
             assert _read_spool("locked-stale")["shard_cleanup_preserved"] is True
 
-    def test_late_spawn_is_terminated_when_recovery_wins(self, tmp_path):
+    def test_late_owner_barrier_is_closed_without_observer_signal_when_recovery_wins(self, tmp_path):
         spool_id = "recovered-before-pid"
         proc = MagicMock()
         proc.pid = 737373
@@ -6592,21 +6356,17 @@ class TestRecoverOrphansPending:
                 },
             )
             spindle._PROC_HANDLES[spool_id] = proc
-            with patch("spindle._spool_process_group_is_alive", return_value=True):
-                with patch("spindle._spool_process_group_identity_matches", return_value=True):
-                    with patch("spindle._terminate_process_group", return_value=True) as terminate:
-                        assert spindle._publish_spawned_process(spool_id, 737373) is False
+            with patch("spindle._terminate_process_group") as terminate:
+                assert spindle._publish_spawned_process(spool_id, 737373) is False
             saved = _read_spool(spool_id)
 
-        terminate.assert_called_once()
-        assert terminate.call_args.args == (737373, 0.2)
-        assert callable(terminate.call_args.kwargs["identity_check"])
+        terminate.assert_not_called()
         proc.poll.assert_called_once_with()
         assert spool_id not in spindle._PROC_HANDLES
         assert saved["status"] == "error"
         assert "pid" not in saved
 
-    def test_late_spawn_cleanup_warning_records_new_process_birth(self, tmp_path):
+    def test_late_owner_does_not_publish_pid_or_warning_after_recovery_wins(self, tmp_path):
         spool_id = "recovered-live-process"
         with patch("spindle.SPINDLE_DIR", tmp_path):
             _write_spool(
@@ -6619,18 +6379,14 @@ class TestRecoverOrphansPending:
                     "created_at": datetime.now().isoformat(),
                 },
             )
-            with patch("spindle._process_start_time", return_value="new-birth-token"):
-                with patch("spindle._spool_process_group_is_alive", return_value=True):
-                    with patch("spindle._spool_process_group_identity_matches", return_value=True):
-                        with patch("spindle._terminate_process_group", return_value=False):
-                            assert spindle._publish_spawned_process(spool_id, 747474) is False
+            with patch("spindle._terminate_process_group") as terminate:
+                assert spindle._publish_spawned_process(spool_id, 747474) is False
             saved = _read_spool(spool_id)
 
-        assert saved["pid"] == 747474
-        assert saved["process_start_time"] == "new-birth-token"
-        assert saved["process_group_cleanup_warning"] == (
-            "Process group survived cleanup after spool startup lost its terminal race"
-        )
+        terminate.assert_not_called()
+        assert "pid" not in saved
+        assert saved["process_start_time"] == "stale-birth-token"
+        assert "process_group_cleanup_warning" not in saved
 
     def test_setup_does_not_overwrite_recovered_shard_reservation(self, tmp_path):
         spool_id = "recovered-during-setup"
@@ -6718,7 +6474,7 @@ class TestRecoverOrphansPending:
                 },
             )
 
-            _recover_orphans()
+            _recovery_pass()
 
             spool = _read_spool("fresh1")
             assert spool["status"] == "pending"
@@ -6736,8 +6492,9 @@ class TestRecoverOrphansPending:
             )
             with patch("spindle._check_and_finalize_spool", return_value=False):
                 with patch("spindle._start_spool_monitor") as start:
-                    _recover_orphans()
-            start.assert_called_once_with("running-after-restart")
+                    needs_monitor = _recovery_pass()
+            assert needs_monitor == ["running-after-restart"]
+            start.assert_not_called()
 
     def test_pending_spool_with_pid_not_touched(self, tmp_path):
         """Pending spool that has a PID should not be marked as error."""
@@ -6753,7 +6510,7 @@ class TestRecoverOrphansPending:
                 },
             )
 
-            _recover_orphans()
+            _recovery_pass()
 
             spool = _read_spool("haspid")
             assert spool["status"] == "pending"
@@ -6775,7 +6532,7 @@ class TestRecoverOrphansPending:
             # Before recovery, counts as running
             assert _count_running() == 1
 
-            _recover_orphans()
+            _recovery_pass()
 
             # After recovery, no longer counts
             assert _count_running() == 0
@@ -7547,13 +7304,12 @@ class TestShardMergeCleanupFailure:
                     "shard": shard,
                 },
             )
-            with patch("spindle._is_pid_alive", return_value=False):
-                with patch("spindle._is_process_group_alive", return_value=False):
-                    with patch("spindle.subprocess.run", side_effect=[git_ok, git_ok]):
-                        with patch("spindle._cleanup_shard", return_value=True):
-                            with patch("spindle._close_tender_folios", return_value=None):
-                                merge_result = asyncio.run(merge(merge_id, caller_cwd=str(tmp_path / "outside")))
-                                abandon_result = asyncio.run(abandon(abandon_id, caller_cwd=str(tmp_path / "outside")))
+            with patch("spindle._reconcile_spool_ownership", return_value=MagicMock(state="terminalizable")):
+                with patch("spindle.subprocess.run", side_effect=[git_ok, git_ok]):
+                    with patch("spindle._cleanup_shard", return_value=True):
+                        with patch("spindle._close_tender_folios", return_value=None):
+                            merge_result = asyncio.run(merge(merge_id, caller_cwd=str(tmp_path / "outside")))
+                            abandon_result = asyncio.run(abandon(abandon_id, caller_cwd=str(tmp_path / "outside")))
 
         assert merge_result == f"Successfully merged shard {merge_id} to main"
         assert abandon_result == f"Abandoned shard {abandon_id}"
@@ -7728,7 +7484,7 @@ class TestShardMergeCleanupFailure:
         assert saved["status"] == "pending"
         cleanup.assert_not_called()
 
-    def test_merge_holds_terminal_lock_and_drains_warned_group(self, tmp_path):
+    def test_merge_holds_terminal_lock_after_owner_released_without_signaling(self, tmp_path):
         spool_id = "merge-warned-group"
         state_dir = tmp_path / "spools"
         worktree = tmp_path / "worktrees" / "merge-warned-group"
@@ -7758,21 +7514,18 @@ class TestShardMergeCleanupFailure:
         merge = shard_merge.fn if hasattr(shard_merge, "fn") else shard_merge
         with patch("spindle.SPINDLE_DIR", state_dir):
             _write_spool(spool_id, spool)
-            with patch("spindle._process_start_time", return_value="warned-start-token"):
-                with patch("spindle._is_pid_alive", return_value=True):
-                    with patch("spindle._terminate_process_group", return_value=True) as terminate:
-                        with patch("spindle._pop_and_reap_process_handle") as reap:
-                            with patch("spindle.subprocess.run", side_effect=git_run):
-                                with patch("spindle._cleanup_shard", return_value=True):
-                                    with patch("spindle._close_tender_folios", return_value=None):
-                                        result = asyncio.run(merge(spool_id, caller_cwd=str(tmp_path / "outside")))
+            with patch("spindle._reconcile_spool_ownership", return_value=MagicMock(state="terminalizable")):
+                with patch("spindle._terminate_process_group") as terminate:
+                    with patch("spindle._pop_and_reap_process_handle") as reap:
+                        with patch("spindle.subprocess.run", side_effect=git_run):
+                            with patch("spindle._cleanup_shard", return_value=True):
+                                with patch("spindle._close_tender_folios", return_value=None):
+                                    result = asyncio.run(merge(spool_id, caller_cwd=str(tmp_path / "outside")))
             saved = _read_spool(spool_id)
 
         assert result == f"Successfully merged shard {spool_id} to main"
         assert lock_attempts == [False, False]
-        terminate.assert_called_once()
-        assert terminate.call_args.args == (747474, 0.5)
-        assert callable(terminate.call_args.kwargs["identity_check"])
+        terminate.assert_not_called()
         reap.assert_called_once_with(spool_id)
         assert "process_group_cleanup_warning" not in saved
 
@@ -7800,20 +7553,15 @@ class TestShardMergeCleanupFailure:
 
         with patch("spindle.SPINDLE_DIR", state_dir):
             _write_spool(spool_id, spool)
-            with patch("spindle._is_pid_alive", return_value=False):
-                with patch("spindle._is_process_group_alive", return_value=False):
-                    with patch(
-                        "spindle._spool_process_group_identity_matches",
-                        side_effect=AssertionError("dead groups need no identity proof"),
-                    ):
-                        with patch(
-                            "spindle._terminate_process_group",
-                            side_effect=AssertionError("dead groups need no signal"),
-                        ):
-                            with patch("spindle.subprocess.run", side_effect=[git_ok, git_ok]):
-                                with patch("spindle._cleanup_shard", return_value=True):
-                                    with patch("spindle._close_tender_folios", return_value=None):
-                                        result = asyncio.run(merge(spool_id, caller_cwd=str(tmp_path / "outside")))
+            with patch("spindle._reconcile_spool_ownership", return_value=MagicMock(state="terminalizable")):
+                with patch(
+                    "spindle._terminate_process_group",
+                    side_effect=AssertionError("released owners need no signal"),
+                ):
+                    with patch("spindle.subprocess.run", side_effect=[git_ok, git_ok]):
+                        with patch("spindle._cleanup_shard", return_value=True):
+                            with patch("spindle._close_tender_folios", return_value=None):
+                                result = asyncio.run(merge(spool_id, caller_cwd=str(tmp_path / "outside")))
             saved = _read_spool(spool_id)
 
         assert result == f"Successfully merged shard {spool_id} to main"
@@ -7840,18 +7588,13 @@ class TestShardMergeCleanupFailure:
 
         with patch("spindle.SPINDLE_DIR", state_dir):
             _write_spool(spool_id, spool)
-            with patch("spindle._is_pid_alive", return_value=False):
-                with patch("spindle._is_process_group_alive", return_value=False):
-                    with patch(
-                        "spindle._spool_process_group_identity_matches",
-                        side_effect=AssertionError("dead groups need no identity proof"),
-                    ):
-                        with patch(
-                            "spindle._terminate_process_group",
-                            side_effect=AssertionError("dead groups need no signal"),
-                        ):
-                            with patch("spindle._cleanup_shard", return_value=True):
-                                result = asyncio.run(abandon(spool_id, caller_cwd=str(tmp_path / "outside")))
+            with patch("spindle._reconcile_spool_ownership", return_value=MagicMock(state="terminalizable")):
+                with patch(
+                    "spindle._terminate_process_group",
+                    side_effect=AssertionError("released owners need no signal"),
+                ):
+                    with patch("spindle._cleanup_shard", return_value=True):
+                        result = asyncio.run(abandon(spool_id, caller_cwd=str(tmp_path / "outside")))
             saved = _read_spool(spool_id)
 
         assert result == f"Abandoned shard {spool_id}"
@@ -9563,42 +9306,12 @@ class TestReviewTagTimeout:
         assert not _is_review_tag("fell-notanumber")
         assert not _is_review_tag("triage")
 
-    def test_monitor_spool_kills_timed_out_process(self, tmp_path):
-        """_monitor_spool sends SIGTERM to a process that exceeds its timeout."""
-        proc = subprocess.Popen(
-            ["sleep", "60"],
-            start_new_session=True,
-        )
-        spool_id = "test-timeout-kill"
-
-        with patch("spindle.SPINDLE_DIR", tmp_path):
-            with patch("spindle.MONITOR_POLL_INTERVAL", 0.1):
-                # created_at is 5s in the past so the 1s timeout is already expired
-                spool = {
-                    "id": spool_id,
-                    "status": "running",
-                    "pid": proc.pid,
-                    "process_start_time": spindle._process_start_time(proc.pid),
-                    "timeout": 1,
-                    "created_at": (datetime.now() - timedelta(seconds=5)).isoformat(),
-                    "prompt": "test",
-                }
-                _write_spool(spool_id, spool)
-                _monitor_spool(spool_id)
-
-                pid_alive_after = _is_pid_alive(proc.pid)
-                result = _read_spool(spool_id)
-
-        assert not pid_alive_after, "process should have been killed by _monitor_spool"
-        assert result["status"] == "timeout"
-        assert "Timeout" in result["error"]
-
-    def test_monitor_spool_terminates_live_group_after_leader_exits(self, tmp_path):
-        spool_id = "test-timeout-orphan-group"
+    def test_timeout_publishes_owner_request_without_signaling(self, tmp_path):
+        spool_id = "test-timeout-request"
         spool = {
             "id": spool_id,
             "status": "running",
-            "pid": 424242,
+            "owner_generation": 7,
             "timeout": 1,
             "created_at": (datetime.now() - timedelta(seconds=5)).isoformat(),
             "prompt": "test",
@@ -9606,120 +9319,74 @@ class TestReviewTagTimeout:
 
         with patch("spindle.SPINDLE_DIR", tmp_path):
             _write_spool(spool_id, spool)
-            with patch("spindle._is_pid_alive", return_value=False):
-                with patch("spindle._is_process_group_alive", return_value=True):
-                    with patch("spindle._spool_process_group_identity_matches", return_value=True):
-                        with patch("spindle._terminate_process_group", return_value=True) as terminate:
-                            _monitor_spool(spool_id)
+            active = MagicMock(state="active")
+            with patch("spindle._reconcile_spool_ownership", return_value=active) as reconcile:
+                with patch(
+                    "spindle._terminate_process_group",
+                    side_effect=AssertionError("observer must not signal"),
+                ):
+                    assert spindle._reconcile_spool_step(spool_id) is True
             result = _read_spool(spool_id)
 
-        terminate.assert_called_once()
-        assert terminate.call_args.args == (424242, 0.5)
-        assert callable(terminate.call_args.kwargs["identity_check"])
-        assert result["status"] == "timeout"
-
-    def test_monitor_spool_terminalizes_timeout_when_group_survives_kill(self, tmp_path):
-        spool_id = "test-timeout-stubborn-group"
-        spool = {
-            "id": spool_id,
-            "status": "running",
-            "pid": 434343,
-            "timeout": 1,
-            "created_at": (datetime.now() - timedelta(seconds=5)).isoformat(),
-            "prompt": "test",
-            "shard": {"worktree_path": str(tmp_path / "worktree")},
-            "shard_created_by_spool": True,
-        }
-
-        with patch("spindle.SPINDLE_DIR", tmp_path):
-            _write_spool(spool_id, spool)
-            with patch("spindle._is_pid_alive", return_value=False):
-                with patch("spindle._is_process_group_alive", return_value=True):
-                    with patch("spindle._spool_process_group_identity_matches", return_value=True):
-                        with patch("spindle._terminate_process_group", return_value=False):
-                            _monitor_spool(spool_id)
-            result = _read_spool(spool_id)
-
-        assert result["status"] == "timeout"
-        assert result["error"] == "Timeout after 1s"
-        assert result["process_group_cleanup_warning"] == ("Process group survived TERM and KILL after spool timeout")
-        assert result["shard_cleanup_preserved"] is True
-        assert result["shard"]["startup_failure_preserved"] is True
-
-    def test_monitor_timeout_never_signals_reused_pid(self, tmp_path):
-        spool_id = "test-timeout-reused-pid"
-        spool = {
-            "id": spool_id,
-            "status": "running",
-            "pid": 939393,
-            "process_start_time": "original-birth",
-            "timeout": 1,
-            "created_at": (datetime.now() - timedelta(seconds=5)).isoformat(),
-            "prompt": "test",
-        }
-
-        with patch("spindle.SPINDLE_DIR", tmp_path):
-            _write_spool(spool_id, spool)
-            with patch("spindle._is_pid_alive", return_value=True):
-                with patch("spindle._process_start_time", return_value="reused-birth"):
-                    with patch("spindle._terminate_process_group") as terminate:
-                        _monitor_spool(spool_id)
-            result = _read_spool(spool_id)
-
-        terminate.assert_not_called()
-        assert result["status"] == "timeout"
-        assert result["process_group_cleanup_warning"] == (
-            "Process group identity could not be verified after spool timeout"
-        )
-
-    def test_timeout_rechecks_completed_output_after_taking_terminal_lock(self, tmp_path):
-        spool_id = "test-timeout-result-lock-race"
-        spool = {
-            "id": spool_id,
-            "status": "running",
-            "harness": "claude-code",
-            "pid": 606060,
-            "timeout": 1,
-            "created_at": (datetime.now() - timedelta(seconds=5)).isoformat(),
-            "prompt": "test",
-        }
-
-        with patch("spindle.SPINDLE_DIR", tmp_path):
-            _write_spool(spool_id, spool)
-            with patch("spindle._spool_has_complete_output", side_effect=[False, True]):
-                with patch("spindle._check_and_finalize_spool", return_value=True):
-                    with patch("spindle._terminate_process_group") as terminate:
-                        _monitor_spool(spool_id)
-            result = _read_spool(spool_id)
-
-        terminate.assert_not_called()
+        assert reconcile.call_count == 2
         assert result["status"] == "running"
-        assert result["output_complete_detected_at"]
-        assert "error" not in result
+        assert result["lifecycle"]["public_stop_state"] == "stopping"
+        assert result["lifecycle"]["desired_terminal_kind"] == "timeout"
+        requests = list((tmp_path / f"{spool_id}.control-mailbox").glob("*.request"))
+        assert len(requests) == 1
+        assert json.loads(requests[0].read_text())["kind"] == "timeout"
 
-    def test_completed_output_at_timeout_is_not_discarded_during_cli_shutdown(self, tmp_path):
+    @pytest.mark.parametrize("ownership_state", ["unverifiable", "store_unhealthy"])
+    def test_timeout_with_unresolved_ownership_stays_active(self, tmp_path, ownership_state):
+        spool_id = f"test-timeout-{ownership_state}"
+        spool = {
+            "id": spool_id,
+            "status": "running",
+            "owner_generation": 7,
+            "timeout": 1,
+            "created_at": (datetime.now() - timedelta(seconds=5)).isoformat(),
+        }
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool(spool_id, spool)
+            with patch(
+                "spindle._reconcile_spool_ownership",
+                return_value=MagicMock(state=ownership_state),
+            ):
+                with patch(
+                    "spindle._terminate_process_group",
+                    side_effect=AssertionError("observer must not signal"),
+                ):
+                    assert spindle._reconcile_spool_step(spool_id) is True
+            result = _read_spool(spool_id)
+
+        assert result == spool
+        assert not (tmp_path / f"{spool_id}.control-mailbox").exists()
+
+    def test_terminalizable_completed_output_is_parsed_without_signaling(self, tmp_path):
         spool_id = "test-timeout-completed-output"
-        proc = MagicMock()
-        proc.poll.return_value = None
         stream = json.dumps({"type": "result", "subtype": "success", "result": "done", "session_id": "session-timeout"})
         spool = {
             "id": spool_id,
             "status": "running",
             "harness": "claude-code",
-            "pid": 585858,
             "timeout": 1,
             "created_at": (datetime.now() - timedelta(seconds=5)).isoformat(),
             "prompt": "test",
         }
 
         with patch("spindle.SPINDLE_DIR", tmp_path):
-            spindle._PROC_HANDLES[spool_id] = proc
             _write_spool(spool_id, spool)
             _get_output_path(spool_id).write_text(stream)
-            with patch("spindle.OUTPUT_COMPLETION_GRACE_SECONDS", 0):
-                with patch("spindle._is_process_group_alive", return_value=True):
-                    with patch("spindle._terminate_process_group", return_value=True):
-                        _monitor_spool(spool_id)
+            with patch(
+                "spindle._reconcile_spool_ownership",
+                return_value=MagicMock(state="terminalizable"),
+            ):
+                with patch(
+                    "spindle._terminate_process_group",
+                    side_effect=AssertionError("observer must not signal"),
+                ):
+                    assert spindle._reconcile_spool_step(spool_id) is False
             result = _read_spool(spool_id)
 
         assert result["status"] == "complete"
@@ -11050,8 +10717,7 @@ class TestProfiles:
             _profile_spawn_env("bad", None, strict=True)
 
     def test_all_profile_spawn_paths_route_through_helper(self, profiles_root, tmp_path, monkeypatch):
-        """spin, respin, retry, and the expired-session fallback all reconstruct
-        the profile spawn env through the one shared helper."""
+        """Spin, respin, and retry reconstruct profile spawn env through one helper."""
         monkeypatch.setenv("ALT_KEY", "k")
         _make_profile(
             profiles_root,
@@ -11062,7 +10728,6 @@ class TestProfiles:
         def fake_spawn(spool_id, cmd, cwd, env=None):
             return 1
 
-        # Distinct originals per path so _find_spool_by_session stays unambiguous.
         _write_spool(
             "route-respin",
             {
@@ -11093,34 +10758,6 @@ class TestProfiles:
                 "created_at": datetime.now().isoformat(),
             },
         )
-        _write_spool(
-            "route-exp-orig",
-            {
-                "id": "route-exp-orig",
-                "status": "complete",
-                "session_id": "sess-exp-route",
-                "model": "big",
-                "profile": "alt",
-                "env": None,
-                "working_dir": str(tmp_path),
-                "harness": "claude-code",
-                "created_at": datetime.now().isoformat(),
-            },
-        )
-        exp_transcript = _get_transcript_path("route-exp-orig")
-        exp_transcript.parent.mkdir(parents=True, exist_ok=True)
-        exp_transcript.write_text("prior transcript")
-        failing = {
-            "id": "route-exp-fail",
-            "status": "running",
-            "session_id": "sess-exp-route",
-            "prompt": "Continue sess-exp-route: keep going",
-            "profile": "alt",
-            "env": None,
-            "working_dir": str(tmp_path),
-            "pid": None,
-        }
-
         wrapped = MagicMock(side_effect=_profile_spawn_env)
         with patch("spindle._profile_spawn_env", wrapped):
             with patch("spindle._spawn_detached", side_effect=fake_spawn):
@@ -11128,13 +10765,12 @@ class TestProfiles:
                     asyncio.run(self._spin()("x", harness="alt", working_dir=str(tmp_path)))  # 1. spin
                     _respin_sync("sess-respin", "again")  # 2. respin
                     asyncio.run(spool_retry.fn("route-retry"))  # 3. retry
-                    assert _handle_expired_session("route-exp-fail", failing) is True  # 4. expired
 
         called_profiles = [c.args[0] for c in wrapped.call_args_list]
         # Every path asked the helper to reconstruct the "alt" profile spawn env.
-        assert called_profiles.count("alt") == 4
+        assert called_profiles.count("alt") == 3
 
-    # --- retry / expired-session profile re-resolution --------------------
+    # --- retry profile re-resolution --------------------------------------
 
     def test_retry_reresolves_profile_secret_not_persisted(self, profiles_root, tmp_path, monkeypatch):
         """Retrying a profile spool re-resolves the alt endpoint/key/model/extra_args
@@ -11229,117 +10865,6 @@ class TestProfiles:
 
         assert captured["env"] == {"SOME_VAR": "v"}
         assert "ANTHROPIC_BASE_URL" not in captured["env"]
-
-    def test_expired_session_reresolves_profile_secret_not_persisted(self, profiles_root, tmp_path, monkeypatch):
-        """The transcript-fallback respin of a profile spool rebuilds the alt
-        endpoint/key/model rather than running against the default endpoint."""
-        sentinel = "SENTINEL-EXPIRED-b71c"
-        monkeypatch.setenv("ALT_KEY", sentinel)
-        _make_profile(
-            profiles_root,
-            "alt",
-            {
-                "base_url": "https://api.example.com/anthropic",
-                "api_key": "${ALT_KEY}",
-                "extra_args": ["--verbose"],
-                "model": "big",
-            },
-        )
-        # The original (resumable) spool carries the effective model + profile.
-        _write_spool(
-            "exp-orig",
-            {
-                "id": "exp-orig",
-                "status": "complete",
-                "session_id": "sess-exp",
-                "model": "big",
-                "profile": "alt",
-                "env": {"CALLER_TAG": "from-caller"},
-                "working_dir": str(tmp_path),
-                "harness": "claude-code",
-                "created_at": datetime.now().isoformat(),
-            },
-        )
-        transcript = _get_transcript_path("exp-orig")
-        transcript.parent.mkdir(parents=True, exist_ok=True)
-        transcript.write_text("prior conversation")
-
-        # The failing respin spool (session expired) carries the caller env + profile.
-        failing = {
-            "id": "exp-fail",
-            "status": "running",
-            "session_id": "sess-exp",
-            "prompt": "Continue sess-exp: keep going",
-            "profile": "alt",
-            "env": {"CALLER_TAG": "from-caller"},
-            "working_dir": str(tmp_path),
-            "pid": None,
-        }
-        captured = {}
-
-        def fake_spawn(spool_id, cmd, cwd, env=None):
-            captured["env"] = env
-            captured["cmd"] = cmd
-            return 7777
-
-        with patch("spindle._spawn_detached", side_effect=fake_spawn):
-            assert _handle_expired_session("exp-fail", failing) is True
-
-        # The fallback spawn hits the alt endpoint with the re-resolved key.
-        env = captured["env"]
-        assert env["ANTHROPIC_BASE_URL"] == "https://api.example.com/anthropic"
-        assert env["ANTHROPIC_API_KEY"] == sentinel
-        assert env["CALLER_TAG"] == "from-caller"
-        cmd = captured["cmd"]
-        # Re-injected recorded model + extra_args; no --resume on a transcript fallback.
-        assert "--model" in cmd and cmd[cmd.index("--model") + 1] == "big"
-        assert "--verbose" in cmd
-        assert "--resume" not in cmd
-
-        # The fallback never persists the secret on the spool record.
-        assert sentinel not in _get_spool_path("exp-fail").read_text()
-
-    def test_expired_session_non_profile_unchanged(self, tmp_path):
-        """A non-profile expired-session fallback keeps the stored env and adds no --model."""
-        _write_spool(
-            "exp-orig2",
-            {
-                "id": "exp-orig2",
-                "status": "complete",
-                "session_id": "sess-exp2",
-                "model": "opus",
-                "profile": None,
-                "env": {"SOME_VAR": "v"},
-                "working_dir": str(tmp_path),
-                "harness": "claude-code",
-                "created_at": datetime.now().isoformat(),
-            },
-        )
-        transcript = _get_transcript_path("exp-orig2")
-        transcript.parent.mkdir(parents=True, exist_ok=True)
-        transcript.write_text("prior")
-        failing = {
-            "id": "exp-fail2",
-            "status": "running",
-            "session_id": "sess-exp2",
-            "prompt": "Continue sess-exp2: go",
-            "profile": None,
-            "env": {"SOME_VAR": "v"},
-            "working_dir": str(tmp_path),
-            "pid": None,
-        }
-        captured = {}
-
-        def fake_spawn(spool_id, cmd, cwd, env=None):
-            captured["env"] = env
-            captured["cmd"] = cmd
-            return 1
-
-        with patch("spindle._spawn_detached", side_effect=fake_spawn):
-            assert _handle_expired_session("exp-fail2", failing) is True
-
-        assert captured["env"] == {"SOME_VAR": "v"}
-        assert "--model" not in captured["cmd"]
 
     # --- malformed profile fields -----------------------------------------
 
