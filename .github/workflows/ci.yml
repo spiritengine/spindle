@@ -23,6 +23,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Install system test dependencies
+        if: matrix.python-version == '3.12'
         run: |
           sudo apt-get update
           sudo apt-get install --yes bubblewrap
@@ -39,9 +40,15 @@ jobs:
         run: |
           ruff check .
 
-      - name: Run tests
+      - name: Run tests with namespace coverage
+        if: matrix.python-version == '3.12'
         run: |
           pytest tests/ -v
+
+      - name: Run tests
+        if: matrix.python-version != '3.12'
+        run: |
+          pytest tests/ -v -m "not ns_required"
 
   lint:
     runs-on: ubuntu-latest
