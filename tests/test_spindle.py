@@ -6119,7 +6119,11 @@ class TestSpawnFailureRecovery:
         (kimi_home / ".kimi").mkdir(parents=True)
         with patch("spindle.SPINDLE_DIR", tmp_path):
             with patch("spindle._count_running", return_value=0):
-                with patch("spindle._spawn_detached", side_effect=FileNotFoundError("kimi-cli not found")):
+                with (
+                    patch("spindle._kimi_validate_model", return_value=None),
+                    patch("spindle._kimi_bwrap_binary", return_value="/usr/bin/bwrap"),
+                    patch("spindle._spawn_detached", side_effect=FileNotFoundError("kimi-cli not found")),
+                ):
                     result = _kimi_spin_sync(
                         prompt="test prompt",
                         working_dir=str(working_dir),
