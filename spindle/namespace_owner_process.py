@@ -560,9 +560,21 @@ class LogicalOwner:
 
     def _terminal_output_precedes_timeout(self, request, written_at: Optional[datetime]) -> bool:
         """Whether terminal evidence was durably written before this timeout."""
+        return self._terminal_output_precedes_boundary(written_at, request.deadline or request.requested_at)
+
+    def _terminal_output_precedes_deadline(self, written_at: Optional[datetime]) -> bool:
+        """Whether terminal evidence predates the episode's absolute deadline."""
+        if self.wall_deadline_at is None:
+            # Legacy timeout episodes may have only a monotonic budget. Preserve
+            # their prior completed-output precedence; new reservations always
+            # carry the absolute deadline needed for exact ordering.
+            return written_at is not None
+        return self._terminal_output_precedes_boundary(written_at, self.wall_deadline_at)
+
+    @staticmethod
+    def _terminal_output_precedes_boundary(written_at: Optional[datetime], boundary_raw: Optional[str]) -> bool:
         if written_at is None:
             return False
-        boundary_raw = request.deadline or request.requested_at
         try:
             boundary = datetime.fromisoformat(boundary_raw)
         except (TypeError, ValueError):
@@ -1227,12 +1239,15 @@ class LogicalOwner:
                 terminal_output, shutdown_due, terminal_written_at = self._terminal_output_state()
                 if accepted_request is None:
                     accepted_request = self._next_current_request()
-                if accepted_request is None and self.args.timeout is not None and not terminal_output:
+                terminal_precedes_deadline = terminal_output and self._terminal_output_precedes_deadline(
+                    terminal_written_at
+                )
+                if accepted_request is None and self.args.timeout is not None and not terminal_precedes_deadline:
                     if self.clock.monotonic() - started >= monotonic_budget:
                         # Close the output/deadline observation race in favor of
                         # an already durable terminal protocol record.
                         terminal_output, shutdown_due, terminal_written_at = self._terminal_output_state()
-                        if not terminal_output:
+                        if not (terminal_output and self._terminal_output_precedes_deadline(terminal_written_at)):
                             accepted_request = create_control_request(
                                 self.store,
                                 self.spool_id,

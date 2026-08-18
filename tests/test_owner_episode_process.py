@@ -328,6 +328,37 @@ def test_terminal_output_written_before_deadline_rejects_later_supervisor_timeou
     _assert_terminal_projection_is_idempotent(owner, terminal)
 
 
+def test_terminal_output_written_after_deadline_does_not_suppress_owner_timeout(
+    watchdog_owner_case,
+    owner_clock,
+):
+    _current, advance, clock_fd = owner_clock
+    wall_deadline = (datetime.now(timezone.utc) + timedelta(seconds=4)).isoformat()
+    owner = watchdog_owner_case(
+        "gemini-late-terminal-linger",
+        timeout=100,
+        controlled_clock_fd=clock_fd.fileno(),
+        spool_overrides={
+            "harness": "gemini",
+            "wall_deadline_at": wall_deadline,
+        },
+    )
+    output_path = owner.store / f"{owner.spool_id}.stdout"
+    deadline = time.monotonic() + 6
+    while time.monotonic() < deadline and (not output_path.exists() or output_path.stat().st_size == 0):
+        time.sleep(0.01)
+    assert output_path.exists() and output_path.stat().st_size > 0
+    assert datetime.fromtimestamp(output_path.stat().st_mtime, timezone.utc) > datetime.fromisoformat(wall_deadline)
+
+    advance(101)
+    owner.process.wait(timeout=8)
+    terminal = _finalize(owner)
+    assert terminal["status"] == "timeout"
+    assert terminal["terminal_origin"] == "accepted_timeout"
+    assert terminal["output_complete_written_at"] > wall_deadline
+    _assert_terminal_projection_is_idempotent(owner, terminal)
+
+
 @pytest.mark.parametrize("production_entrypoint", ["recovery_pass", "supervisor_step"])
 def test_watchdog_loss_at_provider_start_boundary_uses_owner_containment_authority(
     watchdog_owner_case,
