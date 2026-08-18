@@ -4772,6 +4772,7 @@ class TestKimiHarness:
         assert result.startswith("Error: Kimi writable path cannot replace reserved sandbox mount ")
         reserve.assert_not_called()
 
+    @pytest.mark.ns_required
     def test_kimi_bwrap_blocks_sibling_and_symlink_escape(self, tmp_path):
         """Execute the real wrapper: cwd and Kimi state write, a sibling and a
         symlink into that sibling do not, and sandbox /tmp is not host /tmp."""
@@ -4828,6 +4829,7 @@ class TestKimiHarness:
         assert not (outside / "symlink-bad").exists()
         assert not (Path("/tmp") / private_tmp_marker).exists()
 
+    @pytest.mark.ns_required
     def test_kimi_bwrap_payload_stops_when_detached_group_is_terminated(self, tmp_path):
         bwrap = shutil.which("bwrap")
         if not bwrap:
@@ -4886,6 +4888,7 @@ class TestKimiHarness:
                     with contextlib.suppress(subprocess.TimeoutExpired):
                         handle.wait(timeout=2)
 
+    @pytest.mark.ns_required
     def test_kimi_linked_worktree_git_metadata_stays_read_only(self, tmp_path):
         """Kimi may edit a worktree but cannot stage through external Git metadata."""
         bwrap = shutil.which("bwrap")
