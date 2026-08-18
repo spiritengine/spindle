@@ -14,7 +14,7 @@ import sys
 import threading
 import time
 from contextlib import contextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -9214,6 +9214,171 @@ class TestReviewTagTimeout:
             spools = _list_spools()
             assert len(spools) == 1
             assert spools[0]["timeout"] == DEFAULT_REVIEW_TIMEOUT
+            assert spools[0]["wall_deadline_at"] == spools[0]["owner_episode"]["deadline"]
+
+    @pytest.mark.parametrize("harness", ["claude-code", "codex", "gemini", "kimi"])
+    @pytest.mark.parametrize("explicit, expected", [(None, DEFAULT_REVIEW_TIMEOUT), (0, None)])
+    def test_harness_entrypoints_normalize_timeout_before_reservation(
+        self,
+        tmp_path,
+        monkeypatch,
+        harness,
+        explicit,
+        expected,
+    ):
+        captured = {}
+
+        def reserve(_spool_id, initial_status="pending", reservation_metadata=None):
+            captured.update(reservation_metadata or {})
+            return False, "captured"
+
+        monkeypatch.setattr(spindle, "_try_reserve_slot_and_create", reserve)
+        monkeypatch.setattr(spindle, "_detect_default_branch", lambda _path: "master")
+        if harness == "claude-code":
+            result = _spin_sync(
+                "review task",
+                "readonly",
+                False,
+                None,
+                str(tmp_path),
+                None,
+                "review",
+                None,
+                explicit,
+                True,
+                None,
+            )
+        elif harness == "codex":
+            monkeypatch.setattr(spindle, "_resolve_codex_binary", lambda _env: "/bin/true")
+            monkeypatch.setattr(spindle, "_codex_cli_version", lambda *_args: "test")
+            monkeypatch.setattr(spindle, "_codex_auth_mode", lambda *_args: "chatgpt")
+            monkeypatch.setattr(spindle, "_codex_sandbox_refusal", lambda *_args: None)
+            result = _codex_spin_sync("review task", str(tmp_path), None, "workspace-write", explicit, "review", None)
+        elif harness == "gemini":
+            result = _gemini_spin_sync("review task", str(tmp_path), None, None, explicit, "review", None)
+        else:
+            monkeypatch.setattr(spindle, "_kimi_validate_model", lambda _model: None)
+            result = _kimi_spin_sync(
+                "review task",
+                str(tmp_path),
+                None,
+                None,
+                explicit,
+                "review",
+                None,
+                permission="full",
+            )
+
+        assert result == "captured"
+        assert captured["timeout"] == expected
+
+    def test_reservation_freezes_one_absolute_deadline(self, tmp_path):
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle._ensure_store_supervisor_locked", return_value=(True, None)):
+                with patch("spindle._count_running", return_value=0):
+                    before = datetime.now(timezone.utc)
+                    success, error = _try_reserve_slot_and_create(
+                        "deadline-reserved",
+                        reservation_metadata={"timeout": 30, "tags": ["batch"]},
+                    )
+                    after = datetime.now(timezone.utc)
+
+            assert (success, error) == (True, None)
+            spool = _read_spool("deadline-reserved")
+            deadline = datetime.fromisoformat(spool["wall_deadline_at"])
+            assert before + timedelta(seconds=30) <= deadline <= after + timedelta(seconds=30)
+            assert spool["owner_episode"]["deadline"] == spool["wall_deadline_at"]
+            frozen = spool["wall_deadline_at"]
+
+            assert spindle._prepare_pending_spool_for_spawn(
+                {
+                    "id": "deadline-reserved",
+                    "status": "pending",
+                    "timeout": 30,
+                    "harness": "claude-code",
+                }
+            )
+            prepared = _read_spool("deadline-reserved")
+            assert prepared["wall_deadline_at"] == frozen
+            assert prepared["owner_episode"]["deadline"] == frozen
+
+            provider = MagicMock()
+            provider.pid = os.getpid()
+            with patch("spindle.subprocess.Popen", return_value=provider) as popen:
+                spindle._spawn_detached(
+                    "deadline-reserved",
+                    [sys.executable, "-c", "pass"],
+                    str(tmp_path),
+                )
+            owner_command = popen.call_args.args[0]
+            assert owner_command[owner_command.index("--timeout") + 1] == "30"
+            assert owner_command[owner_command.index("--deadline") + 1] == frozen
+            spindle._finish_spawn_barrier("deadline-reserved", start=False)
+            spindle._PROC_HANDLES.pop("deadline-reserved", None)
+
+    def test_zero_timeout_reservation_has_no_deadline(self, tmp_path):
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle._ensure_store_supervisor_locked", return_value=(True, None)):
+                with patch("spindle._count_running", return_value=0):
+                    success, error = _try_reserve_slot_and_create(
+                        "timeout-disabled",
+                        reservation_metadata={"timeout": None, "tags": ["review"]},
+                    )
+
+            assert (success, error) == (True, None)
+            spool = _read_spool("timeout-disabled")
+            assert spool["timeout"] is None
+            assert "wall_deadline_at" not in spool
+            assert "deadline" not in spool["owner_episode"]
+
+            provider = MagicMock()
+            provider.pid = os.getpid()
+            with patch("spindle.subprocess.Popen", return_value=provider) as popen:
+                spindle._spawn_detached(
+                    "timeout-disabled",
+                    [sys.executable, "-c", "pass"],
+                    str(tmp_path),
+                )
+            owner_command = popen.call_args.args[0]
+            assert "--timeout" not in owner_command
+            assert "--deadline" not in owner_command
+            spindle._finish_spawn_barrier("timeout-disabled", start=False)
+            spindle._PROC_HANDLES.pop("timeout-disabled", None)
+
+    @pytest.mark.parametrize("harness", ["claude-code", "codex", "gemini", "kimi"])
+    def test_respin_paths_reserve_the_inherited_effective_timeout(self, tmp_path, monkeypatch, harness):
+        original = {
+            "id": "original",
+            "status": "complete",
+            "session_id": "session",
+            "harness": harness,
+            "working_dir": str(tmp_path),
+            "timeout": 17,
+            "tags": ["batch"],
+            "permission": "full",
+            "filesystem_boundary": {"kind": "none"},
+        }
+        captured = {}
+
+        def reserve(_spool_id, initial_status="pending", reservation_metadata=None):
+            captured.update(reservation_metadata or {})
+            return False, "captured"
+
+        monkeypatch.setattr(spindle, "_try_reserve_slot_and_create", reserve)
+        if harness == "claude-code":
+            monkeypatch.setattr(spindle, "_resolve_spool_for_respin", lambda _handle: original)
+            result = _respin_sync("original", "continue")
+        elif harness == "codex":
+            monkeypatch.setattr(spindle, "_find_spool_by_session", lambda _session: original)
+            result = _codex_respin_sync("session", "continue")
+        elif harness == "gemini":
+            result = spindle._gemini_respin_sync("session", "continue", original)
+        else:
+            monkeypatch.setattr(spindle, "_kimi_validate_model", lambda _model: None)
+            result = _kimi_respin_sync("session", "continue", original)
+
+        assert result == "captured"
+        assert captured["timeout"] == 17
 
     def test_fell_r1_tag_applies_soft_timeout(self, tmp_path):
         """A spool tagged 'fell-r1' gets the review soft timeout."""
@@ -10817,6 +10982,7 @@ class TestProfiles:
                 "working_dir": str(tmp_path),
                 "harness": "claude-code",
                 "tags": [],
+                "timeout": 17,
                 "created_at": datetime.now().isoformat(),
             },
         )
@@ -10838,6 +11004,9 @@ class TestProfiles:
         assert env["CALLER_TAG"] == "from-caller"
         cmd = captured["cmd"]
         assert "--model" in cmd and cmd[cmd.index("--model") + 1] == "big"
+        retried = _read_spool(new_id)
+        assert retried["timeout"] == 17
+        assert retried["wall_deadline_at"] == retried["owner_episode"]["deadline"]
         assert "--verbose" in cmd
 
         # The re-resolved secret is never persisted on the retried spool.

@@ -53,6 +53,11 @@ def fake_provider_factory(namespace_owner_env):
 
     def factory(mode="cooperative"):
         path = namespace_owner_env["bin"] / f"fake-provider-{len(created)}"
+        if mode == "missing-interpreter":
+            path.write_text("#!/definitely/missing/spindle-test-interpreter\n")
+            path.chmod(path.stat().st_mode | stat.S_IXUSR)
+            created.append(path)
+            return path
         path.write_text(
             "#!/usr/bin/env python3\n"
             "import json, os, signal, socket, sys, time\n"
@@ -62,6 +67,26 @@ def fake_provider_factory(namespace_owner_env):
             "SPOOL_ID = os.environ['SPINDLE_OWNER_SPOOL_ID']\n"
             "CONTROL_FD = int(os.environ['SPINDLE_PROVIDER_CONTROL_FD'])\n"
             "control = socket.socket(fileno=CONTROL_FD)\n"
+            "if MODE == 'gemini-terminal-linger':\n"
+            "    print(json.dumps({'response': 'durable gemini result', 'session_id': 'gemini-session'}), flush=True)\n"
+            "    time.sleep(10.0)\n"
+            "    raise SystemExit(0)\n"
+            "if MODE == 'gemini-incomplete-linger':\n"
+            "    print('{incomplete', flush=True)\n"
+            "    time.sleep(1.0)\n"
+            "    raise SystemExit(0)\n"
+            "if MODE == 'codex-terminal-linger':\n"
+            "    print(json.dumps({'type': 'turn.completed', 'usage': {}}), flush=True)\n"
+            "    time.sleep(1.0)\n"
+            "    raise SystemExit(0)\n"
+            "if MODE in {'claude-terminal-linger', 'claude-intermediate-linger'}:\n"
+            "    print(json.dumps({'type': 'result', 'subtype': 'success', 'is_error': False,\n"
+            "        'session_id': 'claude-session', 'result': 'durable claude result'}), flush=True)\n"
+            "    if MODE == 'claude-terminal-linger':\n"
+            "        print(json.dumps({'type': 'spindle_driver_terminal', 'subtype': 'complete',\n"
+            "            'protocol': 'spindle-claude-driver/1', 'unresolved_tasks': []}), flush=True)\n"
+            "    time.sleep(10.0 if MODE == 'claude-terminal-linger' else 1.0)\n"
+            "    raise SystemExit(0)\n"
             "if MODE in {'setsid-grandchild', 'setsid-grandchild-causal'}:\n"
             "    child = os.fork()\n"
             "    if child == 0:\n"
@@ -391,6 +416,7 @@ def watchdog_owner_case(namespace_owner_env, fake_provider_factory, process_ledg
         spool_overrides=None,
         controlled_clock_fd=None,
         store_kind="bridge_schema1",
+        expect_ready=True,
     ):
         from spindle.namespace_owner import capture_pid_namespace, read_proc_starttime
         from tests.owner_episode_fixtures import make_episode
@@ -527,7 +553,12 @@ def watchdog_owner_case(namespace_owner_env, fake_provider_factory, process_ledg
         ready = {}
         if ready_read in readable:
             with os.fdopen(ready_read) as stream:
-                ready = json.loads(stream.readline())
+                line = stream.readline()
+                if expect_ready:
+                    ready = json.loads(line)
+                else:
+                    assert line == "", "provider unexpectedly reached readiness"
+                    ready = {}
         else:
             os.close(ready_read)
             initial = json.loads(checkpoint_controller.recv(4096).splitlines()[0])

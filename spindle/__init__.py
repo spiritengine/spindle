@@ -402,6 +402,21 @@ def _is_review_tag(tag: str) -> bool:
     return tag in REVIEW_TAGS or bool(re.match(r"^fell-r\d+$", tag))
 
 
+def _normalize_launch_timeout(timeout, tags=None):
+    """Resolve the effective wall timeout before reserving an owner episode."""
+    if timeout == 0:
+        return None
+    if timeout is not None:
+        return timeout
+    if isinstance(tags, str):
+        tag_values = [tag.strip() for tag in tags.split(",") if tag.strip()]
+    else:
+        tag_values = list(tags or [])
+    if any(_is_review_tag(tag) for tag in tag_values):
+        return DEFAULT_REVIEW_TIMEOUT
+    return None
+
+
 # Claude Code stores background-task state here: ~/.claude/tasks/<session_id>/<n>.json
 CLAUDE_TASKS_DIR = Path.home() / ".claude" / "tasks"
 
@@ -2392,7 +2407,11 @@ def _foreign_episode_retirement(
 def _ensure_spool_wall_deadline(spool: dict) -> Optional[str]:
     """Persist one absolute timeout budget before the owner is launched."""
     timeout = spool.get("timeout")
+    if timeout == 0:
+        timeout = None
+        spool["timeout"] = None
     if timeout is None:
+        spool.pop("wall_deadline_at", None)
         return None
     if spool.get("wall_deadline_at"):
         return spool["wall_deadline_at"]
@@ -4418,6 +4437,8 @@ def _spin_sync(
     # Resolve to absolute path to avoid cwd-dependent resolution
     working_dir = str(Path(working_dir).resolve())
     base_branch = base_branch or _detect_default_branch(working_dir)
+    tag_list = [tag.strip() for tag in tags.split(",") if tag.strip()] if tags else []
+    timeout = _normalize_launch_timeout(timeout, tag_list)
 
     # Resolve permission to allowed_tools and check for auto-shard
     try:
@@ -4458,6 +4479,8 @@ def _spin_sync(
             "base_branch": base_branch,
             "harness": "claude-code",
             "shard_requested": use_shard,
+            "tags": tag_list,
+            "timeout": timeout,
         },
     )
     if not success:
@@ -4638,15 +4661,6 @@ Your task:
         cmd.extend(claude_cmd)
     else:
         cmd = claude_cmd
-
-    # Parse tags
-    tag_list = [t.strip() for t in tags.split(",")] if tags else []
-
-    # Review-tagged spools get a soft default timeout when the caller didn't
-    # specify one. Reviews typically finish in 10-30 min; this caps wedged
-    # spools (e.g. a self-referential pgrep bg-task loop — see friction-20260505-b87l).
-    if timeout is None and any(_is_review_tag(t) for t in tag_list):
-        timeout = DEFAULT_REVIEW_TIMEOUT
 
     # Create spool record
     spool = {
@@ -5383,9 +5397,14 @@ def _respin_sync(handle: str, prompt: str, rebuild: bool = False) -> str:
 
         # Generate spool ID first
         spool_id = str(uuid.uuid4())[:8]
+        respin_timeout = _normalize_launch_timeout(original_spool.get("timeout"), original_spool.get("tags"))
 
         # Atomically check concurrency limit and create initial spool entry
-        success, error_msg = _try_reserve_slot_and_create(spool_id, initial_status="pending")
+        success, error_msg = _try_reserve_slot_and_create(
+            spool_id,
+            initial_status="pending",
+            reservation_metadata={"timeout": respin_timeout, "tags": ["respin"]},
+        )
         if not success:
             return error_msg
 
@@ -5507,6 +5526,8 @@ def _respin_sync(handle: str, prompt: str, rebuild: bool = False) -> str:
             "env": caller_env,
             "profile": profile_name,
             "shard": shard_info,
+            "tags": ["respin"],
+            "timeout": respin_timeout,
             "claude_protocol": claude_protocol,
             "created_at": datetime.now().isoformat(),
             "completed_at": None,
@@ -7796,6 +7817,9 @@ def _codex_spin_sync(
     if not working_dir:
         return "Error: working_dir required. Pass the project directory."
 
+    tag_list = [tag.strip() for tag in tags.split(",") if tag.strip()] if tags else []
+    timeout = _normalize_launch_timeout(timeout, tag_list)
+
     try:
         research_target_info = (
             _validate_research_target(research_target, working_dir)
@@ -7847,6 +7871,8 @@ def _codex_spin_sync(
             "base_branch": base_branch or _detect_default_branch(working_dir),
             "harness": "codex",
             "shard_requested": shard,
+            "tags": [*tag_list, "codex"],
+            "timeout": timeout,
         },
     )
     if not success:
@@ -7982,8 +8008,6 @@ Your task:
     else:
         cmd = codex_cmd
 
-    # Parse tags
-    tag_list = [t.strip() for t in tags.split(",")] if tags else []
     tag_list.append("codex")  # Auto-tag as codex spool
 
     # Create spool record
@@ -8053,13 +8077,24 @@ def _codex_respin_sync(session_id: str, prompt: str) -> str:
     # Generate spool ID
     spool_id = "codex-" + str(uuid.uuid4())[:8]
 
+    # Resolve the source before reserving so the new owner episode receives its
+    # complete effective timeout and freezes a fresh absolute deadline.
+    original_spool = _find_spool_by_session(session_id)
+    respin_timeout = _normalize_launch_timeout(
+        original_spool.get("timeout") if original_spool else None,
+        original_spool.get("tags") if original_spool else None,
+    )
+
     # Atomically check concurrency limit and create initial spool entry
-    success, error_msg = _try_reserve_slot_and_create(spool_id, initial_status="pending")
+    success, error_msg = _try_reserve_slot_and_create(
+        spool_id,
+        initial_status="pending",
+        reservation_metadata={"timeout": respin_timeout, "tags": ["codex", "respin"]},
+    )
     if not success:
         return error_msg
 
     # Get working_dir, env, and shard info from original spool if possible
-    original_spool = _find_spool_by_session(session_id)
     working_dir = original_spool.get("working_dir") if original_spool else os.getcwd()
     env = original_spool.get("env") if original_spool else None
     shard_info = original_spool.get("shard") if original_spool else None
@@ -8164,6 +8199,7 @@ def _codex_respin_sync(session_id: str, prompt: str) -> str:
         "codex_bin": codex_bin,
         "codex_version": codex_version,
         "tags": ["codex", "respin"],
+        "timeout": respin_timeout,
         "env": env,
         "shard": shard_info,
         "created_at": datetime.now().isoformat(),
@@ -8600,6 +8636,8 @@ def _gemini_spin_sync(
     # Resolve to absolute path to avoid cwd-dependent resolution
     working_dir = str(Path(working_dir).resolve())
     base_branch = base_branch or _detect_default_branch(working_dir)
+    tag_list = [tag.strip() for tag in tags.split(",") if tag.strip()] if tags else []
+    timeout = _normalize_launch_timeout(timeout, tag_list)
 
     try:
         research_target_info = (
@@ -8622,6 +8660,8 @@ def _gemini_spin_sync(
             "base_branch": base_branch,
             "harness": "gemini",
             "shard_requested": shard,
+            "tags": [*tag_list, "gemini"],
+            "timeout": timeout,
         },
     )
     if not success:
@@ -8723,8 +8763,6 @@ Your task:
             process_env=_process_env(env),
         )
 
-    # Parse tags
-    tag_list = [t.strip() for t in tags.split(",")] if tags else []
     tag_list.append("gemini")  # Auto-tag as gemini spool
 
     # Create spool record
@@ -8765,8 +8803,13 @@ Your task:
 def _gemini_respin_sync(session_id: str, prompt: str, original_spool: dict) -> str:
     """Synchronous implementation of gemini respin - continue a Gemini session."""
     spool_id = "gemini-" + str(uuid.uuid4())[:8]
+    respin_timeout = _normalize_launch_timeout(original_spool.get("timeout"), original_spool.get("tags"))
 
-    success, error_msg = _try_reserve_slot_and_create(spool_id, initial_status="pending")
+    success, error_msg = _try_reserve_slot_and_create(
+        spool_id,
+        initial_status="pending",
+        reservation_metadata={"timeout": respin_timeout, "tags": ["gemini", "respin"]},
+    )
     if not success:
         return error_msg
 
@@ -8789,6 +8832,7 @@ def _gemini_respin_sync(session_id: str, prompt: str, original_spool: dict) -> s
         "session_id": session_id,
         "working_dir": working_dir,
         "tags": ["gemini", "respin"],
+        "timeout": respin_timeout,
         "env": env,
         "model": model or "auto",
         "shard": original_spool.get("shard"),
@@ -8848,6 +8892,8 @@ def _kimi_spin_sync(
 
     working_dir = str(Path(working_dir).resolve())
     base_branch = base_branch or _detect_default_branch(working_dir)
+    tag_list = [tag.strip() for tag in tags.split(",") if tag.strip()] if tags else []
+    timeout = _normalize_launch_timeout(timeout, tag_list)
     process_env = _process_env(env)
     # Shard intent always wins: full is uncontained only without a shard.
     use_bwrap = permission != "full" or shard
@@ -8907,6 +8953,8 @@ def _kimi_spin_sync(
             "base_branch": base_branch,
             "harness": "kimi",
             "shard_requested": shard,
+            "tags": [*tag_list, "kimi"],
+            "timeout": timeout,
         },
     )
     if not success:
@@ -9034,8 +9082,6 @@ Your task:
             "isolated_processes": True,
         }
 
-    # Parse tags
-    tag_list = [t.strip() for t in tags.split(",")] if tags else []
     tag_list.append("kimi")  # Auto-tag as kimi spool
 
     # Create spool record
@@ -9171,9 +9217,14 @@ def _kimi_respin_sync(
 
     # Generate new spool ID
     spool_id = "kimi-" + str(uuid.uuid4())[:8]
+    respin_timeout = _normalize_launch_timeout(original_spool.get("timeout"), original_spool.get("tags"))
 
     # Atomically check concurrency limit and create initial spool entry
-    success, error_msg = _try_reserve_slot_and_create(spool_id, initial_status="pending")
+    success, error_msg = _try_reserve_slot_and_create(
+        spool_id,
+        initial_status="pending",
+        reservation_metadata={"timeout": respin_timeout, "tags": ["kimi", "respin"]},
+    )
     if not success:
         return error_msg
 
@@ -9228,7 +9279,7 @@ def _kimi_respin_sync(
         "thinking": enable_thinking,
         "system_prompt": None,
         "tags": tag_list,
-        "timeout": original_spool.get("timeout"),
+        "timeout": respin_timeout,
         "env": original_spool.get("env"),
         "permission": original_spool.get("permission"),
         "filesystem_boundary": {

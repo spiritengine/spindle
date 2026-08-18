@@ -299,6 +299,74 @@ class LogicalOwner:
         )
         return True
 
+    def _settle_provider_spawn_failure(self, error: OSError) -> bool:
+        """Publish a bound episode that never transferred provider custody."""
+        if not self._verify_lock():
+            return False
+        observed_at = _utc_now()
+        detail = f"provider spawn failed: {error}"
+        cleanup = {
+            "outcome": "provider_spawn_failed",
+            "provider_reaped": True,
+            "adopted_children_reaped": 0,
+            "child_exit_observed_at": observed_at,
+            "provider_exit_code": None,
+        }
+        failure = {
+            "kind": "provider_spawn_failure",
+            "detail": detail,
+            "observed_at": observed_at,
+        }
+        if self.episode_mode:
+            episode = self._read_spool().get("owner_episode") or {}
+            settled = transition_owner_episode(
+                self.store,
+                self.spool_id,
+                actor="owner",
+                destination="cleanup_proven",
+                generation=self.generation,
+                expected_revision=episode.get("revision"),
+                facts={
+                    "containment": {
+                        "contained": True,
+                        "adopted_children_reaped": 0,
+                        "observed_at": observed_at,
+                    },
+                    "cleanup": cleanup,
+                    "failure": failure,
+                },
+            )
+            if not settled.accepted:
+                return False
+        else:
+            lifecycle = {
+                **(self._read_spool().get("lifecycle") or {}),
+                "ownership_state": "held",
+                "transport_state": "reaped",
+                "normalized_terminal_kind": "failed",
+            }
+            self._update_spool(
+                status="error",
+                error=detail,
+                error_kind="provider_spawn_failure",
+                completed_at=observed_at,
+                lifecycle=lifecycle,
+            )
+        _atomic_json_write(
+            self.owner_exit_path,
+            {
+                "owner_pid": os.getpid(),
+                "owner_generation": self.generation,
+                "provider_pid": None,
+                "provider_exit_code": None,
+                "provider_reaped": True,
+                "adopted_children_reaped": 0,
+                "cleanup_outcome": cleanup["outcome"],
+                "observed_at": observed_at,
+            },
+        )
+        return True
+
     def _contain_after_watchdog_loss(self) -> bool:
         """Take over containment, publish proof, and leave no live descendants."""
         returncode = None
@@ -445,6 +513,33 @@ class LogicalOwner:
             deadline = deadline.replace(tzinfo=timezone.utc)
         return max(0.0, (deadline.astimezone(timezone.utc) - datetime.now(timezone.utc)).total_seconds())
 
+    def _terminal_output_state(self) -> tuple[bool, bool]:
+        """Recognize Claude/Gemini terminal output and bound post-result linger."""
+        import spindle
+
+        if not all(hasattr(self, name) for name in ("spool_path", "stdout_path", "stderr_path")):
+            return False, False
+        spool = self._read_spool()
+        if (spool.get("harness") or "claude-code").lower() not in {"claude-code", "gemini"}:
+            return False, False
+        if not spindle._spool_has_complete_output(spool, self.stdout_path, self.stderr_path):
+            return False, False
+        detected_raw = spool.get("output_complete_detected_at")
+        try:
+            detected = datetime.fromisoformat(detected_raw) if detected_raw else None
+        except (TypeError, ValueError):
+            detected = None
+        now = datetime.now(timezone.utc)
+        if detected is None:
+            self._update_spool(output_complete_detected_at=now.isoformat())
+            return True, False
+        if detected.tzinfo is None:
+            detected = detected.replace(tzinfo=timezone.utc)
+        shutdown_due = (
+            now - detected.astimezone(timezone.utc)
+        ).total_seconds() >= spindle.OUTPUT_COMPLETION_GRACE_SECONDS
+        return True, shutdown_due
+
     def _publish_owner_identity(self) -> ProcessIdentity:
         namespace = capture_pid_namespace()
         identity = ProcessIdentity(
@@ -540,6 +635,7 @@ class LogicalOwner:
         provider_env["SPINDLE_OWNER_STORE"] = str(self.store)
         provider_env["SPINDLE_OWNER_SPOOL_ID"] = self.spool_id
         stdin_stream = open(self.args.stdin_path, "r") if self.args.stdin_path else subprocess.DEVNULL
+        spawn_error = None
         try:
             with open(self.stdout_path, "w") as stdout, open(self.stderr_path, "w") as stderr:
                 self.checkpoints.reach("before_provider_start_checks")
@@ -555,23 +651,30 @@ class LogicalOwner:
                     if not self._settle_deadline_expiry_after_binding():
                         raise RuntimeError("could not durably settle inherited deadline before provider start")
                     return 124
-                self.provider = subprocess.Popen(
-                    self.args.command,
-                    cwd=self.args.cwd,
-                    env=provider_env,
-                    stdin=stdin_stream,
-                    stdout=stdout,
-                    stderr=stderr,
-                    start_new_session=True,
-                    pass_fds=(child_end.fileno(),),
-                    preexec_fn=_provider_preexec(os.getpid(), self.args.disable_pdeathsig),
-                )
+                try:
+                    self.provider = subprocess.Popen(
+                        self.args.command,
+                        cwd=self.args.cwd,
+                        env=provider_env,
+                        stdin=stdin_stream,
+                        stdout=stdout,
+                        stderr=stderr,
+                        start_new_session=True,
+                        pass_fds=(child_end.fileno(),),
+                        preexec_fn=_provider_preexec(os.getpid(), self.args.disable_pdeathsig),
+                    )
+                except OSError as exc:
+                    spawn_error = exc
         finally:
             child_end.close()
             if stdin_stream is not subprocess.DEVNULL:
                 stdin_stream.close()
             if self.provider is None:
                 owner_end.close()
+        if spawn_error is not None:
+            if not self._settle_provider_spawn_failure(spawn_error):
+                raise RuntimeError("could not durably settle provider spawn failure") from spawn_error
+            return 127
         self.control = owner_end
         self.control.setblocking(False)
         self.provider_pgid = self.provider.pid
@@ -1077,23 +1180,38 @@ class LogicalOwner:
                     break
                 if accepted_request is None:
                     accepted_request = self._next_current_request()
-                if accepted_request is None and self.args.timeout is not None:
+                terminal_output = False
+                shutdown_due = False
+                if accepted_request is None:
+                    terminal_output, shutdown_due = self._terminal_output_state()
+                if accepted_request is None and self.args.timeout is not None and not terminal_output:
                     if self.clock.monotonic() - started >= monotonic_budget:
-                        accepted_request = create_control_request(
-                            self.store,
-                            self.spool_id,
-                            "timeout",
-                            self.generation,
-                            "logical-owner",
-                            observer_namespace=capture_pid_namespace(),
-                            reason="durable wall deadline elapsed",
-                            deadline=self.wall_deadline_at,
-                        )
+                        # Close the output/deadline observation race in favor of
+                        # an already durable terminal protocol record.
+                        terminal_output, shutdown_due = self._terminal_output_state()
+                        if not terminal_output:
+                            accepted_request = create_control_request(
+                                self.store,
+                                self.spool_id,
+                                "timeout",
+                                self.generation,
+                                "logical-owner",
+                                observer_namespace=capture_pid_namespace(),
+                                reason="durable wall deadline elapsed",
+                                deadline=self.wall_deadline_at,
+                            )
                 if accepted_request is not None:
                     result = self._handle_request(accepted_request)
                     if result >= 0:
                         break
                     accepted_request = None
+                if shutdown_due and not self._provider_exited():
+                    if not self._signal_provider_group(signal.SIGTERM):
+                        time.sleep(self.args.poll_interval)
+                        continue
+                    if not self._wait_provider(0.25) and not self._signal_provider_group(signal.SIGKILL):
+                        time.sleep(self.args.poll_interval)
+                        continue
                 if self._provider_exited():
                     returncode = self._finish_provider()
                     descendants_clean = self._settle_descendants(force=False)

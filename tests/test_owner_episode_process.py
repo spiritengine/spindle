@@ -13,8 +13,9 @@ import os
 import select
 import signal
 import sys
+import time
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -213,6 +214,83 @@ def test_deadline_crossing_after_binding_settles_timeout_without_starting_provid
     assert terminal["status"] == "timeout"
     assert terminal["error_kind"] == "deadline_expired_before_provider_start"
     assert terminal["lifecycle"]["normalized_terminal_kind"] == "timeout"
+
+
+def test_provider_exec_failure_after_binding_publishes_spawn_failure_evidence(watchdog_owner_case):
+    owner = watchdog_owner_case("missing-interpreter", expect_ready=False)
+
+    assert owner.process.wait(timeout=8) == 127
+    proven = _episode(owner)
+    assert proven["phase"] == "cleanup_proven"
+    assert proven["failure"]["kind"] == "provider_spawn_failure"
+    assert proven["cleanup"]["outcome"] == "provider_spawn_failed"
+    assert proven["cleanup"]["provider_reaped"] is True
+    assert "provider" not in proven
+    assert "provider_custody" not in proven
+    evidence = json.loads((owner.store / f"{owner.spool_id}.owner-exit").read_text())
+    assert evidence["provider_pid"] is None
+    assert evidence["provider_exit_code"] is None
+    assert evidence["provider_reaped"] is True
+
+    terminal = _finalize(owner)
+    assert terminal["status"] == "error"
+    assert terminal["terminal_origin"] == "provider_spawn_failure_after_binding"
+    assert terminal["error_kind"] == "provider_spawn_failure"
+    assert terminal["lifecycle"]["normalized_terminal_kind"] == "failed"
+
+
+@pytest.mark.parametrize(
+    ("mode", "spool_overrides", "expected_status"),
+    [
+        ("gemini-terminal-linger", {"harness": "gemini"}, "complete"),
+        (
+            "claude-terminal-linger",
+            {"harness": "claude-code", "claude_protocol": spindle.CLAUDE_PROTOCOL_STREAM_V1},
+            "complete",
+        ),
+        (
+            "claude-intermediate-linger",
+            {"harness": "claude-code", "claude_protocol": spindle.CLAUDE_PROTOCOL_STREAM_V1},
+            "timeout",
+        ),
+        ("codex-terminal-linger", {"harness": "codex"}, "timeout"),
+    ],
+)
+def test_terminal_protocol_output_precedes_timeout_but_partial_output_does_not(
+    watchdog_owner_case,
+    owner_clock,
+    mode,
+    spool_overrides,
+    expected_status,
+):
+    _current, advance, clock_fd = owner_clock
+    if expected_status == "complete":
+        spool_overrides = {
+            **spool_overrides,
+            "output_complete_detected_at": (datetime.now(timezone.utc) - timedelta(seconds=10)).isoformat(),
+        }
+    owner = watchdog_owner_case(
+        mode,
+        timeout=100,
+        controlled_clock_fd=clock_fd.fileno(),
+        spool_overrides=spool_overrides,
+    )
+    output_path = owner.store / f"{owner.spool_id}.stdout"
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline and (not output_path.exists() or output_path.stat().st_size == 0):
+        time.sleep(0.01)
+    assert output_path.exists() and output_path.stat().st_size > 0
+    advance(101)
+
+    owner.process.wait(timeout=8)
+    terminal = _finalize(owner)
+    assert terminal["status"] == expected_status
+    if expected_status == "complete":
+        assert terminal["terminal_origin"] == "natural_success"
+        assert terminal["lifecycle"]["normalized_terminal_kind"] == "complete"
+    else:
+        assert terminal["terminal_origin"] == "accepted_timeout"
+        assert terminal["lifecycle"]["normalized_terminal_kind"] == "timeout"
     _assert_terminal_projection_is_idempotent(owner, terminal)
 
 
