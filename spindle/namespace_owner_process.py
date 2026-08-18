@@ -513,32 +513,78 @@ class LogicalOwner:
             deadline = deadline.replace(tzinfo=timezone.utc)
         return max(0.0, (deadline.astimezone(timezone.utc) - datetime.now(timezone.utc)).total_seconds())
 
-    def _terminal_output_state(self) -> tuple[bool, bool]:
-        """Recognize Claude/Gemini terminal output and bound post-result linger."""
+    def _terminal_output_state(self) -> tuple[bool, bool, Optional[datetime]]:
+        """Recognize terminal output, its durable write time, and linger state."""
         import spindle
 
         if not all(hasattr(self, name) for name in ("spool_path", "stdout_path", "stderr_path")):
-            return False, False
+            return False, False, None
         spool = self._read_spool()
         if (spool.get("harness") or "claude-code").lower() not in {"claude-code", "gemini"}:
-            return False, False
-        if not spindle._spool_has_complete_output(spool, self.stdout_path, self.stderr_path):
-            return False, False
+            return False, False, None
+        output_path = spindle._spool_complete_output_path(spool, self.stdout_path, self.stderr_path)
+        if output_path is None:
+            return False, False, None
+        try:
+            filesystem_written = datetime.fromtimestamp(output_path.stat().st_mtime, timezone.utc)
+        except OSError:
+            return False, False, None
         detected_raw = spool.get("output_complete_detected_at")
+        written_raw = spool.get("output_complete_written_at")
         try:
             detected = datetime.fromisoformat(detected_raw) if detected_raw else None
         except (TypeError, ValueError):
             detected = None
+        try:
+            written = datetime.fromisoformat(written_raw) if written_raw else None
+        except (TypeError, ValueError):
+            written = None
         now = datetime.now(timezone.utc)
+        updates = {}
         if detected is None:
-            self._update_spool(output_complete_detected_at=now.isoformat())
-            return True, False
+            detected = now
+            updates["output_complete_detected_at"] = detected.isoformat()
+        if written is None:
+            written = filesystem_written
+            updates["output_complete_written_at"] = written.isoformat()
+        if updates:
+            self._update_spool(**updates)
         if detected.tzinfo is None:
             detected = detected.replace(tzinfo=timezone.utc)
+        if written.tzinfo is None:
+            written = written.replace(tzinfo=timezone.utc)
         shutdown_due = (
             now - detected.astimezone(timezone.utc)
         ).total_seconds() >= spindle.OUTPUT_COMPLETION_GRACE_SECONDS
-        return True, shutdown_due
+        return True, shutdown_due, written.astimezone(timezone.utc)
+
+    def _terminal_output_precedes_timeout(self, request, written_at: Optional[datetime]) -> bool:
+        """Whether terminal evidence was durably written before this timeout."""
+        if written_at is None:
+            return False
+        boundary_raw = request.deadline or request.requested_at
+        try:
+            boundary = datetime.fromisoformat(boundary_raw)
+        except (TypeError, ValueError):
+            return False
+        if boundary.tzinfo is None:
+            boundary = boundary.replace(tzinfo=timezone.utc)
+        return written_at <= boundary.astimezone(timezone.utc)
+
+    def _reject_timeout_for_terminal_output(self, request) -> bool:
+        """Durably settle a timeout that lost to pre-deadline terminal output."""
+        with mailbox_guard(self.store, self.spool_id):
+            if not self._verify_lock():
+                return False
+            write_control_receipt(
+                self.store,
+                self.spool_id,
+                request,
+                current_generation=self.generation,
+                accepted=False,
+                rejection_outcome="rejected_terminal",
+            )
+        return True
 
     def _publish_owner_identity(self) -> ProcessIdentity:
         namespace = capture_pid_namespace()
@@ -1178,17 +1224,14 @@ class LogicalOwner:
                     self._contain_after_watchdog_loss_until_proven()
                     result = 125
                     break
+                terminal_output, shutdown_due, terminal_written_at = self._terminal_output_state()
                 if accepted_request is None:
                     accepted_request = self._next_current_request()
-                terminal_output = False
-                shutdown_due = False
-                if accepted_request is None:
-                    terminal_output, shutdown_due = self._terminal_output_state()
                 if accepted_request is None and self.args.timeout is not None and not terminal_output:
                     if self.clock.monotonic() - started >= monotonic_budget:
                         # Close the output/deadline observation race in favor of
                         # an already durable terminal protocol record.
-                        terminal_output, shutdown_due = self._terminal_output_state()
+                        terminal_output, shutdown_due, terminal_written_at = self._terminal_output_state()
                         if not terminal_output:
                             accepted_request = create_control_request(
                                 self.store,
@@ -1200,6 +1243,18 @@ class LogicalOwner:
                                 reason="durable wall deadline elapsed",
                                 deadline=self.wall_deadline_at,
                             )
+                if accepted_request is not None and accepted_request.kind == "timeout":
+                    # A supervisor may publish while the owner is between its
+                    # output check and mailbox read. Recheck before accepting;
+                    # only evidence written by the request's deadline wins.
+                    terminal_output, shutdown_due, terminal_written_at = self._terminal_output_state()
+                    if terminal_output and self._terminal_output_precedes_timeout(
+                        accepted_request, terminal_written_at
+                    ):
+                        if not self._reject_timeout_for_terminal_output(accepted_request):
+                            time.sleep(self.args.poll_interval)
+                            continue
+                        accepted_request = None
                 if accepted_request is not None:
                     result = self._handle_request(accepted_request)
                     if result >= 0:

@@ -22,7 +22,7 @@ from unittest.mock import patch
 import pytest
 
 import spindle
-from spindle.namespace_owner import iter_control_requests, read_control_receipt
+from spindle.namespace_owner import create_control_request, iter_control_requests, read_control_receipt
 from tests.owner_episode_fixtures import EPISODE_KEY, make_episode
 
 OBSERVER_PROLOGUE = r"""
@@ -291,6 +291,40 @@ def test_terminal_protocol_output_precedes_timeout_but_partial_output_does_not(
     else:
         assert terminal["terminal_origin"] == "accepted_timeout"
         assert terminal["lifecycle"]["normalized_terminal_kind"] == "timeout"
+    _assert_terminal_projection_is_idempotent(owner, terminal)
+
+
+def test_terminal_output_written_before_deadline_rejects_later_supervisor_timeout(watchdog_owner_case):
+    owner = watchdog_owner_case(
+        "gemini-terminal-linger",
+        timeout=100,
+        spool_overrides={"harness": "gemini"},
+    )
+    output_path = owner.store / f"{owner.spool_id}.stdout"
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline and (not output_path.exists() or output_path.stat().st_size == 0):
+        time.sleep(0.01)
+    assert output_path.exists() and output_path.stat().st_size > 0
+
+    episode = _episode(owner)
+    request = create_control_request(
+        owner.store,
+        owner.spool_id,
+        "timeout",
+        episode["generation"],
+        "test-supervisor",
+        deadline=episode["deadline"],
+    )
+
+    owner.process.wait(timeout=8)
+    receipt = read_control_receipt(owner.store, owner.spool_id, request.request_id)
+    assert receipt is not None
+    assert receipt.owner_acknowledged_at is None
+    assert receipt.cleanup_outcome == "rejected_terminal"
+    terminal = _finalize(owner)
+    assert terminal["status"] == "complete"
+    assert terminal["terminal_origin"] == "natural_success"
+    assert terminal["output_complete_written_at"] <= episode["deadline"]
     _assert_terminal_projection_is_idempotent(owner, terminal)
 
 

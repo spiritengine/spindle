@@ -9271,6 +9271,7 @@ class TestReviewTagTimeout:
 
         assert result == "captured"
         assert captured["timeout"] == expected
+        assert captured["timeout_disabled"] is (explicit == 0)
 
     def test_reservation_freezes_one_absolute_deadline(self, tmp_path):
         with patch("spindle.SPINDLE_DIR", tmp_path):
@@ -9322,12 +9323,17 @@ class TestReviewTagTimeout:
                 with patch("spindle._count_running", return_value=0):
                     success, error = _try_reserve_slot_and_create(
                         "timeout-disabled",
-                        reservation_metadata={"timeout": None, "tags": ["review"]},
+                        reservation_metadata={
+                            "timeout": None,
+                            "timeout_disabled": True,
+                            "tags": ["review"],
+                        },
                     )
 
             assert (success, error) == (True, None)
             spool = _read_spool("timeout-disabled")
             assert spool["timeout"] is None
+            assert spool["timeout_disabled"] is True
             assert "wall_deadline_at" not in spool
             assert "deadline" not in spool["owner_episode"]
 
@@ -9379,6 +9385,82 @@ class TestReviewTagTimeout:
 
         assert result == "captured"
         assert captured["timeout"] == 17
+        assert captured["timeout_disabled"] is False
+
+    @pytest.mark.parametrize("harness", ["claude-code", "codex", "gemini", "kimi"])
+    def test_respin_preserves_explicit_zero_across_review_tags(self, tmp_path, monkeypatch, harness):
+        original = {
+            "id": "original",
+            "status": "complete",
+            "session_id": "session",
+            "harness": harness,
+            "working_dir": str(tmp_path),
+            "timeout": None,
+            "timeout_disabled": True,
+            "tags": ["review"],
+            "permission": "full",
+            "filesystem_boundary": {"kind": "none"},
+        }
+        captured = {}
+
+        def reserve(_spool_id, initial_status="pending", reservation_metadata=None):
+            captured.update(reservation_metadata or {})
+            return False, "captured"
+
+        monkeypatch.setattr(spindle, "_try_reserve_slot_and_create", reserve)
+        if harness == "claude-code":
+            monkeypatch.setattr(spindle, "_resolve_spool_for_respin", lambda _handle: original)
+            result = _respin_sync("original", "continue")
+        elif harness == "codex":
+            monkeypatch.setattr(spindle, "_find_spool_by_session", lambda _session: original)
+            result = _codex_respin_sync("session", "continue")
+        elif harness == "gemini":
+            result = spindle._gemini_respin_sync("session", "continue", original)
+        else:
+            monkeypatch.setattr(spindle, "_kimi_validate_model", lambda _model: None)
+            result = _kimi_respin_sync("session", "continue", original)
+
+        assert result == "captured"
+        assert captured["timeout"] is None
+        assert captured["timeout_disabled"] is True
+
+    @pytest.mark.parametrize("harness", ["claude-code", "codex", "gemini", "kimi"])
+    def test_retry_preserves_explicit_zero_across_review_tags(self, tmp_path, monkeypatch, harness):
+        original = {
+            "id": "original",
+            "status": "error",
+            "prompt": "review task",
+            "harness": harness,
+            "working_dir": str(tmp_path),
+            "timeout": None,
+            "timeout_disabled": True,
+            "tags": ["review"],
+            "permission": "full",
+            "sandbox": "workspace-write",
+            "filesystem_boundary": {"kind": "none"},
+        }
+        captured = {}
+
+        def reserve(_spool_id, initial_status="pending", reservation_metadata=None):
+            captured.update(reservation_metadata or {})
+            return False, "captured"
+
+        monkeypatch.setattr(spindle, "_read_spool", lambda _spool_id: original)
+        monkeypatch.setattr(spindle, "_try_reserve_slot_and_create", reserve)
+        monkeypatch.setattr(spindle, "_detect_default_branch", lambda _path: "master")
+        if harness == "codex":
+            monkeypatch.setattr(spindle, "_resolve_codex_binary", lambda _env: "/bin/true")
+            monkeypatch.setattr(spindle, "_codex_cli_version", lambda *_args: "test")
+            monkeypatch.setattr(spindle, "_codex_auth_mode", lambda *_args: "chatgpt")
+            monkeypatch.setattr(spindle, "_codex_sandbox_refusal", lambda *_args: None)
+        elif harness == "kimi":
+            monkeypatch.setattr(spindle, "_kimi_validate_model", lambda _model: None)
+
+        result = asyncio.run(spindle.spool_retry.fn("original"))
+
+        assert result == "captured"
+        assert captured["timeout"] is None
+        assert captured["timeout_disabled"] is True
 
     def test_fell_r1_tag_applies_soft_timeout(self, tmp_path):
         """A spool tagged 'fell-r1' gets the review soft timeout."""
