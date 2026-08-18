@@ -26,6 +26,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes bubblewrap
+          # Ubuntu 24.04 otherwise blocks bwrap's unprivileged user namespace.
+          sudo sysctl --write kernel.apparmor_restrict_unprivileged_userns=0
+          bwrap --unshare-pid --ro-bind / / --dev /dev --proc /proc /bin/true
 
       - name: Install dependencies
         run: |
