@@ -6172,8 +6172,17 @@ class TestSpawnFailureRecovery:
                                     elif harness == "gemini":
                                         result = spindle._gemini_spin_sync(**common)
                                     else:
-                                        with patch("spindle._kimi_validate_model", return_value=None):
-                                            result = spindle._kimi_spin_sync(**common)
+                                        kimi_share_dir = tmp_path / "kimi-state"
+                                        kimi_share_dir.mkdir()
+                                        kimi_common = {
+                                            **common,
+                                            "env": {"KIMI_SHARE_DIR": str(kimi_share_dir)},
+                                        }
+                                        with (
+                                            patch("spindle._kimi_validate_model", return_value=None),
+                                            patch("spindle._kimi_bwrap_binary", return_value="/usr/bin/bwrap"),
+                                        ):
+                                            result = spindle._kimi_spin_sync(**kimi_common)
 
             cleanup.assert_not_called()
             spool = _list_spools()[0]
