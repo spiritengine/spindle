@@ -224,14 +224,16 @@ def test_cli_exit_does_not_abandon_timeout(supervisor_env):
     env["FAKE_HARNESS_MODE"] = "ignore-term"
     env["FAKE_HARNESS_PID"] = str(store / "harness.pid")
 
-    cli = _spin_cli(env, workdir, timeout=1)
+    # The public timeout now starts at reservation, so leave enough budget for
+    # the detached supervisor/owner handshake before asserting provider death.
+    cli = _spin_cli(env, workdir, timeout=4)
 
     assert cli.returncode == 0, cli.stderr
     spool_id = _parse_spool_id(cli.stdout)
-    spool = _wait_spool(store, spool_id, "timeout", timeout=8)
+    spool = _wait_spool(store, spool_id, "timeout", timeout=10)
     harness_pid = int((store / "harness.pid").read_text())
     _wait_for(lambda: not _pid_alive(harness_pid), timeout=3, description="timed-out harness process death")
-    assert spool["error"] == "Timeout after 1s"
+    assert spool["error"] == "Timeout after 4s"
 
 
 def test_concurrent_launchers_share_one_store_owner(supervisor_env):
