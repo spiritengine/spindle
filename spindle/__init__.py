@@ -312,16 +312,20 @@ REVIEW_TAGS = {"review"}
 DEFAULT_REVIEW_TIMEOUT = int(os.environ.get("SPINDLE_REVIEW_TIMEOUT", str(90 * 60)))
 
 # Persistent stream-json driver for headless Claude spools (see
-# spindle_claude_driver.py and finding-20260724-2niy). Opt-in while the
-# provider behavior it depends on is being canaried; each spool records the
-# protocol it actually launched under so old one-shot spools and new driver
-# spools coexist across the rollout and across server restarts.
+# spindle_claude_driver.py and finding-20260724-2niy). It is the default for
+# new spools; set SPINDLE_CLAUDE_STREAM_DRIVER=0 for the legacy one-shot
+# rollback path. Each spool records the protocol it actually launched under so
+# old one-shot spools and new driver spools coexist across rollouts and server
+# restarts.
 CLAUDE_STREAM_DRIVER_ENV = "SPINDLE_CLAUDE_STREAM_DRIVER"
 CLAUDE_PROTOCOL_STREAM_V1 = _claude_driver.DRIVER_PROTOCOL
 
 
 def _claude_stream_driver_enabled() -> bool:
-    return os.environ.get(CLAUDE_STREAM_DRIVER_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+    value = os.environ.get(CLAUDE_STREAM_DRIVER_ENV)
+    if value is None:
+        return True
+    return value.strip().lower() not in {"0", "false", "no", "off"}
 
 
 def _stream_driver_script_path() -> Optional[Path]:
@@ -378,7 +382,8 @@ def _claude_headless_cmd(prompt: str, flags: list, prompt_path: Optional[Path] =
             ]
             return cmd, CLAUDE_PROTOCOL_STREAM_V1
         logger.warning(
-            "spindle: %s is set but the driver script is missing; falling back to one-shot claude",
+            "spindle: stream driver is enabled but its script is missing; "
+            "falling back to one-shot claude (set %s=0 for an explicit rollback)",
             CLAUDE_STREAM_DRIVER_ENV,
         )
     cmd = [
