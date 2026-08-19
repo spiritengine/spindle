@@ -360,6 +360,31 @@ def test_overlapping_requests_receive_superseded_receipts(owner_case, later_kind
     assert superseded.cleanup_outcome == "rejected_superseded"
 
 
+def test_malformed_receipt_is_preserved_while_owner_handles_valid_sibling(owner_case):
+    owner = owner_case("ignore-term", pause_checkpoint="provider_ready")
+    readable, _, _ = select.select([owner.checkpoint], [], [], 5)
+    assert readable
+    checkpoint = json.loads(owner.checkpoint.recv(4096).splitlines()[0])
+    assert checkpoint["name"] == "provider_ready"
+
+    damaged = owner.request("cancel", request_id="000-malformed-receipt")
+    damaged_path = owner.store / f"{owner.spool_id}.control-mailbox" / f"{damaged.request_id}.receipt"
+    damaged_path.write_text("{")
+    valid = owner.request("drop", request_id="zzz-valid-request")
+    owner.checkpoint.sendall(b"continue\n")
+
+    terminal = owner.wait_terminal()
+    owner.process.wait(timeout=8)
+    stderr = owner.process.stderr.read()
+    valid_receipt = owner.receipt(valid.request_id)
+
+    assert terminal["status"] == "error"
+    assert valid_receipt.owner_acknowledged_at
+    assert valid_receipt.cleanup_outcome == "cleaned"
+    assert damaged_path.read_text() == "{"
+    assert f"malformed control receipt {damaged_path.name}" in stderr
+
+
 @pytest.mark.parametrize(
     ("checkpoint", "provider_survives"),
     [

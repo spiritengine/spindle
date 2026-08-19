@@ -80,6 +80,7 @@ from .namespace_owner import (  # noqa: E402
     LegacyAuthority,
     LivenessEvidence,
     LockEvidence,
+    MalformedControlReceipt,
     NamespaceIdentity,
     ProcessIdentity,
     ReconciliationResult,
@@ -3733,7 +3734,11 @@ def _settle_recovered_episode_requests(spool_id: str, episode: dict) -> None:
     for request in iter_control_requests(SPINDLE_DIR, spool_id):
         if request.request_id == winning_request_id:
             continue
-        if read_control_receipt(SPINDLE_DIR, spool_id, request.request_id) is not None:
+        try:
+            receipt = read_control_receipt(SPINDLE_DIR, spool_id, request.request_id)
+        except MalformedControlReceipt:
+            continue
+        if receipt is not None:
             continue
         write_control_receipt(
             SPINDLE_DIR,

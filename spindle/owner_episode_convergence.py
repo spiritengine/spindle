@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .namespace_owner import NamespaceIdentity
+from .namespace_owner import MalformedControlReceipt, NamespaceIdentity
 
 CONVERGENCE_FORMAT = "spindle.owner-convergence/1"
 EPISODE_FORMAT = "spindle.owner-episode/1"
@@ -309,13 +309,20 @@ def _capture(
     requests = _current_generation_requests(spool_id, generation)
     if isinstance(requests, MailboxUnavailable):
         return requests
-    try:
-        receipts = {
-            request.request_id: spindle.read_control_receipt(spindle.SPINDLE_DIR, spool_id, request.request_id)
-            for request in requests
-        }
-    except OSError as exc:
-        return MailboxUnavailable(f"{type(exc).__name__}: {exc}")
+    receipts = {}
+    receipt_errors = {}
+    for request in requests:
+        try:
+            receipts[request.request_id] = spindle.read_control_receipt(
+                spindle.SPINDLE_DIR,
+                spool_id,
+                request.request_id,
+            )
+        except MalformedControlReceipt as exc:
+            receipts[request.request_id] = None
+            receipt_errors[request.request_id] = str(exc)
+        except OSError as exc:
+            return MailboxUnavailable(f"{type(exc).__name__}: {exc}")
     owner_exit = _read_json(spindle._get_owner_exit_path(spool_id))
     stdout_path = spindle._get_output_path(spool_id)
     stderr_path = spindle._get_stderr_path(spool_id)
@@ -337,7 +344,12 @@ def _capture(
         output={"stdout": stdout, "stderr": stderr, "stdout_path": stdout_path},
         generation=generation,
         revision=episode.get("revision") if isinstance(episode, dict) else None,
-        observations={"meaning": meaning, "lock": meaning.lock, "liveness": meaning.liveness},
+        observations={
+            "meaning": meaning,
+            "lock": meaning.lock,
+            "liveness": meaning.liveness,
+            "receipt_errors": receipt_errors,
+        },
     )
 
 
@@ -1042,49 +1054,58 @@ def _run_obligations(spool_id: str, record: dict) -> dict:
         try:
             if kind == "control_receipts":
                 outcomes = {}
+                receipt_errors = []
                 intent = entry["intent"]
                 requests = {
                     request.request_id: request
                     for request in spindle.iter_control_requests(spindle.SPINDLE_DIR, spool_id)
                 }
                 for request_id in intent["requests"]:
-                    receipt = spindle.read_control_receipt(spindle.SPINDLE_DIR, spool_id, request_id)
-                    if receipt is None:
-                        request = requests[request_id]
-                        winning = request_id == intent.get("winning_request_id")
-                        acknowledgement = (record.get(EPISODE_KEY) or {}).get("acknowledgement") or {}
-                        receipt = spindle.write_control_receipt(
-                            spindle.SPINDLE_DIR,
-                            spool_id,
-                            request,
-                            current_generation=generation,
-                            accepted=winning,
-                            rejection_outcome=_disposition_of(request_id, intent),
-                            owner_acknowledged_at=(acknowledgement.get("acknowledged_at") if winning else None),
-                        )
-                    if not _receipt_settles(receipt, request_id, intent):
-                        # A receipt an owner opened and never finished - accepted,
-                        # with no cleanup terminal on it - is the duty still owed,
-                        # not evidence that it was discharged.
-                        receipt = _finish_receipt(spool_id, receipt, request_id, intent, record)
-                    if not _receipt_settles(receipt, request_id, intent):
-                        raise OSError(f"control request {request_id} still has no settling receipt")
-                    outcomes[request_id] = receipt.cleanup_outcome
+                    try:
+                        receipt = spindle.read_control_receipt(spindle.SPINDLE_DIR, spool_id, request_id)
+                        if receipt is None:
+                            request = requests[request_id]
+                            winning = request_id == intent.get("winning_request_id")
+                            acknowledgement = (record.get(EPISODE_KEY) or {}).get("acknowledgement") or {}
+                            receipt = spindle.write_control_receipt(
+                                spindle.SPINDLE_DIR,
+                                spool_id,
+                                request,
+                                current_generation=generation,
+                                accepted=winning,
+                                rejection_outcome=_disposition_of(request_id, intent),
+                                owner_acknowledged_at=(acknowledgement.get("acknowledged_at") if winning else None),
+                            )
+                        if not _receipt_settles(receipt, request_id, intent):
+                            # A receipt an owner opened and never finished - accepted,
+                            # with no cleanup terminal on it - is the duty still owed,
+                            # not evidence that it was discharged.
+                            receipt = _finish_receipt(spool_id, receipt, request_id, intent, record)
+                        if not _receipt_settles(receipt, request_id, intent):
+                            raise OSError(f"control request {request_id} still has no settling receipt")
+                        outcomes[request_id] = receipt.cleanup_outcome
+                    except MalformedControlReceipt as exc:
+                        receipt_errors.append(str(exc))
                 # Stale-generation requests are not convergence obligations for
                 # this episode, but the established mailbox protocol still
                 # gives them their generation-scoped rejection when observed.
                 for request in requests.values():
                     if request.owner_generation == generation:
                         continue
-                    receipt = spindle.read_control_receipt(spindle.SPINDLE_DIR, spool_id, request.request_id)
-                    if receipt is None:
-                        spindle.write_control_receipt(
-                            spindle.SPINDLE_DIR,
-                            spool_id,
-                            request,
-                            current_generation=generation,
-                            accepted=False,
-                        )
+                    try:
+                        receipt = spindle.read_control_receipt(spindle.SPINDLE_DIR, spool_id, request.request_id)
+                        if receipt is None:
+                            spindle.write_control_receipt(
+                                spindle.SPINDLE_DIR,
+                                spool_id,
+                                request,
+                                current_generation=generation,
+                                accepted=False,
+                            )
+                    except MalformedControlReceipt as exc:
+                        receipt_errors.append(str(exc))
+                if receipt_errors:
+                    raise ValueError("; ".join(receipt_errors))
                 _mark(record, kind, completion={"receipts": outcomes})
             elif kind == "failed_shard_preservation":
                 spindle._preserve_failed_spool_shard(record)
@@ -1291,6 +1312,9 @@ def converge_owner_episode(spool_id: str, observer: ObserverIdentity) -> Converg
                         return _result(missing, None)
                     return _mailbox_unavailable_result(current, observer, captured)
                 meaning: _Meaning = captured.observations["meaning"]
+                for error in captured.observations.get("receipt_errors", {}).values():
+                    if error not in local_errors:
+                        local_errors.append(error)
                 authorized = meaning.classification == "terminalizable" and meaning.may_mutate
                 pre_release_authorized = _may_materialize_before_cleanup_release(
                     captured.record,
@@ -1298,10 +1322,10 @@ def converge_owner_episode(spool_id: str, observer: ObserverIdentity) -> Converg
                     meaning,
                 )
                 if not authorized and not pre_release_authorized:
-                    return _result(meaning, captured.record)
+                    return _result(meaning, captured.record, local_errors)
                 published = _materialize_status_only_obligations(spool_id, captured)
                 if captured.episode is None or not authorized:
-                    return _result(meaning, captured.record)
+                    return _result(meaning, captured.record, local_errors)
 
                 episode = captured.episode
                 if episode.get("phase") == "cleanup_proven":
@@ -1380,6 +1404,9 @@ def converge_owner_episode(spool_id: str, observer: ObserverIdentity) -> Converg
                             continue
                         return _mailbox_unavailable_result(current, observer, captured)
                     meaning = captured.observations["meaning"]
+                    for error in captured.observations.get("receipt_errors", {}).values():
+                        if error not in local_errors:
+                            local_errors.append(error)
 
                 record = captured.record
                 if not has_published_terminal(record):

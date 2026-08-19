@@ -753,6 +753,22 @@ class ControlReceipt:
         return cls(**value)
 
 
+class MalformedControlReceipt(ValueError):
+    """A published receipt exists but cannot be interpreted safely."""
+
+    def __init__(self, path: Path, cause: Exception):
+        self.path = path
+        self.cause = cause
+        super().__init__(f"malformed control receipt {path.name}: {type(cause).__name__}: {cause}")
+
+
+def _load_control_receipt(path: Path) -> ControlReceipt:
+    try:
+        return ControlReceipt.from_dict(json.loads(path.read_text()))
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+        raise MalformedControlReceipt(path, exc) from exc
+
+
 def write_control_receipt(
     root: str | os.PathLike[str],
     spool_id: str,
@@ -766,7 +782,7 @@ def write_control_receipt(
 ) -> ControlReceipt:
     path = mailbox_path(root, spool_id) / f"{request.request_id}.receipt"
     if path.exists():
-        return ControlReceipt.from_dict(json.loads(path.read_text()))
+        return _load_control_receipt(path)
     generation_matches = request.owner_generation == current_generation
     if accepted is None:
         accepted = generation_matches
@@ -783,7 +799,7 @@ def write_control_receipt(
     )
     if _atomic_json_create(path, asdict(receipt)):
         return receipt
-    return ControlReceipt.from_dict(json.loads(path.read_text()))
+    return _load_control_receipt(path)
 
 
 def read_control_receipt(
@@ -793,7 +809,7 @@ def read_control_receipt(
 ) -> Optional[ControlReceipt]:
     path = mailbox_path(root, spool_id) / f"{request_id}.receipt"
     try:
-        return ControlReceipt.from_dict(json.loads(path.read_text()))
+        return _load_control_receipt(path)
     except FileNotFoundError:
         return None
 
