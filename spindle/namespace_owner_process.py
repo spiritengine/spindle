@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Optional
 
 from .namespace_owner import (
+    MalformedControlReceipt,
     ProcessIdentity,
     _atomic_json_write,
     _utc_now,
@@ -135,6 +136,7 @@ class LogicalOwner:
         self.adopted_reaped = 0
         self.wall_deadline_at: Optional[str] = args.deadline
         self.episode_mode = False
+        self._reported_malformed_receipts: set[str] = set()
 
     def _watchdog_alive(self) -> bool:
         """Whether the mandatory containment parent still holds its lease FD."""
@@ -980,7 +982,7 @@ class LogicalOwner:
         """Return the next current-generation request and reject stale siblings."""
         with mailbox_guard(self.store, self.spool_id):
             for request in iter_control_requests(self.store, self.spool_id):
-                if read_control_receipt(self.store, self.spool_id, request.request_id) is not None:
+                if self._receipt_exists_or_is_malformed(request.request_id):
                     continue
                 if request.owner_generation != self.generation:
                     if not self._verify_lock():
@@ -1008,7 +1010,7 @@ class LogicalOwner:
         for request in iter_control_requests(self.store, self.spool_id):
             if request.request_id == accepted_request_id:
                 continue
-            if read_control_receipt(self.store, self.spool_id, request.request_id) is not None:
+            if self._receipt_exists_or_is_malformed(request.request_id):
                 continue
             write_control_receipt(
                 self.store,
@@ -1019,6 +1021,16 @@ class LogicalOwner:
                 rejection_outcome=rejection_outcome,
             )
         return True
+
+    def _receipt_exists_or_is_malformed(self, request_id: str) -> bool:
+        """Preserve an unreadable receipt while allowing independent siblings."""
+        try:
+            return read_control_receipt(self.store, self.spool_id, request_id) is not None
+        except MalformedControlReceipt as exc:
+            if request_id not in self._reported_malformed_receipts:
+                print(f"Spindle owner: {exc}", file=sys.stderr, flush=True)
+                self._reported_malformed_receipts.add(request_id)
+            return True
 
     def _settle_other_requests(self, accepted_request_id: str) -> bool:
         with mailbox_guard(self.store, self.spool_id):

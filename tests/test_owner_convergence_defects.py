@@ -58,6 +58,7 @@ from tests.owner_convergence_fixtures import (
     causal_episode,
     converge,
     converge_to_fixed_point,
+    converge_without_escape,
     dead_process_fact,
     failure_fact,
     live_process_fact,
@@ -1523,6 +1524,54 @@ def test_malformed_mailbox_entry_does_not_hide_a_valid_status_only_duty(episode_
     assert receipt is not None, "the malformed sibling hid the valid current-generation request"
     assert receipt.cleanup_outcome == NO_WINNER_RECEIPT
     assert obligations_of(episode_store.read(spool_id))["control_receipts"]["progress"] == "complete"
+
+
+@pytest.mark.parametrize("damaged_id", ("000-malformed-receipt", "zzz-malformed-receipt"))
+@pytest.mark.parametrize("damaged_body", ("{", "[]"), ids=("truncated-json", "non-object-json"))
+def test_malformed_receipt_does_not_hide_valid_sibling_duties(
+    episode_store,
+    tmp_path,
+    damaged_id,
+    damaged_body,
+):
+    """A corrupt receipt stays visible without blocking independent siblings."""
+    spool_id = f"malformed-receipt-{damaged_id[:3]}-{len(damaged_body)}"
+    scenario = build_scenario(
+        episode_store,
+        BY_EVIDENCE["natural_failure"],
+        spool_id=spool_id,
+        tmp_path=tmp_path,
+        with_handle=False,
+        extra_request="drop",
+    )
+    valid_id = scenario.extras["extra_request_id"]
+    publish_request(
+        episode_store,
+        spool_id,
+        "cancel",
+        GENERATION,
+        request_id=damaged_id,
+    )
+    damaged_path = mailbox_path(episode_store.root, spool_id) / f"{damaged_id}.receipt"
+    damaged_path.write_text(damaged_body)
+    damaged_bytes = damaged_path.read_bytes()
+
+    converge_without_escape(spool_id)
+
+    valid_receipt = read_control_receipt(episode_store.root, spool_id, valid_id)
+    record = episode_store.read(spool_id)
+    entry = obligations_of(record)["control_receipts"]
+    assert valid_receipt is not None
+    assert valid_receipt.cleanup_outcome == NO_WINNER_RECEIPT
+    assert damaged_path.read_bytes() == damaged_bytes
+    assert record["status"] == "error"
+    assert entry["progress"] == "pending"
+    assert damaged_id in entry["error"]
+    assert "malformed control receipt" in entry["error"]
+
+    converge_without_escape(spool_id)
+    assert damaged_path.read_bytes() == damaged_bytes
+    assert read_control_receipt(episode_store.root, spool_id, valid_id) == valid_receipt
 
 
 def test_durable_supervisor_revisits_terminal_obligations_until_complete(episode_store, monkeypatch):
