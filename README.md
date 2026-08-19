@@ -641,7 +641,18 @@ Environment variables:
 | `SPINDLE_UNSPOOL_TAIL_CHARS` | `12000` | Chars kept from the end of a truncated result |
 
 Storage location: `~/.spindle/spools/`, or `$SPINDLE_HOME/spools/` when set.
-`spindle doctor` reports the store it resolved and whether it is writable.
+The spool store must be on a persistent local filesystem. Network and
+distributed filesystems (such as NFS, SMB/CIFS, and CephFS), network-backed
+FUSE or object-storage mounts, VM shared folders, container writable overlay
+layers, and ephemeral filesystems such as tmpfs are unsupported because they
+may not preserve Spindle's locking, inode-identity, and crash-durability
+assumptions. In a container, bind-mount a directory from a local host
+filesystem; in WSL, keep the store in the Linux filesystem rather than under
+`/mnt/c`.
+
+`spindle doctor` reports the store it resolved, whether it is writable, and
+whether its existing ownership artifacts are healthy. It does not verify the
+filesystem semantics above.
 
 ## How It Works
 
