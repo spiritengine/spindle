@@ -98,6 +98,14 @@ from spindle import (
 )
 
 
+def _claude_prompt_from_cmd(cmd):
+    if "--prompt" in cmd:
+        return cmd[cmd.index("--prompt") + 1]
+    if "--prompt-file" in cmd:
+        return Path(cmd[cmd.index("--prompt-file") + 1]).read_text()
+    return cmd[cmd.index("-p") + 1]
+
+
 class TestPermissionProfiles:
     """Test permission profile resolution."""
 
@@ -326,7 +334,7 @@ class TestPermissionProfiles:
 
         assert len(captured_cmd) == 1
         cmd = captured_cmd[0]
-        prompt = cmd[cmd.index("-p") + 1]
+        prompt = _claude_prompt_from_cmd(cmd)
         assert "You are a research agent." in prompt
         assert f"Your output target is: file:{target}." in prompt
         assert f"Write your final report to exactly {target}" in prompt
@@ -361,7 +369,7 @@ class TestPermissionProfiles:
                                 research_target=f"file:{target}",
                             )
 
-        prompt = captured_cmd[0][captured_cmd[0].index("-p") + 1]
+        prompt = _claude_prompt_from_cmd(captured_cmd[0])
         assert "Write your final report to exactly" in prompt
         assert "git commit" not in prompt
         assert "skein shard tender" not in prompt
@@ -397,7 +405,7 @@ class TestPermissionProfiles:
                                     research_target="site:research-inbox",
                                 )
 
-        prompt = captured_cmd[0][captured_cmd[0].index("-p") + 1]
+        prompt = _claude_prompt_from_cmd(captured_cmd[0])
         assert "You are a research agent." in prompt
         assert "git commit" in prompt
         assert "skein shard tender" in prompt
@@ -738,7 +746,8 @@ class TestClaudePermissionCommandShape:
 
         assert not result.startswith("Error"), result
         assert wrapped[0][1:] == (shard, str(worktree))
-        assert wrapped[0][0][0] == "claude"
+        claude_cmd = wrapped[0][0]
+        assert claude_cmd[claude_cmd.index("--") + 1] == "claude"
         assert "--resume" in wrapped[0][0]
         assert spawned[0][1:] == (["wrapped-claude"], str(worktree))
 
@@ -2304,10 +2313,15 @@ class TestCancellationTermination:
             )
             spindle._finish_spawn_barrier(spool_id, start=True)
             owner = spindle._PROC_HANDLES.pop(spool_id)
-            deadline = time.monotonic() + 5
-            while (_read_spool(spool_id) or {}).get("status") != "running" and time.monotonic() < deadline:
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                running = _read_spool(spool_id) or {}
+                if running.get("status") == "running" and running.get("provider_pid") is not None:
+                    break
                 time.sleep(0.02)
             running = _read_spool(spool_id)
+            assert running.get("status") == "running", running
+            assert running.get("provider_pid") is not None, running
             provider_pid = running["provider_pid"]
             try:
                 if tool_path == "sync":
@@ -6978,23 +6992,24 @@ class TestShardSpawnPreamblesAndCodexCd:
                     with patch("spindle._spawn_shard", return_value=(fake_shard, None)):
                         with patch("spindle._detect_existing_shard", return_value=None):
                             with patch("spindle._spawn_detached", side_effect=fake_detached):
-                                _spin_sync(
-                                    "do shard work",
-                                    "careful",
-                                    True,
-                                    None,
-                                    str(tmp_path),
-                                    None,
-                                    None,
-                                    None,
-                                    None,
-                                    False,
-                                    None,
-                                )
+                                with patch("spindle._start_spool_monitor"):
+                                    _spin_sync(
+                                        "do shard work",
+                                        "careful",
+                                        True,
+                                        None,
+                                        str(tmp_path),
+                                        None,
+                                        None,
+                                        None,
+                                        None,
+                                        False,
+                                        None,
+                                    )
 
         assert len(captured_cmd) == 1
         cmd = captured_cmd[0]
-        prompt = cmd[cmd.index("-p") + 1]
+        prompt = _claude_prompt_from_cmd(cmd)
         assert "skein ready --name" not in prompt
         assert "2. Then: skein ready" in prompt
 

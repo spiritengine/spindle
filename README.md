@@ -636,6 +636,7 @@ Environment variables:
 | `SPINDLE_PORT` | `8002` | Port used by `serve --http`, `status`, and `doctor` |
 | `SPINDLE_HOST` | `127.0.0.1` | Host used by the same |
 | `SPINDLE_MAX_CONCURRENT` | `15` | Maximum concurrent spools |
+| `SPINDLE_CLAUDE_STREAM_DRIVER` | enabled | Claude stream driver; set to `0`, `false`, `no`, or `off` for the legacy one-shot rollback path |
 | `SPINDLE_UNSPOOL_MAX_CHARS` | `50000` | Results longer than this are truncated to head+tail by `unspool()` |
 | `SPINDLE_UNSPOOL_HEAD_CHARS` | `12000` | Chars kept from the start of a truncated result |
 | `SPINDLE_UNSPOOL_TAIL_CHARS` | `12000` | Chars kept from the end of a truncated result |

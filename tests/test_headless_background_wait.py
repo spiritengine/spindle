@@ -483,15 +483,26 @@ class TestFinalizeParkedDetection:
 
 class TestHeadlessCmdBuilder:
     def test_one_shot_disallows_monitor_and_wakeup(self, monkeypatch):
-        monkeypatch.delenv("SPINDLE_CLAUDE_STREAM_DRIVER", raising=False)
+        monkeypatch.setenv("SPINDLE_CLAUDE_STREAM_DRIVER", "0")
         cmd, protocol = _claude_headless_cmd("do work", ["--permission-mode", "auto"])
         assert protocol is None
         assert cmd[:5] == ["claude", "-p", "do work", "--output-format", "json"]
         assert cmd[cmd.index("--disallowedTools") + 1] == "Monitor,ScheduleWakeup"
         assert cmd[cmd.index("--permission-mode") + 1] == "auto"
 
-    def test_driver_mode_wraps_with_stream_flags(self, monkeypatch):
-        monkeypatch.setenv("SPINDLE_CLAUDE_STREAM_DRIVER", "1")
+    @pytest.mark.parametrize("value", ["0", "false", "NO", "Off"])
+    def test_false_values_select_one_shot_rollback(self, monkeypatch, value):
+        monkeypatch.setenv("SPINDLE_CLAUDE_STREAM_DRIVER", value)
+        cmd, protocol = _claude_headless_cmd("do work", [])
+        assert protocol is None
+        assert cmd[0] == "claude"
+
+    @pytest.mark.parametrize("value", [None, "", "1", "true", "YES", "on"])
+    def test_driver_mode_wraps_with_stream_flags(self, monkeypatch, value):
+        if value is None:
+            monkeypatch.delenv("SPINDLE_CLAUDE_STREAM_DRIVER", raising=False)
+        else:
+            monkeypatch.setenv("SPINDLE_CLAUDE_STREAM_DRIVER", value)
         cmd, protocol = _claude_headless_cmd("do work", ["--model", "claude-sonnet-5"])
         assert protocol == CLAUDE_PROTOCOL_STREAM_V1
         assert cmd[0] == sys.executable
@@ -536,8 +547,8 @@ class TestHeadlessCmdBuilder:
             spool = _read_spool(spool_id)
 
         cmd = captured["cmd"]
-        assert cmd[cmd.index("--disallowedTools") + 1] == "Monitor,ScheduleWakeup"
-        assert spool["claude_protocol"] is None
+        assert cmd[cmd.index("--disallowedTools") + 1] == "ScheduleWakeup"
+        assert spool["claude_protocol"] == CLAUDE_PROTOCOL_STREAM_V1
 
 
 # --- driver-protocol finalization -------------------------------------------
@@ -803,6 +814,14 @@ class TestSanitizedTranscript:
 
 
 class TestRespinParkedRecovery:
+    @staticmethod
+    def _prompt_from_cmd(cmd):
+        if "--prompt" in cmd:
+            return cmd[cmd.index("--prompt") + 1]
+        if "--prompt-file" in cmd:
+            return Path(cmd[cmd.index("--prompt-file") + 1]).read_text()
+        return cmd[cmd.index("-p") + 1]
+
     def _respin(
         self,
         tmp_path,
@@ -853,7 +872,7 @@ class TestRespinParkedRecovery:
         result, cmd, new_spool, _ = self._respin(tmp_path, self._parked_spool(), events)
         assert not result.startswith("Error"), result
         assert "--resume" not in cmd
-        prompt_arg = cmd[cmd.index("-p") + 1]
+        prompt_arg = self._prompt_from_cmd(cmd)
         assert "task-notification" not in prompt_arg
         assert "bhbhqvqfz" in prompt_arg  # abandonment note
         assert prompt_arg.rstrip().endswith("continue now")
@@ -902,7 +921,7 @@ class TestRespinParkedRecovery:
         result, cmd, new_spool, _ = self._respin(tmp_path, legacy, events, rebuild=True)
         assert not result.startswith("Error"), result
         assert "--resume" not in cmd
-        prompt_arg = cmd[cmd.index("-p") + 1]
+        prompt_arg = self._prompt_from_cmd(cmd)
         assert "oldtask" in prompt_arg
         assert "task-notification" not in prompt_arg
         assert new_spool["parked_recovery_of"] == "legacy02"
@@ -975,8 +994,9 @@ class TestRespinParkedRecovery:
         assert "--resume" not in cmd
         for arg in cmd:
             assert len(arg.encode()) < 131072
-        assert stdin_path is not None
-        content = Path(stdin_path).read_text()
+        assert stdin_path is None
+        assert "--prompt-file" in cmd
+        content = self._prompt_from_cmd(cmd)
         assert big_text in content
         assert content.rstrip().endswith("continue now")
 
@@ -996,7 +1016,7 @@ class TestRespinParkedRecovery:
     def test_parked_recovery_disallows_background_tools(self, tmp_path):
         events = [monitor_arm_event(), result_event(PARKED_STUB)]
         _, cmd, _, _ = self._respin(tmp_path, self._parked_spool("guard01"), events)
-        assert cmd[cmd.index("--disallowedTools") + 1] == "Monitor,ScheduleWakeup"
+        assert cmd[cmd.index("--disallowedTools") + 1] == "ScheduleWakeup"
 
     def test_ordinary_resume_disallows_background_tools(self, tmp_path):
         clean = {
@@ -1009,7 +1029,7 @@ class TestRespinParkedRecovery:
             "working_dir": "/tmp",
         }
         _, cmd, _, _ = self._respin(tmp_path, clean, transcript_events=None)
-        assert cmd[cmd.index("--disallowedTools") + 1] == "Monitor,ScheduleWakeup"
+        assert cmd[cmd.index("--disallowedTools") + 1] == "ScheduleWakeup"
 
 
 # --- fake-Claude stream-json end-to-end --------------------------------------
