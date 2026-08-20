@@ -625,6 +625,10 @@ once no spools are running or pending, so in-flight agents finish cleanly. New
 spins are still accepted while draining; the restart happens at the next idle
 moment. Pass `force=True` to restart immediately (the old behavior), which may
 interrupt in-flight spools and leave them to orphan recovery on the next boot.
+If both the logical owner and its containment watchdog died before either could
+publish cleanup proof, an unforced reload refuses with the affected spool ID
+instead of waiting forever or inventing a terminal result. `--force`/`force=True`
+still bypasses that refusal and may interrupt other live spools.
 
 ## Configuration
 
