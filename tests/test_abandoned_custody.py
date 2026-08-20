@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -62,6 +63,29 @@ def test_live_watchdog_keeps_released_dead_owner_episode_out_of_abandoned_diagno
     episode_store.write(record["id"], **{key: value for key, value in current.items() if key not in {"id", "status", "created_at"}})
 
     assert spindle._drain_blockers() == []
+
+
+def test_drain_blocker_revalidates_after_watchdog_publishes_cleanup(episode_store):
+    record = _abandoned_record(episode_store)
+    stale = deepcopy(record)
+    cleanup = localize_identities(make_episode("cleanup_proven"))
+    episode_store.bind_lock(record["id"], cleanup)
+
+    def scan_then_publish_cleanup():
+        episode_store.write(
+            record["id"],
+            status="running",
+            episode=cleanup,
+            prompt=record["prompt"],
+            lifecycle=record["lifecycle"],
+        )
+        return [stale]
+
+    with patch("spindle._list_spools", side_effect=scan_then_publish_cleanup):
+        blockers = spindle._drain_blockers()
+
+    assert episode_store.read(record["id"])["owner_episode"]["phase"] == "cleanup_proven"
+    assert blockers == [], "a stale accepted snapshot refused a drain after cleanup became durable"
 
 
 @pytest.mark.parametrize("failure", ("foreign_namespace", "reused_pid"))

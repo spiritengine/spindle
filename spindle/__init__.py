@@ -2505,10 +2505,24 @@ def _abandoned_custody_reason(spool: dict) -> Optional[str]:
 def _drain_blockers() -> list[DrainBlocker]:
     """Return non-progressing records which make an unforced drain impossible."""
     blockers = []
-    for spool in _list_spools():
-        reason = _abandoned_custody_reason(spool)
-        if reason:
-            blockers.append(DrainBlocker(str(spool.get("id", "unknown")), reason))
+    for observed in _list_spools():
+        spool_id = observed.get("id")
+        if not spool_id:
+            continue
+        # Episode writers take this same record lock.  The list scan may be
+        # stale by the time liveness is probed (a watchdog can publish cleanup
+        # and exit in between), so diagnose only a fresh serialized snapshot.
+        # A busy writer is progress, not evidence of abandonment; retry it on
+        # the next drain poll rather than blocking here.
+        with _spool_lock(spool_id, blocking=False) as acquired:
+            if not acquired:
+                continue
+            spool = _read_spool(spool_id)
+            if spool is None:
+                continue
+            reason = _abandoned_custody_reason(spool)
+            if reason:
+                blockers.append(DrainBlocker(str(spool_id), reason))
     return blockers
 
 
