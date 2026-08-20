@@ -117,6 +117,32 @@ def test_unverifiable_owner_identity_never_becomes_abandoned(episode_store, fail
     assert spindle._drain_blockers() == []
 
 
+@pytest.mark.parametrize("role", ("owner", "watchdog"))
+@pytest.mark.parametrize("invalid", ("unavailable", "malformed"))
+def test_inexact_role_identity_never_becomes_abandoned(episode_store, role, invalid):
+    record = _abandoned_record(episode_store)
+    current = episode_store.read(record["id"])
+    namespace = spindle.capture_pid_namespace().to_dict()
+    if invalid == "unavailable":
+        current["owner_episode"][role] = {
+            "pid": 999_999_991,
+            "birth_token": "unavailable",
+            "namespace": namespace,
+        }
+    else:
+        current["owner_episode"][role] = {
+            "pid": "999999992",
+            "birth_token": ["not-a-token"],
+            "namespace": namespace,
+        }
+    episode_store.write(
+        record["id"],
+        **{key: value for key, value in current.items() if key not in {"id", "status", "created_at"}},
+    )
+
+    assert spindle._drain_blockers() == []
+
+
 def test_wait_until_idle_raises_when_active_work_becomes_abandoned():
     blocker = spindle.DrainBlocker("late-abandonment", ABANDONED_REASON)
     with (
@@ -147,6 +173,26 @@ def test_mcp_reload_refuses_abandoned_custody_before_starting_a_waiter():
     assert "force=True" in output
     assert spindle._reload_pending is False
     wait.assert_not_called()
+    assert not restarted.is_set()
+
+
+def test_repeat_mcp_reload_surfaces_abandonment_instead_of_repromising_restart():
+    restarted = threading.Event()
+    blocker = spindle.DrainBlocker("repeat-stuck", ABANDONED_REASON)
+    spindle._reload_pending = True
+    try:
+        with (
+            patch("spindle.subprocess.run", _fake_systemctl(restarted)),
+            patch("spindle._run_store_maintenance"),
+            patch("spindle._drain_blockers", return_value=[blocker]),
+        ):
+            output = asyncio.run(spindle.spindle_reload.fn())
+    finally:
+        spindle._reload_pending = False
+
+    assert "repeat-stuck" in output
+    assert ABANDONED_REASON in output
+    assert "already pending" not in output.lower()
     assert not restarted.is_set()
 
 

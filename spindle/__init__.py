@@ -2492,6 +2492,25 @@ def _abandoned_custody_reason(spool: dict) -> Optional[str]:
     episode = spool.get("owner_episode")
     if not isinstance(episode, dict) or episode.get("phase") not in {"lock_bound", "accepted"}:
         return None
+    # The public episode producers persist positive integer PIDs and Linux
+    # /proc start-time tokens as decimal strings.  Do not let the permissive
+    # compatibility parser below turn placeholders or malformed JSON values
+    # into an apparently exact identity: pidfd ESRCH is only affirmative death
+    # after the durable identity itself is exact.
+    for role in ("owner", "watchdog"):
+        fact = episode.get(role)
+        if not isinstance(fact, dict):
+            return None
+        pid = fact.get("pid")
+        birth_token = fact.get("birth_token")
+        if (
+            not isinstance(pid, int)
+            or isinstance(pid, bool)
+            or pid <= 0
+            or not isinstance(birth_token, str)
+            or not birth_token.isdecimal()
+        ):
+            return None
     lock, owner_liveness = _owner_episode_observation(spool)
     classification = classify_owner_episode(spool, lock, owner_liveness)
     if classification.reason != "released_without_cleanup_proof" or owner_liveness.state != "dead":
@@ -9534,16 +9553,17 @@ async def spindle_reload(force: bool = False) -> str:
         threading.Thread(target=immediate, daemon=True).start()
         return "Restarting now via systemd (force)..." if is_active else "Starting via systemd..."
 
-    if _reload_pending:
-        return f"Reload already pending; will restart when idle ({_count_running()} spool(s) active)."
-
     # Recovery may finalize ordinary dead owners, but simultaneous unwitnessed
     # owner/watchdog loss has no lawful producer of cleanup proof.  Diagnose it
-    # before promising an asynchronous restart that can never occur.
+    # before promising an asynchronous restart that can never occur, including
+    # on a repeat call while an earlier drain waiter is still pending.
     _run_store_maintenance()
     blockers = _drain_blockers()
     if blockers:
         return f"Error: {DrainBlockedError(blockers)}. Use force=True to restart without draining."
+
+    if _reload_pending:
+        return f"Reload already pending; will restart when idle ({_count_running()} spool(s) active)."
 
     _reload_pending = True
 
