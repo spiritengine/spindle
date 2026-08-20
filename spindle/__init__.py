@@ -2502,6 +2502,17 @@ def _abandoned_custody_reason(spool: dict) -> Optional[str]:
     return "custody_abandoned_without_cleanup_proof"
 
 
+def _serialized_abandoned_custody_reason(spool_id: str) -> Optional[str]:
+    """Diagnose one fresh record snapshot serialized against episode writers."""
+    # A busy writer is progress, not evidence of abandonment.  Callers either
+    # retry on the next drain poll or render the ordinary running diagnostic.
+    with _spool_lock(spool_id, blocking=False) as acquired:
+        if not acquired:
+            return None
+        spool = _read_spool(spool_id)
+        return _abandoned_custody_reason(spool) if spool is not None else None
+
+
 def _drain_blockers() -> list[DrainBlocker]:
     """Return non-progressing records which make an unforced drain impossible."""
     blockers = []
@@ -2509,20 +2520,12 @@ def _drain_blockers() -> list[DrainBlocker]:
         spool_id = observed.get("id")
         if not spool_id:
             continue
-        # Episode writers take this same record lock.  The list scan may be
-        # stale by the time liveness is probed (a watchdog can publish cleanup
-        # and exit in between), so diagnose only a fresh serialized snapshot.
-        # A busy writer is progress, not evidence of abandonment; retry it on
-        # the next drain poll rather than blocking here.
-        with _spool_lock(spool_id, blocking=False) as acquired:
-            if not acquired:
-                continue
-            spool = _read_spool(spool_id)
-            if spool is None:
-                continue
-            reason = _abandoned_custody_reason(spool)
-            if reason:
-                blockers.append(DrainBlocker(str(spool_id), reason))
+        # The list scan may be stale by the time liveness is probed (a watchdog
+        # can publish cleanup and exit in between), so re-read under the record
+        # lock shared by every episode writer.
+        reason = _serialized_abandoned_custody_reason(spool_id)
+        if reason:
+            blockers.append(DrainBlocker(str(spool_id), reason))
     return blockers
 
 
@@ -5042,7 +5045,8 @@ def _budget_result(text: str, spool_id: str) -> str:
 
 
 def _running_spool_message(spool: dict) -> str:
-    abandoned_reason = _abandoned_custody_reason(spool)
+    spool_id = str(spool.get("id", "unknown"))
+    abandoned_reason = _serialized_abandoned_custody_reason(spool_id)
     if abandoned_reason:
         return (
             f"Spool {spool['id']} still running; ownership is unrecoverable "

@@ -191,3 +191,22 @@ def test_running_message_names_abandoned_custody(episode_store):
     assert record["id"] in message
     assert ABANDONED_REASON in message
     assert "manual recovery" in message.lower()
+
+
+def test_running_message_revalidates_after_watchdog_publishes_cleanup(episode_store):
+    record = _abandoned_record(episode_store)
+    stale = deepcopy(record)
+    cleanup = localize_identities(make_episode("cleanup_proven"))
+    episode_store.bind_lock(record["id"], cleanup)
+    episode_store.write(
+        record["id"],
+        status="running",
+        episode=cleanup,
+        prompt=record["prompt"],
+        lifecycle=record["lifecycle"],
+    )
+
+    message = spindle._running_spool_message(stale)
+
+    assert ABANDONED_REASON not in message
+    assert "unrecoverable" not in message
