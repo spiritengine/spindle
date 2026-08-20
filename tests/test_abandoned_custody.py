@@ -88,6 +88,20 @@ def test_drain_blocker_revalidates_after_watchdog_publishes_cleanup(episode_stor
     assert blockers == [], "a stale accepted snapshot refused a drain after cleanup became durable"
 
 
+def test_drain_blocker_scan_skips_history_that_cannot_be_abandoned(episode_store):
+    episode_store.write("terminal-history", status="complete", result="done")
+    record = _abandoned_record(episode_store)
+
+    with patch(
+        "spindle._serialized_abandoned_custody_reason",
+        wraps=spindle._serialized_abandoned_custody_reason,
+    ) as diagnose:
+        blockers = spindle._drain_blockers()
+
+    assert [item.spool_id for item in blockers] == [record["id"]]
+    diagnose.assert_called_once_with(record["id"])
+
+
 @pytest.mark.parametrize("failure", ("foreign_namespace", "reused_pid"))
 def test_unverifiable_owner_identity_never_becomes_abandoned(episode_store, failure):
     record = _abandoned_record(episode_store)

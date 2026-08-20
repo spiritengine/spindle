@@ -2518,7 +2518,13 @@ def _drain_blockers() -> list[DrainBlocker]:
     blockers = []
     for observed in _list_spools():
         spool_id = observed.get("id")
-        if not spool_id:
+        episode = observed.get("owner_episode")
+        if (
+            not spool_id
+            or observed.get("status") not in {"pending", "running"}
+            or not isinstance(episode, dict)
+            or episode.get("phase") not in {"lock_bound", "accepted"}
+        ):
             continue
         # The list scan may be stale by the time liveness is probed (a watchdog
         # can publish cleanup and exit in between), so re-read under the record
