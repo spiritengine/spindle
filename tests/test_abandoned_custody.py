@@ -60,7 +60,9 @@ def test_live_watchdog_keeps_released_dead_owner_episode_out_of_abandoned_diagno
     record = _abandoned_record(episode_store)
     current = episode_store.read(record["id"])
     current["owner_episode"]["watchdog"] = live_process_fact()
-    episode_store.write(record["id"], **{key: value for key, value in current.items() if key not in {"id", "status", "created_at"}})
+    episode_store.write(
+        record["id"], **{key: value for key, value in current.items() if key not in {"id", "status", "created_at"}}
+    )
 
     assert spindle._drain_blockers() == []
 
@@ -112,7 +114,9 @@ def test_unverifiable_owner_identity_never_becomes_abandoned(episode_store, fail
     else:
         live = live_process_fact()
         owner.update(live, birth_token=f"wrong-{live['birth_token']}")
-    episode_store.write(record["id"], **{key: value for key, value in current.items() if key not in {"id", "status", "created_at"}})
+    episode_store.write(
+        record["id"], **{key: value for key, value in current.items() if key not in {"id", "status", "created_at"}}
+    )
 
     assert spindle._drain_blockers() == []
 

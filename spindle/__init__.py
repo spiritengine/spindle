@@ -320,6 +320,7 @@ class DrainBlockedError(RuntimeError):
         details = "; ".join(f"{item.spool_id}: {item.reason}" for item in self.blockers)
         super().__init__(f"drain blocked by unrecoverable spool custody ({details})")
 
+
 # Tags that mark a spool as a review/fell pass. Review spools get a soft default
 # timeout (DEFAULT_REVIEW_TIMEOUT) when the caller didn't pass an explicit one.
 # Typical reviews finish in 10-30 min; 90 min caps runaway wedged spools.
@@ -2499,9 +2500,7 @@ def _abandoned_custody_reason(spool: dict) -> Optional[str]:
     # death after the durable identity itself is exact.
     lock_fact = episode.get("lock")
     if not isinstance(lock_fact, dict) or any(
-        not isinstance(lock_fact.get(field), int)
-        or isinstance(lock_fact.get(field), bool)
-        or lock_fact.get(field) < 0
+        not isinstance(lock_fact.get(field), int) or isinstance(lock_fact.get(field), bool) or lock_fact.get(field) < 0
         for field in ("device", "inode")
     ):
         return None
