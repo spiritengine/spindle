@@ -11,6 +11,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import select
 import signal
 import socket
 import subprocess
@@ -329,8 +330,14 @@ def test_dead_supervisor_is_reclaimed_without_relaunching_harness(supervisor_env
         lambda: _read_json(store / SUPERVISOR_RECORD),
         description="first supervisor owner",
     )
-    os.kill(owner["pid"], signal.SIGKILL)
-    _wait_for(lambda: not _pid_alive(owner["pid"]), description="first supervisor death")
+    owner_pidfd = os.pidfd_open(owner["pid"])
+    try:
+        os.kill(owner["pid"], signal.SIGKILL)
+        poller = select.poll()
+        poller.register(owner_pidfd, select.POLLIN | select.POLLHUP | select.POLLERR)
+        assert poller.poll(10000), "first supervisor did not exit"
+    finally:
+        os.close(owner_pidfd)
 
     # A later Spindle process reclaims the store.  It may inspect/recover, but
     # must not launch a second copy of the already-running task.

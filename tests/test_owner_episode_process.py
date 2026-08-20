@@ -374,26 +374,27 @@ def test_watchdog_loss_at_provider_start_boundary_uses_owner_containment_authori
     owner_pid = checkpoint["owner_pid"]
     assert _episode(owner)["phase"] == "lock_bound"
 
-    owner.process.kill()
-    assert owner.process.wait(timeout=8) == -9
-    owner.resume()
-    for _attempt in range(400):
-        if _episode(owner)["phase"] == "cleanup_proven":
-            break
-        select.select([], [], [], 0.02)
-    else:
-        pytest.fail("owner did not publish watchdog-loss cleanup proof")
+    owner_pidfd = os.pidfd_open(owner_pid)
+    try:
+        owner.process.kill()
+        assert owner.process.wait(timeout=8) == -9
+        owner.resume()
+        for _attempt in range(400):
+            if _episode(owner)["phase"] == "cleanup_proven":
+                break
+            select.select([], [], [], 0.02)
+        else:
+            pytest.fail("owner did not publish watchdog-loss cleanup proof")
 
-    proven = _episode(owner)
-    assert proven["failure"]["kind"] == "watchdog_parent_loss"
-    assert proven["cleanup"]["provider_reaped"] is True
-    assert not (owner.store / f"{owner.spool_id}.launch-record").exists()
-    for _attempt in range(400):
-        if not Path(f"/proc/{owner_pid}").exists():
-            break
-        select.select([], [], [], 0.02)
-    else:
-        pytest.fail("logical owner did not exit after proving watchdog-loss containment")
+        proven = _episode(owner)
+        assert proven["failure"]["kind"] == "watchdog_parent_loss"
+        assert proven["cleanup"]["provider_reaped"] is True
+        assert not (owner.store / f"{owner.spool_id}.launch-record").exists()
+        poller = select.poll()
+        poller.register(owner_pidfd, select.POLLIN | select.POLLHUP | select.POLLERR)
+        assert poller.poll(8000), "logical owner did not exit after proving watchdog-loss containment"
+    finally:
+        os.close(owner_pidfd)
 
     assert owner.spool()["status"] == "pending"
     terminal = _reconcile_through_production(owner, production_entrypoint)
