@@ -143,6 +143,50 @@ def test_inexact_role_identity_never_becomes_abandoned(episode_store, role, inva
     assert spindle._drain_blockers() == []
 
 
+@pytest.mark.parametrize("role", ("owner", "watchdog"))
+@pytest.mark.parametrize("field", ("device", "inode"))
+@pytest.mark.parametrize("coerce", (str, float), ids=("numeric_string", "float"))
+def test_coerced_role_namespace_never_becomes_abandoned(episode_store, role, field, coerce):
+    record = _abandoned_record(episode_store)
+    current = episode_store.read(record["id"])
+    namespace = current["owner_episode"][role]["namespace"]
+    namespace[field] = coerce(namespace[field])
+    episode_store.write(
+        record["id"],
+        **{key: value for key, value in current.items() if key not in {"id", "status", "created_at"}},
+    )
+
+    assert spindle._drain_blockers() == []
+
+
+@pytest.mark.parametrize("field", ("device", "inode"))
+@pytest.mark.parametrize("coerce", (str, float), ids=("numeric_string", "float"))
+def test_coerced_lock_coordinate_never_becomes_abandoned(episode_store, field, coerce):
+    record = _abandoned_record(episode_store)
+    current = episode_store.read(record["id"])
+    lock = current["owner_episode"]["lock"]
+    lock[field] = coerce(lock[field])
+    episode_store.write(
+        record["id"],
+        **{key: value for key, value in current.items() if key not in {"id", "status", "created_at"}},
+    )
+
+    assert spindle._drain_blockers() == []
+
+
+@pytest.mark.parametrize("role", ("owner", "watchdog"))
+def test_unicode_decimal_birth_token_never_becomes_abandoned(episode_store, role):
+    record = _abandoned_record(episode_store)
+    current = episode_store.read(record["id"])
+    current["owner_episode"][role]["birth_token"] = "\u0661\u0662\u0663"
+    episode_store.write(
+        record["id"],
+        **{key: value for key, value in current.items() if key not in {"id", "status", "created_at"}},
+    )
+
+    assert spindle._drain_blockers() == []
+
+
 def test_wait_until_idle_raises_when_active_work_becomes_abandoned():
     blocker = spindle.DrainBlocker("late-abandonment", ABANDONED_REASON)
     with (

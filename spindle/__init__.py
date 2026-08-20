@@ -2492,23 +2492,42 @@ def _abandoned_custody_reason(spool: dict) -> Optional[str]:
     episode = spool.get("owner_episode")
     if not isinstance(episode, dict) or episode.get("phase") not in {"lock_bound", "accepted"}:
         return None
-    # The public episode producers persist positive integer PIDs and Linux
-    # /proc start-time tokens as decimal strings.  Do not let the permissive
-    # compatibility parser below turn placeholders or malformed JSON values
-    # into an apparently exact identity: pidfd ESRCH is only affirmative death
-    # after the durable identity itself is exact.
+    # The public episode producers persist integer kernel coordinates, positive
+    # integer PIDs, and Linux /proc start-time tokens as ASCII digit strings.
+    # Do not let the permissive compatibility parser below coerce malformed JSON
+    # values into an apparently exact identity: pidfd ESRCH is only affirmative
+    # death after the durable identity itself is exact.
+    lock_fact = episode.get("lock")
+    if not isinstance(lock_fact, dict) or any(
+        not isinstance(lock_fact.get(field), int)
+        or isinstance(lock_fact.get(field), bool)
+        or lock_fact.get(field) < 0
+        for field in ("device", "inode")
+    ):
+        return None
     for role in ("owner", "watchdog"):
         fact = episode.get(role)
         if not isinstance(fact, dict):
             return None
         pid = fact.get("pid")
         birth_token = fact.get("birth_token")
+        namespace = fact.get("namespace")
         if (
             not isinstance(pid, int)
             or isinstance(pid, bool)
             or pid <= 0
             or not isinstance(birth_token, str)
-            or not birth_token.isdecimal()
+            or not birth_token
+            or not birth_token.isascii()
+            or not birth_token.isdigit()
+            or not isinstance(namespace, dict)
+            or namespace.get("status") != "supported"
+            or any(
+                not isinstance(namespace.get(field), int)
+                or isinstance(namespace.get(field), bool)
+                or namespace.get(field) < 0
+                for field in ("device", "inode")
+            )
         ):
             return None
     lock, owner_liveness = _owner_episode_observation(spool)
