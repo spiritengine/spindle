@@ -303,6 +303,23 @@ SUPERVISOR_IDLE_GRACE = float(os.environ.get("SPINDLE_SUPERVISOR_IDLE_GRACE", "5
 # Poll interval for draining the queue before a reload (spindle_reload)
 RELOAD_DRAIN_POLL_INTERVAL = 5  # seconds
 
+
+@dataclass(frozen=True)
+class DrainBlocker:
+    """A spool which cannot make protocol-authorized progress during drain."""
+
+    spool_id: str
+    reason: str
+
+
+class DrainBlockedError(RuntimeError):
+    """Raised when drain would otherwise wait forever on abandoned custody."""
+
+    def __init__(self, blockers) -> None:
+        self.blockers = tuple(blockers)
+        details = "; ".join(f"{item.spool_id}: {item.reason}" for item in self.blockers)
+        super().__init__(f"drain blocked by unrecoverable spool custody ({details})")
+
 # Tags that mark a spool as a review/fell pass. Review spools get a soft default
 # timeout (DEFAULT_REVIEW_TIMEOUT) when the caller didn't pass an explicit one.
 # Typical reviews finish in 10-30 min; 90 min caps runaway wedged spools.
@@ -2461,10 +2478,47 @@ def _spools_idle() -> bool:
     return _count_running() == 0
 
 
+def _abandoned_custody_reason(spool: dict) -> Optional[str]:
+    """Diagnose a bound episode after every protocol-authorized writer died.
+
+    This is deliberately not cleanup or terminal evidence.  A released exact
+    ownership inode plus affirmative same-namespace death of both the owner and
+    watchdog proves only that nobody can advance the episode.  Provider or
+    process-group observations cannot prove descendant cleanup and therefore
+    do not participate in this diagnosis.
+    """
+    if spool.get("status") not in {"pending", "running"}:
+        return None
+    episode = spool.get("owner_episode")
+    if not isinstance(episode, dict) or episode.get("phase") not in {"lock_bound", "accepted"}:
+        return None
+    lock, owner_liveness = _owner_episode_observation(spool)
+    classification = classify_owner_episode(spool, lock, owner_liveness)
+    if classification.reason != "released_without_cleanup_proof" or owner_liveness.state != "dead":
+        return None
+    watchdog = _episode_process_identity(episode, "watchdog")
+    if watchdog is None or assess_process_liveness(watchdog).state != "dead":
+        return None
+    return "custody_abandoned_without_cleanup_proof"
+
+
+def _drain_blockers() -> list[DrainBlocker]:
+    """Return non-progressing records which make an unforced drain impossible."""
+    blockers = []
+    for spool in _list_spools():
+        reason = _abandoned_custody_reason(spool)
+        if reason:
+            blockers.append(DrainBlocker(str(spool.get("id", "unknown")), reason))
+    return blockers
+
+
 def _wait_until_idle(poll_interval: float = RELOAD_DRAIN_POLL_INTERVAL) -> None:
     """Block until no spools are running or pending. New spins are allowed during
     the wait, so this returns at the next moment the queue happens to be empty."""
     while not _spools_idle():
+        blockers = _drain_blockers()
+        if blockers:
+            raise DrainBlockedError(blockers)
         time.sleep(poll_interval)
 
 
@@ -4974,6 +5028,12 @@ def _budget_result(text: str, spool_id: str) -> str:
 
 
 def _running_spool_message(spool: dict) -> str:
+    abandoned_reason = _abandoned_custody_reason(spool)
+    if abandoned_reason:
+        return (
+            f"Spool {spool['id']} still running; ownership is unrecoverable "
+            f"({abandoned_reason}). Manual recovery is required before settlement."
+        )
     reconciliation = _reconcile_spool_ownership(spool)
     if reconciliation.state in {"unverifiable", "store_unhealthy"}:
         return (
@@ -9453,6 +9513,14 @@ async def spindle_reload(force: bool = False) -> str:
     if _reload_pending:
         return f"Reload already pending; will restart when idle ({_count_running()} spool(s) active)."
 
+    # Recovery may finalize ordinary dead owners, but simultaneous unwitnessed
+    # owner/watchdog loss has no lawful producer of cleanup proof.  Diagnose it
+    # before promising an asynchronous restart that can never occur.
+    _run_store_maintenance()
+    blockers = _drain_blockers()
+    if blockers:
+        return f"Error: {DrainBlockedError(blockers)}. Use force=True to restart without draining."
+
     _reload_pending = True
 
     def drain_and_restart():
@@ -9461,6 +9529,8 @@ async def spindle_reload(force: bool = False) -> str:
             _wait_until_idle()
             time.sleep(0.5)  # Give time for response to be sent
             _do_restart()
+        except DrainBlockedError as exc:
+            print(f"[spindle] reload drain aborted: {exc}", file=sys.stderr)
         finally:
             _reload_pending = False
 
@@ -11425,12 +11495,28 @@ def main():
                     file=sys.stderr,
                 )
                 sys.exit(1)
+            _run_store_maintenance()
+            blockers = _drain_blockers()
+            if blockers:
+                print(
+                    f"Refusing to wait forever: {DrainBlockedError(blockers)}. "
+                    "Use --force to restart without draining.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
             active = _count_running()
             if active:
                 # flush: this is the last output before a potentially long block,
                 # and stdout is block-buffered when redirected (not a tty).
                 print(f"Draining: waiting for {active} spool(s) to finish (--force to restart now)...", flush=True)
-            _wait_until_idle()
+            try:
+                _wait_until_idle()
+            except DrainBlockedError as exc:
+                print(
+                    f"Drain aborted: {exc}. Use --force to restart without draining.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
         proc = subprocess.run(["systemctl", "--user", "restart", args.name], capture_output=True, text=True)
         if proc.returncode == 0:
             print(f"Restarted {unit} via systemd")

@@ -179,3 +179,11 @@ the namespace-safe shared owner primitive.
     not migrate a live pre-episode owner in place. Unknown or mixed live formats
     are unhealthy. Schema-1 terminal history remains readable, and current
     startup may proceed only after the incompatible lifetime owner drains.
+35. Abandoned custody diagnosis: a valid `lock_bound` or `accepted` episode
+    whose exact ownership inode is released and whose recorded owner and
+    watchdog are both affirmatively dead in the observer's PID namespace has no
+    protocol-authorized writer left. This is not cleanup or terminal evidence:
+    recovery preserves the record and never infers provider outcome, descendant
+    containment, or exit status from provider/PID-group absence. Drain-first
+    reload refuses with the spool ID instead of waiting forever; force behavior,
+    capacity accounting, and destructive-action blocking remain unchanged.
