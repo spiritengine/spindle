@@ -166,6 +166,10 @@ def supervisor_env(tmp_path):
             "SPINDLE_PENDING_SPAWN_TIMEOUT": "0.3",
             "SPINDLE_SUPERVISOR_IDLE_GRACE": "0.4",
             "SPINDLE_SUPERVISOR_POLL_INTERVAL": "0.05",
+            # Same reason as the timings above: an end-to-end case about the
+            # supervisor/owner handshake should not spend the production
+            # evidence-preservation grace waiting on a harness that traps TERM.
+            "SPINDLE_EVIDENCE_GRACE_SECONDS": "0.2",
         }
     )
     assert not (home / "spools-v2").exists()

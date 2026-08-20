@@ -35,6 +35,12 @@ def namespace_owner_env(tmp_path):
         "PYTHONPATH": str(Path(__file__).resolve().parents[1]),
         "PYTHONDONTWRITEBYTECODE": "1",
         "PATH": os.pathsep.join((str(private_bin), os.environ.get("PATH", ""))),
+        # Real-subprocess lifecycle cases drive the SIGTERM/SIGKILL escalation
+        # directly, so they run it at the historical 0.2s width instead of the
+        # production evidence-preservation grace.  Cases that are about the
+        # grace itself override this per start(); the shipped default is pinned
+        # by tests/test_namespace_owner_unit.py.
+        "SPINDLE_EVIDENCE_GRACE_SECONDS": "0.2",
     }
     return {
         "env": env,
@@ -92,6 +98,39 @@ def fake_provider_factory(namespace_owner_env):
             "            'protocol': 'spindle-claude-driver/1', 'unresolved_tasks': []}), flush=True)\n"
             "    time.sleep(10.0 if MODE == 'claude-terminal-linger' else 1.0)\n"
             "    raise SystemExit(0)\n"
+            # A legacy one-shot provider that answers SIGTERM the way Claude
+            # Code documents: abort the turn, spend a while shutting down, then
+            # write its terminal JSON.  Nothing reaches stdout before that, so
+            # the capture is complete only if the owner waited for the flush.
+            "if MODE.startswith('term-delayed-flush-'):\n"
+            "    delay = int(MODE.rsplit('-', 1)[1]) / 1000.0\n"
+            "    def flush_then_exit(*_):\n"
+            "        time.sleep(delay)\n"
+            "        print(json.dumps({'type': 'result', 'subtype': 'success', 'is_error': False,\n"
+            "            'session_id': 'claude-session', 'result': 'terminal json flushed after SIGTERM'}), flush=True)\n"
+            "        raise SystemExit(143)\n"
+            "    signal.signal(signal.SIGTERM, flush_then_exit)\n"
+            "    while True: time.sleep(0.05)\n"
+            # The stream-driver topology: the wrapper forwards SIGTERM and exits
+            # at once, so the owner's direct provider is gone while the real
+            # work still runs in a same-process-group child that the owner
+            # adopts as a subreaper.  The child records its own graceful exit,
+            # which SIGKILL cannot fake.
+            "if MODE.startswith('term-wrapper-exit-lingering-child-'):\n"
+            "    delay = int(MODE.rsplit('-', 1)[1]) / 1000.0\n"
+            "    child = os.fork()\n"
+            "    if child == 0:\n"
+            "        def settle_then_exit(*_):\n"
+            "            time.sleep(delay)\n"
+            "            (STORE / f'{SPOOL_ID}.descendant-settled').write_text('graceful')\n"
+            "            raise SystemExit(0)\n"
+            "        signal.signal(signal.SIGTERM, settle_then_exit)\n"
+            "        (STORE / f'{SPOOL_ID}.descendant-ready').write_text(str(os.getpid()))\n"
+            "        while True: time.sleep(0.05)\n"
+            "    def wrapper_exit(*_):\n"
+            "        raise SystemExit(143)\n"
+            "    signal.signal(signal.SIGTERM, wrapper_exit)\n"
+            "    while True: time.sleep(0.05)\n"
             "if MODE in {'setsid-grandchild', 'setsid-grandchild-causal'}:\n"
             "    child = os.fork()\n"
             "    if child == 0:\n"
@@ -422,6 +461,7 @@ def watchdog_owner_case(namespace_owner_env, fake_provider_factory, process_ledg
         controlled_clock_fd=None,
         store_kind="bridge_schema1",
         expect_ready=True,
+        extra_env=None,
     ):
         from spindle.namespace_owner import capture_pid_namespace, read_proc_starttime
         from tests.owner_episode_fixtures import make_episode
@@ -516,7 +556,7 @@ def watchdog_owner_case(namespace_owner_env, fake_provider_factory, process_ledg
                 subprocess.Popen(
                     args,
                     cwd=repo_root,
-                    env=dict(namespace_owner_env["env"]),
+                    env={**namespace_owner_env["env"], **(extra_env or {})},
                     pass_fds=tuple(pass_fds),
                     start_new_session=True,
                     stdout=subprocess.PIPE,

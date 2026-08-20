@@ -96,6 +96,7 @@ from spindle import (
     spool_peek,
     spool_retry,
 )
+from spindle.namespace_owner_process import EVIDENCE_PRESERVATION_GRACE_SECONDS
 
 
 def _claude_prompt_from_cmd(cmd):
@@ -2330,7 +2331,12 @@ class TestCancellationTermination:
                     drop_tool = spindle.spin_drop.fn if hasattr(spindle.spin_drop, "fn") else spindle.spin_drop
                     result = asyncio.run(drop_tool(spool_id))
                 assert result.startswith(f"Cancellation requested for spool {spool_id}")
-                owner.wait(timeout=5)
+                # A provider that traps TERM is only resolved by the SIGKILL
+                # that follows the evidence-preservation grace, so this owner
+                # legitimately takes a whole grace longer than a cooperative
+                # one.  Deriving the patience from the constant keeps the case
+                # about escalation rather than about a fixed number of seconds.
+                owner.wait(timeout=EVIDENCE_PRESERVATION_GRACE_SECONDS + 5)
             finally:
                 if owner.poll() is None:
                     owner.kill()

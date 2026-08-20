@@ -379,6 +379,64 @@ def test_natural_exit_retries_descendant_cleanup_before_evidence_or_release(tmp_
     assert owner.lock.closed is True
 
 
+def test_evidence_preservation_grace_ships_at_five_seconds():
+    """Pin the shipped grace; the lifecycle fixtures run it at a short width.
+
+    finding-20260820-u3go measured a real Claude Code SIGTERM shutdown at 607ms
+    for a legacy one-shot and 2.86s for a stream-driver descendant with the
+    configured 1.5s default SessionEnd hook budget.  5.0s covers both with
+    scheduler margin while keeping the SIGKILL backstop bounded.
+    """
+    from spindle.namespace_owner_process import (
+        DEFAULT_EVIDENCE_PRESERVATION_GRACE_SECONDS,
+        EVIDENCE_PRESERVATION_GRACE_SECONDS,
+    )
+
+    assert DEFAULT_EVIDENCE_PRESERVATION_GRACE_SECONDS == 5.0
+    if "SPINDLE_EVIDENCE_GRACE_SECONDS" not in os.environ:
+        assert EVIDENCE_PRESERVATION_GRACE_SECONDS == DEFAULT_EVIDENCE_PRESERVATION_GRACE_SECONDS
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("inf", 5.0),
+        ("Infinity", 5.0),
+        ("-inf", 5.0),
+        ("nan", 5.0),
+        ("not-a-number", 5.0),
+        ("", 5.0),
+        ("-5", 0.0),
+        ("0.2", 0.2),
+        ("5.0", 5.0),
+        ("50", 5.0),
+    ],
+)
+def test_evidence_grace_override_is_clamped_to_the_production_ceiling(monkeypatch, raw, expected):
+    """The override can only shorten the grace, never lengthen or unbound it.
+
+    ``float()`` happily parses "inf"/"nan" without raising, so a leaked or
+    malformed SPINDLE_EVIDENCE_GRACE_SECONDS must not let a provider that
+    ignores SIGTERM hold off the SIGKILL backstop past the shipped 5.0s
+    ceiling - that would silently break the "SIGKILL is unconditional"
+    invariant the termination path depends on.
+    """
+    from spindle.namespace_owner_process import _resolve_evidence_grace_seconds
+
+    monkeypatch.setenv("SPINDLE_EVIDENCE_GRACE_SECONDS", raw)
+    assert _resolve_evidence_grace_seconds() == expected
+
+
+def test_evidence_grace_defaults_when_unset(monkeypatch):
+    from spindle.namespace_owner_process import (
+        DEFAULT_EVIDENCE_PRESERVATION_GRACE_SECONDS,
+        _resolve_evidence_grace_seconds,
+    )
+
+    monkeypatch.delenv("SPINDLE_EVIDENCE_GRACE_SECONDS", raising=False)
+    assert _resolve_evidence_grace_seconds() == DEFAULT_EVIDENCE_PRESERVATION_GRACE_SECONDS
+
+
 def test_watchdog_retries_after_first_descendant_confirmation_deadline(monkeypatch):
     import spindle.owner_watchdog as watchdog
 

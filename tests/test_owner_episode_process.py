@@ -359,6 +359,110 @@ def test_terminal_output_written_after_deadline_does_not_suppress_owner_timeout(
     _assert_terminal_projection_is_idempotent(owner, terminal)
 
 
+# --- bounded evidence-preservation grace ------------------------------------
+#
+# issue-20260819-c1hm: the owner used to allow 0.2s between SIGTERM and SIGKILL,
+# which is shorter than a real Claude Code shutdown (measured 607ms for a legacy
+# one-shot and 2.86s for a stream-driver descendant in finding-20260820-u3go),
+# so a timed-out spool lost its terminal JSON.  Each case below is parametrized
+# on a short grace and a long one so the constant is proven causal, and the
+# public outcome is asserted in both legs: a wider grace preserves evidence, it
+# never turns a post-deadline flush into success.
+
+
+def _flushed_after(owner, boundary: str) -> bool:
+    stdout_path = owner.store / f"{owner.spool_id}.stdout"
+    written = datetime.fromtimestamp(stdout_path.stat().st_mtime, timezone.utc)
+    return written > datetime.fromisoformat(boundary)
+
+
+@pytest.mark.parametrize(("grace", "preserved"), [(0.05, False), (2.0, True)])
+def test_evidence_grace_preserves_terminal_json_flushed_after_owner_timeout(
+    watchdog_owner_case,
+    grace,
+    preserved,
+):
+    owner = watchdog_owner_case(
+        "term-delayed-flush-400",
+        timeout=3,
+        extra_env={"SPINDLE_EVIDENCE_GRACE_SECONDS": str(grace)},
+    )
+    deadline = _episode(owner)["deadline"]
+
+    owner.process.wait(timeout=15)
+
+    spool = owner.spool()
+    stdout_path = owner.store / f"{owner.spool_id}.stdout"
+    stderr_path = owner.store / f"{owner.spool_id}.stderr"
+    assert spindle._spool_has_complete_output(spool, stdout_path, stderr_path) is preserved
+    if preserved:
+        assert _flushed_after(owner, deadline), "the flush must land after the deadline to test the classification"
+
+    terminal = _finalize(owner)
+    assert terminal["status"] == "timeout"
+    assert terminal["terminal_origin"] == "accepted_timeout"
+    assert terminal["lifecycle"]["normalized_terminal_kind"] == "timeout"
+    _assert_terminal_projection_is_idempotent(owner, terminal)
+
+
+def test_shipped_evidence_grace_preserves_a_delayed_flush(watchdog_owner_case, namespace_owner_env):
+    """The same case at the shipped constant, with no override in the owner's env.
+
+    A cooperative provider exits as soon as it has flushed, so waiting on the
+    real 5.0s bound costs this case the provider's 400ms and nothing more.
+    """
+    namespace_owner_env["env"].pop("SPINDLE_EVIDENCE_GRACE_SECONDS")
+
+    owner = watchdog_owner_case("term-delayed-flush-400", timeout=3)
+    deadline = _episode(owner)["deadline"]
+    owner.process.wait(timeout=15)
+
+    spool = owner.spool()
+    stdout_path = owner.store / f"{owner.spool_id}.stdout"
+    stderr_path = owner.store / f"{owner.spool_id}.stderr"
+    assert spindle._spool_has_complete_output(spool, stdout_path, stderr_path) is True
+    assert _flushed_after(owner, deadline)
+    assert _finalize(owner)["status"] == "timeout"
+
+
+@pytest.mark.parametrize(("grace", "settled"), [(0.05, False), (2.0, True)])
+def test_evidence_grace_lets_an_adopted_descendant_settle_after_the_wrapper_exits(
+    watchdog_owner_case,
+    grace,
+    settled,
+):
+    owner = watchdog_owner_case(
+        "term-wrapper-exit-lingering-child-400",
+        extra_env={"SPINDLE_EVIDENCE_GRACE_SECONDS": str(grace)},
+    )
+    ready_path = owner.store / f"{owner.spool_id}.descendant-ready"
+    boundary = time.monotonic() + 5
+    while time.monotonic() < boundary and not ready_path.exists():
+        time.sleep(0.01)
+    assert ready_path.exists(), "the wrapper never forked the descendant this case is about"
+    descendant = int(ready_path.read_text())
+
+    request = create_control_request(
+        owner.store,
+        owner.spool_id,
+        "cancel",
+        _episode(owner)["generation"],
+        "evidence-grace-test",
+    )
+    owner.process.wait(timeout=15)
+
+    receipt = read_control_receipt(owner.store, owner.spool_id, request.request_id)
+    settled_path = owner.store / f"{owner.spool_id}.descendant-settled"
+    assert settled_path.exists() is settled
+    assert not Path(f"/proc/{descendant}").exists(), "the SIGKILL backstop must still remove the descendant"
+    assert receipt.cleanup_outcome == "cleaned"
+
+    terminal = _finalize(owner)
+    assert terminal["status"] == "error"
+    assert terminal["terminal_origin"] == "accepted_cancel"
+    assert terminal["lifecycle"]["normalized_terminal_kind"] == "cancelled"
+
+
 @pytest.mark.parametrize("production_entrypoint", ["recovery_pass", "supervisor_step"])
 def test_watchdog_loss_at_provider_start_boundary_uses_owner_containment_authority(
     watchdog_owner_case,

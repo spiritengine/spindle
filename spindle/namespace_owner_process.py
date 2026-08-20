@@ -6,6 +6,7 @@ import argparse
 import ctypes
 import fcntl
 import json
+import math
 import os
 import select
 import signal
@@ -37,6 +38,48 @@ from .namespace_owner import (
 
 PR_SET_PDEATHSIG = 1
 PR_SET_CHILD_SUBREAPER = 36
+
+# Bounded evidence-preservation grace between SIGTERM and the SIGKILL backstop
+# on the timeout/cancel termination path.  SIGTERM is not a synonym for "gone":
+# Claude Code documents that it aborts the turn, terminates the process tree of
+# a running Bash tool, runs SessionEnd hooks and only then exits 143, and
+# finding-20260820-u3go measured that shutdown at 607ms for a legacy one-shot
+# and 2862ms for a stream-driver descendant with the configured 1.5s default
+# SessionEnd hook budget.  The owner's previous 0.2s wait preempted all of it,
+# which is how incident 8dedf9d0 lost its terminal JSON (issue-20260819-c1hm).
+#
+# The grace buys evidence, not authority: an accepted timeout or cancel has
+# already frozen the public outcome, so output flushed inside this window is
+# preserved as capture but can never become success.  It stays a small fixed
+# number so a provider that ignores SIGTERM cannot hold a deadline open - the
+# SIGKILL that follows is unconditional.
+DEFAULT_EVIDENCE_PRESERVATION_GRACE_SECONDS = 5.0
+
+
+def _resolve_evidence_grace_seconds() -> float:
+    """Read SPINDLE_EVIDENCE_GRACE_SECONDS, clamped to [0, DEFAULT].
+
+    Real-subprocess lifecycle tests drive the SIGTERM/SIGKILL escalation
+    directly, so they use this override to run it at a short width instead of
+    adding whole seconds of wall-clock time per case.  The clamp means the
+    override can only shorten that wait, never lengthen it past the production
+    ceiling: negative values clamp to zero, while unparseable and non-finite
+    values fall back to the shipped default instead of silently letting a
+    provider that ignores SIGTERM hold off the SIGKILL backstop indefinitely.
+    """
+    raw = os.environ.get("SPINDLE_EVIDENCE_GRACE_SECONDS")
+    if raw is None:
+        return DEFAULT_EVIDENCE_PRESERVATION_GRACE_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEFAULT_EVIDENCE_PRESERVATION_GRACE_SECONDS
+    if not math.isfinite(value):
+        return DEFAULT_EVIDENCE_PRESERVATION_GRACE_SECONDS
+    return min(max(value, 0.0), DEFAULT_EVIDENCE_PRESERVATION_GRACE_SECONDS)
+
+
+EVIDENCE_PRESERVATION_GRACE_SECONDS = _resolve_evidence_grace_seconds()
 
 
 def _prctl(option: int, value: int) -> None:
@@ -878,8 +921,18 @@ class LogicalOwner:
         except (FileNotFoundError, OSError, ValueError):
             return []
 
-    def _settle_descendants(self, *, force: bool) -> bool:
-        deadline = time.monotonic() + (0.2 if force else 0.5)
+    def _settle_descendants(self, *, force: bool, grace: Optional[float] = None) -> bool:
+        """Reap adopted descendants, then SIGKILL whatever is still running.
+
+        ``grace`` is the soft wait before that unconditional escalation.  It
+        defaults to the containment widths used where there is no evidence left
+        to preserve - a natural exit, or a watchdog-loss takeover that has
+        already SIGKILLed the provider group.  The termination path passes
+        EVIDENCE_PRESERVATION_GRACE_SECONDS instead, because under the stream
+        driver the wrapper exits within milliseconds of SIGTERM and the real
+        Claude process is a same-group descendant this owner has adopted.
+        """
+        deadline = time.monotonic() + (grace if grace is not None else (0.2 if force else 0.5))
         while time.monotonic() < deadline:
             self._drain_reapable()
             children = [pid for pid in self._direct_children() if self.provider is None or pid != self.provider.pid]
@@ -1103,14 +1156,18 @@ class LogicalOwner:
             )
             if not self._signal_provider_group(signal.SIGTERM):
                 return -2
-            if not self._wait_provider(0.2):
+            if not self._wait_provider(EVIDENCE_PRESERVATION_GRACE_SECONDS):
                 self.checkpoints.reach("after_term_before_kill", self.provider.pid)
                 if not self._signal_provider_group(signal.SIGKILL):
                     return -2
         returncode = self._finish_provider()
         if returncode is None:
             return -2
-        descendants_clean = self._settle_descendants(force=True)
+        # Only the first settlement carries the evidence grace.  Anything still
+        # running after that has already had both its window and its SIGKILL, so
+        # retries fall back to the containment width instead of re-granting a
+        # full grace before every re-escalation.
+        descendants_clean = self._settle_descendants(force=True, grace=EVIDENCE_PRESERVATION_GRACE_SECONDS)
         while not descendants_clean:
             if forced_started is None:
                 forced_started = _utc_now()

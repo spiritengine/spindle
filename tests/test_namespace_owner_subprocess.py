@@ -313,6 +313,27 @@ def test_s2_s_ctl_02_ignored_term_forces_cleanup_before_terminal(owner_case):
     assert not Path(f"/proc/{owner.ready['provider_pid']}").exists()
 
 
+@pytest.mark.parametrize("grace", [0.3, 0.8])
+def test_ignored_term_is_killed_at_the_configured_evidence_grace(owner_case, grace):
+    """The evidence grace widens the SIGTERM window; it never removes SIGKILL.
+
+    A provider that ignores SIGTERM must still be gone one grace later, so a
+    wedged provider can never hold deadline authority for longer than the
+    constant (issue-20260819-c1hm).  Both legs pin the escalation to the width
+    that was configured, which fails if the wait ever becomes unbounded.
+    """
+    owner = owner_case("ignore-term", extra_env={"SPINDLE_EVIDENCE_GRACE_SECONDS": str(grace)})
+    request = owner.request()
+    owner.wait_terminal()
+    receipt = owner.receipt(request.request_id)
+
+    started = datetime.fromisoformat(receipt.forced_cleanup_started_at)
+    completed = datetime.fromisoformat(receipt.forced_cleanup_completed_at)
+    escalation = (completed - started).total_seconds()
+    assert grace <= escalation < grace + 2.0, f"escalation took {escalation}s at a {grace}s grace"
+    assert not Path(f"/proc/{owner.ready['provider_pid']}").exists()
+
+
 @pytest.mark.parametrize("kind", ["cancel", "timeout", "drop"])
 def test_s2_s_ctl_03_cancel_drop_and_timeout_are_mailbox_only_from_observers(owner_case, kind):
     owner = owner_case("ignore-term")
