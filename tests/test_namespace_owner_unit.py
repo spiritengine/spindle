@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import builtins
 import errno
+import fcntl
 import json
 import os
 import signal
@@ -609,6 +610,118 @@ def test_publish_owner_identity_rechecks_authority_before_writing_artifacts(tmp_
     assert not owner.owner_identity_path.exists()
     assert not (tmp_path / "pre-identity-loss.journal-guard").exists()
     assert not (tmp_path / "pre-identity-loss.control-mailbox").exists()
+
+
+@pytest.mark.parametrize("cleanup_failure", ["unlock", "close"])
+@pytest.mark.parametrize("body_exception", [True, False])
+def test_mailbox_guard_cleanup_preserves_active_exception_and_reports_clean_exit_failures(
+    tmp_path, monkeypatch, cleanup_failure, body_exception
+):
+    from spindle.namespace_owner import mailbox_guard
+    from spindle.namespace_owner_process import AuthorityLost
+
+    real_flock = fcntl.flock
+    real_close = os.close
+    closed = []
+
+    def maybe_fail_unlock(fd, operation):
+        if cleanup_failure == "unlock" and operation == fcntl.LOCK_UN:
+            raise OSError("simulated mailbox unlock failure")
+        return real_flock(fd, operation)
+
+    def maybe_fail_close(fd):
+        closed.append(fd)
+        real_close(fd)
+        if cleanup_failure == "close":
+            raise OSError("simulated mailbox close failure")
+
+    monkeypatch.setattr("spindle.namespace_owner.fcntl.flock", maybe_fail_unlock)
+    monkeypatch.setattr("spindle.namespace_owner._close_fd", maybe_fail_close)
+
+    if body_exception:
+        with pytest.raises(AuthorityLost):
+            with mailbox_guard(tmp_path, "mailbox-cleanup"):
+                raise AuthorityLost()
+    else:
+        with pytest.raises(OSError, match=f"simulated mailbox {cleanup_failure} failure"):
+            with mailbox_guard(tmp_path, "mailbox-cleanup"):
+                pass
+
+    assert closed, "mailbox cleanup did not attempt to close the guard descriptor"
+
+
+def test_authority_loss_inside_mailbox_guard_survives_cleanup_failure_for_watchdog_classification(
+    tmp_path, monkeypatch
+):
+    from types import MethodType, SimpleNamespace
+
+    from spindle.namespace_owner_process import (
+        AUTHORITY_LOST_DISPOSITION,
+        AUTHORITY_LOST_EXIT_CODE,
+        AuthorityLost,
+        LogicalOwner,
+        mailbox_guard,
+    )
+    from spindle.owner_watchdog import _classify_owner_termination
+
+    real_flock = fcntl.flock
+
+    def fail_mailbox_unlock(fd, operation):
+        if operation == fcntl.LOCK_UN:
+            raise OSError("simulated final mailbox unlock failure")
+        return real_flock(fd, operation)
+
+    disposition_read, disposition_write = os.pipe()
+    spool_id = "mailbox-authority-loss"
+    spool_path = tmp_path / f"{spool_id}.json"
+    original_record = {"id": spool_id, "status": "pending"}
+    spool_path.write_text(json.dumps(original_record, sort_keys=True))
+
+    owner = object.__new__(LogicalOwner)
+    owner.args = SimpleNamespace(watchdog_fd=None, disposition_fd=disposition_write)
+    owner.store = tmp_path
+    owner.spool_id = spool_id
+    owner.spool_path = spool_path
+    owner.owner_exit_path = tmp_path / f"{spool_id}.owner-exit"
+    owner.provider = None
+    owner.provider_pidfd = None
+    owner.control = None
+    owner.lock = None
+    owner._authority_lost = False
+    owner._contain_own_children = lambda _bound: True
+
+    def forbidden_shared_write(*_args, **_kwargs):
+        raise AssertionError("authority-loss finalizer touched shared owner state")
+
+    def guarded_authority_loss(self):
+        with mailbox_guard(self.store, self.spool_id):
+            self._authority_lost = True
+            raise AuthorityLost()
+
+    owner._run = MethodType(guarded_authority_loss, owner)
+    monkeypatch.setattr("spindle.namespace_owner.fcntl.flock", fail_mailbox_unlock)
+    monkeypatch.setattr("spindle.namespace_owner_process._atomic_json_write", forbidden_shared_write)
+    monkeypatch.setattr("spindle.namespace_owner_process.transition_owner_episode", forbidden_shared_write)
+
+    try:
+        assert owner.run() == AUTHORITY_LOST_EXIT_CODE
+        assert os.read(disposition_read, 4096) == AUTHORITY_LOST_DISPOSITION
+        assert (
+            _classify_owner_termination(
+                AUTHORITY_LOST_EXIT_CODE << 8,
+                exception_reported=False,
+                authority_lost=True,
+            )
+            == "authority_lost"
+        )
+        assert json.loads(spool_path.read_text()) == original_record
+        assert not owner.owner_exit_path.exists()
+    finally:
+        os.close(disposition_read)
+        try:
+            os.close(disposition_write)
+        except OSError:
+            pass
 
 
 def test_authority_lost_latch_is_irreversible_even_after_inode_restore(tmp_path, monkeypatch):

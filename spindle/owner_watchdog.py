@@ -12,6 +12,7 @@ from pathlib import Path
 
 from .namespace_owner import (
     _atomic_json_write,
+    _cleanup_locked_fd,
     _utc_now,
     read_proc_starttime,
     transition_owner_episode,
@@ -93,10 +94,7 @@ def _record_guard(store: Path, spool_id: str):
         fcntl.flock(fd, fcntl.LOCK_EX)
         yield
     finally:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-        finally:
-            os.close(fd)
+        _cleanup_locked_fd(fd)
 
 
 def _load(path: Path) -> dict | None:

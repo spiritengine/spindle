@@ -23,6 +23,7 @@ from .namespace_owner import (
     MalformedControlReceipt,
     ProcessIdentity,
     _atomic_json_write,
+    _cleanup_locked_fd,
     _utc_now,
     acquire_ownership_lock,
     capture_pid_namespace,
@@ -605,10 +606,7 @@ class LogicalOwner:
             fcntl.flock(fd, fcntl.LOCK_EX)
             yield
         finally:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-            finally:
-                os.close(fd)
+            _cleanup_locked_fd(fd)
 
     def _update_spool(self, **values) -> dict:
         with self._spool_record_guard():
