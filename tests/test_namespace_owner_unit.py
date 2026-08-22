@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import builtins
 import errno
@@ -1096,6 +1097,166 @@ def test_spool_record_mutations_reprove_after_blocked_record_lock(tmp_path, oper
             fcntl.flock(contender, fcntl.LOCK_UN)
             os.close(contender)
         owner.lock.close()
+
+
+def test_owner_episode_transition_reproves_after_blocked_record_lock(tmp_path):
+    from spindle.namespace_owner_process import AuthorityLost
+    from tests.owner_episode_fixtures import make_episode
+
+    owner = _spawning_owner(tmp_path, "blocked-owner-episode-transition")
+    owner.episode_mode = True
+    owner.spool_path.write_text(
+        json.dumps(
+            {
+                "id": owner.spool_id,
+                "status": "pending",
+                "owner_episode": make_episode("lock_bound", generation=owner.generation),
+            },
+            sort_keys=True,
+        )
+    )
+    owner.spool_lock_path.touch(mode=0o600)
+    before_episode = json.dumps(json.loads(owner.spool_path.read_text())["owner_episode"], sort_keys=True)
+    guard_fd = os.open(owner.spool_lock_path, os.O_RDWR)
+    fcntl.flock(guard_fd, fcntl.LOCK_EX)
+    errors = []
+    results = []
+
+    def transition():
+        try:
+            results.append(
+                owner._transition_owner_episode_locked(
+                    destination="accepted",
+                    facts={
+                        "provider": {
+                            "pid": 4242,
+                            "pgid": 4242,
+                            "birth_token": "test-start",
+                            "namespace": capture_pid_namespace().to_dict(),
+                        },
+                        "provider_custody": {
+                            "pidfd_acquired": False,
+                            "containment": "watchdog",
+                            "published_at": datetime.now().isoformat(),
+                        },
+                    },
+                )
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=transition)
+    worker.start()
+    contender = None
+    try:
+        worker.join(timeout=0.05)
+        assert worker.is_alive(), "transition did not block on the held spool record lock"
+        contender = _replace_and_hold_owner_lock(owner)
+        fcntl.flock(guard_fd, fcntl.LOCK_UN)
+        worker.join(timeout=2)
+        assert not worker.is_alive()
+        assert results == []
+        assert len(errors) == 1 and isinstance(errors[0], AuthorityLost)
+        after_episode = json.dumps(json.loads(owner.spool_path.read_text())["owner_episode"], sort_keys=True)
+        assert after_episode == before_episode
+    finally:
+        try:
+            fcntl.flock(guard_fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(guard_fd)
+        if contender is not None:
+            fcntl.flock(contender, fcntl.LOCK_UN)
+            os.close(contender)
+        owner.lock.close()
+
+
+def test_spool_record_guard_does_not_self_deadlock_restoring_lifecycle(tmp_path):
+    owner = _lock_owner(tmp_path, spool_id="record-guard-no-recursion")
+    owner.spool_lock_path.touch(mode=0o600)
+    owner.spool_path.write_text(
+        json.dumps({"id": owner.spool_id, "lifecycle": {"ownership_state": "unreadable"}}, sort_keys=True)
+    )
+    results = []
+    errors = []
+
+    def enter_guard():
+        try:
+            with owner._spool_record_guard() as record_locked:
+                results.append(record_locked)
+        except BaseException as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=enter_guard, daemon=True)
+    worker.start()
+    try:
+        worker.join(timeout=1)
+        assert not worker.is_alive(), "record guard deadlocked while clearing lifecycle"
+        assert errors == []
+        assert results == [True]
+        assert json.loads(owner.spool_path.read_text())["lifecycle"]["ownership_state"] == "unreadable"
+        assert owner._verify_lock() is True
+        assert json.loads(owner.spool_path.read_text())["lifecycle"]["ownership_state"] == "held"
+    finally:
+        owner.lock.close()
+
+
+def test_prebinding_legacy_deadline_with_compat_lock_does_not_require_owner_lock(tmp_path):
+    from types import SimpleNamespace
+
+    from spindle.namespace_owner_process import LogicalOwner
+
+    owner = object.__new__(LogicalOwner)
+    owner.args = SimpleNamespace(poll_interval=0)
+    owner.store = tmp_path
+    owner.spool_id = "prebinding-legacy-deadline"
+    owner.spool_path = tmp_path / f"{owner.spool_id}.json"
+    owner.spool_lock_path = tmp_path / f"{owner.spool_id}.lock"
+    owner.owner_exit_path = tmp_path / f"{owner.spool_id}.owner-exit"
+    owner.lock_path = tmp_path / f"{owner.spool_id}.process-owner"
+    owner.lock = None
+    owner.generation = 1
+    owner.episode_mode = False
+    owner._authority_lost = False
+    owner.spool_lock_path.touch(mode=0o600)
+    owner.spool_path.write_text(json.dumps({"id": owner.spool_id, "status": "pending", "timeout": 3}, sort_keys=True))
+    owner._verify_lock = lambda **_kwargs: pytest.fail("pre-binding legacy settlement attempted owner proof")
+
+    owner._settle_deadline_expiry_before_binding()
+
+    settled = json.loads(owner.spool_path.read_text())
+    assert settled["status"] == "timeout"
+    assert settled["error_kind"] == "deadline_expired_before_provider_start"
+    evidence = json.loads(owner.owner_exit_path.read_text())
+    assert evidence["cleanup_outcome"] == "deadline_expired_before_provider_start"
+
+
+def test_owner_episode_primitive_is_only_called_by_prebinding_paths_and_wrapper():
+    source = Path(spindle.namespace_owner_process.__file__).read_text()
+    tree = ast.parse(source)
+    callers = []
+
+    class Visitor(ast.NodeVisitor):
+        def __init__(self):
+            self.stack = []
+
+        def visit_FunctionDef(self, node):
+            self.stack.append(node.name)
+            self.generic_visit(node)
+            self.stack.pop()
+
+        def visit_Call(self, node):
+            if isinstance(node.func, ast.Name) and node.func.id == "transition_owner_episode":
+                callers.append(self.stack[-1] if self.stack else "<module>")
+            self.generic_visit(node)
+
+    Visitor().visit(tree)
+
+    assert callers == [
+        "_abort_for_watchdog_loss_before_binding",
+        "_settle_deadline_expiry_before_binding",
+        "_transition_owner_episode_locked",
+    ]
 
 
 @pytest.mark.parametrize("failure", ["read", "write"])

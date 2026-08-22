@@ -405,16 +405,8 @@ class LogicalOwner:
             "observed_at": observed_at,
         }
         if self.episode_mode:
-            self._await_verified_authority()
-            episode = self._read_spool().get("owner_episode") or {}
-            self._await_verified_authority()
-            settled = transition_owner_episode(
-                self.store,
-                self.spool_id,
-                actor="owner",
+            settled = self._transition_owner_episode_locked(
                 destination="cleanup_proven",
-                generation=self.generation,
-                expected_revision=episode.get("revision"),
                 facts={
                     "containment": {
                         "contained": True,
@@ -482,16 +474,8 @@ class LogicalOwner:
             "observed_at": observed_at,
         }
         if self.episode_mode:
-            self._await_verified_authority()
-            episode = self._read_spool().get("owner_episode") or {}
-            self._await_verified_authority()
-            settled = transition_owner_episode(
-                self.store,
-                self.spool_id,
-                actor="owner",
+            settled = self._transition_owner_episode_locked(
                 destination="cleanup_proven",
-                generation=self.generation,
-                expected_revision=episode.get("revision"),
                 facts={
                     "containment": {
                         "contained": True,
@@ -552,14 +536,8 @@ class LogicalOwner:
         if not self._verify_lock():
             return False
         if self.episode_mode:
-            episode = self._read_spool().get("owner_episode") or {}
-            result = transition_owner_episode(
-                self.store,
-                self.spool_id,
-                actor="owner",
+            result = self._transition_owner_episode_locked(
                 destination="cleanup_proven",
-                generation=self.generation,
-                expected_revision=episode.get("revision"),
                 facts={"cleanup": cleanup, "containment": containment, "failure": failure},
             )
             if not result.accepted:
@@ -626,6 +604,10 @@ class LogicalOwner:
             except FileNotFoundError:
                 pass
 
+    def _has_open_owner_lock(self) -> bool:
+        lock = getattr(self, "lock", None)
+        return lock is not None and getattr(lock, "fd", -1) >= 0
+
     @contextmanager
     def _spool_record_guard(self):
         """Join the launcher's compatibility record lock when it exists."""
@@ -636,14 +618,42 @@ class LogicalOwner:
             # owner must not introduce a new ``*.lock`` artifact which an old
             # store sweep can enumerate; public launch always creates this
             # historical lock before releasing the owner barrier.
-            yield
+            yield False
             return
         try:
             fcntl.flock(fd, fcntl.LOCK_EX)
-            self._await_verified_authority(record_unreadable=False)
-            yield
+            if self._has_open_owner_lock():
+                self._await_verified_authority(record_unreadable=False, restore_lifecycle=False)
+            yield True
         finally:
             _cleanup_locked_fd(fd)
+
+    def _transition_owner_episode_locked(self, *, destination: str, facts: dict):
+        """Publish a post-binding owner episode transition under one proof.
+
+        When the compatibility record lock exists, the authority proof and the
+        episode CAS both happen while that exact lock is held.  Direct primitive
+        users may not have a legacy sidecar; in that case the transition keeps
+        its own guard instead of pretending the record is already locked.
+        """
+        if not self._has_open_owner_lock():
+            raise RuntimeError("post-binding owner episode transition requires an open owner lock")
+        with self._spool_record_guard() as record_locked:
+            if not record_locked:
+                self._await_verified_authority()
+            episode = self._read_spool().get("owner_episode") or {}
+            if not record_locked:
+                self._await_verified_authority()
+            return transition_owner_episode(
+                self.store,
+                self.spool_id,
+                actor="owner",
+                destination=destination,
+                generation=self.generation,
+                expected_revision=episode.get("revision"),
+                facts=facts,
+                record_locked=record_locked,
+            )
 
     def _update_spool(self, **values) -> dict:
         with self._spool_record_guard():
@@ -805,15 +815,8 @@ class LogicalOwner:
             lock_created=True,
         )
         if self.episode_mode:
-            episode = self._read_spool().get("owner_episode") or {}
-            self._await_verified_authority()
-            result = transition_owner_episode(
-                self.store,
-                self.spool_id,
-                actor="owner",
+            result = self._transition_owner_episode_locked(
                 destination="lock_bound",
-                generation=self.generation,
-                expected_revision=episode.get("revision"),
                 facts={
                     "owner": {
                         "pid": identity.pid,
@@ -849,7 +852,7 @@ class LogicalOwner:
         except OSError:
             pass
 
-    def _verify_lock(self, *, record_unreadable: bool = True) -> bool:
+    def _verify_lock(self, *, record_unreadable: bool = True, restore_lifecycle: bool = True) -> bool:
         """Prove the exact recorded inode is still bound to the lock pathname.
 
         Identity is proven from stat alone - the held descriptor's device and
@@ -873,6 +876,8 @@ class LogicalOwner:
         """
         if self._authority_lost:
             raise AuthorityLost()
+        if not self._has_open_owner_lock():
+            return False
         try:
             descriptor = os.fstat(self.lock.fd)
         except OSError:
@@ -898,15 +903,21 @@ class LogicalOwner:
             if record_unreadable:
                 self._note_unreadable_ownership()
             return False
-        try:
-            lifecycle = self._read_spool().get("lifecycle") or {}
-            if lifecycle.get("ownership_state") in {"unreadable", "identity_mismatch"}:
-                self._set_lifecycle(ownership_state="held")
-        except OSError:
-            pass
+        if restore_lifecycle:
+            try:
+                lifecycle = self._read_spool().get("lifecycle") or {}
+                if lifecycle.get("ownership_state") in {"unreadable", "identity_mismatch"}:
+                    self._set_lifecycle(ownership_state="held")
+            except OSError:
+                pass
         return True
 
-    def _await_verified_authority(self, *, record_unreadable: bool = True) -> None:
+    def _await_verified_authority(
+        self,
+        *,
+        record_unreadable: bool = True,
+        restore_lifecycle: bool = True,
+    ) -> None:
         """Block until this reservation is provably still ours.
 
         A proven loss raises ``AuthorityLost``; an unreadable pathname is the
@@ -914,11 +925,11 @@ class LogicalOwner:
         does.  Use this immediately before publishing shared state so a stale
         owner cannot write over the reservation that replaced it.
         """
-        if record_unreadable:
+        if record_unreadable and restore_lifecycle:
             while not self._verify_lock():
                 time.sleep(self.args.poll_interval)
         else:
-            while not self._verify_lock(record_unreadable=False):
+            while not self._verify_lock(record_unreadable=record_unreadable, restore_lifecycle=restore_lifecycle):
                 time.sleep(self.args.poll_interval)
 
     def _finalize_authority_lost(self) -> int:
@@ -1096,16 +1107,8 @@ class LogicalOwner:
         _atomic_json_write(self.process_identity_path, process_identity)
         self.checkpoints.reach("process_identity_published", self.provider.pid)
         if self.episode_mode:
-            self._await_verified_authority()
-            episode = self._read_spool().get("owner_episode") or {}
-            self._await_verified_authority()
-            accepted = transition_owner_episode(
-                self.store,
-                self.spool_id,
-                actor="owner",
+            accepted = self._transition_owner_episode_locked(
                 destination="accepted",
-                generation=self.generation,
-                expected_revision=episode.get("revision"),
                 facts={
                     "provider": {
                         "pid": self.provider.pid,
@@ -1449,16 +1452,8 @@ class LogicalOwner:
             if not self._settle_other_requests_unlocked(request.request_id):
                 return -2
             if self.episode_mode:
-                self._await_verified_authority()
-                episode = self._read_spool().get("owner_episode") or {}
-                self._await_verified_authority()
-                accepted = transition_owner_episode(
-                    self.store,
-                    self.spool_id,
-                    actor="owner",
+                accepted = self._transition_owner_episode_locked(
                     destination="accepted",
-                    generation=self.generation,
-                    expected_revision=episode.get("revision"),
                     facts={
                         "winning_request": {
                             "request_id": request.request_id,
@@ -1554,16 +1549,8 @@ class LogicalOwner:
         if not self._write_exit_evidence(returncode, cleanup_outcome="stopped"):
             return -2
         if self.episode_mode:
-            self._await_verified_authority()
-            episode = self._read_spool().get("owner_episode") or {}
-            self._await_verified_authority()
-            cleaned = transition_owner_episode(
-                self.store,
-                self.spool_id,
-                actor="owner",
+            cleaned = self._transition_owner_episode_locked(
                 destination="cleanup_proven",
-                generation=self.generation,
-                expected_revision=episode.get("revision"),
                 facts={
                     "cleanup": {
                         "outcome": "stopped",
@@ -1773,16 +1760,8 @@ class LogicalOwner:
                     self.checkpoints.reach("final_mailbox_guard_acquired", self.provider.pid if self.provider else None)
                     self._await_verified_authority()
                     if self.episode_mode and natural_cleanup is not None:
-                        self._await_verified_authority()
-                        episode = self._read_spool().get("owner_episode") or {}
-                        self._await_verified_authority()
-                        cleaned = transition_owner_episode(
-                            self.store,
-                            self.spool_id,
-                            actor="owner",
+                        cleaned = self._transition_owner_episode_locked(
                             destination="cleanup_proven",
-                            generation=self.generation,
-                            expected_revision=episode.get("revision"),
                             facts={"cleanup": natural_cleanup},
                         )
                         if not cleaned.accepted:
