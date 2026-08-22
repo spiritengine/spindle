@@ -931,35 +931,36 @@ class LogicalOwner:
         stdin_stream = open(self.args.stdin_path, "r") if self.args.stdin_path else subprocess.DEVNULL
         spawn_error = None
         try:
+            self.checkpoints.reach("before_provider_start_checks")
+            # Reverify immediately before the first shared capture-file
+            # mutation and the child start under this reservation.  A
+            # permanent loss here raises AuthorityLost, which unwinds through
+            # this method's own resource-closing ``finally`` below without
+            # truncating captures or calling Popen.  A False return is the
+            # recoverable unreadable case, so keep waiting as the main owner
+            # loop does.  Watchdog loss and inherited deadlines still win
+            # while we wait.
+            while True:
+                if not self._watchdog_alive():
+                    self._contain_after_watchdog_loss_until_proven()
+                    return 125
+                monotonic_expired = (
+                    started is not None
+                    and monotonic_budget is not None
+                    and self.clock.monotonic() - started >= monotonic_budget
+                )
+                if self._deadline_expired() or monotonic_expired:
+                    settlement = self._settle_deadline_expiry_after_binding()
+                    if settlement == SETTLEMENT_RETRY:
+                        time.sleep(self.args.poll_interval)
+                        continue
+                    if settlement == SETTLEMENT_PUBLISHED:
+                        return 124
+                    return EPISODE_UNSETTLEABLE_EXIT_CODE
+                if self._verify_lock():
+                    break
+                time.sleep(self.args.poll_interval)
             with open(self.stdout_path, "w") as stdout, open(self.stderr_path, "w") as stderr:
-                self.checkpoints.reach("before_provider_start_checks")
-                # Reverify immediately before the only statement that starts a
-                # real child under this reservation.  A permanent loss here
-                # raises AuthorityLost, which unwinds through this method's
-                # own resource-closing ``finally`` below without ever calling
-                # Popen.  A False return is the recoverable unreadable case,
-                # so keep waiting as the main owner loop does.  Watchdog loss
-                # and inherited deadlines still win while we wait.
-                while True:
-                    if not self._watchdog_alive():
-                        self._contain_after_watchdog_loss_until_proven()
-                        return 125
-                    monotonic_expired = (
-                        started is not None
-                        and monotonic_budget is not None
-                        and self.clock.monotonic() - started >= monotonic_budget
-                    )
-                    if self._deadline_expired() or monotonic_expired:
-                        settlement = self._settle_deadline_expiry_after_binding()
-                        if settlement == SETTLEMENT_RETRY:
-                            time.sleep(self.args.poll_interval)
-                            continue
-                        if settlement == SETTLEMENT_PUBLISHED:
-                            return 124
-                        return EPISODE_UNSETTLEABLE_EXIT_CODE
-                    if self._verify_lock():
-                        break
-                    time.sleep(self.args.poll_interval)
                 try:
                     self.provider = subprocess.Popen(
                         self.args.command,

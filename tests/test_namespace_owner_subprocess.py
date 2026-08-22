@@ -547,6 +547,34 @@ def test_pre_popen_reverify_never_starts_a_provider_after_authority_loss(owner_c
         os.close(contender)
 
 
+def test_pre_popen_authority_loss_does_not_truncate_replacement_captures(owner_case):
+    """A stale owner must not erase capture bytes from the generation replacing it."""
+    owner = owner_case("record-launch", pause_checkpoint="identity_published")
+    checkpoint = owner.receive_checkpoint()
+    assert checkpoint["name"] == "identity_published"
+    assert checkpoint["provider_pid"] is None
+
+    stdout_path = owner.store / f"{owner.spool_id}.stdout"
+    stderr_path = owner.store / f"{owner.spool_id}.stderr"
+    replacement_stdout = b"replacement generation stdout\n"
+    replacement_stderr = b"replacement generation stderr\n"
+    stdout_path.write_bytes(replacement_stdout)
+    stderr_path.write_bytes(replacement_stderr)
+
+    contender = _replace_lock_path(owner)
+    try:
+        owner.checkpoint.sendall(b"continue\n")
+        assert owner.process.wait(timeout=8) == AUTHORITY_LOST_EXIT_CODE
+        assert stdout_path.read_bytes() == replacement_stdout
+        assert stderr_path.read_bytes() == replacement_stderr
+        assert not (owner.store / f"{owner.spool_id}.launch-record").exists()
+        assert not owner.process_identity_path.exists()
+        assert owner.spool()["status"] == "pending"
+    finally:
+        fcntl.flock(contender, fcntl.LOCK_UN)
+        os.close(contender)
+
+
 def test_already_exited_provider_gets_no_fabricated_terminal_after_authority_loss(owner_case):
     """Loss discovered right after a provider's own clean exit still wins.
 
