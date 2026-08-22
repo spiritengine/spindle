@@ -13,6 +13,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -125,6 +126,10 @@ CONTAINMENT_BOUND_SECONDS = _resolve_containment_bound_seconds()
 SETTLEMENT_PUBLISHED = "published"
 SETTLEMENT_RETRY = "retry"
 SETTLEMENT_UNSETTLEABLE = "unsettleable"
+
+DESCENDANTS_SETTLED = "settled"
+DESCENDANTS_SURVIVED = "survived"
+DESCENDANTS_UNPROVEN = "unproven"
 
 # The only episode rejection a retry can clear.  Every other rejection
 # (stale_generation, illegal_transition, illegal_actor, missing_facts,
@@ -337,7 +342,7 @@ class LogicalOwner:
         }
         if self.episode_mode:
             episode = self._read_spool().get("owner_episode") or {}
-            transition_owner_episode(
+            result = transition_owner_episode(
                 self.store,
                 self.spool_id,
                 actor="owner",
@@ -346,6 +351,8 @@ class LogicalOwner:
                 expected_revision=episode.get("revision"),
                 facts={"failure": failure},
             )
+            if not result.accepted:
+                return
         else:
             lifecycle = {
                 **(self._read_spool().get("lifecycle") or {}),
@@ -398,7 +405,9 @@ class LogicalOwner:
             "observed_at": observed_at,
         }
         if self.episode_mode:
+            self._await_verified_authority()
             episode = self._read_spool().get("owner_episode") or {}
+            self._await_verified_authority()
             settled = transition_owner_episode(
                 self.store,
                 self.spool_id,
@@ -433,7 +442,8 @@ class LogicalOwner:
                 completed_at=observed_at,
                 lifecycle=lifecycle,
             )
-        _atomic_json_write(
+        self._await_verified_authority()
+        self._atomic_json_write_after_authority_proof(
             self.owner_exit_path,
             {
                 "owner_pid": os.getpid(),
@@ -472,7 +482,9 @@ class LogicalOwner:
             "observed_at": observed_at,
         }
         if self.episode_mode:
+            self._await_verified_authority()
             episode = self._read_spool().get("owner_episode") or {}
+            self._await_verified_authority()
             settled = transition_owner_episode(
                 self.store,
                 self.spool_id,
@@ -506,7 +518,8 @@ class LogicalOwner:
                 completed_at=observed_at,
                 lifecycle=lifecycle,
             )
-        _atomic_json_write(
+        self._await_verified_authority()
+        self._atomic_json_write_after_authority_proof(
             self.owner_exit_path,
             {
                 "owner_pid": os.getpid(),
@@ -530,7 +543,7 @@ class LogicalOwner:
             returncode = self._finish_provider()
             if returncode is None:
                 return False
-        while not self._settle_descendants(force=True):
+        while self._settle_descendants(force=True) != DESCENDANTS_SETTLED:
             if not self._verify_lock():
                 return False
             time.sleep(self.args.poll_interval)
@@ -589,6 +602,28 @@ class LogicalOwner:
 
     def _write_spool_unlocked(self, spool: dict) -> None:
         _atomic_json_write(self.spool_path, spool)
+
+    def _atomic_json_write_after_authority_proof(self, path: Path, value: dict) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+        try:
+            with os.fdopen(fd, "w") as stream:
+                json.dump(value, stream, sort_keys=True, separators=(",", ":"))
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            self._await_verified_authority()
+            os.replace(temporary, path)
+            directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        finally:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
 
     @contextmanager
     def _spool_record_guard(self):
@@ -699,6 +734,12 @@ class LogicalOwner:
             written = filesystem_written
             updates["output_complete_written_at"] = written.isoformat()
         if updates:
+            self.checkpoints.reach(
+                "terminal_output_before_timestamp_update",
+                self.provider.pid if self.provider else None,
+            )
+            if not self._verify_lock():
+                return False, False, None
             self._update_spool(**updates)
         if detected.tzinfo is None:
             detected = detected.replace(tzinfo=timezone.utc)
@@ -975,6 +1016,9 @@ class LogicalOwner:
                     break
                 time.sleep(self.args.poll_interval)
             with open(self.stdout_path, "w") as stdout, open(self.stderr_path, "w") as stderr:
+                self.checkpoints.reach("captures_open_before_provider_start")
+                while not self._verify_lock():
+                    time.sleep(self.args.poll_interval)
                 try:
                     self.provider = subprocess.Popen(
                         self.args.command,
@@ -1202,7 +1246,7 @@ class LogicalOwner:
         self._drain_reapable()
         return not self._direct_children()
 
-    def _settle_descendants(self, *, force: bool, grace: Optional[float] = None) -> bool:
+    def _settle_descendants(self, *, force: bool, grace: Optional[float] = None) -> str:
         """Reap adopted descendants, then SIGKILL whatever is still running.
 
         ``grace`` is the soft wait before that unconditional escalation.  It
@@ -1218,11 +1262,11 @@ class LogicalOwner:
             self._drain_reapable()
             children = [pid for pid in self._direct_children() if self.provider is None or pid != self.provider.pid]
             if not children:
-                return True
+                return DESCENDANTS_SETTLED
             time.sleep(0.01)
         children = [pid for pid in self._direct_children() if self.provider is None or pid != self.provider.pid]
         if children and not self._verify_lock():
-            return False
+            return DESCENDANTS_UNPROVEN
         for pid in children:
             try:
                 os.kill(pid, signal.SIGKILL)
@@ -1233,9 +1277,9 @@ class LogicalOwner:
             self._drain_reapable()
             children = [pid for pid in self._direct_children() if self.provider is None or pid != self.provider.pid]
             if not children:
-                return True
+                return DESCENDANTS_SETTLED
             time.sleep(0.01)
-        return not children
+        return DESCENDANTS_SETTLED if not children else DESCENDANTS_SURVIVED
 
     def _send_provider_cancel(self) -> bool:
         if self.control is None:
@@ -1283,10 +1327,10 @@ class LogicalOwner:
                 return None
 
     def _write_exit_evidence(self, returncode: int, *, cleanup_outcome: str) -> bool:
+        legacy_code = 128 - returncode if returncode < 0 else returncode
         if not self._verify_lock():
             return False
-        legacy_code = 128 - returncode if returncode < 0 else returncode
-        _atomic_json_write(
+        self._atomic_json_write_after_authority_proof(
             self.owner_exit_path,
             {
                 "owner_pid": os.getpid(),
@@ -1299,11 +1343,21 @@ class LogicalOwner:
                 "observed_at": _utc_now(),
             },
         )
+        self.checkpoints.reach(
+            "owner_exit_sidecar_published_before_exit_file", self.provider.pid if self.provider else None
+        )
         temporary = self.exit_path.with_name(f".{self.exit_path.name}.{os.getpid()}.tmp")
         with open(temporary, "w") as stream:
             stream.write(f"{legacy_code}\n")
             stream.flush()
             os.fsync(stream.fileno())
+        try:
+            if not self._verify_lock():
+                temporary.unlink(missing_ok=True)
+                return False
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
         os.replace(temporary, self.exit_path)
         directory_fd = os.open(self.store, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
         try:
@@ -1372,9 +1426,10 @@ class LogicalOwner:
 
     def _handle_request(self, request) -> int:
         self.checkpoints.reach("control_observed_before_ack", self.provider.pid)
-        if not self._verify_lock():
-            return -2
         with mailbox_guard(self.store, self.spool_id):
+            self.checkpoints.reach("control_mailbox_guard_acquired_before_ack", self.provider.pid)
+            if not self._verify_lock():
+                return -2
             receipt = write_control_receipt(
                 self.store,
                 self.spool_id,
@@ -1448,8 +1503,10 @@ class LogicalOwner:
         # running after that has already had both its window and its SIGKILL, so
         # retries fall back to the containment width instead of re-granting a
         # full grace before every re-escalation.
-        descendants_clean = self._settle_descendants(force=True, grace=EVIDENCE_PRESERVATION_GRACE_SECONDS)
-        while not descendants_clean:
+        descendant_outcome = self._settle_descendants(force=True, grace=EVIDENCE_PRESERVATION_GRACE_SECONDS)
+        while descendant_outcome != DESCENDANTS_SETTLED:
+            if descendant_outcome == DESCENDANTS_UNPROVEN:
+                return -2
             if forced_started is None:
                 forced_started = _utc_now()
             if not self._verify_lock():
@@ -1464,7 +1521,7 @@ class LogicalOwner:
                 cleanup_outcome="descendants_survived",
             )
             time.sleep(self.args.poll_interval)
-            descendants_clean = self._settle_descendants(force=True)
+            descendant_outcome = self._settle_descendants(force=True)
         if forced_started is not None:
             forced_completed = _utc_now()
         child_exit = _utc_now()
@@ -1478,7 +1535,7 @@ class LogicalOwner:
             forced_cleanup_started_at=forced_started,
             forced_cleanup_completed_at=forced_completed,
             child_exit_observed_at=child_exit,
-            cleanup_outcome="cleaned" if descendants_clean else "descendants_survived",
+            cleanup_outcome="cleaned",
         )
         self.checkpoints.reach("cleanup_receipt_child_exit_durable", self.provider.pid)
         if not self._settle_other_requests(request.request_id):
@@ -1554,6 +1611,8 @@ class LogicalOwner:
         _set_subreaper()
         self.lock = acquire_ownership_lock(self.lock_path)
         self._allocate_generation()
+        self.checkpoints.reach("ownership_lock_acquired_before_wall_deadline")
+        self._await_verified_authority()
         self._ensure_wall_deadline()
         self.checkpoints.reach("identity_lock_acquired")
         self._publish_owner_identity()
@@ -1604,6 +1663,10 @@ class LogicalOwner:
                         # an already durable terminal protocol record.
                         terminal_output, shutdown_due, terminal_written_at = self._terminal_output_state()
                         if not (terminal_output and self._terminal_output_precedes_deadline(terminal_written_at)):
+                            self.checkpoints.reach("before_owner_timeout_request_create", self.provider.pid)
+                            if not self._verify_lock():
+                                time.sleep(self.args.poll_interval)
+                                continue
                             accepted_request = create_control_request(
                                 self.store,
                                 self.spool_id,
@@ -1640,8 +1703,11 @@ class LogicalOwner:
                         continue
                 if self._provider_exited():
                     returncode = self._finish_provider()
-                    descendants_clean = self._settle_descendants(force=False)
-                    if not descendants_clean:
+                    descendant_outcome = self._settle_descendants(force=False)
+                    if descendant_outcome == DESCENDANTS_UNPROVEN:
+                        time.sleep(self.args.poll_interval)
+                        continue
+                    if descendant_outcome == DESCENDANTS_SURVIVED:
                         self._set_lifecycle(cleanup_outcome="descendants_survived")
                         time.sleep(self.args.poll_interval)
                         continue

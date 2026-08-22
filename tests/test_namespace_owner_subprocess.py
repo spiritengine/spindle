@@ -459,6 +459,116 @@ def _store_snapshot(store):
     }
 
 
+def test_post_acquire_reverify_blocks_legacy_deadline_write_after_replacement(owner_case):
+    owner = owner_case(
+        "record-launch",
+        timeout=100,
+        pause_checkpoint="ownership_lock_acquired_before_wall_deadline",
+        expect_ready=False,
+    )
+    checkpoint = owner.receive_checkpoint()
+    assert checkpoint["name"] == "ownership_lock_acquired_before_wall_deadline"
+    assert "wall_deadline_at" not in owner.spool()
+
+    contender = _replace_lock_path(owner)
+    try:
+        owner.checkpoint.sendall(b"continue\n")
+        assert owner.process.wait(timeout=8) == AUTHORITY_LOST_EXIT_CODE
+        assert "wall_deadline_at" not in owner.spool()
+        assert not owner.owner_identity_path.exists()
+    finally:
+        fcntl.flock(contender, fcntl.LOCK_UN)
+        os.close(contender)
+
+
+def test_capture_open_to_popen_reverify_blocks_stale_provider_subprocess(owner_case):
+    owner = owner_case(
+        "record-launch",
+        pause_checkpoint="captures_open_before_provider_start",
+        expect_ready=False,
+    )
+    checkpoint = owner.receive_checkpoint()
+    assert checkpoint["name"] == "captures_open_before_provider_start"
+    stdout_path = owner.store / f"{owner.spool_id}.stdout"
+    stderr_path = owner.store / f"{owner.spool_id}.stderr"
+    assert stdout_path.exists()
+    assert stderr_path.exists()
+    replacement_stdout = b"replacement stdout survives capture-open loss\n"
+    replacement_stderr = b"replacement stderr survives capture-open loss\n"
+    stdout_path.write_bytes(replacement_stdout)
+    stderr_path.write_bytes(replacement_stderr)
+
+    contender = _replace_lock_path(owner)
+    try:
+        owner.checkpoint.sendall(b"continue\n")
+        assert owner.process.wait(timeout=8) == AUTHORITY_LOST_EXIT_CODE
+        assert stdout_path.read_bytes() == replacement_stdout
+        assert stderr_path.read_bytes() == replacement_stderr
+        assert not (owner.store / f"{owner.spool_id}.launch-record").exists()
+        assert not owner.process_identity_path.exists()
+    finally:
+        fcntl.flock(contender, fcntl.LOCK_UN)
+        os.close(contender)
+
+
+def test_replacement_between_owner_exit_and_exit_file_blocks_stale_exit_subprocess(owner_case):
+    owner = owner_case("silent-exit", pause_checkpoint="owner_exit_sidecar_published_before_exit_file")
+    checkpoint = owner.receive_checkpoint()
+    assert checkpoint["name"] == "owner_exit_sidecar_published_before_exit_file"
+    assert owner.owner_exit_path.exists()
+    exit_path = owner.store / f"{owner.spool_id}.exit"
+    assert not exit_path.exists()
+
+    contender = _replace_lock_path(owner)
+    try:
+        owner.checkpoint.sendall(b"continue\n")
+        assert owner.process.wait(timeout=8) == AUTHORITY_LOST_EXIT_CODE
+        assert owner.owner_exit_path.exists()
+        assert not exit_path.exists()
+    finally:
+        fcntl.flock(contender, fcntl.LOCK_UN)
+        os.close(contender)
+
+
+def test_mailbox_guard_reverify_blocks_accepted_receipt_after_replacement_subprocess(owner_case):
+    owner = owner_case("healthy-turn", pause_checkpoint="control_mailbox_guard_acquired_before_ack")
+    request = owner.request("cancel")
+    checkpoint = owner.receive_checkpoint()
+    assert checkpoint["name"] == "control_mailbox_guard_acquired_before_ack"
+
+    contender = _replace_lock_path(owner)
+    try:
+        owner.checkpoint.sendall(b"continue\n")
+        assert owner.process.wait(timeout=8) == AUTHORITY_LOST_EXIT_CODE
+        assert owner.receipt(request.request_id) is None
+    finally:
+        fcntl.flock(contender, fcntl.LOCK_UN)
+        os.close(contender)
+
+
+def test_owner_timeout_request_reverify_blocks_stale_request_subprocess(owner_case, owner_clock):
+    _current, advance, clock_fd = owner_clock
+    owner = owner_case(
+        "ignore-term",
+        timeout=100,
+        controlled_clock_fd=clock_fd.fileno(),
+        pause_checkpoint="before_owner_timeout_request_create",
+    )
+    advance(101)
+    checkpoint = owner.receive_checkpoint()
+    assert checkpoint["name"] == "before_owner_timeout_request_create"
+    assert list(iter_control_requests(owner.store, owner.spool_id)) == []
+
+    contender = _replace_lock_path(owner)
+    try:
+        owner.checkpoint.sendall(b"continue\n")
+        assert owner.process.wait(timeout=8) == AUTHORITY_LOST_EXIT_CODE
+        assert list(iter_control_requests(owner.store, owner.spool_id)) == []
+    finally:
+        fcntl.flock(contender, fcntl.LOCK_UN)
+        os.close(contender)
+
+
 @pytest.mark.parametrize(
     "checkpoint",
     ["control_observed_before_ack", "after_term_before_kill", "before_terminal_publish"],
