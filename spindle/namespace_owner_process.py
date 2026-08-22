@@ -742,6 +742,7 @@ class LogicalOwner:
         return True
 
     def _publish_owner_identity(self) -> ProcessIdentity:
+        self._await_verified_authority()
         namespace = capture_pid_namespace()
         identity = ProcessIdentity(
             pid=os.getpid(),
@@ -837,9 +838,12 @@ class LogicalOwner:
         if not os.access(self.lock_path, os.R_OK | os.W_OK):
             self._note_unreadable_ownership()
             return False
-        lifecycle = self._read_spool().get("lifecycle") or {}
-        if lifecycle.get("ownership_state") in {"unreadable", "identity_mismatch"}:
-            self._set_lifecycle(ownership_state="held")
+        try:
+            lifecycle = self._read_spool().get("lifecycle") or {}
+            if lifecycle.get("ownership_state") in {"unreadable", "identity_mismatch"}:
+                self._set_lifecycle(ownership_state="held")
+        except OSError:
+            pass
         return True
 
     def _await_verified_authority(self) -> None:

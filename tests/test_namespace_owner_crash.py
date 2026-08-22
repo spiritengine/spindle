@@ -245,6 +245,42 @@ def test_s2_c_own_02_crash_before_identity_publication_is_prelaunch_failure(
         os.close(fd)
 
 
+def test_identity_lock_acquired_replaced_lock_exits_without_identity_publication(
+    watchdog_owner_case,
+):
+    owner = watchdog_owner_case(
+        "healthy-turn",
+        pause_checkpoint="identity_lock_acquired",
+        disable_pdeathsig=True,
+        expect_ready=False,
+    )
+    checkpoint = owner.receive_checkpoint()
+    assert checkpoint["name"] == "identity_lock_acquired"
+    assert checkpoint["provider_pid"] is None
+    owner_pidfd = os.pidfd_open(checkpoint["owner_pid"])
+    lock_path = owner.store / f"{owner.spool_id}.process-owner"
+    episode_before = owner.spool()["owner_episode"]
+    lock_path.unlink()
+    lock_path.touch(mode=0o600)
+    contender = os.open(lock_path, os.O_RDWR)
+    try:
+        fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        owner.resume()
+        poller = select.poll()
+        poller.register(owner_pidfd, select.POLLIN | select.POLLHUP | select.POLLERR)
+        assert poller.poll(8000), "owner did not exit after pre-identity authority loss"
+        assert owner.process.wait(timeout=8) == 126
+        assert owner.spool()["owner_episode"] == episode_before
+        assert not (owner.store / f"{owner.spool_id}.owner-identity").exists()
+        assert not (owner.store / f"{owner.spool_id}.journal-guard").exists()
+        assert not (owner.store / f"{owner.spool_id}.control-mailbox").exists()
+        assert not (owner.store / f"{owner.spool_id}.owner-exit").exists()
+    finally:
+        fcntl.flock(contender, fcntl.LOCK_UN)
+        os.close(contender)
+        os.close(owner_pidfd)
+
+
 def test_s2_c_own_03_owner_crash_contains_setsid_escaped_descendant(
     watchdog_owner_case,
 ):

@@ -551,14 +551,20 @@ def test_owner_rechecks_inherited_deadline_immediately_before_provider_popen(tmp
 
 
 def _lock_owner(tmp_path, spool_id="verify-lock"):
+    from types import SimpleNamespace
+
     from spindle.namespace_owner_process import LogicalOwner
 
     owner = object.__new__(LogicalOwner)
+    owner.args = SimpleNamespace(poll_interval=0)
     owner.store = tmp_path
     owner.spool_id = spool_id
     owner.spool_path = tmp_path / f"{spool_id}.json"
     owner.spool_lock_path = tmp_path / f"{spool_id}.lock"
     owner.lock_path = tmp_path / f"{spool_id}.process-owner"
+    owner.owner_identity_path = tmp_path / f"{spool_id}.owner-identity"
+    owner.generation = 1
+    owner.episode_mode = False
     owner.lock = acquire_ownership_lock(owner.lock_path)
     owner._authority_lost = False
     return owner
@@ -587,6 +593,21 @@ def test_verify_lock_latches_authority_lost_on_replaced_inode(tmp_path):
         owner._verify_lock()
     assert owner._authority_lost is True
     assert not owner.spool_path.exists(), "a proven-different inode must not write a diagnostic marker"
+
+
+def test_publish_owner_identity_rechecks_authority_before_writing_artifacts(tmp_path):
+    from spindle.namespace_owner_process import AuthorityLost
+
+    owner = _lock_owner(tmp_path, spool_id="pre-identity-loss")
+    owner.lock_path.unlink()
+    owner.lock_path.touch(mode=0o600)
+
+    with pytest.raises(AuthorityLost):
+        owner._publish_owner_identity()
+    assert owner._authority_lost is True
+    assert not owner.owner_identity_path.exists()
+    assert not (tmp_path / "pre-identity-loss.journal-guard").exists()
+    assert not (tmp_path / "pre-identity-loss.control-mailbox").exists()
 
 
 def test_authority_lost_latch_is_irreversible_even_after_inode_restore(tmp_path, monkeypatch):
@@ -638,6 +659,32 @@ def test_verify_lock_unreadable_pathname_stays_recoverable(tmp_path):
     assert owner._verify_lock() is True
     assert owner._authority_lost is False
     assert owner._read_spool()["lifecycle"]["ownership_state"] == "held"
+
+
+@pytest.mark.parametrize("failure", ["read", "write"])
+def test_verify_lock_treats_unreadable_marker_clearing_as_best_effort(tmp_path, monkeypatch, failure):
+    owner = _lock_owner(tmp_path, spool_id=f"best-effort-{failure}")
+    owner.spool_path.write_text(
+        json.dumps({"id": owner.spool_id, "lifecycle": {"ownership_state": "unreadable"}}),
+        encoding="utf-8",
+    )
+
+    if failure == "read":
+        monkeypatch.setattr(
+            owner,
+            "_read_spool",
+            lambda: (_ for _ in ()).throw(OSError("spool temporarily unreadable")),
+        )
+    else:
+        monkeypatch.setattr(
+            owner,
+            "_set_lifecycle",
+            lambda **_values: (_ for _ in ()).throw(OSError("lifecycle write failed")),
+        )
+
+    assert owner._verify_lock() is True
+    assert owner._authority_lost is False
+    assert json.loads(owner.spool_path.read_text())["lifecycle"]["ownership_state"] == "unreadable"
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file mode bits, so nothing denies access")
