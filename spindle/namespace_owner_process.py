@@ -162,6 +162,16 @@ class AuthorityLost(Exception):
     """
 
 
+def _close_spawn_local(resource, *, authority_lost_active: bool) -> None:
+    """Close a pre-provider local resource without masking AuthorityLost."""
+    try:
+        resource.close()
+    except OSError:
+        if authority_lost_active:
+            return
+        raise
+
+
 def _prctl(option: int, value: int) -> None:
     libc = ctypes.CDLL(None, use_errno=True)
     if libc.prctl(option, value, 0, 0, 0) != 0:
@@ -976,11 +986,12 @@ class LogicalOwner:
                 except OSError as exc:
                     spawn_error = exc
         finally:
-            child_end.close()
+            authority_lost_active = isinstance(sys.exc_info()[1], AuthorityLost)
+            _close_spawn_local(child_end, authority_lost_active=authority_lost_active)
             if stdin_stream is not subprocess.DEVNULL:
-                stdin_stream.close()
+                _close_spawn_local(stdin_stream, authority_lost_active=authority_lost_active)
             if self.provider is None:
-                owner_end.close()
+                _close_spawn_local(owner_end, authority_lost_active=authority_lost_active)
         if spawn_error is not None:
             # A recoverable store must not turn a spawn failure into an owner
             # crash on top of it: keep retrying the settlement while the only

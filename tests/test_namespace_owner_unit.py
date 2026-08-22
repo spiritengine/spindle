@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import builtins
 import errno
 import json
 import os
@@ -773,6 +774,166 @@ def test_pre_popen_reverify_blocks_provider_after_authority_loss(tmp_path, monke
 
     with pytest.raises(AuthorityLost):
         owner._spawn_provider()
+
+
+class _FailingClose:
+    def __init__(self, name, fd):
+        self.name = name
+        self.fd = fd
+        self.closed = False
+        self.inheritable = None
+
+    def fileno(self):
+        return self.fd
+
+    def set_inheritable(self, inheritable):
+        self.inheritable = inheritable
+
+    def close(self):
+        self.closed = True
+        raise OSError(f"simulated {self.name} close failure")
+
+
+def _install_failing_pre_popen_closes(monkeypatch, stdin_path):
+    owner_end = _FailingClose("owner_end", 41)
+    child_end = _FailingClose("child_end", 42)
+    stdin_stream = _FailingClose("stdin_stream", 43)
+
+    monkeypatch.setattr("spindle.namespace_owner_process.socket.socketpair", lambda: (owner_end, child_end))
+
+    def fake_open(path, mode="r", *args, **kwargs):
+        assert path == str(stdin_path)
+        assert mode == "r"
+        assert not args
+        assert not kwargs
+        return stdin_stream
+
+    monkeypatch.setattr(builtins, "open", fake_open)
+    return owner_end, child_end, stdin_stream
+
+
+def test_pre_popen_authority_loss_survives_failing_spawn_local_closes(tmp_path, monkeypatch):
+    """The local pre-Popen cleanup cannot mask the in-flight authority latch."""
+    from types import SimpleNamespace
+
+    from spindle.namespace_owner_process import (
+        AUTHORITY_LOST_DISPOSITION,
+        AUTHORITY_LOST_EXIT_CODE,
+        AuthorityLost,
+        LogicalOwner,
+    )
+    from spindle.owner_watchdog import _classify_owner_termination
+
+    stdin_path = tmp_path / "stdin"
+    owner_end, child_end, stdin_stream = _install_failing_pre_popen_closes(monkeypatch, stdin_path)
+    disposition_read, disposition_write = os.pipe()
+
+    owner = object.__new__(LogicalOwner)
+    owner.args = SimpleNamespace(
+        timeout=None,
+        poll_interval=0,
+        watchdog_fd=None,
+        disposition_fd=disposition_write,
+        launch_barrier_fd=None,
+        stdin_path=str(stdin_path),
+        command=["provider-must-not-run"],
+        cwd=str(tmp_path),
+        disable_pdeathsig=True,
+        ready_fd=None,
+    )
+    owner.store = tmp_path
+    owner.spool_id = "pre-popen-authority-loss-close-failure"
+    owner.spool_path = tmp_path / "pre-popen-authority-loss-close-failure.json"
+    owner.owner_exit_path = tmp_path / "pre-popen-authority-loss-close-failure.owner-exit"
+    owner.lock_path = tmp_path / "pre-popen-authority-loss-close-failure.process-owner"
+    owner.stdout_path = tmp_path / "pre-popen-authority-loss-close-failure.stdout"
+    owner.stderr_path = tmp_path / "pre-popen-authority-loss-close-failure.stderr"
+    owner.wall_deadline_at = None
+    owner.provider = None
+    owner.provider_pidfd = None
+    owner.control = None
+    owner.lock = SimpleNamespace(close=lambda: None)
+    owner.clock = SimpleNamespace(monotonic=lambda: 0.0)
+    owner.checkpoints = SimpleNamespace(reach=lambda *_args: None, socket=None, pause_name=None)
+    owner._authority_lost = False
+    owner._drain_reapable = lambda: 0
+    owner._direct_children = lambda: []
+    owner._watchdog_alive = lambda: True
+    owner._deadline_expired = lambda: False
+    owner._allocate_generation = lambda: None
+    owner._ensure_wall_deadline = lambda: None
+    owner._remaining_wall_budget = lambda: None
+    owner._publish_owner_identity = lambda: None
+    owner.spool_path.write_text(json.dumps({"id": owner.spool_id, "status": "pending"}, sort_keys=True))
+
+    def losing_verify_lock():
+        owner._authority_lost = True
+        raise AuthorityLost()
+
+    owner._verify_lock = losing_verify_lock
+    monkeypatch.setattr("spindle.namespace_owner_process._set_subreaper", lambda: None)
+    monkeypatch.setattr("spindle.namespace_owner_process.acquire_ownership_lock", lambda _path: owner.lock)
+    monkeypatch.setattr(
+        "spindle.namespace_owner_process.subprocess.Popen",
+        lambda *_args, **_kwargs: pytest.fail("provider executed after authority loss"),
+    )
+
+    try:
+        assert owner.run() == AUTHORITY_LOST_EXIT_CODE
+        assert child_end.closed is True
+        assert stdin_stream.closed is True
+        assert owner_end.closed is True
+        assert os.read(disposition_read, 4096) == AUTHORITY_LOST_DISPOSITION
+        assert (
+            _classify_owner_termination(
+                AUTHORITY_LOST_EXIT_CODE << 8,
+                exception_reported=False,
+                authority_lost=True,
+            )
+            == "authority_lost"
+        )
+        assert json.loads(owner.spool_path.read_text())["status"] == "pending"
+        assert not owner.owner_exit_path.exists()
+    finally:
+        os.close(disposition_read)
+        try:
+            os.close(disposition_write)
+        except OSError:
+            pass
+
+
+def test_pre_popen_local_close_failure_still_surfaces_without_authority_loss(tmp_path, monkeypatch):
+    """Only an active AuthorityLost suppresses these local cleanup failures."""
+    from types import SimpleNamespace
+
+    from spindle.namespace_owner_process import LogicalOwner
+
+    stdin_path = tmp_path / "stdin"
+    _owner_end, child_end, _stdin_stream = _install_failing_pre_popen_closes(monkeypatch, stdin_path)
+
+    owner = object.__new__(LogicalOwner)
+    owner.args = SimpleNamespace(
+        watchdog_fd=None,
+        stdin_path=str(stdin_path),
+        command=["provider-must-not-run"],
+        cwd=str(tmp_path),
+        disable_pdeathsig=True,
+    )
+    owner.store = tmp_path
+    owner.spool_id = "pre-popen-close-primary"
+    owner.stdout_path = tmp_path / "pre-popen-close-primary.stdout"
+    owner.stderr_path = tmp_path / "pre-popen-close-primary.stderr"
+    owner.wall_deadline_at = None
+    owner.checkpoints = SimpleNamespace(reach=lambda *_args: None, socket=None, pause_name=None)
+    owner._watchdog_alive = lambda: True
+    owner._deadline_expired = lambda: False
+    owner._verify_lock = lambda: (_ for _ in ()).throw(RuntimeError("primary failure"))
+    owner.provider = None
+    owner.clock = SimpleNamespace(monotonic=lambda: 0.0)
+
+    with pytest.raises(OSError, match="simulated child_end close failure"):
+        owner._spawn_provider()
+    assert child_end.closed is True
 
 
 def _spawning_owner(tmp_path, spool_id, *, ready_fd=None, command=("provider",)):
