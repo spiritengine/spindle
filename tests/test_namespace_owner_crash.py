@@ -5,6 +5,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import select
 import time
 from pathlib import Path
 from unittest.mock import patch
@@ -260,3 +261,53 @@ def test_s2_c_own_03_owner_crash_contains_setsid_escaped_descendant(
     assert wait_until(lambda: not Path(f"/proc/{descendant}").exists())
     terminal = _finalize_after_crash(owner)
     assert terminal["lifecycle"]["normalized_terminal_kind"] == "indeterminate"
+
+
+def test_combined_watchdog_and_authority_loss_contains_the_owner_subtree(
+    watchdog_owner_case,
+):
+    """A lost watchdog adopts nothing, so the owner must contain its own tree.
+
+    With PDEATHSIG disabled nothing kills the provider when the owner exits,
+    and no containment parent survives to adopt it - so the owner's own
+    bounded custody pass is all that stands between an authority loss and a
+    stranded provider plus its setsid descendant (finding-20260821-ikzy).  It
+    still writes nothing: the reservation it would write to is proven gone.
+    """
+    owner = watchdog_owner_case(
+        "setsid-grandchild",
+        pause_checkpoint="provider_ready",
+        disable_pdeathsig=True,
+        extra_env={"SPINDLE_CONTAINMENT_BOUND_SECONDS": "3"},
+    )
+    assert owner.receive_checkpoint()["name"] == "provider_ready"
+    descendant_path = owner.store / f"{owner.spool_id}.descendant-pid"
+    descendant = int(wait_until(lambda: descendant_path.read_text() if descendant_path.exists() else None))
+    provider_pid = owner.provider_pid
+    episode_before = owner.spool()["owner_episode"]
+    assert episode_before["phase"] == "accepted"
+
+    owner_pidfd = os.pidfd_open(owner.owner_pid)
+    try:
+        # Lose the containment parent first, then prove the reservation gone.
+        owner.process.kill()
+        owner.process.wait(timeout=8)
+        lock_path = owner.store / f"{owner.spool_id}.process-owner"
+        lock_path.unlink()
+        lock_path.touch(mode=0o600)
+        contender = os.open(lock_path, os.O_RDWR)
+        try:
+            fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            owner.resume()
+            poller = select.poll()
+            poller.register(owner_pidfd, select.POLLIN | select.POLLHUP | select.POLLERR)
+            assert poller.poll(8000), "owner did not exit after the combined loss"
+            assert wait_until(lambda: not Path(f"/proc/{provider_pid}").exists())
+            assert wait_until(lambda: not Path(f"/proc/{descendant}").exists())
+            assert owner.spool()["owner_episode"] == episode_before
+            assert not (owner.store / f"{owner.spool_id}.owner-exit").exists()
+        finally:
+            fcntl.flock(contender, fcntl.LOCK_UN)
+            os.close(contender)
+    finally:
+        os.close(owner_pidfd)

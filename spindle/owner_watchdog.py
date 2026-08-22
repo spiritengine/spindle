@@ -16,7 +16,12 @@ from .namespace_owner import (
     read_proc_starttime,
     transition_owner_episode,
 )
-from .namespace_owner_process import _set_subreaper
+from .namespace_owner_process import (
+    AUTHORITY_LOST_DISPOSITION,
+    CONTAINMENT_BOUND_SECONDS,
+    DEFAULT_CONTAINMENT_BOUND_SECONDS,
+    _set_subreaper,
+)
 from .namespace_owner_process import main as owner_main
 
 
@@ -37,8 +42,17 @@ def _drain_reapable() -> None:
             return
 
 
-def _contain_adopted_descendants(timeout: float = 3.0) -> bool:
-    """Kill every child adopted after owner death, including later reparents."""
+def _contain_adopted_descendants(timeout: float = DEFAULT_CONTAINMENT_BOUND_SECONDS) -> bool:
+    """Kill every child adopted after owner death, including later reparents.
+
+    The bound is defined beside the owner because both halves of the pair use
+    it: the owner takes one pass over its own live kernel children before
+    exiting, and this takes a second over what reparents here afterwards.
+    Genuine owner crashes still use the unbounded
+    _contain_adopted_descendants_until_clean below - the bound applies only to
+    the disposition-driven takeover, where the owner has already proven it
+    holds no authority to keep retrying under.
+    """
     deadline = time.monotonic() + timeout
     empty_scans = 0
     while time.monotonic() < deadline:
@@ -249,6 +263,23 @@ def _owner_process_crashed(status: int, *, exception_reported: bool) -> bool:
     return os.WIFSIGNALED(status) or exception_reported
 
 
+def _classify_owner_termination(status: int, *, exception_reported: bool, authority_lost: bool) -> str:
+    """Return 'authority_lost', 'crashed', or 'natural' - never the exit code.
+
+    ``authority_lost`` comes solely from the private disposition pipe, so
+    this classification (and everything it gates: whether the watchdog
+    writes crash evidence, whether containment is bounded or retried until
+    clean) is disjoint from the 0-255 exit status space by construction, the
+    same way ``_owner_process_crashed`` already keeps the crash channel
+    disjoint from ordinary return codes.
+    """
+    if authority_lost:
+        return "authority_lost"
+    if _owner_process_crashed(status, exception_reported=exception_reported):
+        return "crashed"
+    return "natural"
+
+
 def main(argv=None) -> int:
     """Fork the logical owner below a longer-lived containment subreaper."""
     _set_subreaper()
@@ -263,12 +294,19 @@ def main(argv=None) -> int:
     owner_generation = int(raw[raw.index("--generation") + 1]) if "--generation" in raw else 1
     error_read, error_write = os.pipe()
     watchdog_read, watchdog_write = os.pipe()
+    disposition_read, disposition_write = os.pipe()
     owner_pid = os.fork()
     if owner_pid == 0:
         os.close(error_read)
         os.close(watchdog_write)
+        os.close(disposition_read)
         delimiter = raw.index("--") if "--" in raw else len(raw)
-        raw[delimiter:delimiter] = ["--watchdog-fd", str(watchdog_read)]
+        raw[delimiter:delimiter] = [
+            "--watchdog-fd",
+            str(watchdog_read),
+            "--disposition-fd",
+            str(disposition_write),
+        ]
         try:
             code = owner_main(raw)
         except BaseException as exc:
@@ -283,6 +321,7 @@ def main(argv=None) -> int:
 
     os.close(error_write)
     os.close(watchdog_read)
+    os.close(disposition_write)
     try:
         owner_birth_token = read_proc_starttime(owner_pid)
     except OSError:
@@ -297,8 +336,23 @@ def main(argv=None) -> int:
         os.close(watchdog_write)
     exception_reported = bool(os.read(error_read, 4096))
     os.close(error_read)
-    crashed = _owner_process_crashed(status, exception_reported=exception_reported)
-    if crashed:
+    # The owner already exited by the time waitpid returns above, so its copy
+    # of disposition_write is closed and this read cannot block: it returns
+    # whatever marker was written, or b"" if none was.
+    authority_lost = os.read(disposition_read, 4096) == AUTHORITY_LOST_DISPOSITION
+    os.close(disposition_read)
+    classification = _classify_owner_termination(
+        status, exception_reported=exception_reported, authority_lost=authority_lost
+    )
+    if classification == "authority_lost":
+        # The owner has already proven it holds no authority to act on this
+        # store.  Take one bounded custody pass over whatever it leaves
+        # behind (a still-live provider reparents to this subreaper the
+        # moment the owner exits) and converge either way: no crash evidence,
+        # no unbounded retry, because there is no further authority to prove
+        # an incomplete pass true against.
+        _contain_adopted_descendants(timeout=CONTAINMENT_BOUND_SECONDS)
+    elif classification == "crashed":
         _contain_adopted_descendants_until_clean()
         _record_owner_crash(store, spool_id, owner_pid, owner_generation, owner_birth_token, status, True)
     else:
