@@ -47,7 +47,7 @@ Preparing Spindle for open-source release.
   - Data structure tests
 
 - [x] **Add GitHub Actions CI**
-  - Tests on Python 3.10, 3.11, 3.12
+  - Tests on Python 3.11, 3.12, 3.13, 3.14
   - Ruff linting and format checking
 
 ### Cleanup
