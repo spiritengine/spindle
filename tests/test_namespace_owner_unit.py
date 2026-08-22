@@ -385,6 +385,118 @@ def test_natural_exit_retries_descendant_cleanup_before_evidence_or_release(tmp_
     assert owner.lock.closed is True
 
 
+def _natural_exit_owner(tmp_path, spool_id, monkeypatch):
+    from types import SimpleNamespace
+
+    from spindle.namespace_owner_process import LogicalOwner
+    from tests.owner_episode_fixtures import make_episode
+
+    owner = object.__new__(LogicalOwner)
+    owner.args = SimpleNamespace(
+        timeout=None,
+        poll_interval=0,
+        watchdog_fd=None,
+        disposition_fd=None,
+        launch_barrier_fd=None,
+    )
+    owner.store = tmp_path
+    owner.spool_id = spool_id
+    owner.generation = 1
+    owner.spool_path = tmp_path / f"{spool_id}.json"
+    owner.spool_lock_path = tmp_path / f"{spool_id}.lock"
+    owner.lock_path = tmp_path / f"{spool_id}.process-owner"
+    owner.provider = SimpleNamespace(pid=456)
+    owner.provider_pidfd = None
+    owner.control = None
+    owner.clock = SimpleNamespace(monotonic=lambda: 0.0)
+    owner.checkpoints = SimpleNamespace(reach=lambda *_args: None, socket=None, pause_name=None)
+    owner.lock = acquire_ownership_lock(owner.lock_path)
+    owner._authority_lost = False
+    owner.adopted_reaped = 0
+    owner.wall_deadline_at = None
+    owner._contain_own_children = lambda _bound: True
+    owner._await_launch_barrier = lambda: True
+    owner._watchdog_alive = lambda: True
+    owner._deadline_expired = lambda: False
+    owner._allocate_generation = lambda: None
+    owner._ensure_wall_deadline = lambda: None
+    owner._remaining_wall_budget = lambda: None
+    owner._publish_owner_identity = lambda: None
+    owner._spawn_provider = lambda **_kwargs: None
+    owner._terminal_output_state = lambda: (False, False, None)
+    owner._next_current_request = lambda: None
+    owner._provider_exited = lambda: True
+    owner._finish_provider = lambda: 0
+    owner.spool_path.write_text(
+        json.dumps(
+            {
+                "id": owner.spool_id,
+                "status": "running",
+                "owner_episode": make_episode("accepted", generation=owner.generation),
+            },
+            sort_keys=True,
+        )
+    )
+    monkeypatch.setattr("spindle.namespace_owner_process._set_subreaper", lambda: None)
+    monkeypatch.setattr("spindle.namespace_owner_process.acquire_ownership_lock", lambda _path: owner.lock)
+    return owner
+
+
+def test_natural_exit_reproves_before_final_arbitration_after_evidence_checkpoint(tmp_path, monkeypatch):
+    from spindle.namespace_owner_process import AUTHORITY_LOST_EXIT_CODE, DESCENDANTS_SETTLED
+
+    owner = _natural_exit_owner(tmp_path, "natural-final-arbitration-loss", monkeypatch)
+    owner._settle_descendants = lambda **_kwargs: DESCENDANTS_SETTLED
+    owner._write_exit_evidence = lambda *_args, **_kwargs: True
+    contender = None
+
+    def checkpoint(name, *_args):
+        nonlocal contender
+        if name == "natural_exit_evidence_published":
+            contender = _replace_and_hold_owner_lock(owner)
+
+    owner.checkpoints = type(
+        "Checkpoints", (), {"reach": staticmethod(checkpoint), "socket": None, "pause_name": None}
+    )()
+    monkeypatch.setattr(
+        "spindle.namespace_owner_process.mailbox_guard",
+        lambda *_args, **_kwargs: pytest.fail("stale natural-exit owner entered final mailbox arbitration"),
+    )
+
+    try:
+        assert owner.run() == AUTHORITY_LOST_EXIT_CODE
+        assert owner._read_spool()["owner_episode"]["phase"] == "accepted"
+    finally:
+        if contender is not None:
+            fcntl.flock(contender, fcntl.LOCK_UN)
+            os.close(contender)
+
+
+def test_descendants_survived_lifecycle_reproves_after_containment(tmp_path, monkeypatch):
+    from spindle.namespace_owner_process import AUTHORITY_LOST_EXIT_CODE, DESCENDANTS_SURVIVED
+
+    owner = _natural_exit_owner(tmp_path, "descendants-survived-lifecycle-loss", monkeypatch)
+    owner.spool_lock_path.touch(mode=0o600)
+    contender = None
+
+    def settle_then_replace(**_kwargs):
+        nonlocal contender
+        contender = _replace_and_hold_owner_lock(owner)
+        return DESCENDANTS_SURVIVED
+
+    owner._settle_descendants = settle_then_replace
+    owner._write_exit_evidence = lambda *_args, **_kwargs: pytest.fail("exit evidence wrote after stale containment")
+
+    try:
+        assert owner.run() == AUTHORITY_LOST_EXIT_CODE
+        lifecycle = owner._read_spool().get("lifecycle") or {}
+        assert lifecycle.get("cleanup_outcome") != "descendants_survived"
+    finally:
+        if contender is not None:
+            fcntl.flock(contender, fcntl.LOCK_UN)
+            os.close(contender)
+
+
 def test_evidence_preservation_grace_ships_at_five_seconds():
     """Pin the shipped grace; the lifecycle fixtures run it at a short width.
 
@@ -876,6 +988,114 @@ def test_verify_lock_unreadable_pathname_stays_recoverable(tmp_path):
     assert owner._verify_lock() is True
     assert owner._authority_lost is False
     assert owner._read_spool()["lifecycle"]["ownership_state"] == "held"
+
+
+def test_spool_record_guard_missing_compatibility_lock_stays_prebinding_noop(tmp_path):
+    owner = _lock_owner(tmp_path, spool_id="prebinding-no-record-lock")
+    owner.spool_path.write_text(json.dumps({"id": owner.spool_id, "status": "pending"}, sort_keys=True))
+    owner._verify_lock = lambda **_kwargs: pytest.fail("absent compatibility lock requested authority proof")
+
+    try:
+        assert owner._update_spool(status="running")["status"] == "running"
+    finally:
+        owner.lock.close()
+
+
+def test_authority_loss_inside_spool_record_guard_survives_cleanup_failure(tmp_path, monkeypatch):
+    from spindle.namespace_owner_process import AuthorityLost
+
+    owner = _lock_owner(tmp_path, spool_id="spool-guard-cleanup-loss")
+    owner.spool_lock_path.touch(mode=0o600)
+    real_flock = fcntl.flock
+
+    def fail_unlock(fd, operation):
+        if operation == fcntl.LOCK_UN:
+            raise OSError("simulated spool lock unlock failure")
+        return real_flock(fd, operation)
+
+    owner._verify_lock = lambda **_kwargs: (_ for _ in ()).throw(AuthorityLost())
+    monkeypatch.setattr("spindle.namespace_owner.fcntl.flock", fail_unlock)
+
+    try:
+        with pytest.raises(AuthorityLost):
+            with owner._spool_record_guard():
+                pytest.fail("guard yielded after authority loss")
+    finally:
+        monkeypatch.setattr("spindle.namespace_owner.fcntl.flock", real_flock)
+        owner.lock.close()
+
+
+@pytest.mark.parametrize(
+    "operation",
+    [
+        "update_spool",
+        "set_lifecycle",
+        "terminal_timestamp",
+        "direct_guard_running_status",
+        "direct_guard_terminal_status",
+    ],
+)
+def test_spool_record_mutations_reprove_after_blocked_record_lock(tmp_path, operation):
+    from spindle.namespace_owner_process import AuthorityLost
+
+    owner = _spawning_owner(tmp_path, f"blocked-record-{operation}")
+    owner.spool_path.write_text(
+        json.dumps({"id": owner.spool_id, "status": "pending", "harness": "gemini"}, sort_keys=True)
+    )
+    owner.spool_lock_path.touch(mode=0o600)
+    if operation == "terminal_timestamp":
+        owner.stdout_path.write_text(json.dumps({"response": "complete", "session_id": "s"}) + "\n")
+    before = owner.spool_path.read_text()
+    guard_fd = os.open(owner.spool_lock_path, os.O_RDWR)
+    fcntl.flock(guard_fd, fcntl.LOCK_EX)
+    errors = []
+    results = []
+
+    def mutate():
+        try:
+            if operation == "update_spool":
+                results.append(owner._update_spool(owner_pid=999))
+            elif operation == "set_lifecycle":
+                results.append(owner._set_lifecycle(transport_state="connected"))
+            elif operation == "terminal_timestamp":
+                results.append(owner._terminal_output_state())
+            elif operation == "direct_guard_running_status":
+                with owner._spool_record_guard():
+                    spool = owner._read_spool()
+                    spool["status"] = "running"
+                    owner._write_spool_unlocked(spool)
+            elif operation == "direct_guard_terminal_status":
+                with owner._spool_record_guard():
+                    spool = owner._read_spool()
+                    spool["status"] = "error"
+                    spool["completed_at"] = "stale"
+                    owner._write_spool_unlocked(spool)
+        except BaseException as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=mutate)
+    worker.start()
+    contender = None
+    try:
+        worker.join(timeout=0.05)
+        assert worker.is_alive(), "mutation did not block on the held spool record lock"
+        contender = _replace_and_hold_owner_lock(owner)
+        fcntl.flock(guard_fd, fcntl.LOCK_UN)
+        worker.join(timeout=2)
+        assert not worker.is_alive()
+        assert results == []
+        assert len(errors) == 1 and isinstance(errors[0], AuthorityLost)
+        assert owner.spool_path.read_text() == before
+    finally:
+        try:
+            fcntl.flock(guard_fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(guard_fd)
+        if contender is not None:
+            fcntl.flock(contender, fcntl.LOCK_UN)
+            os.close(contender)
+        owner.lock.close()
 
 
 @pytest.mark.parametrize("failure", ["read", "write"])
@@ -1784,6 +2004,56 @@ def test_handle_request_reproves_inside_blocked_mailbox_guard_before_accepting(t
         owner.lock.close()
 
 
+def test_handle_request_reproves_after_receipt_settlement_before_episode_ack(tmp_path, monkeypatch):
+    from spindle.namespace_owner import read_control_receipt
+    from spindle.namespace_owner_process import AuthorityLost
+    from tests.owner_episode_fixtures import make_episode
+
+    owner = _spawning_owner(tmp_path, "post-receipt-accept-replacement")
+    owner.episode_mode = True
+    owner.provider = _FakeProvider()
+    owner._reported_malformed_receipts = set()
+    owner.spool_path.write_text(
+        json.dumps(
+            {
+                "id": owner.spool_id,
+                "status": "running",
+                "owner_episode": make_episode("lock_bound", generation=owner.generation),
+            },
+            sort_keys=True,
+        )
+    )
+    request = create_control_request(tmp_path, owner.spool_id, "cancel", owner.generation, "test")
+    real_settle = owner._settle_other_requests_unlocked
+    contender = None
+
+    def settle_then_replace(*args, **kwargs):
+        nonlocal contender
+        result = real_settle(*args, **kwargs)
+        contender = _replace_and_hold_owner_lock(owner)
+        return result
+
+    def forbidden_transition(*_args, **_kwargs):
+        pytest.fail("owner acknowledged the episode after post-receipt authority loss")
+
+    owner._settle_other_requests_unlocked = settle_then_replace
+    monkeypatch.setattr("spindle.namespace_owner_process.transition_owner_episode", forbidden_transition)
+
+    try:
+        with pytest.raises(AuthorityLost):
+            owner._handle_request(request)
+        receipt = read_control_receipt(tmp_path, owner.spool_id, request.request_id)
+        assert receipt is not None
+        assert receipt.cleanup_outcome == "accepted"
+        assert receipt.owner_acknowledged_at is not None
+        assert owner._read_spool()["owner_episode"]["phase"] == "lock_bound"
+    finally:
+        if contender is not None:
+            fcntl.flock(contender, fcntl.LOCK_UN)
+            os.close(contender)
+        owner.lock.close()
+
+
 def test_owner_timeout_request_reproves_immediately_before_create(tmp_path, monkeypatch):
     from types import SimpleNamespace
 
@@ -1873,6 +2143,48 @@ def test_spawn_failure_sidecar_reproves_after_transition_before_owner_exit(tmp_p
         assert owner._read_spool()["owner_episode"]["phase"] == "cleanup_proven"
         assert not owner.owner_exit_path.exists()
     finally:
+        owner.lock.close()
+
+
+def test_watchdog_loss_sidecar_reproves_after_cleanup_transition(tmp_path, monkeypatch):
+    import spindle.namespace_owner_process as owner_module
+    from spindle.namespace_owner_process import DESCENDANTS_SETTLED, AuthorityLost
+    from tests.owner_episode_fixtures import make_episode
+
+    owner = _spawning_owner(tmp_path, "watchdog-loss-sidecar-replacement")
+    owner.episode_mode = True
+    owner.provider = None
+    owner.spool_path.write_text(
+        json.dumps(
+            {
+                "id": owner.spool_id,
+                "status": "running",
+                "owner_episode": make_episode("lock_bound", generation=owner.generation),
+            },
+            sort_keys=True,
+        )
+    )
+    owner._settle_descendants = lambda **_kwargs: DESCENDANTS_SETTLED
+    real_transition = owner_module.transition_owner_episode
+    contender = None
+
+    def transition_then_replace(*args, **kwargs):
+        nonlocal contender
+        result = real_transition(*args, **kwargs)
+        contender = _replace_and_hold_owner_lock(owner)
+        return result
+
+    monkeypatch.setattr("spindle.namespace_owner_process.transition_owner_episode", transition_then_replace)
+
+    try:
+        with pytest.raises(AuthorityLost):
+            owner._contain_after_watchdog_loss()
+        assert owner._read_spool()["owner_episode"]["phase"] == "cleanup_proven"
+        assert not owner.owner_exit_path.exists()
+    finally:
+        if contender is not None:
+            fcntl.flock(contender, fcntl.LOCK_UN)
+            os.close(contender)
         owner.lock.close()
 
 

@@ -564,6 +564,7 @@ class LogicalOwner:
             )
             if not result.accepted:
                 return False
+            self._await_verified_authority()
         evidence = {
             "owner_pid": os.getpid(),
             "owner_generation": self.generation,
@@ -575,7 +576,7 @@ class LogicalOwner:
             "watchdog_parent_lost": True,
             "observed_at": cleanup["child_exit_observed_at"],
         }
-        _atomic_json_write(self.owner_exit_path, evidence)
+        self._atomic_json_write_after_authority_proof(self.owner_exit_path, evidence)
         self.checkpoints.reach("watchdog_loss_cleanup_proven", self.provider.pid if self.provider else None)
         return True
 
@@ -639,6 +640,7 @@ class LogicalOwner:
             return
         try:
             fcntl.flock(fd, fcntl.LOCK_EX)
+            self._await_verified_authority(record_unreadable=False)
             yield
         finally:
             _cleanup_locked_fd(fd)
@@ -847,7 +849,7 @@ class LogicalOwner:
         except OSError:
             pass
 
-    def _verify_lock(self) -> bool:
+    def _verify_lock(self, *, record_unreadable: bool = True) -> bool:
         """Prove the exact recorded inode is still bound to the lock pathname.
 
         Identity is proven from stat alone - the held descriptor's device and
@@ -876,7 +878,8 @@ class LogicalOwner:
         except OSError:
             # The held descriptor is this process's own state; failing to read
             # it proves nothing about who holds the pathname.
-            self._note_unreadable_ownership()
+            if record_unreadable:
+                self._note_unreadable_ownership()
             return False
         try:
             pathname = os.stat(self.lock_path)
@@ -884,14 +887,16 @@ class LogicalOwner:
             self._authority_lost = True
             raise AuthorityLost()
         except OSError:
-            self._note_unreadable_ownership()
+            if record_unreadable:
+                self._note_unreadable_ownership()
             return False
         exact = (descriptor.st_dev, descriptor.st_ino) == (pathname.st_dev, pathname.st_ino)
         if not exact:
             self._authority_lost = True
             raise AuthorityLost()
         if not os.access(self.lock_path, os.R_OK | os.W_OK):
-            self._note_unreadable_ownership()
+            if record_unreadable:
+                self._note_unreadable_ownership()
             return False
         try:
             lifecycle = self._read_spool().get("lifecycle") or {}
@@ -901,7 +906,7 @@ class LogicalOwner:
             pass
         return True
 
-    def _await_verified_authority(self) -> None:
+    def _await_verified_authority(self, *, record_unreadable: bool = True) -> None:
         """Block until this reservation is provably still ours.
 
         A proven loss raises ``AuthorityLost``; an unreadable pathname is the
@@ -909,8 +914,12 @@ class LogicalOwner:
         does.  Use this immediately before publishing shared state so a stale
         owner cannot write over the reservation that replaced it.
         """
-        while not self._verify_lock():
-            time.sleep(self.args.poll_interval)
+        if record_unreadable:
+            while not self._verify_lock():
+                time.sleep(self.args.poll_interval)
+        else:
+            while not self._verify_lock(record_unreadable=False):
+                time.sleep(self.args.poll_interval)
 
     def _finalize_authority_lost(self) -> int:
         """Converge after the irreversible latch without acting as owner.
@@ -1440,7 +1449,9 @@ class LogicalOwner:
             if not self._settle_other_requests_unlocked(request.request_id):
                 return -2
             if self.episode_mode:
+                self._await_verified_authority()
                 episode = self._read_spool().get("owner_episode") or {}
+                self._await_verified_authority()
                 accepted = transition_owner_episode(
                     self.store,
                     self.spool_id,
@@ -1543,7 +1554,9 @@ class LogicalOwner:
         if not self._write_exit_evidence(returncode, cleanup_outcome="stopped"):
             return -2
         if self.episode_mode:
+            self._await_verified_authority()
             episode = self._read_spool().get("owner_episode") or {}
+            self._await_verified_authority()
             cleaned = transition_owner_episode(
                 self.store,
                 self.spool_id,
@@ -1755,10 +1768,14 @@ class LogicalOwner:
             # finishes unwinding past here, not through the guarded path
             # below.
             if not self._authority_lost:
+                self._await_verified_authority()
                 with mailbox_guard(self.store, self.spool_id):
                     self.checkpoints.reach("final_mailbox_guard_acquired", self.provider.pid if self.provider else None)
+                    self._await_verified_authority()
                     if self.episode_mode and natural_cleanup is not None:
+                        self._await_verified_authority()
                         episode = self._read_spool().get("owner_episode") or {}
+                        self._await_verified_authority()
                         cleaned = transition_owner_episode(
                             self.store,
                             self.spool_id,
@@ -1770,6 +1787,7 @@ class LogicalOwner:
                         )
                         if not cleaned.accepted:
                             result = -2
+                    self._await_verified_authority()
                     if accepted_request is not None:
                         self._settle_other_requests_unlocked(accepted_request.request_id)
                     elif natural_exit_settled:
