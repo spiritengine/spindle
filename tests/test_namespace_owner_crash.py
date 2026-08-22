@@ -221,6 +221,47 @@ def test_s2_c_arm_01_fork_parent_death_race_does_not_orphan_provider(
     assert wait_until(lambda: _provider_gone(owner))
 
 
+def test_process_identity_publication_rechecks_before_episode_acceptance(watchdog_owner_case):
+    owner = watchdog_owner_case(
+        "healthy-turn",
+        pause_checkpoint="process_identity_published",
+        disable_pdeathsig=True,
+        expect_ready=False,
+    )
+    checkpoint = owner.receive_checkpoint()
+    assert checkpoint["name"] == "process_identity_published"
+    assert checkpoint["provider_pid"], checkpoint
+    process_identity = owner.store / f"{owner.spool_id}.process-identity"
+    assert process_identity.exists()
+    spool_path = owner.store / f"{owner.spool_id}.json"
+    before_spool = spool_path.read_bytes()
+    before_episode = json.loads(before_spool)["owner_episode"]
+    assert before_episode["phase"] == "lock_bound"
+
+    owner_pidfd = os.pidfd_open(checkpoint["owner_pid"])
+    lock_path = owner.store / f"{owner.spool_id}.process-owner"
+    lock_path.unlink()
+    lock_path.touch(mode=0o600)
+    contender = os.open(lock_path, os.O_RDWR)
+    try:
+        fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        owner.resume()
+        poller = select.poll()
+        poller.register(owner_pidfd, select.POLLIN | select.POLLHUP | select.POLLERR)
+        assert poller.poll(8000), "owner did not exit after process-identity authority loss"
+        assert owner.process.wait(timeout=8) == 126
+        assert spool_path.read_bytes() == before_spool
+        assert owner.spool()["owner_episode"]["phase"] == "lock_bound"
+        assert process_identity.exists()
+        assert not (owner.store / f"{owner.spool_id}.owner-exit").exists()
+        assert not list((owner.store / f"{owner.spool_id}.control-mailbox").glob("*"))
+        assert wait_until(lambda: _provider_gone(owner))
+    finally:
+        fcntl.flock(contender, fcntl.LOCK_UN)
+        os.close(contender)
+        os.close(owner_pidfd)
+
+
 def test_s2_c_own_02_crash_before_identity_publication_is_prelaunch_failure(
     watchdog_owner_case,
 ):

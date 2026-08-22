@@ -750,7 +750,6 @@ class LogicalOwner:
         return True
 
     def _publish_owner_identity(self) -> ProcessIdentity:
-        self._await_verified_authority()
         namespace = capture_pid_namespace()
         identity = ProcessIdentity(
             pid=os.getpid(),
@@ -764,6 +763,7 @@ class LogicalOwner:
         )
         if self.episode_mode:
             episode = self._read_spool().get("owner_episode") or {}
+            self._await_verified_authority()
             result = transition_owner_episode(
                 self.store,
                 self.spool_id,
@@ -782,8 +782,14 @@ class LogicalOwner:
             )
             if not result.accepted:
                 raise RuntimeError(f"owner lock binding rejected: {result.rejection}")
+            self.checkpoints.reach("owner_episode_lock_bound")
+        self._await_verified_authority()
         _atomic_json_write(self.owner_identity_path, identity.to_dict())
+        self.checkpoints.reach("owner_identity_mirror_published")
+        self._await_verified_authority()
         (self.store / f"{self.spool_id}.journal-guard").touch(exist_ok=True)
+        self.checkpoints.reach("owner_journal_guard_published")
+        self._await_verified_authority()
         (self.store / f"{self.spool_id}.control-mailbox").mkdir(exist_ok=True)
         return identity
 
@@ -1035,8 +1041,11 @@ class LogicalOwner:
             "lock_inode": self.lock.inode,
         }
         _atomic_json_write(self.process_identity_path, process_identity)
+        self.checkpoints.reach("process_identity_published", self.provider.pid)
         if self.episode_mode:
+            self._await_verified_authority()
             episode = self._read_spool().get("owner_episode") or {}
+            self._await_verified_authority()
             accepted = transition_owner_episode(
                 self.store,
                 self.spool_id,

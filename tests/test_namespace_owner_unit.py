@@ -567,9 +567,18 @@ def _lock_owner(tmp_path, spool_id="verify-lock"):
     owner.owner_identity_path = tmp_path / f"{spool_id}.owner-identity"
     owner.generation = 1
     owner.episode_mode = False
+    owner.checkpoints = SimpleNamespace(reach=lambda *_args: None, socket=None, pause_name=None)
     owner.lock = acquire_ownership_lock(owner.lock_path)
     owner._authority_lost = False
     return owner
+
+
+def _replace_and_hold_owner_lock(owner):
+    owner.lock_path.unlink()
+    owner.lock_path.touch(mode=0o600)
+    contender = os.open(owner.lock_path, os.O_RDWR)
+    fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    return contender
 
 
 def test_verify_lock_latches_authority_lost_on_missing_pathname(tmp_path):
@@ -610,6 +619,100 @@ def test_publish_owner_identity_rechecks_authority_before_writing_artifacts(tmp_
     assert not owner.owner_identity_path.exists()
     assert not (tmp_path / "pre-identity-loss.journal-guard").exists()
     assert not (tmp_path / "pre-identity-loss.control-mailbox").exists()
+
+
+def test_publish_owner_identity_rechecks_authority_after_lock_bound_transition(tmp_path):
+    from types import SimpleNamespace
+
+    from spindle.namespace_owner_process import AuthorityLost
+    from tests.owner_episode_fixtures import make_episode
+
+    owner = _lock_owner(tmp_path, spool_id="loss-after-lock-bound")
+    owner.episode_mode = True
+    owner.spool_path.write_text(
+        json.dumps(
+            {
+                "id": owner.spool_id,
+                "status": "pending",
+                "owner_episode": make_episode("reserved", generation=owner.generation),
+            },
+            sort_keys=True,
+        )
+    )
+    contenders = []
+
+    def checkpoint(name, *_args):
+        if name == "owner_episode_lock_bound":
+            contenders.append(_replace_and_hold_owner_lock(owner))
+
+    owner.checkpoints = SimpleNamespace(reach=checkpoint, socket=None, pause_name=None)
+
+    try:
+        with pytest.raises(AuthorityLost):
+            owner._publish_owner_identity()
+        assert json.loads(owner.spool_path.read_text())["owner_episode"]["phase"] == "lock_bound"
+        assert not owner.owner_identity_path.exists()
+        assert not (tmp_path / "loss-after-lock-bound.journal-guard").exists()
+        assert not (tmp_path / "loss-after-lock-bound.control-mailbox").exists()
+    finally:
+        for contender in contenders:
+            fcntl.flock(contender, fcntl.LOCK_UN)
+            os.close(contender)
+        owner.lock.close()
+
+
+def test_publish_owner_identity_rechecks_authority_after_identity_mirror(tmp_path):
+    from types import SimpleNamespace
+
+    from spindle.namespace_owner_process import AuthorityLost
+
+    owner = _lock_owner(tmp_path, spool_id="loss-after-identity-mirror")
+    contenders = []
+
+    def checkpoint(name, *_args):
+        if name == "owner_identity_mirror_published":
+            contenders.append(_replace_and_hold_owner_lock(owner))
+
+    owner.checkpoints = SimpleNamespace(reach=checkpoint, socket=None, pause_name=None)
+
+    try:
+        with pytest.raises(AuthorityLost):
+            owner._publish_owner_identity()
+        assert owner.owner_identity_path.exists()
+        assert not (tmp_path / "loss-after-identity-mirror.journal-guard").exists()
+        assert not (tmp_path / "loss-after-identity-mirror.control-mailbox").exists()
+    finally:
+        for contender in contenders:
+            fcntl.flock(contender, fcntl.LOCK_UN)
+            os.close(contender)
+        owner.lock.close()
+
+
+def test_publish_owner_identity_rechecks_authority_after_journal_guard(tmp_path):
+    from types import SimpleNamespace
+
+    from spindle.namespace_owner_process import AuthorityLost
+
+    owner = _lock_owner(tmp_path, spool_id="loss-after-journal-guard")
+    contenders = []
+
+    def checkpoint(name, *_args):
+        if name == "owner_journal_guard_published":
+            contenders.append(_replace_and_hold_owner_lock(owner))
+
+    owner.checkpoints = SimpleNamespace(reach=checkpoint, socket=None, pause_name=None)
+
+    try:
+        with pytest.raises(AuthorityLost):
+            owner._publish_owner_identity()
+        assert owner.owner_identity_path.exists()
+        assert (tmp_path / "loss-after-journal-guard.journal-guard").exists()
+        assert not (tmp_path / "loss-after-journal-guard.control-mailbox").exists()
+    finally:
+        for contender in contenders:
+            fcntl.flock(contender, fcntl.LOCK_UN)
+            os.close(contender)
+        owner.lock.close()
 
 
 @pytest.mark.parametrize("cleanup_failure", ["unlock", "close"])
@@ -1214,6 +1317,105 @@ def test_post_fork_publication_proves_authority_at_every_boundary(tmp_path, monk
         owner.control.close()
         owner.lock.close()
         os.close(ready_read)
+
+
+def test_episode_acceptance_rechecks_authority_after_episode_read(tmp_path, monkeypatch):
+    from types import MethodType
+
+    from spindle.namespace_owner_process import AuthorityLost
+    from tests.owner_episode_fixtures import make_episode
+
+    owner = _spawning_owner(tmp_path, "episode-acceptance-read-loss")
+    owner.episode_mode = True
+    owner.spool_path.write_text(
+        json.dumps(
+            {
+                "id": owner.spool_id,
+                "status": "pending",
+                "owner_episode": make_episode("lock_bound", generation=owner.generation),
+            },
+            sort_keys=True,
+        )
+    )
+    contenders = []
+    replaced = False
+    real_read_spool = owner._read_spool
+
+    def replacing_read_spool(self):
+        nonlocal replaced
+        record = real_read_spool()
+        if not replaced and self.process_identity_path.exists():
+            contenders.append(_replace_and_hold_owner_lock(self))
+            replaced = True
+        return record
+
+    owner._read_spool = MethodType(replacing_read_spool, owner)
+    _fake_provider_start(monkeypatch)
+
+    try:
+        with pytest.raises(AuthorityLost):
+            owner._spawn_provider()
+        assert owner.process_identity_path.exists()
+        after = json.loads(owner.spool_path.read_text())
+        assert after["owner_episode"]["phase"] == "lock_bound"
+        assert after["status"] == "pending"
+    finally:
+        for contender in contenders:
+            fcntl.flock(contender, fcntl.LOCK_UN)
+            os.close(contender)
+        if owner.control is not None:
+            owner.control.close()
+        owner.lock.close()
+
+
+def test_episode_acceptance_rechecks_authority_before_episode_read(tmp_path, monkeypatch):
+    from types import MethodType, SimpleNamespace
+
+    from spindle.namespace_owner_process import AuthorityLost
+    from tests.owner_episode_fixtures import make_episode
+
+    owner = _spawning_owner(tmp_path, "episode-acceptance-pre-read-loss")
+    owner.episode_mode = True
+    owner.spool_path.write_text(
+        json.dumps(
+            {
+                "id": owner.spool_id,
+                "status": "pending",
+                "owner_episode": make_episode("lock_bound", generation=owner.generation),
+            },
+            sort_keys=True,
+        )
+    )
+    contenders = []
+    real_read_spool = owner._read_spool
+
+    def checkpoint(name, *_args):
+        if name == "process_identity_published":
+            contenders.append(_replace_and_hold_owner_lock(owner))
+
+    def guarded_read_spool(self):
+        if self.process_identity_path.exists():
+            pytest.fail("owner read shared episode state after authority loss")
+        return real_read_spool()
+
+    owner.checkpoints = SimpleNamespace(reach=checkpoint, socket=None, pause_name=None)
+    owner._read_spool = MethodType(guarded_read_spool, owner)
+    _fake_provider_start(monkeypatch)
+
+    try:
+        with pytest.raises(AuthorityLost):
+            owner._spawn_provider()
+        assert owner.process_identity_path.exists()
+        after = json.loads(owner.spool_path.read_text())
+        assert after["owner_episode"]["phase"] == "lock_bound"
+        assert after["status"] == "pending"
+    finally:
+        for contender in contenders:
+            fcntl.flock(contender, fcntl.LOCK_UN)
+            os.close(contender)
+        if owner.control is not None:
+            owner.control.close()
+        owner.lock.close()
 
 
 def test_pre_popen_deadline_settlement_treats_an_unreadable_store_as_retryable(tmp_path):
