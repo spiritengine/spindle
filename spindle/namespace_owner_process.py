@@ -13,6 +13,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -23,6 +24,7 @@ from .namespace_owner import (
     MalformedControlReceipt,
     ProcessIdentity,
     _atomic_json_write,
+    _cleanup_locked_fd,
     _utc_now,
     acquire_ownership_lock,
     capture_pid_namespace,
@@ -81,6 +83,100 @@ def _resolve_evidence_grace_seconds() -> float:
 
 EVIDENCE_PRESERVATION_GRACE_SECONDS = _resolve_evidence_grace_seconds()
 
+# Bound on the one adopted-child cleanup/reap pass taken after an
+# authority-loss disposition, mirroring the production ceiling and test
+# override pattern of SPINDLE_EVIDENCE_GRACE_SECONDS.  Both the owner (over
+# its own live kernel children, before it exits) and the watchdog (over what
+# it adopts afterwards) run that single pass under this bound.  A genuine
+# owner crash still gets the watchdog's unbounded retry instead: there the
+# store is still authoritative, so containment can be proven true against it.
+DEFAULT_CONTAINMENT_BOUND_SECONDS = 3.0
+
+
+def _resolve_containment_bound_seconds() -> float:
+    """Read SPINDLE_CONTAINMENT_BOUND_SECONDS, clamped to [0, DEFAULT].
+
+    Real-subprocess tests drive an ignoring-SIGTERM provider through the
+    authority-loss takeover directly, so they use this override to run the
+    bounded pass at a short width instead of adding whole seconds of
+    wall-clock time per case.  The clamp means the override can only shorten
+    the bound, never lengthen it past the production ceiling.
+    """
+    raw = os.environ.get("SPINDLE_CONTAINMENT_BOUND_SECONDS")
+    if raw is None:
+        return DEFAULT_CONTAINMENT_BOUND_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEFAULT_CONTAINMENT_BOUND_SECONDS
+    if not math.isfinite(value):
+        return DEFAULT_CONTAINMENT_BOUND_SECONDS
+    return min(max(value, 0.0), DEFAULT_CONTAINMENT_BOUND_SECONDS)
+
+
+CONTAINMENT_BOUND_SECONDS = _resolve_containment_bound_seconds()
+
+# Outcomes of one attempt to durably settle a pre-provider failure.
+# ``published`` is durable.  ``retry`` is the recoverable case - an unreadable
+# ownership pathname, or an episode revision another actor moved between this
+# owner's read and its transition - where the next attempt can still succeed.
+# ``unsettleable`` means the episode has moved somewhere this generation can
+# never legally transition from again, so retrying would only hold the
+# reservation open forever without ever publishing anything.
+SETTLEMENT_PUBLISHED = "published"
+SETTLEMENT_RETRY = "retry"
+SETTLEMENT_UNSETTLEABLE = "unsettleable"
+
+DESCENDANTS_SETTLED = "settled"
+DESCENDANTS_SURVIVED = "survived"
+DESCENDANTS_UNPROVEN = "unproven"
+
+# The only episode rejection a retry can clear.  Every other rejection
+# (stale_generation, illegal_transition, illegal_actor, missing_facts,
+# contradictory_facts, unknown_episode_format) is fixed for this generation:
+# the owner re-reads the episode before each attempt, so a rejection that does
+# not turn on the revision it read will be returned identically forever.
+RECOVERABLE_EPISODE_REJECTIONS = frozenset({"stale_revision"})
+
+# The process return code for converging on an episode this generation can no
+# longer settle.  It is disjoint from the deadline (124), watchdog-loss (125),
+# authority-loss (126) and spawn-failure (127) convergences so a reader of the
+# process exit status can tell them apart.
+EPISODE_UNSETTLEABLE_EXIT_CODE = 123
+
+# Written to the owner's private disposition pipe (``--disposition-fd``) so the
+# watchdog can classify an authority-loss exit without inferring it from the
+# exit code, which stays free for ordinary provider/owner outcomes.  The exact
+# bytes never leave this process pair, so the value only has to be distinct
+# from an empty read.
+AUTHORITY_LOST_DISPOSITION = b"authority-lost\n"
+
+# The process return code for an authority-loss convergence.  The watchdog
+# never branches on this value - classification comes solely from the
+# disposition pipe - so it exists only for readable process exit status; any
+# value in 0-255 would be equally correct.
+AUTHORITY_LOST_EXIT_CODE = 126
+
+
+class AuthorityLost(Exception):
+    """In-memory-only signal that this process's ownership claim is dead.
+
+    Raised by ``_verify_lock`` once it proves the recorded lock pathname is
+    missing or bound to a different device/inode.  The condition never
+    re-derives from the filesystem after that: ``LogicalOwner._authority_lost``
+    latches so a later restore of the original inode cannot clear it.
+    """
+
+
+def _close_spawn_local(resource, *, authority_lost_active: bool) -> None:
+    """Close a pre-provider local resource without masking AuthorityLost."""
+    try:
+        resource.close()
+    except OSError:
+        if authority_lost_active:
+            return
+        raise
+
 
 def _prctl(option: int, value: int) -> None:
     libc = ctypes.CDLL(None, use_errno=True)
@@ -107,6 +203,13 @@ def _provider_preexec(expected_parent: int, disable_pdeathsig: bool):
 
 def _starttime(pid: int) -> str:
     return parse_proc_stat_starttime((Path("/proc") / str(pid) / "stat").read_text())
+
+
+def _settlement_outcome_for(rejection: Optional[str]) -> str:
+    """Classify one rejected episode transition as retryable or terminal."""
+    if rejection in RECOVERABLE_EPISODE_REJECTIONS:
+        return SETTLEMENT_RETRY
+    return SETTLEMENT_UNSETTLEABLE
 
 
 class Checkpoints:
@@ -180,6 +283,7 @@ class LogicalOwner:
         self.wall_deadline_at: Optional[str] = args.deadline
         self.episode_mode = False
         self._reported_malformed_receipts: set[str] = set()
+        self._authority_lost = False
 
     def _watchdog_alive(self) -> bool:
         """Whether the mandatory containment parent still holds its lease FD."""
@@ -238,7 +342,7 @@ class LogicalOwner:
         }
         if self.episode_mode:
             episode = self._read_spool().get("owner_episode") or {}
-            transition_owner_episode(
+            result = transition_owner_episode(
                 self.store,
                 self.spool_id,
                 actor="owner",
@@ -247,6 +351,8 @@ class LogicalOwner:
                 expected_revision=episode.get("revision"),
                 facts={"failure": failure},
             )
+            if not result.accepted:
+                return
         else:
             lifecycle = {
                 **(self._read_spool().get("lifecycle") or {}),
@@ -276,10 +382,15 @@ class LogicalOwner:
             },
         )
 
-    def _settle_deadline_expiry_after_binding(self) -> bool:
-        """Prove a bound generation timed out without ever starting a provider."""
+    def _settle_deadline_expiry_after_binding(self) -> str:
+        """Prove a bound generation timed out without ever starting a provider.
+
+        Returns one of the SETTLEMENT_* outcomes.  The caller retries only the
+        recoverable one; an unsettleable episode has to converge instead of
+        being retried forever under a held reservation (finding-20260821-a01s).
+        """
         if not self._verify_lock():
-            return False
+            return SETTLEMENT_RETRY
         observed_at = _utc_now()
         cleanup = {
             "outcome": "deadline_expired_before_provider_start",
@@ -294,14 +405,8 @@ class LogicalOwner:
             "observed_at": observed_at,
         }
         if self.episode_mode:
-            episode = self._read_spool().get("owner_episode") or {}
-            settled = transition_owner_episode(
-                self.store,
-                self.spool_id,
-                actor="owner",
+            settled = self._transition_owner_episode_locked(
                 destination="cleanup_proven",
-                generation=self.generation,
-                expected_revision=episode.get("revision"),
                 facts={
                     "containment": {
                         "contained": True,
@@ -313,7 +418,7 @@ class LogicalOwner:
                 },
             )
             if not settled.accepted:
-                return False
+                return _settlement_outcome_for(settled.rejection)
         else:
             spool = self._read_spool()
             lifecycle = {
@@ -329,7 +434,8 @@ class LogicalOwner:
                 completed_at=observed_at,
                 lifecycle=lifecycle,
             )
-        _atomic_json_write(
+        self._await_verified_authority()
+        self._atomic_json_write_after_authority_proof(
             self.owner_exit_path,
             {
                 "owner_pid": os.getpid(),
@@ -342,12 +448,17 @@ class LogicalOwner:
                 "observed_at": observed_at,
             },
         )
-        return True
+        return SETTLEMENT_PUBLISHED
 
-    def _settle_provider_spawn_failure(self, error: OSError) -> bool:
-        """Publish a bound episode that never transferred provider custody."""
+    def _settle_provider_spawn_failure(self, error: OSError) -> str:
+        """Publish a bound episode that never transferred provider custody.
+
+        Returns one of the SETTLEMENT_* outcomes, so a recoverable store makes
+        the caller retry rather than turning a transient sighting into an owner
+        crash on top of the spawn failure (finding-20260821-o0h1).
+        """
         if not self._verify_lock():
-            return False
+            return SETTLEMENT_RETRY
         observed_at = _utc_now()
         detail = f"provider spawn failed: {error}"
         cleanup = {
@@ -363,14 +474,8 @@ class LogicalOwner:
             "observed_at": observed_at,
         }
         if self.episode_mode:
-            episode = self._read_spool().get("owner_episode") or {}
-            settled = transition_owner_episode(
-                self.store,
-                self.spool_id,
-                actor="owner",
+            settled = self._transition_owner_episode_locked(
                 destination="cleanup_proven",
-                generation=self.generation,
-                expected_revision=episode.get("revision"),
                 facts={
                     "containment": {
                         "contained": True,
@@ -382,7 +487,7 @@ class LogicalOwner:
                 },
             )
             if not settled.accepted:
-                return False
+                return _settlement_outcome_for(settled.rejection)
         else:
             lifecycle = {
                 **(self._read_spool().get("lifecycle") or {}),
@@ -397,7 +502,8 @@ class LogicalOwner:
                 completed_at=observed_at,
                 lifecycle=lifecycle,
             )
-        _atomic_json_write(
+        self._await_verified_authority()
+        self._atomic_json_write_after_authority_proof(
             self.owner_exit_path,
             {
                 "owner_pid": os.getpid(),
@@ -410,7 +516,7 @@ class LogicalOwner:
                 "observed_at": observed_at,
             },
         )
-        return True
+        return SETTLEMENT_PUBLISHED
 
     def _contain_after_watchdog_loss(self) -> bool:
         """Take over containment, publish proof, and leave no live descendants."""
@@ -421,7 +527,7 @@ class LogicalOwner:
             returncode = self._finish_provider()
             if returncode is None:
                 return False
-        while not self._settle_descendants(force=True):
+        while self._settle_descendants(force=True) != DESCENDANTS_SETTLED:
             if not self._verify_lock():
                 return False
             time.sleep(self.args.poll_interval)
@@ -430,18 +536,13 @@ class LogicalOwner:
         if not self._verify_lock():
             return False
         if self.episode_mode:
-            episode = self._read_spool().get("owner_episode") or {}
-            result = transition_owner_episode(
-                self.store,
-                self.spool_id,
-                actor="owner",
+            result = self._transition_owner_episode_locked(
                 destination="cleanup_proven",
-                generation=self.generation,
-                expected_revision=episode.get("revision"),
                 facts={"cleanup": cleanup, "containment": containment, "failure": failure},
             )
             if not result.accepted:
                 return False
+            self._await_verified_authority()
         evidence = {
             "owner_pid": os.getpid(),
             "owner_generation": self.generation,
@@ -453,7 +554,7 @@ class LogicalOwner:
             "watchdog_parent_lost": True,
             "observed_at": cleanup["child_exit_observed_at"],
         }
-        _atomic_json_write(self.owner_exit_path, evidence)
+        self._atomic_json_write_after_authority_proof(self.owner_exit_path, evidence)
         self.checkpoints.reach("watchdog_loss_cleanup_proven", self.provider.pid if self.provider else None)
         return True
 
@@ -481,26 +582,79 @@ class LogicalOwner:
     def _write_spool_unlocked(self, spool: dict) -> None:
         _atomic_json_write(self.spool_path, spool)
 
+    def _atomic_json_write_after_authority_proof(self, path: Path, value: dict) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+        try:
+            with os.fdopen(fd, "w") as stream:
+                json.dump(value, stream, sort_keys=True, separators=(",", ":"))
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            self._await_verified_authority()
+            os.replace(temporary, path)
+            directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        finally:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+
+    def _has_open_owner_lock(self) -> bool:
+        lock = getattr(self, "lock", None)
+        return lock is not None and getattr(lock, "fd", -1) >= 0
+
     @contextmanager
-    def _spool_record_guard(self):
+    def _spool_record_guard(self, *, create_missing: bool = False):
         """Join the launcher's compatibility record lock when it exists."""
         try:
-            fd = os.open(self.spool_lock_path, os.O_RDWR)
+            flags = os.O_RDWR
+            if create_missing:
+                self.spool_lock_path.parent.mkdir(parents=True, exist_ok=True)
+                flags |= os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
+            fd = os.open(self.spool_lock_path, flags, 0o600)
         except FileNotFoundError:
             # Direct primitive users have no legacy record-lock sidecar.  The
             # owner must not introduce a new ``*.lock`` artifact which an old
             # store sweep can enumerate; public launch always creates this
             # historical lock before releasing the owner barrier.
-            yield
+            yield False
             return
         try:
             fcntl.flock(fd, fcntl.LOCK_EX)
-            yield
+            if self._has_open_owner_lock():
+                self._await_verified_authority(record_unreadable=False, restore_lifecycle=False)
+            yield True
         finally:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-            finally:
-                os.close(fd)
+            _cleanup_locked_fd(fd)
+
+    def _transition_owner_episode_locked(self, *, destination: str, facts: dict):
+        """Publish a post-binding owner episode transition under one proof.
+
+        When the compatibility record lock exists, the authority proof and the
+        episode CAS both happen while that exact lock is held.  Direct primitive
+        users may not have a legacy sidecar; in that case the transition keeps
+        its own guard instead of pretending the record is already locked.
+        """
+        if not self._has_open_owner_lock():
+            raise RuntimeError("post-binding owner episode transition requires an open owner lock")
+        with self._spool_record_guard(create_missing=True) as record_locked:
+            episode = self._read_spool().get("owner_episode") or {}
+            self._await_verified_authority(record_unreadable=False, restore_lifecycle=False)
+            return transition_owner_episode(
+                self.store,
+                self.spool_id,
+                actor="owner",
+                destination=destination,
+                generation=self.generation,
+                expected_revision=episode.get("revision"),
+                facts=facts,
+                record_locked=record_locked,
+            )
 
     def _update_spool(self, **values) -> dict:
         with self._spool_record_guard():
@@ -593,6 +747,12 @@ class LogicalOwner:
             written = filesystem_written
             updates["output_complete_written_at"] = written.isoformat()
         if updates:
+            self.checkpoints.reach(
+                "terminal_output_before_timestamp_update",
+                self.provider.pid if self.provider else None,
+            )
+            if not self._verify_lock():
+                return False, False, None
             self._update_spool(**updates)
         if detected.tzinfo is None:
             detected = detected.replace(tzinfo=timezone.utc)
@@ -656,14 +816,8 @@ class LogicalOwner:
             lock_created=True,
         )
         if self.episode_mode:
-            episode = self._read_spool().get("owner_episode") or {}
-            result = transition_owner_episode(
-                self.store,
-                self.spool_id,
-                actor="owner",
+            result = self._transition_owner_episode_locked(
                 destination="lock_bound",
-                generation=self.generation,
-                expected_revision=episode.get("revision"),
                 facts={
                     "owner": {
                         "pid": identity.pid,
@@ -675,53 +829,166 @@ class LogicalOwner:
             )
             if not result.accepted:
                 raise RuntimeError(f"owner lock binding rejected: {result.rejection}")
+            self.checkpoints.reach("owner_episode_lock_bound")
+        self._await_verified_authority()
         _atomic_json_write(self.owner_identity_path, identity.to_dict())
+        self.checkpoints.reach("owner_identity_mirror_published")
+        self._await_verified_authority()
         (self.store / f"{self.spool_id}.journal-guard").touch(exist_ok=True)
+        self.checkpoints.reach("owner_journal_guard_published")
+        self._await_verified_authority()
         (self.store / f"{self.spool_id}.control-mailbox").mkdir(exist_ok=True)
         return identity
 
-    def _verify_lock(self) -> bool:
-        if not os.access(self.lock_path, os.R_OK | os.W_OK):
-            if self.lock_path.exists():
-                self._set_lifecycle(ownership_state="unreadable")
-            else:
-                self._set_lifecycle(
-                    ownership_state="identity_mismatch",
-                    recorded_lock_device=self.lock.device,
-                    recorded_lock_inode=self.lock.inode,
-                    observed_lock_device=None,
-                    observed_lock_inode=None,
-                )
+    def _note_unreadable_ownership(self) -> None:
+        """Record a recoverable sighting without letting it become a crash.
+
+        The marker is a diagnostic, not the classification.  When the store
+        directory itself is what denies access, the very write that would
+        record the sighting fails too - and an unreadable store must stay
+        recoverable rather than escaping as an owner crash.
+        """
+        try:
+            self._set_lifecycle(ownership_state="unreadable")
+        except OSError:
+            pass
+
+    def _verify_lock(self, *, record_unreadable: bool = True, restore_lifecycle: bool = True) -> bool:
+        """Prove the exact recorded inode is still bound to the lock pathname.
+
+        Identity is proven from stat alone - the held descriptor's device and
+        inode against the pathname's - because that is the only evidence that
+        distinguishes the two outcomes.  An access check cannot: a replacement
+        inode whose mode denies this user reads exactly like a permission
+        problem on our own file, so asking about permission first would file a
+        provable replacement under the recoverable case (finding-20260821-vbbc)
+        and, when a directory component denies search, escape as a crash.
+
+        A proven-missing or proven-different pathname is permanent: it means
+        some other actor already replaced this reservation, so it latches
+        ``_authority_lost`` and raises instead of returning False.  Once
+        latched, this never re-touches the filesystem or the store again -
+        that is what makes the loss irreversible even if the original inode
+        is later restored.  Anything that leaves identity unproven (an
+        unsearchable directory, an I/O error) stays the recoverable case: it
+        returns False and records the sighting, unchanged from before.  So
+        does a mode change on our own proven inode, which only makes the store
+        unserviceable until it is repaired.
+        """
+        if self._authority_lost:
+            raise AuthorityLost()
+        if not self._has_open_owner_lock():
             return False
         try:
             descriptor = os.fstat(self.lock.fd)
+        except OSError:
+            # The held descriptor is this process's own state; failing to read
+            # it proves nothing about who holds the pathname.
+            if record_unreadable:
+                self._note_unreadable_ownership()
+            return False
+        try:
             pathname = os.stat(self.lock_path)
         except FileNotFoundError:
-            self._set_lifecycle(
-                ownership_state="identity_mismatch",
-                recorded_lock_device=self.lock.device,
-                recorded_lock_inode=self.lock.inode,
-                observed_lock_device=None,
-                observed_lock_inode=None,
-            )
-            return False
+            self._authority_lost = True
+            raise AuthorityLost()
         except OSError:
-            self._set_lifecycle(ownership_state="unreadable")
+            if record_unreadable:
+                self._note_unreadable_ownership()
             return False
         exact = (descriptor.st_dev, descriptor.st_ino) == (pathname.st_dev, pathname.st_ino)
         if not exact:
-            self._set_lifecycle(
-                ownership_state="identity_mismatch",
-                recorded_lock_device=descriptor.st_dev,
-                recorded_lock_inode=descriptor.st_ino,
-                observed_lock_device=pathname.st_dev,
-                observed_lock_inode=pathname.st_ino,
-            )
+            self._authority_lost = True
+            raise AuthorityLost()
+        if not os.access(self.lock_path, os.R_OK | os.W_OK):
+            if record_unreadable:
+                self._note_unreadable_ownership()
             return False
-        lifecycle = self._read_spool().get("lifecycle") or {}
-        if lifecycle.get("ownership_state") in {"unreadable", "identity_mismatch"}:
-            self._set_lifecycle(ownership_state="held")
+        if restore_lifecycle:
+            try:
+                lifecycle = self._read_spool().get("lifecycle") or {}
+                if lifecycle.get("ownership_state") in {"unreadable", "identity_mismatch"}:
+                    self._set_lifecycle(ownership_state="held")
+            except OSError:
+                pass
         return True
+
+    def _await_verified_authority(
+        self,
+        *,
+        record_unreadable: bool = True,
+        restore_lifecycle: bool = True,
+    ) -> None:
+        """Block until this reservation is provably still ours.
+
+        A proven loss raises ``AuthorityLost``; an unreadable pathname is the
+        recoverable case and keeps waiting, exactly as the main owner loop
+        does.  Use this immediately before publishing shared state so a stale
+        owner cannot write over the reservation that replaced it.
+        """
+        if record_unreadable and restore_lifecycle:
+            while not self._verify_lock():
+                time.sleep(self.args.poll_interval)
+        else:
+            while not self._verify_lock(record_unreadable=record_unreadable, restore_lifecycle=restore_lifecycle):
+                time.sleep(self.args.poll_interval)
+
+    def _finalize_authority_lost(self) -> int:
+        """Converge after the irreversible latch without acting as owner.
+
+        Past this point nothing may touch the shared store: no write, no
+        guard acquisition, no request acceptance, no reopen of the ownership
+        pathname, and no signal sent by this process's recorded PID/PGID
+        (that bookkeeping is exactly what is no longer trusted).  Only local
+        cleanup is safe: one bounded custody pass over the children the kernel
+        still says are this process's own, closing descriptors, and reporting
+        the disposition to the watchdog so it can take a second bounded pass
+        over anything left behind.
+
+        The owner takes that pass itself rather than leaving it all to the
+        watchdog, because the watchdog may be gone too: PDEATHSIG is optional
+        and a lost containment parent adopts nothing, so a combined loss would
+        otherwise strand the provider and its setsid descendants
+        (finding-20260821-ikzy).  The disposition is reported first, before any
+        of this fallible local work, so the watchdog classifies the exit
+        correctly even if the cleanup below does not finish.
+        """
+        disposition_fd = getattr(self.args, "disposition_fd", None)
+        if disposition_fd is not None:
+            try:
+                os.write(disposition_fd, AUTHORITY_LOST_DISPOSITION)
+            except OSError:
+                pass
+            try:
+                os.close(disposition_fd)
+            except OSError:
+                pass
+            self.args.disposition_fd = None
+        self._contain_own_children(CONTAINMENT_BOUND_SECONDS)
+        if self.provider_pidfd is not None:
+            try:
+                os.close(self.provider_pidfd)
+            except OSError:
+                pass
+            self.provider_pidfd = None
+        if self.control is not None:
+            try:
+                self.control.close()
+            except OSError:
+                pass
+            self.control = None
+        if self.lock is not None:
+            try:
+                self.lock.close()
+            except OSError:
+                pass
+        if getattr(self.args, "watchdog_fd", None) is not None:
+            try:
+                os.close(self.args.watchdog_fd)
+            except OSError:
+                pass
+            self.args.watchdog_fd = None
+        return AUTHORITY_LOST_EXIT_CODE
 
     def _spawn_provider(
         self,
@@ -740,8 +1007,16 @@ class LogicalOwner:
         stdin_stream = open(self.args.stdin_path, "r") if self.args.stdin_path else subprocess.DEVNULL
         spawn_error = None
         try:
-            with open(self.stdout_path, "w") as stdout, open(self.stderr_path, "w") as stderr:
-                self.checkpoints.reach("before_provider_start_checks")
+            self.checkpoints.reach("before_provider_start_checks")
+            # Reverify immediately before the first shared capture-file
+            # mutation and the child start under this reservation.  A
+            # permanent loss here raises AuthorityLost, which unwinds through
+            # this method's own resource-closing ``finally`` below without
+            # truncating captures or calling Popen.  A False return is the
+            # recoverable unreadable case, so keep waiting as the main owner
+            # loop does.  Watchdog loss and inherited deadlines still win
+            # while we wait.
+            while True:
                 if not self._watchdog_alive():
                     self._contain_after_watchdog_loss_until_proven()
                     return 125
@@ -751,9 +1026,20 @@ class LogicalOwner:
                     and self.clock.monotonic() - started >= monotonic_budget
                 )
                 if self._deadline_expired() or monotonic_expired:
-                    if not self._settle_deadline_expiry_after_binding():
-                        raise RuntimeError("could not durably settle inherited deadline before provider start")
-                    return 124
+                    settlement = self._settle_deadline_expiry_after_binding()
+                    if settlement == SETTLEMENT_RETRY:
+                        time.sleep(self.args.poll_interval)
+                        continue
+                    if settlement == SETTLEMENT_PUBLISHED:
+                        return 124
+                    return EPISODE_UNSETTLEABLE_EXIT_CODE
+                if self._verify_lock():
+                    break
+                time.sleep(self.args.poll_interval)
+            with open(self.stdout_path, "w") as stdout, open(self.stderr_path, "w") as stderr:
+                self.checkpoints.reach("captures_open_before_provider_start")
+                while not self._verify_lock():
+                    time.sleep(self.args.poll_interval)
                 try:
                     self.provider = subprocess.Popen(
                         self.args.command,
@@ -769,15 +1055,26 @@ class LogicalOwner:
                 except OSError as exc:
                     spawn_error = exc
         finally:
-            child_end.close()
+            authority_lost_active = isinstance(sys.exc_info()[1], AuthorityLost)
+            _close_spawn_local(child_end, authority_lost_active=authority_lost_active)
             if stdin_stream is not subprocess.DEVNULL:
-                stdin_stream.close()
+                _close_spawn_local(stdin_stream, authority_lost_active=authority_lost_active)
             if self.provider is None:
-                owner_end.close()
+                _close_spawn_local(owner_end, authority_lost_active=authority_lost_active)
         if spawn_error is not None:
-            if not self._settle_provider_spawn_failure(spawn_error):
-                raise RuntimeError("could not durably settle provider spawn failure") from spawn_error
-            return 127
+            # A recoverable store must not turn a spawn failure into an owner
+            # crash on top of it: keep retrying the settlement while the only
+            # thing blocking it is an unreadable pathname or a revision another
+            # actor just moved.  A proven authority loss raises out of the
+            # verification inside, and an unsettleable episode converges here.
+            while True:
+                settlement = self._settle_provider_spawn_failure(spawn_error)
+                if settlement != SETTLEMENT_RETRY:
+                    break
+                time.sleep(self.args.poll_interval)
+            if settlement == SETTLEMENT_PUBLISHED:
+                return 127
+            return EPISODE_UNSETTLEABLE_EXIT_CODE
         self.control = owner_end
         self.control.setblocking(False)
         self.provider_pgid = self.provider.pid
@@ -790,6 +1087,13 @@ class LogicalOwner:
             self.provider_pidfd = os.pidfd_open(self.provider.pid)
         except (AttributeError, OSError):
             self.provider_pidfd = None
+        # Everything below publishes shared state, and the reservation can be
+        # replaced in the window the checkpoint above stands for: the pre-Popen
+        # proof is already stale here.  Reverify before each publication so a
+        # stale owner can never overwrite the process-identity, episode, spool
+        # record or readiness handshake of the generation that replaced it
+        # (finding-20260821-ac82).
+        self._await_verified_authority()
         process_identity = {
             "owner_pid": os.getpid(),
             "owner_generation": self.generation,
@@ -802,15 +1106,10 @@ class LogicalOwner:
             "lock_inode": self.lock.inode,
         }
         _atomic_json_write(self.process_identity_path, process_identity)
+        self.checkpoints.reach("process_identity_published", self.provider.pid)
         if self.episode_mode:
-            episode = self._read_spool().get("owner_episode") or {}
-            accepted = transition_owner_episode(
-                self.store,
-                self.spool_id,
-                actor="owner",
+            accepted = self._transition_owner_episode_locked(
                 destination="accepted",
-                generation=self.generation,
-                expected_revision=episode.get("revision"),
                 facts={
                     "provider": {
                         "pid": self.provider.pid,
@@ -827,6 +1126,7 @@ class LogicalOwner:
             )
             if not accepted.accepted:
                 raise RuntimeError(f"provider acceptance rejected: {accepted.rejection}")
+        self._await_verified_authority()
         with self._spool_record_guard():
             spool = self._read_spool()
             spool.update(
@@ -847,6 +1147,7 @@ class LogicalOwner:
             )
             self._write_spool_unlocked(spool)
         if self.args.ready_fd is not None:
+            self._await_verified_authority()
             ready = {
                 "owner_pid": os.getpid(),
                 "provider_pid": self.provider.pid,
@@ -921,7 +1222,44 @@ class LogicalOwner:
         except (FileNotFoundError, OSError, ValueError):
             return []
 
-    def _settle_descendants(self, *, force: bool, grace: Optional[float] = None) -> bool:
+    def _contain_own_children(self, bound: float) -> bool:
+        """Take one bounded SIGKILL/reap pass over this process's own children.
+
+        Custody comes only from ``/proc/self/task/<pid>/children``, which the
+        kernel answers for the parent relationship that exists right now.  A
+        PID it lists is a child this process has not reaped, so it cannot have
+        been recycled onto some other program - nothing here depends on the
+        persisted provider PID or PGID that an authority-loss latch
+        invalidates, and nothing here writes to the shared store.
+
+        A descendant that reparents onto this subreaper mid-pass (a setsid
+        grandchild whose parent was just killed) appears in a later scan, so
+        the pass only concludes after consecutive empty scans.  It is one
+        bounded attempt: it reports whether it finished, and the caller exits
+        either way.
+        """
+        deadline = time.monotonic() + bound
+        empty_scans = 0
+        while time.monotonic() < deadline:
+            self._drain_reapable()
+            children = self._direct_children()
+            if not children:
+                empty_scans += 1
+                if empty_scans >= 3:
+                    return True
+                time.sleep(0.01)
+                continue
+            empty_scans = 0
+            for pid in children:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+            time.sleep(0.01)
+        self._drain_reapable()
+        return not self._direct_children()
+
+    def _settle_descendants(self, *, force: bool, grace: Optional[float] = None) -> str:
         """Reap adopted descendants, then SIGKILL whatever is still running.
 
         ``grace`` is the soft wait before that unconditional escalation.  It
@@ -937,11 +1275,11 @@ class LogicalOwner:
             self._drain_reapable()
             children = [pid for pid in self._direct_children() if self.provider is None or pid != self.provider.pid]
             if not children:
-                return True
+                return DESCENDANTS_SETTLED
             time.sleep(0.01)
         children = [pid for pid in self._direct_children() if self.provider is None or pid != self.provider.pid]
         if children and not self._verify_lock():
-            return False
+            return DESCENDANTS_UNPROVEN
         for pid in children:
             try:
                 os.kill(pid, signal.SIGKILL)
@@ -952,9 +1290,9 @@ class LogicalOwner:
             self._drain_reapable()
             children = [pid for pid in self._direct_children() if self.provider is None or pid != self.provider.pid]
             if not children:
-                return True
+                return DESCENDANTS_SETTLED
             time.sleep(0.01)
-        return not children
+        return DESCENDANTS_SETTLED if not children else DESCENDANTS_SURVIVED
 
     def _send_provider_cancel(self) -> bool:
         if self.control is None:
@@ -1002,10 +1340,10 @@ class LogicalOwner:
                 return None
 
     def _write_exit_evidence(self, returncode: int, *, cleanup_outcome: str) -> bool:
+        legacy_code = 128 - returncode if returncode < 0 else returncode
         if not self._verify_lock():
             return False
-        legacy_code = 128 - returncode if returncode < 0 else returncode
-        _atomic_json_write(
+        self._atomic_json_write_after_authority_proof(
             self.owner_exit_path,
             {
                 "owner_pid": os.getpid(),
@@ -1018,11 +1356,21 @@ class LogicalOwner:
                 "observed_at": _utc_now(),
             },
         )
+        self.checkpoints.reach(
+            "owner_exit_sidecar_published_before_exit_file", self.provider.pid if self.provider else None
+        )
         temporary = self.exit_path.with_name(f".{self.exit_path.name}.{os.getpid()}.tmp")
         with open(temporary, "w") as stream:
             stream.write(f"{legacy_code}\n")
             stream.flush()
             os.fsync(stream.fileno())
+        try:
+            if not self._verify_lock():
+                temporary.unlink(missing_ok=True)
+                return False
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
         os.replace(temporary, self.exit_path)
         directory_fd = os.open(self.store, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
         try:
@@ -1091,9 +1439,10 @@ class LogicalOwner:
 
     def _handle_request(self, request) -> int:
         self.checkpoints.reach("control_observed_before_ack", self.provider.pid)
-        if not self._verify_lock():
-            return -2
         with mailbox_guard(self.store, self.spool_id):
+            self.checkpoints.reach("control_mailbox_guard_acquired_before_ack", self.provider.pid)
+            if not self._verify_lock():
+                return -2
             receipt = write_control_receipt(
                 self.store,
                 self.spool_id,
@@ -1104,14 +1453,8 @@ class LogicalOwner:
             if not self._settle_other_requests_unlocked(request.request_id):
                 return -2
             if self.episode_mode:
-                episode = self._read_spool().get("owner_episode") or {}
-                accepted = transition_owner_episode(
-                    self.store,
-                    self.spool_id,
-                    actor="owner",
+                accepted = self._transition_owner_episode_locked(
                     destination="accepted",
-                    generation=self.generation,
-                    expected_revision=episode.get("revision"),
                     facts={
                         "winning_request": {
                             "request_id": request.request_id,
@@ -1167,8 +1510,10 @@ class LogicalOwner:
         # running after that has already had both its window and its SIGKILL, so
         # retries fall back to the containment width instead of re-granting a
         # full grace before every re-escalation.
-        descendants_clean = self._settle_descendants(force=True, grace=EVIDENCE_PRESERVATION_GRACE_SECONDS)
-        while not descendants_clean:
+        descendant_outcome = self._settle_descendants(force=True, grace=EVIDENCE_PRESERVATION_GRACE_SECONDS)
+        while descendant_outcome != DESCENDANTS_SETTLED:
+            if descendant_outcome == DESCENDANTS_UNPROVEN:
+                return -2
             if forced_started is None:
                 forced_started = _utc_now()
             if not self._verify_lock():
@@ -1183,7 +1528,7 @@ class LogicalOwner:
                 cleanup_outcome="descendants_survived",
             )
             time.sleep(self.args.poll_interval)
-            descendants_clean = self._settle_descendants(force=True)
+            descendant_outcome = self._settle_descendants(force=True)
         if forced_started is not None:
             forced_completed = _utc_now()
         child_exit = _utc_now()
@@ -1197,7 +1542,7 @@ class LogicalOwner:
             forced_cleanup_started_at=forced_started,
             forced_cleanup_completed_at=forced_completed,
             child_exit_observed_at=child_exit,
-            cleanup_outcome="cleaned" if descendants_clean else "descendants_survived",
+            cleanup_outcome="cleaned",
         )
         self.checkpoints.reach("cleanup_receipt_child_exit_durable", self.provider.pid)
         if not self._settle_other_requests(request.request_id):
@@ -1205,14 +1550,8 @@ class LogicalOwner:
         if not self._write_exit_evidence(returncode, cleanup_outcome="stopped"):
             return -2
         if self.episode_mode:
-            episode = self._read_spool().get("owner_episode") or {}
-            cleaned = transition_owner_episode(
-                self.store,
-                self.spool_id,
-                actor="owner",
+            cleaned = self._transition_owner_episode_locked(
                 destination="cleanup_proven",
-                generation=self.generation,
-                expected_revision=episode.get("revision"),
                 facts={
                     "cleanup": {
                         "outcome": "stopped",
@@ -1253,6 +1592,12 @@ class LogicalOwner:
         return 0
 
     def run(self) -> int:
+        try:
+            return self._run()
+        except AuthorityLost:
+            return self._finalize_authority_lost()
+
+    def _run(self) -> int:
         if not self._await_launch_barrier():
             return 125
         self.episode_mode = (
@@ -1267,6 +1612,8 @@ class LogicalOwner:
         _set_subreaper()
         self.lock = acquire_ownership_lock(self.lock_path)
         self._allocate_generation()
+        self.checkpoints.reach("ownership_lock_acquired_before_wall_deadline")
+        self._await_verified_authority()
         self._ensure_wall_deadline()
         self.checkpoints.reach("identity_lock_acquired")
         self._publish_owner_identity()
@@ -1317,6 +1664,10 @@ class LogicalOwner:
                         # an already durable terminal protocol record.
                         terminal_output, shutdown_due, terminal_written_at = self._terminal_output_state()
                         if not (terminal_output and self._terminal_output_precedes_deadline(terminal_written_at)):
+                            self.checkpoints.reach("before_owner_timeout_request_create", self.provider.pid)
+                            if not self._verify_lock():
+                                time.sleep(self.args.poll_interval)
+                                continue
                             accepted_request = create_control_request(
                                 self.store,
                                 self.spool_id,
@@ -1353,8 +1704,11 @@ class LogicalOwner:
                         continue
                 if self._provider_exited():
                     returncode = self._finish_provider()
-                    descendants_clean = self._settle_descendants(force=False)
-                    if not descendants_clean:
+                    descendant_outcome = self._settle_descendants(force=False)
+                    if descendant_outcome == DESCENDANTS_UNPROVEN:
+                        time.sleep(self.args.poll_interval)
+                        continue
+                    if descendant_outcome == DESCENDANTS_SURVIVED:
                         self._set_lifecycle(cleanup_outcome="descendants_survived")
                         time.sleep(self.args.poll_interval)
                         continue
@@ -1375,36 +1729,55 @@ class LogicalOwner:
                     break
                 time.sleep(self.args.poll_interval)
         finally:
+            # These closes run while an AuthorityLost may be unwinding through
+            # this block.  An OSError raised here would replace that exception,
+            # so ``run()`` would never reach the finalizer, the disposition
+            # would never be reported, and the watchdog would read the escaping
+            # error as an owner crash and publish crash evidence over a
+            # reservation this process no longer owns (finding-20260821-g7i0).
+            # Closing a local descriptor is not worth any of that.
             if self.provider_pidfd is not None:
-                os.close(self.provider_pidfd)
+                try:
+                    os.close(self.provider_pidfd)
+                except OSError:
+                    pass
                 self.provider_pidfd = None
             if self.control is not None:
-                self.control.close()
-            with mailbox_guard(self.store, self.spool_id):
-                self.checkpoints.reach("final_mailbox_guard_acquired", self.provider.pid if self.provider else None)
-                if self.episode_mode and natural_cleanup is not None:
-                    episode = self._read_spool().get("owner_episode") or {}
-                    cleaned = transition_owner_episode(
-                        self.store,
-                        self.spool_id,
-                        actor="owner",
-                        destination="cleanup_proven",
-                        generation=self.generation,
-                        expected_revision=episode.get("revision"),
-                        facts={"cleanup": natural_cleanup},
-                    )
-                    if not cleaned.accepted:
-                        result = -2
-                if accepted_request is not None:
-                    self._settle_other_requests_unlocked(accepted_request.request_id)
-                elif natural_exit_settled:
-                    self._settle_other_requests_unlocked(None, rejection_outcome="rejected_terminal")
-                self.checkpoints.reach("before_lock_release", self.provider.pid if self.provider else None)
-                self._verify_lock()
-                self.lock.close()
-            if getattr(self.args, "watchdog_fd", None) is not None:
-                os.close(self.args.watchdog_fd)
-                self.args.watchdog_fd = None
+                try:
+                    self.control.close()
+                except OSError:
+                    pass
+                self.control = None
+            # An authority-loss latch set anywhere above must not let this
+            # block acquire the mailbox guard or write anything: both are
+            # forbidden once the claim is proven dead.  Local resource
+            # closing (lock, watchdog fd) still happens, but through
+            # ``_finalize_authority_lost`` in ``run()`` once this exception
+            # finishes unwinding past here, not through the guarded path
+            # below.
+            if not self._authority_lost:
+                self._await_verified_authority()
+                with mailbox_guard(self.store, self.spool_id):
+                    self.checkpoints.reach("final_mailbox_guard_acquired", self.provider.pid if self.provider else None)
+                    self._await_verified_authority()
+                    if self.episode_mode and natural_cleanup is not None:
+                        cleaned = self._transition_owner_episode_locked(
+                            destination="cleanup_proven",
+                            facts={"cleanup": natural_cleanup},
+                        )
+                        if not cleaned.accepted:
+                            result = -2
+                    self._await_verified_authority()
+                    if accepted_request is not None:
+                        self._settle_other_requests_unlocked(accepted_request.request_id)
+                    elif natural_exit_settled:
+                        self._settle_other_requests_unlocked(None, rejection_outcome="rejected_terminal")
+                    self.checkpoints.reach("before_lock_release", self.provider.pid if self.provider else None)
+                    self._verify_lock()
+                    self.lock.close()
+                if getattr(self.args, "watchdog_fd", None) is not None:
+                    os.close(self.args.watchdog_fd)
+                    self.args.watchdog_fd = None
         return result
 
 
@@ -1419,6 +1792,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pause-checkpoint")
     parser.add_argument("--clock-fd", type=int)
     parser.add_argument("--watchdog-fd", type=int)
+    parser.add_argument("--disposition-fd", type=int)
     parser.add_argument("--timeout", type=float)
     parser.add_argument("--deadline")
     parser.add_argument("--poll-interval", type=float, default=0.02)

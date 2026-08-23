@@ -41,6 +41,12 @@ def namespace_owner_env(tmp_path):
         # grace itself override this per start(); the shipped default is pinned
         # by tests/test_namespace_owner_unit.py.
         "SPINDLE_EVIDENCE_GRACE_SECONDS": "0.2",
+        # Same reasoning for the watchdog's post-authority-loss bounded
+        # containment pass: real-subprocess cases drive a provider that
+        # ignores SIGTERM through the takeover directly, so they run the
+        # bound short.  The shipped default is pinned by
+        # tests/test_namespace_owner_unit.py.
+        "SPINDLE_CONTAINMENT_BOUND_SECONDS": "0.2",
     }
     return {
         "env": env,

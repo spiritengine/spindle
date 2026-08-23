@@ -13,6 +13,7 @@ import json
 import os
 import select
 import shutil
+import sys
 import tempfile
 import uuid
 from contextlib import contextmanager, nullcontext
@@ -55,6 +56,8 @@ OWNER_ARTIFACT_SUFFIXES = (
     ".owner-exit",
     ".journal-guard",
 )
+
+_close_fd = os.close
 
 
 def _utc_now() -> str:
@@ -365,10 +368,24 @@ def _episode_record_guard(root: Path, spool_id: str):
         fcntl.flock(fd, fcntl.LOCK_EX)
         yield
     finally:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-        finally:
-            os.close(fd)
+        _cleanup_locked_fd(fd)
+
+
+def _cleanup_locked_fd(fd: int) -> None:
+    """Release and close a lock fd without replacing an active body exception."""
+    active_exception = sys.exc_info()[1] is not None
+    cleanup_error = None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError as exc:
+        cleanup_error = exc
+    try:
+        _close_fd(fd)
+    except OSError as exc:
+        if cleanup_error is None:
+            cleanup_error = exc
+    if cleanup_error is not None and not active_exception:
+        raise cleanup_error
 
 
 def _episode_rejection(actor: str, source: Optional[str], destination: str) -> str:
@@ -642,10 +659,7 @@ def mailbox_guard(root: str | os.PathLike[str], spool_id: str):
         fcntl.flock(fd, fcntl.LOCK_EX)
         yield
     finally:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-        finally:
-            os.close(fd)
+        _cleanup_locked_fd(fd)
 
 
 @dataclass(frozen=True)
