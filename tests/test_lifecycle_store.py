@@ -71,6 +71,17 @@ def test_spool_id_mismatch_raises(tmp_path):
         lc.apply_event(store, "s1", ev("other", lc.ACTIVITY))
 
 
+def test_apply_event_rejects_unsafe_spool_id(tmp_path):
+    store = tmp_path / "store"
+    make_spool_record(store, "s1")
+    victim = tmp_path / "victim.json"
+    victim.write_text('{"id": "victim", "status": "running"}')
+    # The unsafe id is rejected before any lock or write; the sibling is untouched.
+    with pytest.raises(ValueError):
+        lc.apply_event(store, "../victim", ev("s1", lc.ACTIVITY))
+    assert victim.read_text() == '{"id": "victim", "status": "running"}'
+
+
 # --- integration: coexistence with owner keys -------------------------------
 
 

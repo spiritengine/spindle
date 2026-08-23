@@ -308,3 +308,76 @@ def test_evidence_ring_is_bounded():
         state = lc.reduce(state, ev(SPOOL, lc.TURN_TERMINAL, terminal_kind="completed", epoch=1, summary=f"s{i}"))
     assert len(state["evidence"]) <= lc.EVIDENCE_MAX_COUNT
     assert len(__import__("json").dumps(state["evidence"])) <= lc.EVIDENCE_MAX_BYTES
+
+
+# --- round-1 Fell hardening --------------------------------------------------
+
+
+@pytest.mark.parametrize("bad", ["../victim", "a/b", "..", ".", "a\\b", ""])
+def test_unsafe_spool_id_rejected(bad):
+    with pytest.raises(ValueError):
+        lc.LifecycleEvent(spool_id=bad, kind=lc.ACTIVITY)
+
+
+def test_envelope_nested_mappings_are_read_only():
+    event = ev(SPOOL, lc.TURN_TERMINAL, terminal_kind="failed", provider_ids={"thread_id": "t"}, error={"type": "E"})
+    with pytest.raises(TypeError):
+        event.provider_ids["secret_prompt"] = "leak"
+    with pytest.raises(TypeError):
+        event.error["raw_stack"] = "leak"
+
+
+def test_provider_error_is_defensively_copied_not_aliased():
+    event = ev(SPOOL, lc.TURN_TERMINAL, terminal_kind="failed", error={"type": "Boom", "message": "orig"})
+    state = lc.reduce(None, event)
+    assert state["provider_error"] == {"type": "Boom", "message": "orig"}
+    # A plain dict distinct from the event's read-only mapping.
+    assert isinstance(state["provider_error"], dict)
+    assert state["provider_error"] is not event.error
+
+
+def test_unknown_kind_does_not_merge_provider_ids():
+    state = lc.reduce(None, ev(SPOOL, lc.CONVERSATION_ACCEPTED, provider_ids={"thread_id": "real"}))
+    assert state["provider_ids"] == {"thread_id": "real"}
+    state = lc.reduce(state, ev(SPOOL, "provider.mystery", provider_ids={"thread_id": "wrong"}))
+    assert state["provider_ids"] == {"thread_id": "real"}, "unknown kind must not overwrite authoritative ids"
+    assert state["evidence"][-1]["reason"] == "unknown_kind"
+
+
+def test_stale_epoch_does_not_merge_provider_ids():
+    state = lc.reduce(None, ev(SPOOL, lc.PROTOCOL_CONNECTED, epoch=2))
+    state = lc.reduce(state, ev(SPOOL, lc.CONVERSATION_ACCEPTED, epoch=2, provider_ids={"thread_id": "real"}))
+    state = lc.reduce(state, ev(SPOOL, lc.CONVERSATION_ACCEPTED, epoch=1, provider_ids={"thread_id": "wrong"}))
+    assert state["provider_ids"] == {"thread_id": "real"}
+
+
+def test_terminal_clears_active_work_and_late_activity_cannot_revive_it():
+    state = fold(
+        [
+            ev(SPOOL, lc.TURN_STARTED),
+            ev(SPOOL, lc.WORK_STARTED, summary="live"),
+            ev(SPOOL, lc.TURN_TERMINAL, terminal_kind="completed"),
+        ]
+    )
+    assert state["active_work"] is None
+    state = lc.reduce(state, ev(SPOOL, lc.ACTIVITY, summary="late"))
+    assert state["active_work"] is None, "post-terminal activity must not revive active_work"
+
+
+def test_error_nested_value_is_dropped_not_stringified():
+    event = ev(
+        SPOOL, lc.TURN_TERMINAL, terminal_kind="failed", error={"type": "E", "message": {"tool_input": "SECRET"}}
+    )
+    assert event.error == {"type": "E"}
+    assert "SECRET" not in __import__("json").dumps(dict(event.error))
+    # An error whose only field is a nested container collapses to None.
+    only_nested = ev(SPOOL, lc.TURN_TERMINAL, terminal_kind="failed", error={"message": {"tool_input": "SECRET"}})
+    assert only_nested.error is None
+
+
+def test_caps_are_byte_bounded_for_multibyte_input():
+    summary = "🔥" * lc.SUMMARY_MAX  # 4 bytes each, far exceeds the byte cap
+    event = ev(SPOOL, lc.ACTIVITY, summary=summary)
+    assert len(event.summary.encode("utf-8")) <= lc.SUMMARY_MAX
+    # And the truncation leaves valid UTF-8 (no partial code point).
+    event.summary.encode("utf-8").decode("utf-8")

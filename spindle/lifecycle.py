@@ -25,9 +25,18 @@ Boundaries this module keeps deliberately narrow:
 
 Durability point: an event is durably applied when ``apply_event`` returns.
 Recovery is simply reading the last durable snapshot; there is no journal replay,
-so the delivery contract is at-least-once with authoritative-state convergence
-(terminal set-once, monotonic protocol_state, epoch fencing). Non-authoritative
-counters (``activity_count``) and the evidence ring are best-effort.
+so the delivery contract is at-least-once with convergence of the AUTHORITATIVE
+facts only: the protocol terminal (``protocol_terminal_kind`` is set-once by the
+first terminal in applied-sequence order), the cancellation evidence
+(``acknowledged_at``/``terminal_observed_at`` are first-write-wins), and the
+monotonic ``connection_epoch`` fence. The remaining fields are LIVE projections
+of the latest delivered event and are intentionally NOT monotonic: ``protocol_state``
+moves between ``active`` and ``waiting`` as approvals come and go, ``connection_state``
+tracks the last transport event, and ``active_work`` tracks the last work summary.
+Re-delivering an event out of order can therefore re-move a live field, but never
+changes an authoritative fact. ``activity_count`` and the evidence ring are
+best-effort. Downstream (the reconciler) must derive the public/job terminal from
+the authoritative facts, not from a live field.
 """
 
 from __future__ import annotations
@@ -36,9 +45,11 @@ import copy
 import fcntl
 import json
 import os
+import re
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import MappingProxyType
 from typing import Generator, Mapping, Optional
 
 from spindle.namespace_owner import _atomic_json_write
@@ -157,13 +168,31 @@ class LifecycleCorruption(LifecycleError):
 
 # --- sanitizing helpers -----------------------------------------------------
 
+# Spool ids are internally generated (hex, optionally a harness prefix, hyphens),
+# so a lifecycle event must name a single safe path component. This rejects "/",
+# "\\", "..", and leading dots, so a malformed id can never traverse out of the
+# store when building "<id>.json"/"<id>.lock".
+_SAFE_SPOOL_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def _validate_spool_id(spool_id: str) -> None:
+    if not isinstance(spool_id, str) or not spool_id:
+        raise ValueError("spool_id must be a non-empty string")
+    if "/" in spool_id or "\\" in spool_id or ".." in spool_id or not _SAFE_SPOOL_ID.match(spool_id):
+        raise ValueError(f"unsafe spool_id: {spool_id!r}")
+
 
 def _cap_str(value: Optional[str], limit: int) -> Optional[str]:
+    """Return *value* truncated to at most *limit* UTF-8 bytes (not characters)."""
     if value is None:
         return None
     if not isinstance(value, str):
         raise TypeError(f"expected str or None, got {type(value).__name__}")
-    return value[:limit]
+    encoded = value.encode("utf-8")
+    if len(encoded) <= limit:
+        return value
+    # Drop any partial trailing multibyte sequence left by the byte cut.
+    return encoded[:limit].decode("utf-8", errors="ignore")
 
 
 def _clean_ids(value: Optional[Mapping]) -> dict:
@@ -174,7 +203,7 @@ def _clean_ids(value: Optional[Mapping]) -> dict:
     out: dict = {}
     for key, val in value.items():
         if key in PROVIDER_ID_KEYS and isinstance(val, str):
-            out[key] = val[:PROVIDER_ID_VALUE_MAX]
+            out[key] = _cap_str(val, PROVIDER_ID_VALUE_MAX)
     return out
 
 
@@ -185,10 +214,16 @@ def _clean_error(value: Optional[Mapping]) -> Optional[dict]:
         raise TypeError("error must be a mapping or None")
     out: dict = {}
     for key in ERROR_KEYS:
-        if key in value and value[key] is not None:
-            raw = value[key]
-            text = raw if isinstance(raw, str) else str(raw)
-            out[key] = text[:ERROR_VALUE_MAX]
+        if key not in value or value[key] is None:
+            continue
+        raw = value[key]
+        # Keep only scalars. A nested container is dropped rather than stringified,
+        # so a payload like {"message": {"tool_input": "SECRET"}} cannot leak
+        # through str() past the structured-error allowlist.
+        if isinstance(raw, str):
+            out[key] = _cap_str(raw, ERROR_VALUE_MAX)
+        elif isinstance(raw, bool) or isinstance(raw, (int, float)):
+            out[key] = _cap_str(str(raw), ERROR_VALUE_MAX)
     return out or None
 
 
@@ -200,9 +235,10 @@ class LifecycleEvent:
     """A provider-neutral lifecycle event.
 
     Constructing an unknown keyword argument raises ``TypeError`` (unknown
-    envelope fields are rejected). Nested containers are defensively copied and
-    byte-capped during construction, so a frozen instance is genuinely immutable
-    and bounded.
+    envelope fields are rejected). Nested mappings are cleaned, byte-capped, and
+    then wrapped read-only (``MappingProxyType``) during construction, so a frozen
+    instance is genuinely immutable and bounded — a caller cannot add a disallowed
+    key to ``provider_ids`` or ``error`` after the fact.
     """
 
     spool_id: str
@@ -218,8 +254,7 @@ class LifecycleEvent:
     observed_at: Optional[str] = None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.spool_id, str) or not self.spool_id:
-            raise ValueError("spool_id must be a non-empty string")
+        _validate_spool_id(self.spool_id)
         if not isinstance(self.kind, str) or not self.kind:
             raise ValueError("kind must be a non-empty string")
         if isinstance(self.epoch, bool) or not isinstance(self.epoch, int) or self.epoch < 0:
@@ -230,8 +265,9 @@ class LifecycleEvent:
         object.__setattr__(self, "stop_reason", _cap_str(self.stop_reason, STOP_REASON_MAX))
         object.__setattr__(self, "summary", _cap_str(self.summary, SUMMARY_MAX))
         object.__setattr__(self, "observed_at", _cap_str(self.observed_at, OBSERVED_AT_MAX))
-        object.__setattr__(self, "provider_ids", _clean_ids(self.provider_ids))
-        object.__setattr__(self, "error", _clean_error(self.error))
+        object.__setattr__(self, "provider_ids", MappingProxyType(_clean_ids(self.provider_ids)))
+        cleaned_error = _clean_error(self.error)
+        object.__setattr__(self, "error", MappingProxyType(cleaned_error) if cleaned_error is not None else None)
 
 
 # --- reducer state ----------------------------------------------------------
@@ -305,24 +341,29 @@ def reduce(state: Optional[dict], event: "LifecycleEvent") -> dict:
             state["protocol_state"] = PROTOCOL_STARTING
             state["active_work"] = None
 
-    if event.provider_ids:
-        merged = dict(state["provider_ids"])
-        merged.update(event.provider_ids)
-        state["provider_ids"] = merged
-
     kind = event.kind
 
     if kind == ACTIVITY:
         state["activity_count"] += 1
         state["last_activity_at"] = event.observed_at
-        if event.summary is not None:
+        # active_work is a live projection; a late activity must not revive it
+        # once the turn has terminated.
+        if event.summary is not None and state["protocol_state"] != PROTOCOL_TERMINAL:
             state["active_work"] = event.summary
         state["last_event_type"] = kind
         return state
 
     if kind not in KNOWN_KINDS:
+        # Unknown kinds are evidence only and must not mutate authoritative state,
+        # including provider identifiers -- the id merge happens below this guard.
         _append_evidence(state, event, "unknown_kind")
         return state
+
+    # Merge provider identifiers only for recognized, non-activity events.
+    if event.provider_ids:
+        merged = dict(state["provider_ids"])
+        merged.update(event.provider_ids)
+        state["provider_ids"] = merged
 
     state["last_event_type"] = kind
     terminal = state["protocol_state"] == PROTOCOL_TERMINAL
@@ -374,7 +415,10 @@ def reduce(state: Optional[dict], event: "LifecycleEvent") -> dict:
             state["terminal_sequence"] = state["sequence"]
             state["raw_terminal_status"] = event.raw_status
             state["stop_reason"] = event.stop_reason
-            state["provider_error"] = event.error
+            # Defensive plain-dict copy: never alias the event's (read-only)
+            # error mapping into persisted state.
+            state["provider_error"] = dict(event.error) if event.error is not None else None
+            state["active_work"] = None
             state["protocol_state"] = PROTOCOL_TERMINAL
         else:
             # Terminal is set-once; a later provider terminal is evidence.
@@ -444,10 +488,16 @@ def apply_event(store_root, spool_id: str, event: "LifecycleEvent") -> dict:
     """
     if not isinstance(event, LifecycleEvent):
         raise TypeError("event must be a LifecycleEvent")
+    _validate_spool_id(spool_id)
     if event.spool_id != spool_id:
         raise ValueError("event.spool_id does not match the target spool_id")
     root = Path(store_root)
     spool_path = _spool_path(root, spool_id)
+    # Defense in depth: a validated spool_id is already a safe single component,
+    # but confirm the resolved record path stays inside the store root before any
+    # lock or write, so a malformed id can never touch a sibling record.
+    if spool_path.parent.resolve() != root.resolve():
+        raise ValueError(f"spool_id escapes the store root: {spool_id!r}")
     with _record_lock(root, spool_id):
         record = _read_record_strict(spool_path)
         lifecycle = dict(record.get("lifecycle") or {})
