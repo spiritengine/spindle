@@ -381,3 +381,42 @@ def test_caps_are_byte_bounded_for_multibyte_input():
     assert len(event.summary.encode("utf-8")) <= lc.SUMMARY_MAX
     # And the truncation leaves valid UTF-8 (no partial code point).
     event.summary.encode("utf-8").decode("utf-8")
+
+
+# --- round-2 Fell hardening --------------------------------------------------
+
+
+def test_unknown_kind_does_not_advance_epoch_fence():
+    state = lc.reduce(None, ev(SPOOL, lc.PROTOCOL_CONNECTED, epoch=1))
+    assert state["connection_epoch"] == 1
+    # A bogus unknown event at a future epoch must not move the fence.
+    state = lc.reduce(state, ev(SPOOL, "provider.mystery", epoch=99))
+    assert state["connection_epoch"] == 1, "unknown kind must not advance the epoch fence"
+    assert state["evidence"][-1]["reason"] == "unknown_kind"
+    # So a legitimate terminal at the real epoch is still accepted, not staled out.
+    state = lc.reduce(state, ev(SPOOL, lc.TURN_TERMINAL, terminal_kind="completed", epoch=1))
+    assert state["protocol_terminal_kind"] == "completed"
+
+
+def test_coalescer_does_not_reemit_stale_summary():
+    coalescer = lc.ActivityCoalescer(SPOOL, threshold=2)
+    coalescer.observe("work-A")
+    emitted = coalescer.observe("work-A")
+    assert emitted is not None and emitted.summary == "work-A"
+    # A later summary-less batch must not carry the retained summary.
+    coalescer.observe()
+    followup = coalescer.flush()
+    assert followup is not None and followup.summary is None
+
+
+def test_finished_work_not_revived_by_stale_coalesced_summary():
+    coalescer = lc.ActivityCoalescer(SPOOL, threshold=2)
+    state = fold([ev(SPOOL, lc.TURN_STARTED), ev(SPOOL, lc.WORK_STARTED, summary="A")])
+    assert state["active_work"] == "A"
+    coalescer.observe("A")
+    state = lc.reduce(state, coalescer.observe("A"))  # emits summary "A"
+    state = lc.reduce(state, ev(SPOOL, lc.WORK_FINISHED))
+    assert state["active_work"] is None
+    coalescer.observe()  # new, summary-less batch
+    state = lc.reduce(state, coalescer.flush())
+    assert state["active_work"] is None, "a stale coalesced summary must not revive finished work"

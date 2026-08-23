@@ -325,6 +325,16 @@ def reduce(state: Optional[dict], event: "LifecycleEvent") -> dict:
     state = copy.deepcopy(state) if state is not None else initial_state()
     state["sequence"] += 1
 
+    kind = event.kind
+
+    # Unknown kinds are evidence only. This guard runs before epoch handling so a
+    # bogus unknown event cannot advance the connection_epoch fence (which would
+    # stale out later legitimate events), nor touch any other authoritative or
+    # live state.
+    if kind not in KNOWN_KINDS:
+        _append_evidence(state, event, "unknown_kind")
+        return state
+
     # Epoch fencing: an older-epoch event is evidence only; it cannot change
     # authoritative state (classic fencing-token rule).
     if event.epoch < state["connection_epoch"]:
@@ -341,8 +351,6 @@ def reduce(state: Optional[dict], event: "LifecycleEvent") -> dict:
             state["protocol_state"] = PROTOCOL_STARTING
             state["active_work"] = None
 
-    kind = event.kind
-
     if kind == ACTIVITY:
         state["activity_count"] += 1
         state["last_activity_at"] = event.observed_at
@@ -351,12 +359,6 @@ def reduce(state: Optional[dict], event: "LifecycleEvent") -> dict:
         if event.summary is not None and state["protocol_state"] != PROTOCOL_TERMINAL:
             state["active_work"] = event.summary
         state["last_event_type"] = kind
-        return state
-
-    if kind not in KNOWN_KINDS:
-        # Unknown kinds are evidence only and must not mutate authoritative state,
-        # including provider identifiers -- the id merge happens below this guard.
-        _append_evidence(state, event, "unknown_kind")
         return state
 
     # Merge provider identifiers only for recognized, non-activity events.
@@ -562,4 +564,7 @@ class ActivityCoalescer:
             observed_at=observed_at,
         )
         self._pending = 0
+        # Reset the batch summary so a later summary-less batch does not re-emit a
+        # stale summary (which would revive work already cleared by work.finished).
+        self._last_summary = None
         return event
