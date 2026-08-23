@@ -1387,10 +1387,40 @@ def _write_spool(spool_id: str, data: dict) -> None:
             data = dict(data)
             data["owner_episode"] = current_episode
 
+    # The reduced provider-lifecycle block (lifecycle.provider) is authoritative
+    # like the episode: a metadata writer working from a stale snapshot may never
+    # lower its monotonic sequence.  Scoped to the provider sub-key so the owner's
+    # flat lifecycle keys are untouched.  This is defense-in-depth; the primary
+    # guarantee is that every lifecycle writer holds the same <id>.lock.
+    current_provider = None
+    if isinstance(current, dict) and isinstance(current.get("lifecycle"), dict):
+        maybe = current["lifecycle"].get("provider")
+        if isinstance(maybe, dict):
+            current_provider = maybe
+    if current_provider is not None:
+        incoming_lifecycle = data.get("lifecycle")
+        incoming_provider = incoming_lifecycle.get("provider") if isinstance(incoming_lifecycle, dict) else None
+        incoming_seq = incoming_provider.get("sequence", -1) if isinstance(incoming_provider, dict) else -1
+        if incoming_seq < current_provider.get("sequence", 0):
+            data = dict(data)
+            merged_lifecycle = dict(data.get("lifecycle") or {})
+            merged_lifecycle["provider"] = current_provider
+            data["lifecycle"] = merged_lifecycle
+
+    # Durable atomic replace: write temp, fsync the file, atomically replace, then
+    # fsync the directory so the rename survives a crash.  Without the fsyncs a
+    # later write could silently un-durable an authoritative episode or lifecycle
+    # block, and a crash could leave a torn <id>.json.
     with open(tmp_path, "w") as f:
         json.dump(data, f, indent=2)
-
-    os.rename(tmp_path, path)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, path)
+    dir_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
 
 
 def _read_spool(spool_id: str) -> Optional[dict]:
