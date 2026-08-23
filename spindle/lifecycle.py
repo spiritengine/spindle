@@ -405,10 +405,13 @@ def reduce(state: Optional[dict], event: "LifecycleEvent") -> dict:
         if state["cancel_evidence"]["acknowledged_at"] is None:
             state["cancel_evidence"]["acknowledged_at"] = event.observed_at
     elif kind == TURN_TERMINAL:
-        cancel = state["cancel_evidence"]
-        if cancel["acknowledged_at"] is not None and cancel["terminal_observed_at"] is None:
-            cancel["terminal_observed_at"] = event.observed_at
         if state["protocol_terminal_kind"] is None:
+            # Record terminal_observed_at only while accepting the FIRST terminal,
+            # so an at-least-once replay of a terminal cannot fabricate
+            # cancel-associated evidence after the fact.
+            cancel = state["cancel_evidence"]
+            if cancel["acknowledged_at"] is not None and cancel["terminal_observed_at"] is None:
+                cancel["terminal_observed_at"] = event.observed_at
             normalized = event.terminal_kind
             if normalized not in KNOWN_TERMINAL_KINDS:
                 # Fail closed: an unknown terminal discriminator is never success.

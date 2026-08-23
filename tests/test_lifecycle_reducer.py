@@ -420,3 +420,21 @@ def test_finished_work_not_revived_by_stale_coalesced_summary():
     coalescer.observe()  # new, summary-less batch
     state = lc.reduce(state, coalescer.flush())
     assert state["active_work"] is None, "a stale coalesced summary must not revive finished work"
+
+
+def test_terminal_replay_after_cancel_does_not_fabricate_evidence():
+    # The terminal arrives BEFORE any cancel; a cancel ack follows; then the same
+    # terminal is redelivered (at-least-once). terminal_observed_at must stay None
+    # because the terminal genuinely preceded the cancel.
+    state = fold(
+        [
+            ev(SPOOL, lc.TURN_STARTED),
+            ev(SPOOL, lc.TURN_TERMINAL, terminal_kind="completed", observed_at="t0"),
+            ev(SPOOL, lc.CANCEL_ACKNOWLEDGED, observed_at="t1"),
+        ]
+    )
+    assert state["cancel_evidence"]["terminal_observed_at"] is None
+    state = lc.reduce(state, ev(SPOOL, lc.TURN_TERMINAL, terminal_kind="completed", observed_at="t0"))
+    assert state["cancel_evidence"]["terminal_observed_at"] is None, "replay must not fabricate cancel evidence"
+    assert state["protocol_terminal_kind"] == "completed"
+    assert state["evidence"][-1]["reason"] == "terminal_after_terminal"
