@@ -422,6 +422,37 @@ def test_finished_work_not_revived_by_stale_coalesced_summary():
     assert state["active_work"] is None, "a stale coalesced summary must not revive finished work"
 
 
+def test_cancel_evidence_robust_to_missing_timestamp():
+    # observed_at is optional; a timestamp-less cancel.acknowledged must still
+    # record the acknowledgement (presence, not the timestamp value) and be
+    # first-write-wins, and a following terminal must still record terminal_observed.
+    state = fold([ev(SPOOL, lc.TURN_STARTED), ev(SPOOL, lc.CANCEL_ACKNOWLEDGED)])
+    assert state["cancel_evidence"]["acknowledged"] is True
+    assert state["cancel_evidence"]["acknowledged_at"] is None
+    # A later timestamped ack does not overwrite the first.
+    state = lc.reduce(state, ev(SPOOL, lc.CANCEL_ACKNOWLEDGED, observed_at="later"))
+    assert state["cancel_evidence"]["acknowledged_at"] is None
+    state = lc.reduce(state, ev(SPOOL, lc.TURN_TERMINAL, terminal_kind="interrupted", observed_at="t"))
+    assert state["cancel_evidence"]["terminal_observed"] is True
+    assert state["cancel_evidence"]["terminal_observed_at"] == "t"
+
+
+def test_connection_state_tracks_transport_events_after_terminal():
+    state = fold(
+        [
+            ev(SPOOL, lc.PROTOCOL_CONNECTED),
+            ev(SPOOL, lc.TURN_TERMINAL, terminal_kind="completed"),
+            ev(SPOOL, lc.TRANSPORT_EXITED),
+        ]
+    )
+    assert state["connection_state"] == lc.CONNECTION_EXITED
+    # connection_state is a live projection: a later transport reconnect still
+    # updates it, while the protocol terminal stays frozen.
+    state = fold([ev(SPOOL, lc.TRANSPORT_STARTED), ev(SPOOL, lc.PROTOCOL_CONNECTED)], state)
+    assert state["connection_state"] == lc.CONNECTION_CONNECTED
+    assert state["protocol_state"] == lc.PROTOCOL_TERMINAL
+
+
 def test_terminal_replay_after_cancel_does_not_fabricate_evidence():
     # The terminal arrives BEFORE any cancel; a cancel ack follows; then the same
     # terminal is redelivered (at-least-once). terminal_observed_at must stay None

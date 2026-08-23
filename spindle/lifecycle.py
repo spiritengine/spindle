@@ -292,8 +292,15 @@ def initial_state() -> dict:
         "active_work": None,
         # Provider-observed cancellation facts only. The request side
         # (requested_at, forced_kill_at) belongs to the owner/control path in the
-        # flat lifecycle keys, not to this reducer.
-        "cancel_evidence": {"acknowledged_at": None, "terminal_observed_at": None},
+        # flat lifecycle keys, not to this reducer. Presence is tracked by explicit
+        # booleans so a timestamp-less event (observed_at is optional) still records
+        # the fact and is first-write-wins independent of the timestamp value.
+        "cancel_evidence": {
+            "acknowledged": False,
+            "acknowledged_at": None,
+            "terminal_observed": False,
+            "terminal_observed_at": None,
+        },
         "evidence": [],
     }
 
@@ -341,13 +348,14 @@ def reduce(state: Optional[dict], event: "LifecycleEvent") -> dict:
         _append_evidence(state, event, "stale_epoch")
         return state
 
-    # Adopting a newer epoch means the transport reconnected. Reset the protocol
-    # handshake so a re-established turn can progress -- unless already terminal
-    # (terminal is absorbing; a new epoch never un-terminalizes).
+    # Adopting a newer epoch means the transport reconnected. connection_state is a
+    # pure live projection, so it tracks the reconnect even after terminal; the
+    # protocol handshake is reset so a re-established turn can progress -- unless
+    # already terminal (terminal is absorbing; a new epoch never un-terminalizes).
     if event.epoch > state["connection_epoch"]:
         state["connection_epoch"] = event.epoch
+        state["connection_state"] = CONNECTION_CONNECTED
         if state["protocol_state"] != PROTOCOL_TERMINAL:
-            state["connection_state"] = CONNECTION_CONNECTED
             state["protocol_state"] = PROTOCOL_STARTING
             state["active_work"] = None
 
@@ -370,12 +378,13 @@ def reduce(state: Optional[dict], event: "LifecycleEvent") -> dict:
     state["last_event_type"] = kind
     terminal = state["protocol_state"] == PROTOCOL_TERMINAL
 
+    # connection_state is a pure live projection of the latest transport event and
+    # updates unconditionally (even after terminal) so it never gets stuck; the
+    # authoritative protocol state below is what terminal absorbs.
     if kind == TRANSPORT_STARTED:
-        if not terminal:
-            state["connection_state"] = CONNECTION_STARTING
+        state["connection_state"] = CONNECTION_STARTING
     elif kind == PROTOCOL_CONNECTED:
-        if not terminal:
-            state["connection_state"] = CONNECTION_CONNECTED
+        state["connection_state"] = CONNECTION_CONNECTED
     elif kind == TRANSPORT_LOST:
         state["connection_state"] = CONNECTION_LOST
     elif kind == TRANSPORT_EXITED:
@@ -402,15 +411,19 @@ def reduce(state: Optional[dict], event: "LifecycleEvent") -> dict:
         if state["protocol_state"] == PROTOCOL_WAITING:
             state["protocol_state"] = PROTOCOL_ACTIVE
     elif kind == CANCEL_ACKNOWLEDGED:
-        if state["cancel_evidence"]["acknowledged_at"] is None:
-            state["cancel_evidence"]["acknowledged_at"] = event.observed_at
+        cancel = state["cancel_evidence"]
+        if not cancel["acknowledged"]:
+            cancel["acknowledged"] = True
+            cancel["acknowledged_at"] = event.observed_at
     elif kind == TURN_TERMINAL:
         if state["protocol_terminal_kind"] is None:
-            # Record terminal_observed_at only while accepting the FIRST terminal,
-            # so an at-least-once replay of a terminal cannot fabricate
-            # cancel-associated evidence after the fact.
+            # Record terminal-observed evidence only while accepting the FIRST
+            # terminal, so an at-least-once replay of a terminal cannot fabricate
+            # cancel-associated evidence after the fact. Keyed on the acknowledged
+            # flag, not the (optional) timestamp value.
             cancel = state["cancel_evidence"]
-            if cancel["acknowledged_at"] is not None and cancel["terminal_observed_at"] is None:
+            if cancel["acknowledged"] and not cancel["terminal_observed"]:
+                cancel["terminal_observed"] = True
                 cancel["terminal_observed_at"] = event.observed_at
             normalized = event.terminal_kind
             if normalized not in KNOWN_TERMINAL_KINDS:
