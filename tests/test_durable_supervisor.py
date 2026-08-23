@@ -827,7 +827,23 @@ def test_launcher_death_after_shard_creation_preserves_recovery_metadata(supervi
     )
     assert probe.returncode == 77, probe.stderr
 
-    spool = _wait_spool(store, spool_id, "error", timeout=5)
+    _wait_spool(store, spool_id, "error", timeout=5)
+
+    # shard_cleanup_preserved is completed by the retryable failed_shard_preservation
+    # obligation, which converges AFTER the terminal status is published
+    # (DECISIONS #30), so wait for that obligation rather than the status flip alone.
+    # This mirrors the synchronization in
+    # test_launcher_death_mid_skein_spawn_recovers_created_shard.
+    def preservation_complete():
+        record = _read_json(store / f"{spool_id}.json")
+        return record if record.get("shard_cleanup_preserved") is True else None
+
+    spool = _wait_for(
+        preservation_complete,
+        timeout=10,
+        description="failed shard preservation obligation completion",
+    )
+
     assert spool["shard_created_by_spool"] is True
     assert spool["shard_source_dir"] == str(repo)
     assert spool["base_branch"] == "main"
