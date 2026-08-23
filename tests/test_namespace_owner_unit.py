@@ -354,7 +354,7 @@ def test_natural_exit_retries_descendant_cleanup_before_evidence_or_release(tmp_
     owner._remaining_wall_budget = lambda: None
     owner._publish_owner_identity = lambda: None
     owner._spawn_provider = lambda **_kwargs: None
-    owner._verify_lock = lambda: True
+    owner._verify_lock = lambda **_kwargs: True
     owner._next_current_request = lambda: None
     owner._provider_exited = lambda: True
     owner._finish_provider = lambda: 0
@@ -1171,6 +1171,100 @@ def test_owner_episode_transition_reproves_after_blocked_record_lock(tmp_path):
         owner.lock.close()
 
 
+def test_owner_episode_missing_sidecar_transition_reproves_after_creating_blocked_record_lock(tmp_path, monkeypatch):
+    import spindle.namespace_owner_process as owner_module
+    from spindle.namespace_owner_process import AuthorityLost
+    from tests.owner_episode_fixtures import make_episode
+
+    owner = _spawning_owner(tmp_path, "blocked-missing-sidecar-owner-episode")
+    owner.episode_mode = True
+    owner.spool_path.write_text(
+        json.dumps(
+            {
+                "id": owner.spool_id,
+                "status": "pending",
+                "owner_episode": make_episode("lock_bound", generation=owner.generation),
+            },
+            sort_keys=True,
+        )
+    )
+    assert not owner.spool_lock_path.exists()
+    before_episode = json.dumps(json.loads(owner.spool_path.read_text())["owner_episode"], sort_keys=True)
+    real_open = owner_module.os.open
+    sidecar_created = threading.Event()
+    allow_worker_to_flock = threading.Event()
+    errors = []
+    results = []
+
+    def open_then_pause_on_created_sidecar(path, flags, mode=0o777, *, dir_fd=None):
+        if dir_fd is None:
+            fd = real_open(path, flags, mode)
+        else:
+            fd = real_open(path, flags, mode, dir_fd=dir_fd)
+        if Path(path) == owner.spool_lock_path and flags & os.O_CREAT and not sidecar_created.is_set():
+            sidecar_created.set()
+            if not allow_worker_to_flock.wait(timeout=2):
+                raise TimeoutError("test did not acquire the newly created sidecar lock")
+        return fd
+
+    monkeypatch.setattr("spindle.namespace_owner_process.os.open", open_then_pause_on_created_sidecar)
+
+    def transition():
+        try:
+            results.append(
+                owner._transition_owner_episode_locked(
+                    destination="accepted",
+                    facts={
+                        "provider": {
+                            "pid": 4242,
+                            "pgid": 4242,
+                            "birth_token": "test-start",
+                            "namespace": capture_pid_namespace().to_dict(),
+                        },
+                        "provider_custody": {
+                            "pidfd_acquired": False,
+                            "containment": "watchdog",
+                            "published_at": datetime.now().isoformat(),
+                        },
+                    },
+                )
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=transition)
+    worker.start()
+    guard_fd = None
+    contender = None
+    try:
+        assert sidecar_created.wait(timeout=2), "transition did not create the fallback record lock"
+        guard_fd = real_open(owner.spool_lock_path, os.O_RDWR)
+        fcntl.flock(guard_fd, fcntl.LOCK_EX)
+        allow_worker_to_flock.set()
+        worker.join(timeout=0.05)
+        assert worker.is_alive(), "transition did not block on the newly created record lock"
+        contender = _replace_and_hold_owner_lock(owner)
+        fcntl.flock(guard_fd, fcntl.LOCK_UN)
+        worker.join(timeout=2)
+        assert not worker.is_alive()
+        assert results == []
+        assert len(errors) == 1 and isinstance(errors[0], AuthorityLost)
+        after_episode = json.dumps(json.loads(owner.spool_path.read_text())["owner_episode"], sort_keys=True)
+        assert after_episode == before_episode
+    finally:
+        allow_worker_to_flock.set()
+        if guard_fd is not None:
+            try:
+                fcntl.flock(guard_fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            os.close(guard_fd)
+        if contender is not None:
+            fcntl.flock(contender, fcntl.LOCK_UN)
+            os.close(contender)
+        owner.lock.close()
+
+
 def test_spool_record_guard_does_not_self_deadlock_restoring_lifecycle(tmp_path):
     owner = _lock_owner(tmp_path, spool_id="record-guard-no-recursion")
     owner.spool_lock_path.touch(mode=0o600)
@@ -1600,7 +1694,7 @@ def test_pre_popen_local_close_failure_still_surfaces_without_authority_loss(tmp
     owner.checkpoints = SimpleNamespace(reach=lambda *_args: None, socket=None, pause_name=None)
     owner._watchdog_alive = lambda: True
     owner._deadline_expired = lambda: False
-    owner._verify_lock = lambda: (_ for _ in ()).throw(RuntimeError("primary failure"))
+    owner._verify_lock = lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("primary failure"))
     owner.provider = None
     owner.clock = SimpleNamespace(monotonic=lambda: 0.0)
 
@@ -1754,7 +1848,7 @@ def test_post_fork_publication_proves_authority_at_every_boundary(tmp_path, monk
         events.append(f"write:{'spool' if suffix == 'json' else suffix}")
         return real_atomic_write(path, payload)
 
-    owner._verify_lock = lambda: events.append("verify") or True
+    owner._verify_lock = lambda **_kwargs: events.append("verify") or True
     monkeypatch.setattr("spindle.namespace_owner_process._atomic_json_write", traced_atomic_write)
     _fake_provider_start(monkeypatch)
 
@@ -1882,7 +1976,7 @@ def test_pre_popen_deadline_settlement_treats_an_unreadable_store_as_retryable(t
     from spindle.namespace_owner_process import SETTLEMENT_RETRY
 
     owner = _spawning_owner(tmp_path, "unreadable-deadline")
-    owner._verify_lock = lambda: False
+    owner._verify_lock = lambda **_kwargs: False
 
     try:
         assert owner._settle_deadline_expiry_after_binding() == SETTLEMENT_RETRY
@@ -1903,7 +1997,7 @@ def test_pre_popen_deadline_settlement_converges_on_an_unsettleable_episode(tmp_
 
     owner = _spawning_owner(tmp_path, "unsettleable-deadline")
     owner.episode_mode = True
-    owner._verify_lock = lambda: True
+    owner._verify_lock = lambda **_kwargs: True
     owner._deadline_expired = lambda: True
     attempts = []
 
@@ -1932,7 +2026,7 @@ def test_pre_popen_deadline_settlement_retries_a_revision_another_actor_moved(tm
     """The one rejection a re-read can clear still converges on a durable timeout."""
     owner = _spawning_owner(tmp_path, "revision-race-deadline")
     owner.episode_mode = True
-    owner._verify_lock = lambda: True
+    owner._verify_lock = lambda **_kwargs: True
     owner._deadline_expired = lambda: True
     outcomes = iter(
         [
@@ -1989,7 +2083,7 @@ def test_provider_spawn_failure_retries_through_a_transient_unreadable_store(tmp
     # The two pre-Popen proofs, then two unreadable settlement sightings, then
     # the readable settlement plus both sidecar proofs.
     results = iter([True, True, False, False, True, True, True])
-    owner._verify_lock = lambda: next(results)
+    owner._verify_lock = lambda **_kwargs: next(results)
     _fake_provider_start(monkeypatch, spawn_error=OSError("exec format error"))
 
     try:
@@ -2010,7 +2104,7 @@ def test_provider_spawn_failure_converges_when_the_episode_cannot_be_settled(tmp
 
     owner = _spawning_owner(tmp_path, "spawn-failure-unsettleable")
     owner.episode_mode = True
-    owner._verify_lock = lambda: True
+    owner._verify_lock = lambda **_kwargs: True
     attempts = []
 
     def rejecting_transition(*_args, **_kwargs):
@@ -2290,7 +2384,7 @@ def test_spawn_failure_sidecar_reproves_after_transition_before_owner_exit(tmp_p
     )
     verifications = []
 
-    def losing_after_transition():
+    def losing_after_transition(**_kwargs):
         verifications.append(len(verifications))
         if len(verifications) >= 4:
             raise AuthorityLost()
@@ -2356,7 +2450,7 @@ def test_settle_descendants_reports_unproven_authority_without_killing_or_writin
     owner.provider = None
     owner._direct_children = lambda: [987654]
     owner._drain_reapable = lambda: 0
-    owner._verify_lock = lambda: False
+    owner._verify_lock = lambda **_kwargs: False
     monkeypatch.setattr("spindle.namespace_owner_process.time.sleep", lambda _seconds: None)
     monkeypatch.setattr(
         "spindle.namespace_owner_process.os.kill",
@@ -2379,7 +2473,7 @@ def test_terminal_output_state_reproves_before_timestamp_mutation(tmp_path):
     )
     owner.stdout_path.write_text(json.dumps({"response": "complete", "session_id": "s"}) + "\n")
     before = owner.spool_path.read_text()
-    owner._verify_lock = lambda: False
+    owner._verify_lock = lambda **_kwargs: False
 
     try:
         assert LogicalOwner._terminal_output_state(owner) == (False, False, None)
@@ -2404,7 +2498,7 @@ def test_terminal_output_state_existing_timestamps_remain_a_pure_read(tmp_path):
         )
     )
     owner.stdout_path.write_text(json.dumps({"response": "complete", "session_id": "s"}) + "\n")
-    owner._verify_lock = lambda: pytest.fail("pure terminal-output read requested an authority proof")
+    owner._verify_lock = lambda **_kwargs: pytest.fail("pure terminal-output read requested an authority proof")
 
     try:
         terminal, _shutdown_due, observed_written = owner._terminal_output_state()

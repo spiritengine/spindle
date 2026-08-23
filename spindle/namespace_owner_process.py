@@ -609,10 +609,14 @@ class LogicalOwner:
         return lock is not None and getattr(lock, "fd", -1) >= 0
 
     @contextmanager
-    def _spool_record_guard(self):
+    def _spool_record_guard(self, *, create_missing: bool = False):
         """Join the launcher's compatibility record lock when it exists."""
         try:
-            fd = os.open(self.spool_lock_path, os.O_RDWR)
+            flags = os.O_RDWR
+            if create_missing:
+                self.spool_lock_path.parent.mkdir(parents=True, exist_ok=True)
+                flags |= os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
+            fd = os.open(self.spool_lock_path, flags, 0o600)
         except FileNotFoundError:
             # Direct primitive users have no legacy record-lock sidecar.  The
             # owner must not introduce a new ``*.lock`` artifact which an old
@@ -638,12 +642,9 @@ class LogicalOwner:
         """
         if not self._has_open_owner_lock():
             raise RuntimeError("post-binding owner episode transition requires an open owner lock")
-        with self._spool_record_guard() as record_locked:
-            if not record_locked:
-                self._await_verified_authority()
+        with self._spool_record_guard(create_missing=True) as record_locked:
             episode = self._read_spool().get("owner_episode") or {}
-            if not record_locked:
-                self._await_verified_authority()
+            self._await_verified_authority(record_unreadable=False, restore_lifecycle=False)
             return transition_owner_episode(
                 self.store,
                 self.spool_id,
