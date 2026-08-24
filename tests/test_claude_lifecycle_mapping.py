@@ -34,9 +34,7 @@ def test_conversation_summary_is_sorted_bounded_and_private():
         "tools": [{"name": "Read", "input": "SECRET"}],
     }
     summary = driver.claude_conversation_summary(event)
-    assert summary == (
-        "version=2.1.241; capabilities=interrupt_receipt_v1,msg_lifecycle_v1"
-    )
+    assert summary == ("version=2.1.241; capabilities=interrupt_receipt_v1,msg_lifecycle_v1")
     assert len(summary.encode()) <= lc.SUMMARY_MAX
     assert "secret" not in summary.lower()
     assert "/secret" not in summary
@@ -47,7 +45,7 @@ def test_conversation_summary_accepts_legacy_claude_code_version_key():
 
 
 @pytest.mark.parametrize(
-        ("event", "expected"),
+    ("event", "expected"),
     [
         ({"type": "result", "subtype": "success", "is_error": False}, lc.TERMINAL_COMPLETED),
         (
@@ -89,9 +87,7 @@ def test_terminal_summary_allowlists_scalars_and_excludes_sensitive_data():
         "is_error": False,
         "terminal_reason": "completed",
         "total_cost_usd": 0.125,
-        "permission_denials": [
-            {"tool_name": "Write", "tool_input": {"file_path": "/secret", "content": "LEAK"}}
-        ],
+        "permission_denials": [{"tool_name": "Write", "tool_input": {"file_path": "/secret", "content": "LEAK"}}],
         "usage": {
             "input_tokens": 10,
             "output_tokens": 20,
@@ -257,14 +253,10 @@ def test_overlapping_task_finish_does_not_clear_sibling(tmp_path, monkeypatch):
         telemetry.observe({"type": "system", "subtype": "task_started", "task_id": task_id})
     assert read_provider(store, spool_id)["active_work"] == "2 Claude tasks active"
 
-    telemetry.observe(
-        {"type": "system", "subtype": "task_updated", "task_id": "a", "patch": {"status": "completed"}}
-    )
+    telemetry.observe({"type": "system", "subtype": "task_updated", "task_id": "a", "patch": {"status": "completed"}})
     assert read_provider(store, spool_id)["active_work"] == "1 Claude task active"
 
-    telemetry.observe(
-        {"type": "system", "subtype": "task_notification", "task_id": "b", "status": "killed"}
-    )
+    telemetry.observe({"type": "system", "subtype": "task_notification", "task_id": "b", "status": "killed"})
     assert read_provider(store, spool_id)["active_work"] is None
 
 
@@ -300,9 +292,7 @@ def test_task_updated_missing_unknown_or_non_dict_status_never_finishes(tmp_path
     telemetry, store, spool_id = _telemetry(tmp_path, monkeypatch)
     telemetry.observe({"type": "system", "subtype": "task_started", "task_id": "a"})
     for patch_value in (None, "completed", {}, {"status": "future"}):
-        telemetry.observe(
-            {"type": "system", "subtype": "task_updated", "task_id": "a", "patch": patch_value}
-        )
+        telemetry.observe({"type": "system", "subtype": "task_updated", "task_id": "a", "patch": patch_value})
         assert read_provider(store, spool_id)["active_work"] == "1 Claude task active"
 
 

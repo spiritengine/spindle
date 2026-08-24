@@ -9981,8 +9981,9 @@ class TestCCBgTasks:
         complete = {**running, "status": "complete", "result": "exact result payload"}
         failed = {**running, "status": "error", "error": "exact public failure"}
         reconciliation = MagicMock(state="active", reason="owned")
-        with patch("spindle._check_and_finalize_spool"), patch(
-            "spindle._reconcile_spool_ownership", return_value=reconciliation
+        with (
+            patch("spindle._check_and_finalize_spool"),
+            patch("spindle._reconcile_spool_ownership", return_value=reconciliation),
         ):
             with patch("spindle._read_spool", return_value=running):
                 rendered = _unspool_sync("run-provider")

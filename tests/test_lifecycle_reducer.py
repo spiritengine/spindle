@@ -72,9 +72,7 @@ def test_conversation_summary_is_additive_provider_metadata():
             summary="version=2.1.241; capabilities=interrupt_receipt_v1,msg_lifecycle_v1",
         ),
     )
-    assert state["conversation_summary"] == (
-        "version=2.1.241; capabilities=interrupt_receipt_v1,msg_lifecycle_v1"
-    )
+    assert state["conversation_summary"] == ("version=2.1.241; capabilities=interrupt_receipt_v1,msg_lifecycle_v1")
     assert state["protocol_state"] == lc.PROTOCOL_ACCEPTED
 
 

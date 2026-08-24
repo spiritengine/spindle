@@ -86,6 +86,12 @@ CLAUDE_USAGE_KEYS = (
 CLAUDE_ABORT_REASONS = {"aborted_streaming", "aborted_tools"}
 _LIFECYCLE_RUNTIME = None
 _LIFECYCLE_RUNTIME_LOCK = threading.Lock()
+_OWNER_ONLY_ENV_KEYS = (
+    "SPINDLE_OWNER_STORE",
+    "SPINDLE_OWNER_SPOOL_ID",
+    "SPINDLE_PROVIDER_CONTROL_FD",
+    "_SPINDLE_STORE_SUPERVISOR",
+)
 
 
 def _cap_utf8(value, limit=500):
@@ -151,11 +157,7 @@ def normalize_claude_terminal_kind(event):
         )
     ):
         return "failed"
-    if (
-        subtype == "success"
-        and event.get("is_error") is False
-        and terminal_reason in (None, "completed")
-    ):
+    if subtype == "success" and event.get("is_error") is False and terminal_reason in (None, "completed"):
         return "completed"
     return "indeterminate"
 
@@ -223,6 +225,14 @@ def _utc_observed_at():
     return datetime.now(timezone.utc).isoformat()
 
 
+def _claude_child_env():
+    """Prevent Claude, its tools, and nested drivers from addressing this spool."""
+    child_env = os.environ.copy()
+    for key in _OWNER_ONLY_ENV_KEYS:
+        child_env.pop(key, None)
+    return child_env
+
+
 class ClaudeLifecycleTelemetry:
     """Best-effort Claude-event adapter for the provider lifecycle reducer.
 
@@ -241,6 +251,7 @@ class ClaudeLifecycleTelemetry:
         self._active_tasks = set()
         self._approval_requests = set()
         self._result_candidate = None
+        self._terminal_requested = False
         store = os.environ.get("SPINDLE_OWNER_STORE")
         spool_id = os.environ.get("SPINDLE_OWNER_SPOOL_ID")
         if not store or not spool_id:
@@ -283,15 +294,16 @@ class ClaudeLifecycleTelemetry:
 
     def _emit(self, kind, **kwargs):
         if not self.enabled:
-            return
+            return False
         self._flush_activity()
         if self.enabled:
             try:
                 event = self._event(kind, **kwargs)
             except Exception as exc:
                 self._disable(exc)
-                return
-            self._apply(event)
+                return False
+            return self._apply(event)
+        return False
 
     def activity(self, summary=None):
         if not self.enabled:
@@ -314,8 +326,10 @@ class ClaudeLifecycleTelemetry:
 
     def transport_exited(self, exit_code):
         if self.enabled:
+            self._try_terminal()
             raw = str(exit_code) if isinstance(exit_code, int) and not isinstance(exit_code, bool) else None
             self._emit(self._runtime.TRANSPORT_EXITED, provider_event="claude.exited", raw_status=raw)
+            self._try_terminal()
 
     def turn_started(self):
         if self.enabled:
@@ -461,10 +475,18 @@ class ClaudeLifecycleTelemetry:
     def finalize_result(self, sentinel_subtype):
         if not self.enabled:
             return
-        candidate = self._result_candidate
-        self._result_candidate = None
-        if candidate is not None and sentinel_subtype in {"complete", "parked"}:
-            self._emit(self._runtime.TURN_TERMINAL, **candidate)
+        if self._result_candidate is not None and sentinel_subtype in {"complete", "parked"}:
+            self._terminal_requested = True
+            self._try_terminal()
+
+    def _try_terminal(self):
+        if not self.enabled or not self._terminal_requested or self._result_candidate is None:
+            return False
+        if self._emit(self._runtime.TURN_TERMINAL, **self._result_candidate):
+            self._result_candidate = None
+            self._terminal_requested = False
+            return True
+        return False
 
 
 def iter_user_texts(event):
@@ -725,6 +747,7 @@ def _reader(stream, out_queue):
         for line in stream:
             out_queue.put(line)
     except OSError as exc:
+        print(f"spindle_claude_driver: claude stdout read failed: {exc}", file=sys.stderr)
         out_queue.put(_ReaderFailure(exc))
     finally:
         out_queue.put(None)
@@ -832,6 +855,7 @@ def main(argv=None):
         stderr=None,  # inherit: claude's stderr lands in the spool's stderr capture
         text=True,
         bufsize=1,
+        env=_claude_child_env(),
     )
     telemetry.transport_started()
 
@@ -863,6 +887,13 @@ def main(argv=None):
     user_after_result = False  # a delivered notification suggests a requery is coming
     grace_started = None  # entered the idle-clean phase at this time
 
+    def _publish_sentinel(sentinel):
+        # Public completion evidence must reach stdout before any best-effort
+        # telemetry store I/O. A busy terminal candidate is retained and retried
+        # through transport exit, but can never delay the existing sentinel.
+        _emit(sentinel)
+        telemetry.finalize_result(sentinel.get("subtype"))
+
     def _linger_terminal():
         """Terminal sentinel once the idle grace is exhausted.
 
@@ -872,10 +903,8 @@ def main(argv=None):
         stale answer as complete: the original false-completion otherwise
         returns through this exit.
         """
-        sentinel_subtype = "parked" if tracker.stale_resolved else "complete"
-        telemetry.finalize_result(sentinel_subtype)
         if tracker.stale_resolved:
-            _emit(
+            _publish_sentinel(
                 build_sentinel(
                     "parked",
                     [],
@@ -884,7 +913,7 @@ def main(argv=None):
                 )
             )
         else:
-            _emit(build_sentinel("complete", []))
+            _publish_sentinel(build_sentinel("complete", []))
         exit_code = _finish(proc)
         telemetry.transport_exited(exit_code)
         return exit_code or 0
@@ -898,8 +927,7 @@ def main(argv=None):
             unresolved = tracker.unresolved
             if unresolved:
                 if now > _park_deadline(unresolved, args.default_task_timeout_seconds, args.park_grace_seconds):
-                    telemetry.finalize_result("parked")
-                    _emit(
+                    _publish_sentinel(
                         build_sentinel(
                             "parked",
                             unresolved,
@@ -928,8 +956,7 @@ def main(argv=None):
             exit_code = proc.wait()
             unresolved = tracker.unresolved
             if unresolved:
-                telemetry.finalize_result("parked")
-                _emit(
+                _publish_sentinel(
                     build_sentinel(
                         "parked",
                         unresolved,
@@ -938,8 +965,7 @@ def main(argv=None):
                     )
                 )
             elif tracker.saw_result and tracker.stale_resolved:
-                telemetry.finalize_result("parked")
-                _emit(
+                _publish_sentinel(
                     build_sentinel(
                         "parked",
                         [],
@@ -949,11 +975,9 @@ def main(argv=None):
                     )
                 )
             elif tracker.saw_result:
-                telemetry.finalize_result("complete")
-                _emit(build_sentinel("complete", [], claude_exit_code=exit_code))
+                _publish_sentinel(build_sentinel("complete", [], claude_exit_code=exit_code))
             else:
-                telemetry.finalize_result("no_result")
-                _emit(
+                _publish_sentinel(
                     build_sentinel(
                         "no_result",
                         [],
@@ -984,8 +1008,7 @@ def main(argv=None):
             if not tracker.unresolved and not tracker.ever_armed:
                 # No background tasks ever existed, so no notification can be
                 # queued — finish immediately (the common fast path).
-                telemetry.finalize_result("complete")
-                _emit(build_sentinel("complete", []))
+                _publish_sentinel(build_sentinel("complete", []))
                 exit_code = _finish(proc)
                 telemetry.transport_exited(exit_code)
                 return exit_code or 0
