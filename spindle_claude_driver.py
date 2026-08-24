@@ -37,6 +37,7 @@ transcripts 688e30c3/7de8960e):
 """
 
 import argparse
+import importlib.util
 import json
 import math
 import os
@@ -47,6 +48,7 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 DRIVER_PROTOCOL = "stream-driver-v1"
@@ -82,6 +84,8 @@ CLAUDE_USAGE_KEYS = (
     "cache_read_input_tokens",
 )
 CLAUDE_ABORT_REASONS = {"aborted_streaming", "aborted_tools"}
+_LIFECYCLE_RUNTIME = None
+_LIFECYCLE_RUNTIME_LOCK = threading.Lock()
 
 
 def _cap_utf8(value, limit=500):
@@ -182,18 +186,41 @@ def claude_terminal_summary(event):
 
 
 def _load_lifecycle_runtime():
-    """Lazily import the durable reducer without starting the Spindle server."""
+    """Load the reducer by file path without importing the Spindle server."""
+    global _LIFECYCLE_RUNTIME
+    if _LIFECYCLE_RUNTIME is not None:
+        return _LIFECYCLE_RUNTIME
     guard = "_SPINDLE_STORE_SUPERVISOR"
-    previous = os.environ.get(guard)
-    os.environ[guard] = "1"
-    try:
-        from spindle import lifecycle
-    finally:
-        if previous is None:
-            os.environ.pop(guard, None)
-        else:
-            os.environ[guard] = previous
-    return lifecycle
+    with _LIFECYCLE_RUNTIME_LOCK:
+        if _LIFECYCLE_RUNTIME is not None:
+            return _LIFECYCLE_RUNTIME
+        previous = os.environ.get(guard)
+        os.environ[guard] = "1"
+        module_name = "_spindle_standalone_lifecycle"
+        lifecycle_path = Path(__file__).resolve().parent / "spindle" / "lifecycle.py"
+        try:
+            spec = importlib.util.spec_from_file_location(module_name, lifecycle_path)
+            if spec is None or spec.loader is None:
+                raise ImportError(f"cannot load lifecycle runtime from {lifecycle_path}")
+            lifecycle = importlib.util.module_from_spec(spec)
+            sys.modules[module_name] = lifecycle
+            try:
+                spec.loader.exec_module(lifecycle)
+            except Exception:
+                if sys.modules.get(module_name) is lifecycle:
+                    sys.modules.pop(module_name, None)
+                raise
+            _LIFECYCLE_RUNTIME = lifecycle
+        finally:
+            if previous is None:
+                os.environ.pop(guard, None)
+            else:
+                os.environ[guard] = previous
+        return _LIFECYCLE_RUNTIME
+
+
+def _utc_observed_at():
+    return datetime.now(timezone.utc).isoformat()
 
 
 class ClaudeLifecycleTelemetry:
@@ -210,6 +237,7 @@ class ClaudeLifecycleTelemetry:
         self._store = None
         self._spool_id = None
         self._coalescer = None
+        self._last_activity_at = None
         self._active_tasks = set()
         self._approval_requests = set()
         self._result_candidate = None
@@ -234,19 +262,23 @@ class ClaudeLifecycleTelemetry:
         if not self.enabled:
             return False
         try:
-            self._runtime.apply_event(self._store, self._spool_id, event)
+            self._runtime.apply_event(self._store, self._spool_id, event, blocking=False)
             return True
+        except self._runtime.LifecycleBusy:
+            return False
         except Exception as exc:
             self._disable(exc)
             return False
 
     def _event(self, kind, **kwargs):
+        kwargs.setdefault("observed_at", _utc_observed_at())
         return self._runtime.LifecycleEvent(spool_id=self._spool_id, kind=kind, **kwargs)
 
     def _flush_activity(self):
         if self.enabled:
-            pending = self._coalescer.flush()
+            pending = self._coalescer.flush(observed_at=self._last_activity_at)
             if pending is not None:
+                self._last_activity_at = None
                 self._apply(pending)
 
     def _emit(self, kind, **kwargs):
@@ -261,11 +293,14 @@ class ClaudeLifecycleTelemetry:
                 return
             self._apply(event)
 
-    def activity(self, summary="Claude activity"):
+    def activity(self, summary=None):
         if not self.enabled:
             return
-        event = self._coalescer.observe(summary=summary)
+        observed_at = _utc_observed_at()
+        self._last_activity_at = observed_at
+        event = self._coalescer.observe(summary=summary, observed_at=observed_at)
         if event is not None:
+            self._last_activity_at = None
             self._apply(event)
 
     def transport_started(self):
@@ -397,7 +432,12 @@ class ClaudeLifecycleTelemetry:
         elif etype == "control_request":
             request = event.get("request")
             request_id = event.get("request_id")
-            if isinstance(request, dict) and request.get("subtype") == "can_use_tool" and isinstance(request_id, str):
+            if (
+                isinstance(request, dict)
+                and request.get("subtype") == "can_use_tool"
+                and isinstance(request_id, str)
+                and request_id
+            ):
                 self._approval_requests.add(request_id)
                 self._emit(self._runtime.APPROVAL_REQUESTED, provider_event="control_request.can_use_tool")
         elif etype == "control_response":
@@ -405,7 +445,10 @@ class ClaudeLifecycleTelemetry:
             request_id = response.get("request_id") if isinstance(response, dict) else None
             if isinstance(request_id, str) and request_id in self._approval_requests:
                 self._approval_requests.discard(request_id)
-                self._emit(self._runtime.APPROVAL_RESOLVED, provider_event="control_response")
+                if self._approval_requests:
+                    self.activity()
+                else:
+                    self._emit(self._runtime.APPROVAL_RESOLVED, provider_event="control_response")
         elif etype == "result":
             self._remember_result(event)
         elif etype in {"assistant", "user", "rate_limit_event", "stream_event"} or (

@@ -1,6 +1,7 @@
 """Durable/in-process integration for optional Claude lifecycle telemetry."""
 
 import ast
+import fcntl
 import json
 import os
 import subprocess
@@ -41,12 +42,13 @@ def test_guarded_lazy_load_restores_absent_and_existing_environment(monkeypatch)
     guard = "_SPINDLE_STORE_SUPERVISOR"
     monkeypatch.delenv(guard, raising=False)
     runtime = driver._load_lifecycle_runtime()
-    assert runtime is lc
+    assert runtime.apply_event is not lc.apply_event
+    assert runtime.TRANSPORT_STARTED == lc.TRANSPORT_STARTED
     assert guard not in os.environ
 
     monkeypatch.setenv(guard, "outer-owner")
     runtime = driver._load_lifecycle_runtime()
-    assert runtime is lc
+    assert runtime.TRANSPORT_STARTED == lc.TRANSPORT_STARTED
     assert os.environ[guard] == "outer-owner"
 
 
@@ -68,9 +70,10 @@ def test_guarded_lazy_load_fresh_process_does_not_run_store_maintenance(tmp_path
     )
     before = record.read_bytes()
     code = (
-        "import os; import spindle_claude_driver as d; "
+        "import os, sys; import spindle_claude_driver as d; "
         "d._load_lifecycle_runtime(); "
-        "assert '_SPINDLE_STORE_SUPERVISOR' not in os.environ"
+        "assert '_SPINDLE_STORE_SUPERVISOR' not in os.environ; "
+        "assert 'spindle' not in sys.modules"
     )
     env = {
         **os.environ,
@@ -108,6 +111,52 @@ def test_activity_threshold_and_authoritative_flush_order(tmp_path, monkeypatch)
     assert provider["sequence"] == 3
     assert provider["activity_count"] == 2
     assert provider["last_event_type"] == lc.TRANSPORT_STARTED
+
+
+def test_activity_timestamps_survive_threshold_and_authoritative_flush(tmp_path, monkeypatch):
+    values = iter(f"2026-08-24T14:00:{second:02d}+00:00" for second in range(60))
+    monkeypatch.setattr(driver, "_utc_observed_at", lambda: next(values))
+    telemetry, store, spool_id = _telemetry(tmp_path, monkeypatch)
+    for _ in range(50):
+        telemetry.activity()
+    assert read_provider(store, spool_id)["last_activity_at"] == "2026-08-24T14:00:49+00:00"
+
+    telemetry.activity()
+    telemetry.transport_started()
+    provider = read_provider(store, spool_id)
+    assert provider["last_activity_at"] == "2026-08-24T14:00:50+00:00"
+    assert provider["last_event_type"] == lc.TRANSPORT_STARTED
+
+
+def test_raw_activity_never_overwrites_or_revives_structured_work(tmp_path, monkeypatch):
+    telemetry, store, spool_id = _telemetry(tmp_path, monkeypatch)
+    telemetry.observe({"type": "system", "subtype": "task_started", "task_id": "a"})
+    for _ in range(50):
+        telemetry.observe({"type": "assistant", "message": {"content": "SECRET"}})
+    assert read_provider(store, spool_id)["active_work"] == "1 Claude task active"
+
+    telemetry.observe(
+        {"type": "system", "subtype": "task_notification", "task_id": "a", "status": "completed"}
+    )
+    for _ in range(50):
+        telemetry.observe({"type": "assistant", "message": {"content": "SECRET"}})
+    assert read_provider(store, spool_id)["active_work"] is None
+
+
+def test_telemetry_skips_busy_owner_lock_and_recovers_on_next_event(tmp_path, monkeypatch):
+    telemetry, store, spool_id = _telemetry(tmp_path, monkeypatch)
+    fd = os.open(str(store / f"{spool_id}.lock"), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        telemetry.transport_started()
+        assert read_provider(store, spool_id) is None
+        assert telemetry.enabled is True
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+    telemetry.turn_started()
+    assert read_provider(store, spool_id)["protocol_state"] == lc.PROTOCOL_ACTIVE
 
 
 def test_transport_loss_exit_and_terminal_are_independent(tmp_path, monkeypatch):

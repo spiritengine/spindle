@@ -278,12 +278,21 @@ def test_unmatched_or_malformed_control_response_does_not_resolve_approval(tmp_p
             "request": {"subtype": "can_use_tool", "tool_use_id": "tool-1"},
         }
     )
+    telemetry.observe(
+        {
+            "type": "control_request",
+            "request_id": "approval-2",
+            "request": {"subtype": "can_use_tool", "tool_use_id": "tool-2"},
+        }
+    )
     assert read_provider(store, spool_id)["protocol_state"] == lc.PROTOCOL_WAITING
     telemetry.observe({"type": "control_response", "response": {"request_id": "other"}})
     telemetry.observe({"type": "control_response", "response": "malformed"})
     # The unmatched frames are only coalesced activity; neither resolves wait.
     assert read_provider(store, spool_id)["protocol_state"] == lc.PROTOCOL_WAITING
     telemetry.observe({"type": "control_response", "response": {"request_id": "approval-1"}})
+    assert read_provider(store, spool_id)["protocol_state"] == lc.PROTOCOL_WAITING
+    telemetry.observe({"type": "control_response", "response": {"request_id": "approval-2"}})
     assert read_provider(store, spool_id)["protocol_state"] == lc.PROTOCOL_ACTIVE
 
 
@@ -310,7 +319,8 @@ def test_missing_owner_environment_disables_telemetry(monkeypatch):
 
 
 def test_apply_failure_is_nonfatal_and_disables_future_telemetry(tmp_path, monkeypatch, capsys):
-    monkeypatch.setenv("SPINDLE_OWNER_STORE", str(tmp_path / "missing"))
+    missing = tmp_path / "missing"
+    monkeypatch.setenv("SPINDLE_OWNER_STORE", str(missing))
     monkeypatch.setenv("SPINDLE_OWNER_SPOOL_ID", "missing-spool")
     telemetry = driver.ClaudeLifecycleTelemetry()
 
@@ -320,6 +330,7 @@ def test_apply_failure_is_nonfatal_and_disables_future_telemetry(tmp_path, monke
 
     assert telemetry.enabled is False
     assert "telemetry disabled" in capsys.readouterr().err
+    assert not missing.exists()
 
 
 def test_summary_is_valid_utf8_and_bounded_for_many_capabilities():

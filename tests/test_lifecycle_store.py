@@ -51,8 +51,10 @@ def test_apply_event_sequence_advances_across_calls(tmp_path):
 
 
 def test_missing_spool_raises_spool_not_found(tmp_path):
+    before = set(tmp_path.iterdir())
     with pytest.raises(lc.SpoolNotFound):
         lc.apply_event(tmp_path, "nope", ev("nope", lc.ACTIVITY))
+    assert set(tmp_path.iterdir()) == before, "an absent record must not create a lock sidecar"
 
 
 def test_corrupt_record_raises_corruption_not_reinit(tmp_path):
@@ -231,6 +233,21 @@ def test_apply_event_composes_with_owner_writer_holding_same_record_lock(tmp_pat
     assert record["lifecycle"]["ownership_state"] == "held"
     assert record["lifecycle"]["transport_state"] == "reaped"
     assert record["lifecycle"]["provider"]["sequence"] == 1
+
+
+def test_nonblocking_apply_skips_owner_lock_without_waiting_or_writing(tmp_path):
+    store = tmp_path / "store"
+    make_spool_record(store, "s1", extra={"lifecycle": {"transport_state": "connected"}})
+    before = (store / "s1.json").read_bytes()
+    fd = os.open(str(store / "s1.lock"), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        with pytest.raises(lc.LifecycleBusy):
+            lc.apply_event(store, "s1", ev("s1", lc.TRANSPORT_STARTED), blocking=False)
+        assert (store / "s1.json").read_bytes() == before
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
 
 
 # --- crash atomicity --------------------------------------------------------
