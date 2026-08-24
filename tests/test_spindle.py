@@ -9963,6 +9963,35 @@ class TestCCBgTasks:
         assert "active_work=working " in result
         assert len(result.splitlines()[1]) < 400
 
+    @pytest.mark.parametrize(
+        ("stdout_state", "expected_message"),
+        [("missing", "No output yet"), ("empty", "Output file exists but is empty")],
+    )
+    def test_cli_peek_includes_provider_detail_before_stdout_exists(self, tmp_path, stdout_state, expected_message):
+        spool_data = {
+            "id": f"cli-peek-{stdout_state}",
+            "status": "running",
+            "harness": "claude-code",
+            "prompt": "test",
+            "lifecycle": {
+                "provider": {
+                    "protocol_state": "waiting",
+                    "connection_state": "connected",
+                    "last_event_type": "approval.requested",
+                    "last_activity_at": "2026-08-24T14:00:00Z",
+                }
+            },
+        }
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool(spool_data["id"], spool_data)
+            if stdout_state == "empty":
+                _get_output_path(spool_data["id"]).write_text("")
+            result = spindle._spool_peek_sync(spool_data["id"])
+
+        assert expected_message in result
+        assert "protocol=waiting connection=connected" in result
+        assert "last_event=approval.requested" in result
+
     def test_running_unspool_adds_provider_detail_but_terminal_reads_are_unchanged(self):
         provider = {
             "protocol_state": "waiting",

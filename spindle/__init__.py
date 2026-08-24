@@ -5321,14 +5321,18 @@ def _spool_peek_sync(spool_id: str, lines: int = 50) -> str:
 
     stdout_path = _get_output_path(spool_id)
     if not stdout_path.exists():
-        return f"No output yet for spool {spool_id}"
+        message = f"No output yet for spool {spool_id}"
+        detail = _provider_lifecycle_detail(spool)
+        return message + (f"\n{detail}" if detail else "")
 
     try:
         with open(stdout_path, "r") as f:
             all_lines = f.readlines()
 
         if not all_lines:
-            return f"Output file exists but is empty for spool {spool_id}"
+            message = f"Output file exists but is empty for spool {spool_id}"
+            detail = _provider_lifecycle_detail(spool)
+            return message + (f"\n{detail}" if detail else "")
 
         # Get last N lines
         tail = all_lines[-lines:] if len(all_lines) > lines else all_lines
