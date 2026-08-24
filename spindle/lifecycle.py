@@ -286,6 +286,8 @@ def initial_state() -> dict:
         "stop_reason": None,
         "provider_error": None,
         "provider_ids": {},
+        "conversation_summary": None,
+        "terminal_summary": None,
         "last_event_type": None,
         "last_activity_at": None,
         "activity_count": 0,
@@ -330,6 +332,10 @@ def _append_evidence(state: dict, event: "LifecycleEvent", reason: str) -> None:
 def reduce(state: Optional[dict], event: "LifecycleEvent") -> dict:
     """Fold *event* into *state*, returning a new state (input untouched)."""
     state = copy.deepcopy(state) if state is not None else initial_state()
+    # Additive schema evolution: old provider snapshots acquire the new
+    # summaries only when another lifecycle event is applied.
+    state.setdefault("conversation_summary", None)
+    state.setdefault("terminal_summary", None)
     state["sequence"] += 1
 
     kind = event.kind
@@ -390,6 +396,8 @@ def reduce(state: Optional[dict], event: "LifecycleEvent") -> dict:
     elif kind == TRANSPORT_EXITED:
         state["connection_state"] = CONNECTION_EXITED
     elif kind == CONVERSATION_ACCEPTED:
+        if not terminal and state["conversation_summary"] is None:
+            state["conversation_summary"] = event.summary
         if state["protocol_state"] == PROTOCOL_STARTING:
             state["protocol_state"] = PROTOCOL_ACCEPTED
     elif kind == TURN_STARTED:
@@ -436,6 +444,7 @@ def reduce(state: Optional[dict], event: "LifecycleEvent") -> dict:
             # Defensive plain-dict copy: never alias the event's (read-only)
             # error mapping into persisted state.
             state["provider_error"] = dict(event.error) if event.error is not None else None
+            state["terminal_summary"] = event.summary
             state["active_work"] = None
             state["protocol_state"] = PROTOCOL_TERMINAL
         else:
