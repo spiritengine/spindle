@@ -10,6 +10,7 @@ driver-side activity coalescer bounding the durable-write rate.
 import fcntl
 import json
 import os
+import threading
 
 import pytest
 
@@ -50,8 +51,10 @@ def test_apply_event_sequence_advances_across_calls(tmp_path):
 
 
 def test_missing_spool_raises_spool_not_found(tmp_path):
+    before = set(tmp_path.iterdir())
     with pytest.raises(lc.SpoolNotFound):
         lc.apply_event(tmp_path, "nope", ev("nope", lc.ACTIVITY))
+    assert set(tmp_path.iterdir()) == before, "an absent record must not create a lock sidecar"
 
 
 def test_corrupt_record_raises_corruption_not_reinit(tmp_path):
@@ -106,6 +109,44 @@ def test_apply_event_preserves_owner_episode_and_flat_lifecycle(tmp_path):
     assert record["lifecycle"]["provider"]["provider_ids"] == {"thread_id": "t1"}
 
 
+def test_apply_event_changes_only_provider_substate(tmp_path):
+    store = tmp_path / "store"
+    protected = {
+        "status": "running",
+        "result": "existing result",
+        "completed_at": "never-touch",
+        "owner_episode": {"generation": 4, "revision": 9, "phase": "accepted"},
+        "lifecycle": {
+            "normalized_terminal_kind": "timeout",
+            "ownership_state": "held",
+            "public_stop_state": "stopping",
+            "desired_terminal_kind": "timeout",
+            "cleanup_outcome": "pending",
+            "transport_state": "connected",
+        },
+    }
+    make_spool_record(store, "s1", extra=protected)
+    before = read_record(store, "s1")
+
+    lc.apply_event(
+        store,
+        "s1",
+        ev("s1", lc.CONVERSATION_ACCEPTED, summary="version=2.1.241; capabilities=msg_lifecycle_v1"),
+    )
+    lc.apply_event(
+        store,
+        "s1",
+        ev("s1", lc.TURN_TERMINAL, terminal_kind="completed", summary="terminal_reason=completed"),
+    )
+
+    after = read_record(store, "s1")
+    assert after["lifecycle"].pop("provider")["terminal_summary"] == "terminal_reason=completed"
+    before_lifecycle = before.pop("lifecycle")
+    after_lifecycle = after.pop("lifecycle")
+    assert after == before
+    assert after_lifecycle == before_lifecycle
+
+
 # --- record lock discipline -------------------------------------------------
 
 
@@ -136,6 +177,77 @@ def test_apply_event_holds_record_lock_during_write(tmp_path, monkeypatch):
     monkeypatch.setattr(lc, "_atomic_json_write", probing)
     lc.apply_event(store, "s1", ev("s1", lc.TRANSPORT_STARTED))
     assert observed["locked_out"] is True, "record lock must be held during the durable write"
+
+
+def test_apply_event_composes_with_owner_writer_holding_same_record_lock(tmp_path, monkeypatch):
+    """An owner transition and provider apply serialize without recursion or loss."""
+    store = tmp_path / "store"
+    make_spool_record(store, "s1", extra={"lifecycle": {"ownership_state": "held"}})
+    owner_locked = threading.Event()
+    apply_requested_lock = threading.Event()
+    owner_may_write = threading.Event()
+    errors = []
+    real_flock = fcntl.flock
+
+    def observed_flock(fd, operation):
+        if threading.current_thread().name == "provider-apply" and operation & fcntl.LOCK_EX:
+            apply_requested_lock.set()
+        return real_flock(fd, operation)
+
+    monkeypatch.setattr(lc.fcntl, "flock", observed_flock)
+
+    def owner_transition():
+        fd = os.open(str(store / "s1.lock"), os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            real_flock(fd, fcntl.LOCK_EX)
+            owner_locked.set()
+            assert owner_may_write.wait(timeout=5)
+            record = read_record(store, "s1")
+            record["lifecycle"]["transport_state"] = "reaped"
+            lc._atomic_json_write(store / "s1.json", record)
+        except Exception as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+        finally:
+            real_flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
+    def provider_apply():
+        try:
+            lc.apply_event(store, "s1", ev("s1", lc.TRANSPORT_STARTED))
+        except Exception as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    owner = threading.Thread(target=owner_transition, name="owner-transition")
+    owner.start()
+    assert owner_locked.wait(timeout=5)
+    provider = threading.Thread(target=provider_apply, name="provider-apply")
+    provider.start()
+    assert apply_requested_lock.wait(timeout=5), "provider must join the already-held record lock"
+    owner_may_write.set()
+    owner.join(timeout=5)
+    provider.join(timeout=5)
+
+    assert not owner.is_alive() and not provider.is_alive(), "writers must not deadlock"
+    assert errors == []
+    record = read_record(store, "s1")
+    assert record["lifecycle"]["ownership_state"] == "held"
+    assert record["lifecycle"]["transport_state"] == "reaped"
+    assert record["lifecycle"]["provider"]["sequence"] == 1
+
+
+def test_nonblocking_apply_skips_owner_lock_without_waiting_or_writing(tmp_path):
+    store = tmp_path / "store"
+    make_spool_record(store, "s1", extra={"lifecycle": {"transport_state": "connected"}})
+    before = (store / "s1.json").read_bytes()
+    fd = os.open(str(store / "s1.lock"), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        with pytest.raises(lc.LifecycleBusy):
+            lc.apply_event(store, "s1", ev("s1", lc.TRANSPORT_STARTED), blocking=False)
+        assert (store / "s1.json").read_bytes() == before
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
 
 
 # --- crash atomicity --------------------------------------------------------

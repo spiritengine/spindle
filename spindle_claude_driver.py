@@ -37,7 +37,9 @@ transcripts 688e30c3/7de8960e):
 """
 
 import argparse
+import importlib.util
 import json
+import math
 import os
 import queue
 import re
@@ -46,6 +48,8 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import datetime, timezone
+from pathlib import Path
 
 DRIVER_PROTOCOL = "stream-driver-v1"
 SENTINEL_TYPE = "spindle_driver_terminal"
@@ -72,6 +76,417 @@ MONITOR_STARTED_RE = re.compile(r"\AMonitor started \(task ([A-Za-z0-9_-]+)")
 BACKGROUND_CMD_RE = re.compile(r"\ACommand running in background with ID:\s*([A-Za-z0-9_-]+)")
 
 WAKEUP_TASK_ID = "scheduled-wakeup"
+
+CLAUDE_USAGE_KEYS = (
+    "input_tokens",
+    "output_tokens",
+    "cache_creation_input_tokens",
+    "cache_read_input_tokens",
+)
+CLAUDE_ABORT_REASONS = {"aborted_streaming", "aborted_tools"}
+_LIFECYCLE_RUNTIME = None
+_LIFECYCLE_RUNTIME_LOCK = threading.Lock()
+_OWNER_ONLY_ENV_KEYS = (
+    "SPINDLE_OWNER_STORE",
+    "SPINDLE_OWNER_SPOOL_ID",
+    "SPINDLE_PROVIDER_CONTROL_FD",
+    "_SPINDLE_STORE_SUPERVISOR",
+)
+
+
+def _cap_utf8(value, limit=500):
+    """Return a valid UTF-8 string no larger than *limit* encoded bytes."""
+    if not isinstance(value, str):
+        return ""
+    encoded = value.encode("utf-8")
+    if len(encoded) <= limit:
+        return value
+    return encoded[:limit].decode("utf-8", errors="ignore")
+
+
+def _bounded_summary(parts):
+    return _cap_utf8("; ".join(part for part in parts if part), 500)
+
+
+def _number_text(value):
+    """Return a compact finite non-negative number, or None for unsafe input."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        return None
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    try:
+        rendered = str(value)
+    except (OverflowError, ValueError):
+        return None
+    return rendered if len(rendered) <= 100 else None
+
+
+def claude_conversation_summary(event):
+    """Build the bounded, non-prose summary persisted for Claude init."""
+    if not isinstance(event, dict):
+        return ""
+    parts = []
+    version = event.get("version")
+    if not isinstance(version, str) or not version:
+        version = event.get("claude_code_version")
+    if isinstance(version, str) and version:
+        parts.append(f"version={version}")
+    capabilities = event.get("capabilities")
+    if isinstance(capabilities, list):
+        clean = sorted({item for item in capabilities if isinstance(item, str) and item})
+        if clean:
+            parts.append(f"capabilities={','.join(clean)}")
+    return _bounded_summary(parts)
+
+
+def normalize_claude_terminal_kind(event):
+    """Conservatively normalize a Claude result without treating unknowns as success."""
+    if not isinstance(event, dict):
+        return "indeterminate"
+    if event.get("stop_reason") == "refusal":
+        return "refused"
+    terminal_reason = event.get("terminal_reason")
+    if terminal_reason in CLAUDE_ABORT_REASONS:
+        return "interrupted"
+    subtype = event.get("subtype")
+    if event.get("is_error") is True or (
+        isinstance(subtype, str)
+        and (
+            subtype.startswith("error")
+            or subtype in {"failed", "api_error", "max_turns", "max_budget_usd", "execution_error"}
+        )
+    ):
+        return "failed"
+    if subtype == "success" and event.get("is_error") is False and terminal_reason in (None, "completed"):
+        return "completed"
+    return "indeterminate"
+
+
+def claude_terminal_summary(event):
+    """Build the terminal scalar allowlist; never include model or tool prose."""
+    if not isinstance(event, dict):
+        return ""
+    parts = []
+    terminal_reason = event.get("terminal_reason")
+    if isinstance(terminal_reason, str) and terminal_reason:
+        parts.append(f"terminal_reason={terminal_reason}")
+    denials = event.get("permission_denials")
+    if isinstance(denials, list):
+        parts.append(f"permission_denials={len(denials)}")
+    cost = event.get("total_cost_usd")
+    cost_text = _number_text(cost)
+    if cost_text is not None:
+        parts.append(f"total_cost_usd={cost_text}")
+    usage = event.get("usage")
+    if isinstance(usage, dict):
+        for key in CLAUDE_USAGE_KEYS:
+            value = usage.get(key)
+            value_text = _number_text(value)
+            if value_text is not None:
+                parts.append(f"{key}={value_text}")
+    return _bounded_summary(parts)
+
+
+def _load_lifecycle_runtime():
+    """Load the reducer by file path without importing the Spindle server."""
+    global _LIFECYCLE_RUNTIME
+    if _LIFECYCLE_RUNTIME is not None:
+        return _LIFECYCLE_RUNTIME
+    guard = "_SPINDLE_STORE_SUPERVISOR"
+    with _LIFECYCLE_RUNTIME_LOCK:
+        if _LIFECYCLE_RUNTIME is not None:
+            return _LIFECYCLE_RUNTIME
+        previous = os.environ.get(guard)
+        os.environ[guard] = "1"
+        module_name = "_spindle_standalone_lifecycle"
+        lifecycle_path = Path(__file__).resolve().parent / "spindle" / "lifecycle.py"
+        try:
+            spec = importlib.util.spec_from_file_location(module_name, lifecycle_path)
+            if spec is None or spec.loader is None:
+                raise ImportError(f"cannot load lifecycle runtime from {lifecycle_path}")
+            lifecycle = importlib.util.module_from_spec(spec)
+            sys.modules[module_name] = lifecycle
+            try:
+                spec.loader.exec_module(lifecycle)
+            except Exception:
+                if sys.modules.get(module_name) is lifecycle:
+                    sys.modules.pop(module_name, None)
+                raise
+            _LIFECYCLE_RUNTIME = lifecycle
+        finally:
+            if previous is None:
+                os.environ.pop(guard, None)
+            else:
+                os.environ[guard] = previous
+        return _LIFECYCLE_RUNTIME
+
+
+def _utc_observed_at():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _claude_child_env():
+    """Prevent Claude, its tools, and nested drivers from addressing this spool."""
+    child_env = os.environ.copy()
+    for key in _OWNER_ONLY_ENV_KEYS:
+        child_env.pop(key, None)
+    return child_env
+
+
+class ClaudeLifecycleTelemetry:
+    """Best-effort Claude-event adapter for the provider lifecycle reducer.
+
+    The owner and this emitter both serialize each short record transition with
+    ``<id>.lock``. The emitter never calls ``apply_event`` while holding that
+    lock itself, so there is no recursive acquisition or lock-order inversion.
+    """
+
+    def __init__(self):
+        self.enabled = False
+        self._runtime = None
+        self._store = None
+        self._spool_id = None
+        self._coalescer = None
+        self._last_activity_at = None
+        self._active_tasks = set()
+        self._approval_requests = set()
+        self._result_candidate = None
+        self._terminal_requested = False
+        store = os.environ.get("SPINDLE_OWNER_STORE")
+        spool_id = os.environ.get("SPINDLE_OWNER_SPOOL_ID")
+        if not store or not spool_id:
+            return
+        try:
+            self._runtime = _load_lifecycle_runtime()
+            self._store = Path(store)
+            self._spool_id = spool_id
+            self._coalescer = self._runtime.ActivityCoalescer(spool_id)
+            self.enabled = True
+        except Exception as exc:
+            self._disable(exc)
+
+    def _disable(self, exc):
+        print(f"spindle_claude_driver: lifecycle telemetry disabled: {exc}", file=sys.stderr)
+        self.enabled = False
+
+    def _apply(self, event):
+        if not self.enabled:
+            return False
+        try:
+            self._runtime.apply_event(self._store, self._spool_id, event, blocking=False)
+            return True
+        except self._runtime.LifecycleBusy:
+            return False
+        except Exception as exc:
+            self._disable(exc)
+            return False
+
+    def _event(self, kind, **kwargs):
+        kwargs.setdefault("observed_at", _utc_observed_at())
+        return self._runtime.LifecycleEvent(spool_id=self._spool_id, kind=kind, **kwargs)
+
+    def _flush_activity(self):
+        if self.enabled:
+            pending = self._coalescer.flush(observed_at=self._last_activity_at)
+            if pending is not None:
+                self._last_activity_at = None
+                self._apply(pending)
+
+    def _emit(self, kind, **kwargs):
+        if not self.enabled:
+            return False
+        self._flush_activity()
+        if self.enabled:
+            try:
+                event = self._event(kind, **kwargs)
+            except Exception as exc:
+                self._disable(exc)
+                return False
+            return self._apply(event)
+        return False
+
+    def activity(self, summary=None):
+        if not self.enabled:
+            return
+        observed_at = _utc_observed_at()
+        self._last_activity_at = observed_at
+        event = self._coalescer.observe(summary=summary, observed_at=observed_at)
+        if event is not None:
+            self._last_activity_at = None
+            self._apply(event)
+
+    def transport_started(self):
+        if self.enabled:
+            self._emit(self._runtime.TRANSPORT_STARTED, provider_event="claude.spawned")
+
+    def transport_lost(self, message=None):
+        if self.enabled:
+            error = {"type": "ClaudeTransportError", "message": message} if isinstance(message, str) else None
+            self._emit(self._runtime.TRANSPORT_LOST, provider_event="claude.stdout_lost", error=error)
+
+    def transport_exited(self, exit_code):
+        if self.enabled:
+            self._try_terminal()
+            raw = str(exit_code) if isinstance(exit_code, int) and not isinstance(exit_code, bool) else None
+            self._emit(self._runtime.TRANSPORT_EXITED, provider_event="claude.exited", raw_status=raw)
+            self._try_terminal()
+
+    def turn_started(self):
+        if self.enabled:
+            self._emit(self._runtime.TURN_STARTED, provider_event="user.dispatched")
+
+    def _work_summary(self):
+        count = len(self._active_tasks)
+        if count == 1:
+            return "1 Claude task active"
+        if count > 1:
+            return f"{count} Claude tasks active"
+        return None
+
+    def _observe_task(self, event, subtype):
+        task_id = event.get("task_id")
+        if not isinstance(task_id, str) or not task_id:
+            self.activity()
+            return
+        self.activity()
+        if subtype == "task_started":
+            self._active_tasks.add(task_id)
+            self._emit(
+                self._runtime.WORK_STARTED,
+                provider_event="system.task_started",
+                summary=self._work_summary(),
+            )
+            return
+        if subtype == "task_progress":
+            self._emit(
+                self._runtime.WORK_UPDATED,
+                provider_event="system.task_progress",
+                summary=self._work_summary(),
+            )
+            return
+        if subtype == "task_updated":
+            patch = event.get("patch")
+            status = patch.get("status") if isinstance(patch, dict) else None
+        else:
+            status = event.get("status")
+        if not isinstance(status, str) or status not in TERMINAL_TASK_STATUSES | {
+            "pending",
+            "running",
+            "paused",
+        }:
+            return
+        if status in TERMINAL_TASK_STATUSES:
+            self._active_tasks.discard(task_id)
+            kind = self._runtime.WORK_UPDATED if self._active_tasks else self._runtime.WORK_FINISHED
+        else:
+            already_active = task_id in self._active_tasks
+            self._active_tasks.add(task_id)
+            kind = self._runtime.WORK_UPDATED if already_active or status == "paused" else self._runtime.WORK_STARTED
+        self._emit(
+            kind,
+            provider_event=f"system.{subtype}",
+            raw_status=status if isinstance(status, str) else None,
+            summary=self._work_summary(),
+        )
+
+    def _remember_result(self, event):
+        ids = {}
+        session_id = event.get("session_id")
+        if isinstance(session_id, str):
+            ids["session_id"] = session_id
+        errors = event.get("errors")
+        error = None
+        if isinstance(errors, list):
+            first = next((item for item in errors if isinstance(item, str) and item), None)
+            if first:
+                error = {"type": "ClaudeResultError", "message": first}
+        api_error_status = event.get("api_error_status")
+        if error is None and isinstance(api_error_status, (str, int)) and not isinstance(api_error_status, bool):
+            error = {"type": "ClaudeResultError", "code": api_error_status}
+        subtype = event.get("subtype")
+        self._result_candidate = {
+            "provider_event": f"result.{subtype}" if isinstance(subtype, str) else "result",
+            "provider_ids": ids,
+            "terminal_kind": normalize_claude_terminal_kind(event),
+            "raw_status": subtype if isinstance(subtype, str) else None,
+            "stop_reason": event.get("stop_reason") if isinstance(event.get("stop_reason"), str) else None,
+            "error": error,
+            "summary": claude_terminal_summary(event),
+        }
+
+    def observe(self, event):
+        if not self.enabled or not isinstance(event, dict):
+            return
+        try:
+            self._observe(event)
+        except Exception as exc:
+            self._disable(exc)
+
+    def _observe(self, event):
+        etype = event.get("type")
+        subtype = event.get("subtype")
+        if etype == "system" and subtype == "init":
+            ids = {}
+            if isinstance(event.get("session_id"), str):
+                ids["session_id"] = event["session_id"]
+            self._emit(self._runtime.PROTOCOL_CONNECTED, provider_event="system.init", provider_ids=ids)
+            self._emit(
+                self._runtime.CONVERSATION_ACCEPTED,
+                provider_event="system.init",
+                provider_ids=ids,
+                summary=claude_conversation_summary(event),
+            )
+        elif etype == "system" and subtype in {
+            "task_started",
+            "task_progress",
+            "task_updated",
+            "task_notification",
+        }:
+            self._observe_task(event, subtype)
+        elif etype == "control_request":
+            request = event.get("request")
+            request_id = event.get("request_id")
+            if (
+                isinstance(request, dict)
+                and request.get("subtype") == "can_use_tool"
+                and isinstance(request_id, str)
+                and request_id
+            ):
+                self._approval_requests.add(request_id)
+                self._emit(self._runtime.APPROVAL_REQUESTED, provider_event="control_request.can_use_tool")
+        elif etype == "control_response":
+            response = event.get("response")
+            request_id = response.get("request_id") if isinstance(response, dict) else None
+            if isinstance(request_id, str) and request_id in self._approval_requests:
+                self._approval_requests.discard(request_id)
+                if self._approval_requests:
+                    self.activity()
+                else:
+                    self._emit(self._runtime.APPROVAL_RESOLVED, provider_event="control_response")
+        elif etype == "result":
+            self._remember_result(event)
+        elif etype in {"assistant", "user", "rate_limit_event", "stream_event"} or (
+            etype == "system" and isinstance(subtype, str) and subtype.startswith("hook_")
+        ):
+            self.activity()
+        else:
+            self.activity()
+
+    def finalize_result(self, sentinel_subtype):
+        if not self.enabled:
+            return
+        if self._result_candidate is not None and sentinel_subtype in {"complete", "parked"}:
+            self._terminal_requested = True
+            self._try_terminal()
+
+    def _try_terminal(self):
+        if not self.enabled or not self._terminal_requested or self._result_candidate is None:
+            return False
+        if self._emit(self._runtime.TURN_TERMINAL, **self._result_candidate):
+            self._result_candidate = None
+            self._terminal_requested = False
+            return True
+        return False
 
 
 def iter_user_texts(event):
@@ -322,10 +737,18 @@ def _emit(obj):
     sys.stdout.flush()
 
 
+class _ReaderFailure:
+    def __init__(self, error):
+        self.error = error
+
+
 def _reader(stream, out_queue):
     try:
         for line in stream:
             out_queue.put(line)
+    except OSError as exc:
+        print(f"spindle_claude_driver: claude stdout read failed: {exc}", file=sys.stderr)
+        out_queue.put(_ReaderFailure(exc))
     finally:
         out_queue.put(None)
 
@@ -424,6 +847,7 @@ def main(argv=None):
             print(f"spindle_claude_driver: cannot read --prompt-file: {exc}", file=sys.stderr)
             return 2
 
+    telemetry = ClaudeLifecycleTelemetry()
     proc = subprocess.Popen(
         claude_cmd,
         stdin=subprocess.PIPE,
@@ -431,7 +855,9 @@ def main(argv=None):
         stderr=None,  # inherit: claude's stderr lands in the spool's stderr capture
         text=True,
         bufsize=1,
+        env=_claude_child_env(),
     )
+    telemetry.transport_started()
 
     def _handle_term(signum, frame):
         proc.terminate()
@@ -442,6 +868,7 @@ def main(argv=None):
     try:
         proc.stdin.write(json.dumps({"type": "user", "message": {"role": "user", "content": prompt}}) + "\n")
         proc.stdin.flush()
+        telemetry.turn_started()
     except (BrokenPipeError, OSError):
         pass  # claude died at startup; the read loop below drains and reports
 
@@ -460,6 +887,13 @@ def main(argv=None):
     user_after_result = False  # a delivered notification suggests a requery is coming
     grace_started = None  # entered the idle-clean phase at this time
 
+    def _publish_sentinel(sentinel):
+        # Public completion evidence must reach stdout before any best-effort
+        # telemetry store I/O. A busy terminal candidate is retained and retried
+        # through transport exit, but can never delay the existing sentinel.
+        _emit(sentinel)
+        telemetry.finalize_result(sentinel.get("subtype"))
+
     def _linger_terminal():
         """Terminal sentinel once the idle grace is exhausted.
 
@@ -470,7 +904,7 @@ def main(argv=None):
         returns through this exit.
         """
         if tracker.stale_resolved:
-            _emit(
+            _publish_sentinel(
                 build_sentinel(
                     "parked",
                     [],
@@ -479,8 +913,10 @@ def main(argv=None):
                 )
             )
         else:
-            _emit(build_sentinel("complete", []))
-        return _finish(proc) or 0
+            _publish_sentinel(build_sentinel("complete", []))
+        exit_code = _finish(proc)
+        telemetry.transport_exited(exit_code)
+        return exit_code or 0
 
     while True:
         # Idle-deadline checks run every iteration — with or without events —
@@ -491,14 +927,16 @@ def main(argv=None):
             unresolved = tracker.unresolved
             if unresolved:
                 if now > _park_deadline(unresolved, args.default_task_timeout_seconds, args.park_grace_seconds):
-                    _emit(
+                    _publish_sentinel(
                         build_sentinel(
                             "parked",
                             unresolved,
                             reason="no task notification arrived before the task timeout deadline",
                         )
                     )
-                    return _finish(proc) or 0
+                    exit_code = _finish(proc)
+                    telemetry.transport_exited(exit_code)
+                    return exit_code or 0
             elif grace_started is not None:
                 idle_grace = args.requery_start_window_seconds if user_after_result else args.complete_grace_seconds
                 if now - grace_started >= idle_grace:
@@ -509,12 +947,16 @@ def main(argv=None):
         except queue.Empty:
             continue
 
+        if isinstance(line, _ReaderFailure):
+            telemetry.transport_lost(str(line.error))
+            continue
+
         if line is None:
             # claude exited on its own; report what the stream established.
             exit_code = proc.wait()
             unresolved = tracker.unresolved
             if unresolved:
-                _emit(
+                _publish_sentinel(
                     build_sentinel(
                         "parked",
                         unresolved,
@@ -523,7 +965,7 @@ def main(argv=None):
                     )
                 )
             elif tracker.saw_result and tracker.stale_resolved:
-                _emit(
+                _publish_sentinel(
                     build_sentinel(
                         "parked",
                         [],
@@ -533,9 +975,9 @@ def main(argv=None):
                     )
                 )
             elif tracker.saw_result:
-                _emit(build_sentinel("complete", [], claude_exit_code=exit_code))
+                _publish_sentinel(build_sentinel("complete", [], claude_exit_code=exit_code))
             else:
-                _emit(
+                _publish_sentinel(
                     build_sentinel(
                         "no_result",
                         [],
@@ -543,6 +985,7 @@ def main(argv=None):
                         reason="claude exited without emitting a result event",
                     )
                 )
+            telemetry.transport_exited(exit_code)
             return exit_code
 
         sys.stdout.write(line if line.endswith("\n") else line + "\n")
@@ -556,6 +999,7 @@ def main(argv=None):
             continue
 
         tracker.observe(event)
+        telemetry.observe(event)
 
         etype = event.get("type")
         if etype == "result":
@@ -564,8 +1008,10 @@ def main(argv=None):
             if not tracker.unresolved and not tracker.ever_armed:
                 # No background tasks ever existed, so no notification can be
                 # queued — finish immediately (the common fast path).
-                _emit(build_sentinel("complete", []))
-                return _finish(proc) or 0
+                _publish_sentinel(build_sentinel("complete", []))
+                exit_code = _finish(proc)
+                telemetry.transport_exited(exit_code)
+                return exit_code or 0
         elif etype == "assistant" or (etype == "system" and event.get("subtype") == "init"):
             # Inference is in progress; all idle timers are off until its
             # result arrives.

@@ -46,13 +46,12 @@ import fcntl
 import json
 import os
 import re
+import tempfile
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
 from typing import Generator, Mapping, Optional
-
-from spindle.namespace_owner import _atomic_json_write
 
 # --- event kinds ------------------------------------------------------------
 
@@ -164,6 +163,10 @@ class SpoolNotFound(LifecycleError):
 
 class LifecycleCorruption(LifecycleError):
     """The on-disk spool record exists but is not a parseable JSON object."""
+
+
+class LifecycleBusy(LifecycleError):
+    """The record lock is currently held and a nonblocking apply was requested."""
 
 
 # --- sanitizing helpers -----------------------------------------------------
@@ -286,6 +289,8 @@ def initial_state() -> dict:
         "stop_reason": None,
         "provider_error": None,
         "provider_ids": {},
+        "conversation_summary": None,
+        "terminal_summary": None,
         "last_event_type": None,
         "last_activity_at": None,
         "activity_count": 0,
@@ -330,6 +335,10 @@ def _append_evidence(state: dict, event: "LifecycleEvent", reason: str) -> None:
 def reduce(state: Optional[dict], event: "LifecycleEvent") -> dict:
     """Fold *event* into *state*, returning a new state (input untouched)."""
     state = copy.deepcopy(state) if state is not None else initial_state()
+    # Additive schema evolution: old provider snapshots acquire the new
+    # summaries only when another lifecycle event is applied.
+    state.setdefault("conversation_summary", None)
+    state.setdefault("terminal_summary", None)
     state["sequence"] += 1
 
     kind = event.kind
@@ -390,6 +399,8 @@ def reduce(state: Optional[dict], event: "LifecycleEvent") -> dict:
     elif kind == TRANSPORT_EXITED:
         state["connection_state"] = CONNECTION_EXITED
     elif kind == CONVERSATION_ACCEPTED:
+        if not terminal and state["conversation_summary"] is None:
+            state["conversation_summary"] = event.summary
         if state["protocol_state"] == PROTOCOL_STARTING:
             state["protocol_state"] = PROTOCOL_ACCEPTED
     elif kind == TURN_STARTED:
@@ -436,6 +447,7 @@ def reduce(state: Optional[dict], event: "LifecycleEvent") -> dict:
             # Defensive plain-dict copy: never alias the event's (read-only)
             # error mapping into persisted state.
             state["provider_error"] = dict(event.error) if event.error is not None else None
+            state["terminal_summary"] = event.summary
             state["active_work"] = None
             state["protocol_state"] = PROTOCOL_TERMINAL
         else:
@@ -448,6 +460,34 @@ def reduce(state: Optional[dict], event: "LifecycleEvent") -> dict:
 # --- durable store ----------------------------------------------------------
 
 
+def _atomic_json_write(path: Path, value: dict) -> None:
+    """Crash-atomically replace *path* without importing the server package.
+
+    This intentionally matches ``namespace_owner._atomic_json_write``. Keeping
+    the primitive local lets the standalone Claude driver load this file by
+    path without executing ``spindle.__init__`` and its server dependencies.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w") as stream:
+            json.dump(value, stream, sort_keys=True, separators=(",", ":"))
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
 def _spool_path(store_root: Path, spool_id: str) -> Path:
     return store_root / f"{spool_id}.json"
 
@@ -457,7 +497,7 @@ def _lock_path(store_root: Path, spool_id: str) -> Path:
 
 
 @contextmanager
-def _record_lock(store_root: Path, spool_id: str) -> Generator[None, None, None]:
+def _record_lock(store_root: Path, spool_id: str, *, blocking: bool = True) -> Generator[None, None, None]:
     """Hold the per-spool record lock (``<id>.lock``).
 
     This is the exact pathname and advisory-lock mechanism used by
@@ -468,12 +508,19 @@ def _record_lock(store_root: Path, spool_id: str) -> Generator[None, None, None]
     lock_path = _lock_path(store_root, spool_id)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+    acquired = False
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        operation = fcntl.LOCK_EX if blocking else fcntl.LOCK_EX | fcntl.LOCK_NB
+        try:
+            fcntl.flock(fd, operation)
+        except BlockingIOError as exc:
+            raise LifecycleBusy(f"spool record lock {_lock_path(store_root, spool_id)} is busy") from exc
+        acquired = True
         yield
     finally:
         try:
-            fcntl.flock(fd, fcntl.LOCK_UN)
+            if acquired:
+                fcntl.flock(fd, fcntl.LOCK_UN)
         finally:
             os.close(fd)
 
@@ -492,7 +539,7 @@ def _read_record_strict(spool_path: Path) -> dict:
     return data
 
 
-def apply_event(store_root, spool_id: str, event: "LifecycleEvent") -> dict:
+def apply_event(store_root, spool_id: str, event: "LifecycleEvent", *, blocking: bool = True) -> dict:
     """Durably fold *event* into the spool's reduced provider-lifecycle block.
 
     Under the per-spool record lock: read the record (which must already exist and
@@ -500,12 +547,19 @@ def apply_event(store_root, spool_id: str, event: "LifecycleEvent") -> dict:
     rewrite the record (temp -> fsync -> atomic replace -> directory fsync). The
     owner's flat ``lifecycle`` keys and every other record field are preserved.
 
+    ``blocking=False`` is the driver telemetry path: if an owner transition
+    already holds the record lock, raise :class:`LifecycleBusy` immediately so
+    observational telemetry can be dropped without delaying provider I/O or a
+    terminal sentinel. The default remains blocking for store primitives.
+
     Returns the new ``provider`` sub-state. Raises :class:`SpoolNotFound` if the
     record is absent and :class:`LifecycleCorruption` if it exists but is not a
     JSON object -- never silently reinitializes over a corrupt record.
     """
     if not isinstance(event, LifecycleEvent):
         raise TypeError("event must be a LifecycleEvent")
+    if not isinstance(blocking, bool):
+        raise TypeError("blocking must be a bool")
     _validate_spool_id(spool_id)
     if event.spool_id != spool_id:
         raise ValueError("event.spool_id does not match the target spool_id")
@@ -516,7 +570,12 @@ def apply_event(store_root, spool_id: str, event: "LifecycleEvent") -> dict:
     # lock or write, so a malformed id can never touch a sibling record.
     if spool_path.parent.resolve() != root.resolve():
         raise ValueError(f"spool_id escapes the store root: {spool_id!r}")
-    with _record_lock(root, spool_id):
+    # Fail before _record_lock can create a directory/sidecar for an absent
+    # spool. Public records already have the sidecar; direct primitive records
+    # retain the established create-on-first-apply behavior.
+    if not spool_path.is_file():
+        raise SpoolNotFound(f"spool record {spool_path} does not exist")
+    with _record_lock(root, spool_id, blocking=blocking):
         record = _read_record_strict(spool_path)
         lifecycle = dict(record.get("lifecycle") or {})
         new_provider = reduce(lifecycle.get("provider"), event)

@@ -5117,21 +5117,48 @@ def _budget_result(text: str, spool_id: str) -> str:
     return truncated
 
 
+def _provider_lifecycle_detail(spool: dict) -> str:
+    """Render bounded observational provider state without deriving public status."""
+    lifecycle = spool.get("lifecycle")
+    provider = lifecycle.get("provider") if isinstance(lifecycle, dict) else None
+    if not isinstance(provider, dict):
+        return ""
+
+    def _value(key: str) -> str:
+        value = provider.get(key)
+        if value is None or isinstance(value, (dict, list)):
+            return "-"
+        return " ".join(str(value).split())[:160] or "-"
+
+    parts = [
+        f"protocol={_value('protocol_state')}",
+        f"connection={_value('connection_state')}",
+        f"last_event={_value('last_event_type')}",
+        f"last_activity={_value('last_activity_at')}",
+    ]
+    if provider.get("active_work") is not None:
+        parts.append(f"active_work={_value('active_work')}")
+    return "[provider lifecycle: " + " ".join(parts) + "]"
+
+
 def _running_spool_message(spool: dict) -> str:
     spool_id = str(spool.get("id", "unknown"))
+    detail = _provider_lifecycle_detail(spool)
+    suffix = f"\n{detail}" if detail else ""
     abandoned_reason = _serialized_abandoned_custody_reason(spool_id)
     if abandoned_reason:
         return (
             f"Spool {spool['id']} still running; ownership is unrecoverable "
             f"({abandoned_reason}). Manual recovery is required before settlement."
-        )
+        ) + suffix
     reconciliation = _reconcile_spool_ownership(spool)
     if reconciliation.state in {"unverifiable", "store_unhealthy"}:
         return (
             f"Spool {spool['id']} still running; ownership is {reconciliation.state} "
             f"({reconciliation.reason}). Manual recovery is required before settlement."
-        )
-    return f"Spool {spool['id']} still running: {spool.get('prompt', '')[:50]}..."
+        ) + suffix
+    message = f"Spool {spool['id']} still running: {spool.get('prompt', '')[:50]}..."
+    return message + suffix
 
 
 def _unspool_sync(spool_id: str) -> str:
@@ -5294,20 +5321,27 @@ def _spool_peek_sync(spool_id: str, lines: int = 50) -> str:
 
     stdout_path = _get_output_path(spool_id)
     if not stdout_path.exists():
-        return f"No output yet for spool {spool_id}"
+        message = f"No output yet for spool {spool_id}"
+        detail = _provider_lifecycle_detail(spool)
+        return message + (f"\n{detail}" if detail else "")
 
     try:
         with open(stdout_path, "r") as f:
             all_lines = f.readlines()
 
         if not all_lines:
-            return f"Output file exists but is empty for spool {spool_id}"
+            message = f"Output file exists but is empty for spool {spool_id}"
+            detail = _provider_lifecycle_detail(spool)
+            return message + (f"\n{detail}" if detail else "")
 
         # Get last N lines
         tail = all_lines[-lines:] if len(all_lines) > lines else all_lines
         status = spool.get("status", "unknown")
 
         header = f"[spool {spool_id} - {status} - {len(all_lines)} total lines, showing last {len(tail)}]\n"
+        detail = _provider_lifecycle_detail(spool)
+        if detail:
+            header += detail + "\n"
         return header + "".join(tail)
     except Exception as e:
         return f"Error reading output: {e}"
@@ -6378,8 +6412,11 @@ async def spool_peek(spool_id: str, lines: int = 50) -> str:
     if not stdout_path.exists():
         fallback = _bg_task_summary()
         if fallback:
-            return fallback
-        return f"No output yet for spool {spool_id}"
+            detail = _provider_lifecycle_detail(spool)
+            return fallback + (f"\n{detail}" if detail else "")
+        message = f"No output yet for spool {spool_id}"
+        detail = _provider_lifecycle_detail(spool)
+        return message + (f"\n{detail}" if detail else "")
 
     try:
         with open(stdout_path, "r") as f:
@@ -6388,14 +6425,20 @@ async def spool_peek(spool_id: str, lines: int = 50) -> str:
         if not all_lines:
             fallback = _bg_task_summary()
             if fallback:
-                return fallback
-            return f"Output file exists but is empty for spool {spool_id}"
+                detail = _provider_lifecycle_detail(spool)
+                return fallback + (f"\n{detail}" if detail else "")
+            message = f"Output file exists but is empty for spool {spool_id}"
+            detail = _provider_lifecycle_detail(spool)
+            return message + (f"\n{detail}" if detail else "")
 
         # Get last N lines
         tail = all_lines[-lines:] if len(all_lines) > lines else all_lines
         status = spool.get("status", "unknown")
 
         header = f"[spool {spool_id} - {status} - {len(all_lines)} total lines, showing last {len(tail)}]\n"
+        detail = _provider_lifecycle_detail(spool)
+        if detail:
+            header += detail + "\n"
         return header + "".join(tail)
     except Exception as e:
         return f"Error reading output: {e}"

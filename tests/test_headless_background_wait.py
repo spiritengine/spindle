@@ -10,7 +10,9 @@ Event fixtures mirror the real shapes captured from the 2026-07-24 incident
 (spools 688e30c3/7de8960e, Claude Code 2.1.219).
 """
 
+import fcntl
 import json
+import os
 import subprocess
 import sys
 import textwrap
@@ -1173,7 +1175,7 @@ def write_fake_claude(tmp_path, mode, timeout_ms=600000):
     return script
 
 
-def run_driver(tmp_path, mode, timeout_ms=600000, extra_args=()):
+def run_driver(tmp_path, mode, timeout_ms=600000, extra_args=(), env=None):
     fake = write_fake_claude(tmp_path, mode, timeout_ms)
     cmd = [
         sys.executable,
@@ -1189,12 +1191,89 @@ def run_driver(tmp_path, mode, timeout_ms=600000, extra_args=()):
         sys.executable,
         str(fake),
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    if env is None:
+        env = os.environ.copy()
+        # The test runner itself may be a Spindle-owned provider. A nested fake
+        # Claude driver must not mistake the parent test spool for its own.
+        env.pop("SPINDLE_OWNER_STORE", None)
+        env.pop("SPINDLE_OWNER_SPOOL_ID", None)
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30, env=env)
     events = driver.parse_ndjson_events(proc.stdout)
     return proc, events
 
 
 class TestDriverEndToEnd:
+    @pytest.mark.parametrize(
+        ("mode", "sentinel_subtype"),
+        [("notify", "complete"), ("notify_system", "complete"), ("exit", "parked")],
+    )
+    def test_optional_telemetry_preserves_driver_outcome(self, tmp_path, mode, sentinel_subtype):
+        spool_id = f"telemetry-{mode}"
+        store = tmp_path / "telemetry-store"
+        store.mkdir()
+        (store / f"{spool_id}.json").write_text(
+            json.dumps({"id": spool_id, "status": "running", "prompt": "unchanged"}, indent=2)
+        )
+        env = {
+            **os.environ,
+            "SPINDLE_HOME": str(tmp_path / "isolated-home"),
+            "SPINDLE_OWNER_STORE": str(store),
+            "SPINDLE_OWNER_SPOOL_ID": spool_id,
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
+        proc, events = run_driver(tmp_path, mode, env=env)
+        assert proc.returncode == 0, proc.stderr
+        assert driver.find_sentinel(events)["subtype"] == sentinel_subtype
+        record = json.loads((store / f"{spool_id}.json").read_text())
+        assert record["status"] == "running"
+        assert "normalized_terminal_kind" not in record
+        provider = record["lifecycle"]["provider"]
+        assert provider["protocol_terminal_kind"] == "completed"
+        assert provider["connection_state"] == "exited"
+
+    def test_telemetry_store_failure_is_nonfatal_to_driver_outcome(self, tmp_path):
+        env = {
+            **os.environ,
+            "SPINDLE_HOME": str(tmp_path / "isolated-home"),
+            "SPINDLE_OWNER_STORE": str(tmp_path / "missing-store"),
+            "SPINDLE_OWNER_SPOOL_ID": "missing-spool",
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
+        proc, events = run_driver(tmp_path, "notify", env=env)
+        assert proc.returncode == 0
+        assert driver.find_sentinel(events)["subtype"] == "complete"
+        assert [event for event in events if event.get("type") == "result"][-1]["result"] == (
+            "Final answer after wakeup."
+        )
+        assert "lifecycle telemetry disabled" in proc.stderr
+
+    def test_busy_owner_lock_cannot_delay_public_sentinel(self, tmp_path):
+        spool_id = "telemetry-busy-owner"
+        store = tmp_path / "telemetry-store"
+        store.mkdir()
+        (store / f"{spool_id}.json").write_text(
+            json.dumps({"id": spool_id, "status": "running", "prompt": "unchanged"}, indent=2)
+        )
+        env = {
+            **os.environ,
+            "SPINDLE_HOME": str(tmp_path / "isolated-home"),
+            "SPINDLE_OWNER_STORE": str(store),
+            "SPINDLE_OWNER_SPOOL_ID": spool_id,
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
+        fd = os.open(str(store / f"{spool_id}.lock"), os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            proc, events = run_driver(tmp_path, "notify", env=env)
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
+        assert proc.returncode == 0, proc.stderr
+        assert driver.find_sentinel(events)["subtype"] == "complete"
+        record = json.loads((store / f"{spool_id}.json").read_text())
+        assert record == {"id": spool_id, "status": "running", "prompt": "unchanged"}
+
     def test_driver_survives_intermediate_result_and_completes_on_notification(self, tmp_path):
         proc, events = run_driver(tmp_path, "notify")
         assert proc.returncode == 0, proc.stderr

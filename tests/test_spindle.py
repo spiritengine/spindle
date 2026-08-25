@@ -9820,6 +9820,27 @@ class TestCCBgTasks:
         assert data["_bg_tasks"][0]["subject"] == "wait loop"
         assert data["_bg_tasks_incomplete"] == 1
 
+    async def test_spool_info_preserves_complete_provider_lifecycle_block(self, tmp_path):
+        provider = {
+            "sequence": 7,
+            "protocol_state": "active",
+            "connection_state": "connected",
+            "last_event_type": "work.updated",
+            "active_work": "2 Claude tasks active",
+            "conversation_summary": "version=2.1.241",
+        }
+        spool_data = {
+            "id": "info-provider",
+            "status": "running",
+            "harness": "claude-code",
+            "prompt": "test",
+            "lifecycle": {"ownership_state": "held", "provider": provider},
+        }
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool("info-provider", spool_data)
+            result = await spool_info.fn("info-provider")
+        assert json.loads(result)["lifecycle"]["provider"] == provider
+
     async def test_spool_info_no_bg_tasks_key_when_none(self, tmp_path):
         """spool_info does not include _bg_tasks when there are none."""
         tasks_dir = tmp_path / "tasks"
@@ -9915,6 +9936,95 @@ class TestCCBgTasks:
 
         assert "normal agent output line" in result
         assert "background tasks" not in result
+
+    async def test_spool_peek_adds_bounded_provider_detail_without_changing_status(self, tmp_path):
+        spool_data = {
+            "id": "peek-provider",
+            "status": "running",
+            "harness": "claude-code",
+            "prompt": "test",
+            "lifecycle": {
+                "provider": {
+                    "protocol_state": "active",
+                    "connection_state": "connected",
+                    "last_event_type": "work.updated",
+                    "last_activity_at": "2026-08-24T14:00:00Z",
+                    "active_work": "working\n" + "x" * 1000,
+                }
+            },
+        }
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool("peek-provider", spool_data)
+            _get_output_path("peek-provider").write_text("normal agent output line\n")
+            result = await spool_peek.fn("peek-provider")
+        assert "[spool peek-provider - running -" in result
+        assert "protocol=active connection=connected" in result
+        assert "last_event=work.updated" in result
+        assert "active_work=working " in result
+        assert len(result.splitlines()[1]) < 400
+
+    @pytest.mark.parametrize(
+        ("stdout_state", "expected_message"),
+        [("missing", "No output yet"), ("empty", "Output file exists but is empty")],
+    )
+    def test_cli_peek_includes_provider_detail_before_stdout_exists(self, tmp_path, stdout_state, expected_message):
+        spool_data = {
+            "id": f"cli-peek-{stdout_state}",
+            "status": "running",
+            "harness": "claude-code",
+            "prompt": "test",
+            "lifecycle": {
+                "provider": {
+                    "protocol_state": "waiting",
+                    "connection_state": "connected",
+                    "last_event_type": "approval.requested",
+                    "last_activity_at": "2026-08-24T14:00:00Z",
+                }
+            },
+        }
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool(spool_data["id"], spool_data)
+            if stdout_state == "empty":
+                _get_output_path(spool_data["id"]).write_text("")
+            result = spindle._spool_peek_sync(spool_data["id"])
+
+        assert expected_message in result
+        assert "protocol=waiting connection=connected" in result
+        assert "last_event=approval.requested" in result
+
+    def test_running_unspool_adds_provider_detail_but_terminal_reads_are_unchanged(self):
+        provider = {
+            "protocol_state": "waiting",
+            "connection_state": "connected",
+            "last_event_type": "approval.requested",
+            "last_activity_at": None,
+            "active_work": "1 Claude task active",
+        }
+        running = {
+            "id": "run-provider",
+            "status": "running",
+            "harness": "claude-code",
+            "prompt": "test prompt",
+            "lifecycle": {"provider": provider},
+        }
+        complete = {**running, "status": "complete", "result": "exact result payload"}
+        failed = {**running, "status": "error", "error": "exact public failure"}
+        reconciliation = MagicMock(state="active", reason="owned")
+        with (
+            patch("spindle._check_and_finalize_spool"),
+            patch("spindle._reconcile_spool_ownership", return_value=reconciliation),
+        ):
+            with patch("spindle._read_spool", return_value=running):
+                rendered = _unspool_sync("run-provider")
+            with patch("spindle._read_spool", return_value=complete):
+                assert _unspool_sync("run-provider") == "exact result payload"
+            with patch("spindle._read_spool", return_value=failed):
+                failure = _unspool_sync("run-provider")
+        assert rendered.startswith("Spool run-provider still running: test prompt...")
+        assert "protocol=waiting connection=connected" in rendered
+        assert "still running" not in failure
+        assert "exact public failure" in failure
+        assert "provider lifecycle" not in failure
 
 
 class TestRespinHandleResolution:

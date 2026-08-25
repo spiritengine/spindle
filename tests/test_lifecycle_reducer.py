@@ -63,6 +63,19 @@ def test_approval_waiting_then_resolve_returns_to_active():
     assert state["protocol_state"] == lc.PROTOCOL_ACTIVE
 
 
+def test_conversation_summary_is_additive_provider_metadata():
+    state = lc.reduce(
+        None,
+        ev(
+            SPOOL,
+            lc.CONVERSATION_ACCEPTED,
+            summary="version=2.1.241; capabilities=interrupt_receipt_v1,msg_lifecycle_v1",
+        ),
+    )
+    assert state["conversation_summary"] == ("version=2.1.241; capabilities=interrupt_receipt_v1,msg_lifecycle_v1")
+    assert state["protocol_state"] == lc.PROTOCOL_ACCEPTED
+
+
 def test_sequence_is_monotonic_even_for_ignored_events():
     state = fold([ev(SPOOL, lc.ACTIVITY), ev(SPOOL, "wat.unknown"), ev(SPOOL, lc.TRANSPORT_STARTED)])
     assert state["sequence"] == 3
@@ -92,6 +105,22 @@ def test_terminal_set_once_and_absorbing():
     state = lc.reduce(state, ev(SPOOL, lc.WORK_STARTED, summary="late"))
     assert state["protocol_state"] == lc.PROTOCOL_TERMINAL
     assert state["active_work"] is None
+
+
+def test_terminal_summary_is_first_terminal_set_once():
+    first = "terminal_reason=completed; total_cost_usd=0.01"
+    state = lc.reduce(
+        None,
+        ev(SPOOL, lc.TURN_TERMINAL, terminal_kind="completed", summary=first),
+    )
+    assert state["terminal_summary"] == first
+
+    state = lc.reduce(
+        state,
+        ev(SPOOL, lc.TURN_TERMINAL, terminal_kind="failed", summary="terminal_reason=api_error"),
+    )
+    assert state["protocol_terminal_kind"] == "completed"
+    assert state["terminal_summary"] == first
 
 
 def test_unknown_terminal_kind_fails_closed_indeterminate():
