@@ -135,6 +135,33 @@ def system_task_notification_event(task_id, status="completed"):
     }
 
 
+_MISSING = object()
+
+
+def system_task_started_event(task_id="claude-bg", is_backgrounded=_MISSING, **extra):
+    event = {
+        "type": "system",
+        "subtype": "task_started",
+        "task_id": task_id,
+        "subagent_type": "Explore",
+    }
+    if is_backgrounded is not _MISSING:
+        event["is_backgrounded"] = is_backgrounded
+    event.update(extra)
+    return event
+
+
+def system_task_progress_event(task_id="claude-bg", **extra):
+    event = {
+        "type": "system",
+        "subtype": "task_progress",
+        "task_id": task_id,
+        "subagent_type": "Explore",
+    }
+    event.update(extra)
+    return event
+
+
 def system_task_updated_event(task_id, status="completed"):
     return {
         "type": "system",
@@ -182,6 +209,98 @@ def running_claude_spool(spool_id, **extra):
 
 
 class TestBackgroundTaskDetector:
+    def test_structured_task_parser_extracts_only_identity_marker_and_status(self):
+        started = driver.parse_claude_structured_task(
+            system_task_started_event(
+                "bg-private",
+                True,
+                description="SECRET DESCRIPTION",
+                prompt="SECRET PROMPT",
+                tool_input={"secret": "LEAK"},
+                result="SECRET RESULT",
+            )
+        )
+        assert started == {
+            "task_id": "bg-private",
+            "subtype": "task_started",
+            "is_backgrounded": True,
+        }
+        assert "SECRET" not in json.dumps(started)
+
+        assert driver.parse_claude_structured_task(system_task_notification_event("bg-private", "failed")) == {
+            "task_id": "bg-private",
+            "subtype": "task_notification",
+            "status": "failed",
+        }
+        assert driver.parse_claude_structured_task(system_task_updated_event("bg-private", "killed")) == {
+            "task_id": "bg-private",
+            "subtype": "task_updated",
+            "status": "killed",
+        }
+
+    @pytest.mark.parametrize(
+        "event",
+        [
+            None,
+            [],
+            {},
+            {"type": "assistant", "subtype": "task_started", "task_id": "a", "is_backgrounded": True},
+            {"type": "system", "subtype": "other", "task_id": "a", "is_backgrounded": True},
+            {"type": "system", "subtype": "task_started", "task_id": "", "is_backgrounded": True},
+            {"type": "system", "subtype": "task_started", "task_id": 7, "is_backgrounded": True},
+        ],
+    )
+    def test_structured_task_parser_rejects_unrecognized_or_malformed_identity(self, event):
+        assert driver.parse_claude_structured_task(event) is None
+
+    def test_task_updated_parser_reads_status_only_from_dict_patch(self):
+        for patch_value in (None, "completed", [], {"other": "completed"}):
+            parsed = driver.parse_claude_structured_task(
+                {"type": "system", "subtype": "task_updated", "task_id": "a", "patch": patch_value}
+            )
+            assert parsed == {"task_id": "a", "subtype": "task_updated"}
+
+    def test_explicit_true_structured_start_arms_once_and_progress_preserves_it(self):
+        events = [
+            system_task_started_event("a", True),
+            system_task_started_event("a", True),
+            system_task_progress_event("a", description="SECRET PROGRESS"),
+        ]
+        state = driver.background_task_state(events)
+        assert [(task["id"], task["source"]) for task in state["unresolved"]] == [("a", "claude_task")]
+        assert "SECRET" not in json.dumps(state)
+
+    @pytest.mark.parametrize("marker", [_MISSING, False, None, "true", 1, {}, []])
+    def test_missing_false_or_malformed_background_marker_does_not_arm(self, marker):
+        event = system_task_started_event("a") if marker is _MISSING else system_task_started_event("a", marker)
+        state = driver.background_task_state([event, result_event("ordinary result")])
+        assert state == {"unresolved": [], "stale_resolved": []}
+
+    def test_progress_never_invents_unknown_task(self):
+        state = driver.background_task_state([system_task_progress_event("unknown"), result_event("done")])
+        assert state == {"unresolved": [], "stale_resolved": []}
+
+    @pytest.mark.parametrize("subtype", ["task_notification", "task_updated"])
+    @pytest.mark.parametrize("status", ["completed", "failed", "stopped", "killed"])
+    def test_structured_terminal_status_resolves_matching_background_task(self, subtype, status):
+        terminal = (
+            system_task_notification_event("a", status)
+            if subtype == "task_notification"
+            else system_task_updated_event("a", status)
+        )
+        state = driver.background_task_state([system_task_started_event("a", True), terminal])
+        assert state["unresolved"] == []
+
+    def test_overlapping_structured_tasks_resolve_independently(self):
+        events = [
+            system_task_started_event("a", True),
+            system_task_started_event("b", True),
+            system_task_notification_event("unknown", "completed"),
+            system_task_updated_event("a", "completed"),
+        ]
+        state = driver.background_task_state(events)
+        assert [(task["id"], task["source"]) for task in state["unresolved"]] == [("b", "claude_task")]
+
     def test_monitor_arm_without_notification_is_unresolved(self):
         state = driver.background_task_state([monitor_arm_event(), result_event(PARKED_STUB)])
         assert [t["id"] for t in state["unresolved"]] == ["bhbhqvqfz"]
@@ -1053,13 +1172,25 @@ FAKE_CLAUDE_TEMPLATE = textwrap.dedent(
     emit({"type": "system", "subtype": "init", "session_id": "fake-sess"})
     MODE = {mode!r}
 
-    emit({
-        "type": "user",
-        "message": {"role": "user", "content": [
-            {"tool_use_id": "t", "type": "tool_result",
-             "content": "Monitor started (task faketask, timeout {timeout_ms}ms)."}]},
-        "tool_use_result": {"taskId": "faketask", "timeoutMs": {timeout_ms}, "persistent": False},
-    })
+    if MODE.startswith("structured_"):
+        start = {"type": "system", "subtype": "task_started", "task_id": "claude-a",
+                 "subagent_type": "Explore", "description": "SECRET DESCRIPTION"}
+        if MODE != "structured_foreground":
+            start["is_backgrounded"] = True
+        emit(start)
+        emit({"type": "system", "subtype": "task_progress", "task_id": "claude-a",
+              "subagent_type": "Explore", "description": "SECRET PROGRESS"})
+        if MODE == "structured_overlap":
+            emit({"type": "system", "subtype": "task_started", "task_id": "claude-b",
+                  "is_backgrounded": True, "subagent_type": "Explore"})
+    else:
+        emit({
+            "type": "user",
+            "message": {"role": "user", "content": [
+                {"tool_use_id": "t", "type": "tool_result",
+                 "content": "Monitor started (task faketask, timeout {timeout_ms}ms)."}]},
+            "tool_use_result": {"taskId": "faketask", "timeoutMs": {timeout_ms}, "persistent": False},
+        })
     if MODE == "requery_preresult":
         # Run-2 ordering: notifications land mid-turn, BEFORE the model ends
         # its turn with a stale stub.
@@ -1071,7 +1202,26 @@ FAKE_CLAUDE_TEMPLATE = textwrap.dedent(
           "stop_reason": "end_turn", "session_id": "fake-sess",
           "result": "Waiting for the background task."})
 
-    if MODE == "requery_preresult":
+    if MODE == "structured_requery":
+        emit({"type": "system", "subtype": "task_notification", "task_id": "claude-a",
+              "status": "completed", "summary": "SECRET RESULT"})
+        time.sleep(0.15)
+        emit({"type": "system", "subtype": "init", "session_id": "fake-sess"})
+        emit({"type": "assistant", "message": {"role": "assistant",
+              "content": [{"type": "text", "text": "Structured requery answer."}]}})
+        emit({"type": "result", "subtype": "success", "is_error": False,
+              "stop_reason": "end_turn", "session_id": "fake-sess",
+              "result": "Structured requery answer."})
+        sys.stdin.read()
+    elif MODE == "structured_stale":
+        emit({"type": "system", "subtype": "task_updated", "task_id": "claude-a",
+              "patch": {"status": "completed", "result": "SECRET RESULT"}})
+    elif MODE == "structured_overlap":
+        emit({"type": "system", "subtype": "task_notification", "task_id": "claude-a",
+              "status": "completed"})
+    elif MODE in {"structured_unresolved", "structured_foreground"}:
+        pass
+    elif MODE == "requery_preresult":
         # The CLI-queued requery turn with the real answer.
         time.sleep(0.15)
         emit({"type": "system", "subtype": "init", "session_id": "fake-sess"})
@@ -1203,6 +1353,46 @@ def run_driver(tmp_path, mode, timeout_ms=600000, extra_args=(), env=None):
 
 
 class TestDriverEndToEnd:
+    def test_redacted_86eb2a4a_ordering_parks_and_never_emits_complete(self, tmp_path):
+        proc, events = run_driver(tmp_path, "structured_unresolved")
+        assert proc.returncode == 0, proc.stderr
+        sentinels = [event for event in events if event.get("type") == driver.SENTINEL_TYPE]
+        assert [sentinel["subtype"] for sentinel in sentinels] == ["parked"]
+        assert [(task["id"], task["source"]) for task in sentinels[0]["unresolved_tasks"]] == [
+            ("claude-a", "claude_task")
+        ]
+
+    def test_structured_resolution_requires_later_requery_result_to_complete(self, tmp_path):
+        proc, events = run_driver(tmp_path, "structured_requery")
+        assert proc.returncode == 0, proc.stderr
+        sentinel = driver.find_sentinel(events)
+        assert sentinel["subtype"] == "complete"
+        results = [event for event in events if event.get("type") == "result"]
+        assert len(results) == 2
+        assert results[-1]["result"] == "Structured requery answer."
+
+    def test_structured_resolution_after_last_result_parks_as_stale(self, tmp_path):
+        proc, events = run_driver(tmp_path, "structured_stale")
+        assert proc.returncode == 0, proc.stderr
+        sentinel = driver.find_sentinel(events)
+        assert sentinel["subtype"] == "parked"
+        assert sentinel["unresolved_tasks"] == []
+        assert sentinel["stale_resolved_tasks"] == [{"id": "claude-a", "source": "claude_task"}]
+
+    def test_overlapping_structured_tasks_cannot_complete_after_only_one_resolution(self, tmp_path):
+        proc, events = run_driver(tmp_path, "structured_overlap")
+        assert proc.returncode == 0, proc.stderr
+        sentinel = driver.find_sentinel(events)
+        assert sentinel["subtype"] == "parked"
+        assert [(task["id"], task["source"]) for task in sentinel["unresolved_tasks"]] == [("claude-b", "claude_task")]
+
+    def test_missing_marker_structured_task_does_not_stick_ordinary_completion(self, tmp_path):
+        proc, events = run_driver(tmp_path, "structured_foreground")
+        assert proc.returncode == 0, proc.stderr
+        sentinel = driver.find_sentinel(events)
+        assert sentinel["subtype"] == "complete"
+        assert sentinel["unresolved_tasks"] == []
+
     @pytest.mark.parametrize(
         ("mode", "sentinel_subtype"),
         [("notify", "complete"), ("notify_system", "complete"), ("exit", "parked")],
@@ -1408,6 +1598,23 @@ class TestDriverEndToEnd:
         assert spool["status"] == "error"
         assert spool["error_kind"] == "headless_background_wait"
         assert spool["pending_background_tasks"] == [{"id": "faketask", "source": "monitor"}]
+
+    def test_structured_parked_stream_is_public_background_wait_without_sensitive_fields(self, tmp_path):
+        proc, events = run_driver(tmp_path, "structured_unresolved")
+        spool_id = "e2e-structured-parked"
+        with patch("spindle.SPINDLE_DIR", tmp_path / "store"):
+            (tmp_path / "store").mkdir(exist_ok=True)
+            _write_spool(
+                spool_id,
+                running_claude_spool(spool_id, claude_protocol=CLAUDE_PROTOCOL_STREAM_V1),
+            )
+            _get_output_path(spool_id).write_text(proc.stdout)
+            assert _check_and_finalize_spool(spool_id) is True
+            spool = _read_spool(spool_id)
+        assert spool["status"] == "error"
+        assert spool["error_kind"] == "headless_background_wait"
+        assert spool["pending_background_tasks"] == [{"id": "claude-a", "source": "claude_task"}]
+        assert "SECRET" not in json.dumps(spool["pending_background_tasks"])
 
 
 # --- sentinel helpers --------------------------------------------------------
