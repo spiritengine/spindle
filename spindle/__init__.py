@@ -11592,8 +11592,8 @@ def main():
             # a spindle/ directory) would start the service from THAT code while
             # the console script is the installed one — precisely the "which
             # install is answering the port?" confusion this release removes.
-            # -P / PYTHONSAFEPATH would be cleaner but are 3.11+, and the floor
-            # here is 3.10.
+            # An explicit safe cwd remains portable across every supported
+            # interpreter and keeps service startup independent of the caller.
             subprocess.Popen(
                 [sys.executable, "-m", "spindle", "serve", "--http", "--port", str(args.port)],
                 cwd=str(Path.home()),

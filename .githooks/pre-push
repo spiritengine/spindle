@@ -10,8 +10,15 @@
 set -euo pipefail
 
 if ! command -v ruff >/dev/null 2>&1; then
-  echo "pre-push: ruff not found on PATH — skipping lint gate (pip install ruff to enable). CI still checks." >&2
+  echo "pre-push: ruff not found on PATH — skipping lint gate (pip install ruff==0.16.3 to enable). CI still checks." >&2
   exit 0
+fi
+
+required_ruff="ruff 0.16.3"
+actual_ruff="$(ruff --version)"
+if [ "$actual_ruff" != "$required_ruff" ]; then
+  echo "pre-push: expected $required_ruff, found $actual_ruff (pip install ruff==0.16.3)." >&2
+  exit 1
 fi
 
 fail=0

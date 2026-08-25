@@ -21,7 +21,7 @@ MCP server for multi-harness AI agent delegation. Spawn background agents (Claud
 
 ## Requirements
 
-- Python 3.10+
+- Python 3.11+
 - At least one harness CLI, installed and already authenticated. Spindle shells
   out to the CLI you already use and inherits its login — it never asks for an
   API key of its own:

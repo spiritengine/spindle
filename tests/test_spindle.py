@@ -11341,7 +11341,8 @@ class TestVersionSingleSource:
         pyproject = Path(spindle.__file__).parent.parent / "pyproject.toml"
         if not pyproject.exists():  # installed wheel, not a checkout
             pytest.skip("no pyproject.toml (running against an installed wheel)")
-        tomllib = pytest.importorskip("tomllib")  # 3.11+; the check is skipped on 3.10
+        import tomllib
+
         data = tomllib.loads(pyproject.read_text())
         assert "version" in data["project"]["dynamic"]
         assert "version" not in data["project"]  # no static version to drift
