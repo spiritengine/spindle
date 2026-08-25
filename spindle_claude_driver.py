@@ -61,6 +61,14 @@ SENTINEL_TYPE = "spindle_driver_terminal"
 # binary also carries a "timed_out" literal, but it has zero observed
 # occurrences and Monitor timeouts are already bounded by the park deadline.
 TERMINAL_TASK_STATUSES = {"completed", "failed", "stopped", "killed"}
+STRUCTURED_TASK_SUBTYPES = frozenset(
+    {
+        "task_started",
+        "task_progress",
+        "task_notification",
+        "task_updated",
+    }
+)
 
 TASK_NOTIFICATION_RE = re.compile(r"<task-notification>(.*?)</task-notification>", re.DOTALL)
 TASK_ID_RE = re.compile(r"<task-id>\s*([^<\s]+)\s*</task-id>")
@@ -119,6 +127,39 @@ def _number_text(value):
     except (OverflowError, ValueError):
         return None
     return rendered if len(rendered) <= 100 else None
+
+
+def parse_claude_structured_task(event):
+    """Return the non-prose allowlist from a recognized Claude task event.
+
+    This parser deliberately carries no consumer policy. In particular,
+    is_backgrounded is preserved only when explicitly present and is never
+    coerced; the completion tracker and observational telemetry decide
+    independently what that marker means.
+    """
+    if not isinstance(event, dict) or event.get("type") != "system":
+        return None
+    subtype = event.get("subtype")
+    if subtype not in STRUCTURED_TASK_SUBTYPES:
+        return None
+    task_id = event.get("task_id")
+    if not isinstance(task_id, str) or not task_id:
+        return None
+
+    task = {"task_id": task_id, "subtype": subtype}
+    if "is_backgrounded" in event:
+        task["is_backgrounded"] = event["is_backgrounded"]
+
+    status = None
+    if subtype == "task_notification":
+        status = event.get("status")
+    elif subtype == "task_updated":
+        patch = event.get("patch")
+        if isinstance(patch, dict):
+            status = patch.get("status")
+    if isinstance(status, str) and status:
+        task["status"] = status
+    return task
 
 
 def claude_conversation_summary(event):
@@ -343,11 +384,9 @@ class ClaudeLifecycleTelemetry:
             return f"{count} Claude tasks active"
         return None
 
-    def _observe_task(self, event, subtype):
-        task_id = event.get("task_id")
-        if not isinstance(task_id, str) or not task_id:
-            self.activity()
-            return
+    def _observe_task(self, task):
+        task_id = task["task_id"]
+        subtype = task["subtype"]
         self.activity()
         if subtype == "task_started":
             self._active_tasks.add(task_id)
@@ -364,11 +403,7 @@ class ClaudeLifecycleTelemetry:
                 summary=self._work_summary(),
             )
             return
-        if subtype == "task_updated":
-            patch = event.get("patch")
-            status = patch.get("status") if isinstance(patch, dict) else None
-        else:
-            status = event.get("status")
+        status = task.get("status")
         if not isinstance(status, str) or status not in TERMINAL_TASK_STATUSES | {
             "pending",
             "running",
@@ -436,13 +471,12 @@ class ClaudeLifecycleTelemetry:
                 provider_ids=ids,
                 summary=claude_conversation_summary(event),
             )
-        elif etype == "system" and subtype in {
-            "task_started",
-            "task_progress",
-            "task_updated",
-            "task_notification",
-        }:
-            self._observe_task(event, subtype)
+        elif etype == "system" and subtype in STRUCTURED_TASK_SUBTYPES:
+            task = parse_claude_structured_task(event)
+            if task is None:
+                self.activity()
+            else:
+                self._observe_task(task)
         elif etype == "control_request":
             request = event.get("request")
             request_id = event.get("request_id")
@@ -581,21 +615,20 @@ class BackgroundTaskTracker:
             self.stale_resolved = []
             return
 
-        # Structured lifecycle events (observed live on Claude Code 2.1.219):
-        # the CLI reports task completion as top-level system events — a
-        # Monitor's completion arrives ONLY on this channel, with no user-level
-        # XML notification. Top-level event types cannot be forged by tool
-        # output (which is confined to text inside tool_result blocks), so
-        # this is also the most trustworthy resolution source.
+        # Structured lifecycle events: Claude reports explicit background
+        # subagent starts and task completion as top-level system events.
+        # Monitor completion also arrives only on this channel. Top-level
+        # events cannot be forged by tool output, which is confined to text
+        # inside tool_result blocks.
         if event.get("type") == "system":
-            subtype = event.get("subtype")
-            task_id = event.get("task_id")
-            if subtype == "task_notification" and isinstance(task_id, str):
-                self._resolve(task_id, event.get("status"))
-            elif subtype == "task_updated" and isinstance(task_id, str):
-                patch = event.get("patch")
-                if isinstance(patch, dict):
-                    self._resolve(task_id, patch.get("status"))
+            task = parse_claude_structured_task(event)
+            if task is not None:
+                subtype = task["subtype"]
+                task_id = task["task_id"]
+                if subtype == "task_started" and task.get("is_backgrounded") is True:
+                    self._arm(task_id, "claude_task")
+                elif subtype in {"task_notification", "task_updated"}:
+                    self._resolve(task_id, task.get("status"))
             return
 
         if event.get("type") != "user":

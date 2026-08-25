@@ -260,6 +260,22 @@ def test_overlapping_task_finish_does_not_clear_sibling(tmp_path, monkeypatch):
     assert read_provider(store, spool_id)["active_work"] is None
 
 
+def test_missing_background_marker_remains_observable_but_not_completion_authority(tmp_path, monkeypatch):
+    event = {
+        "type": "system",
+        "subtype": "task_started",
+        "task_id": "ordinary-task",
+        "description": "SECRET DESCRIPTION",
+    }
+    assert driver.background_task_state([event]) == {"unresolved": [], "stale_resolved": []}
+
+    telemetry, store, spool_id = _telemetry(tmp_path, monkeypatch)
+    telemetry.observe(event)
+    provider = read_provider(store, spool_id)
+    assert provider["active_work"] == "1 Claude task active"
+    assert "SECRET" not in json.dumps(provider)
+
+
 def test_unmatched_or_malformed_control_response_does_not_resolve_approval(tmp_path, monkeypatch):
     telemetry, store, spool_id = _telemetry(tmp_path, monkeypatch)
     telemetry.turn_started()
