@@ -826,6 +826,45 @@ def test_sandbox_refusal_preserves_and_aborts_the_episode(episode_store):
     assert "watchdog" not in stored
 
 
+def test_sandbox_refusal_keeps_owner_spool_after_durable_abort_cleanup_failure(episode_store, monkeypatch):
+    spool_id = "writer-sandbox-refusal-durable-abort"
+    reserved = make_episode("reserved", generation=2, path="before_watchdog")
+    episode_store.write(spool_id, status="pending", episode=reserved)
+    real_close = os.close
+    directory = episode_store.root.stat()
+    directory_closes = 0
+
+    def fail_abort_directory_close(fd):
+        nonlocal directory_closes
+        opened = os.fstat(fd)
+        if (opened.st_dev, opened.st_ino) == (directory.st_dev, directory.st_ino):
+            directory_closes += 1
+            real_close(fd)
+            if directory_closes == 2:
+                raise OSError(errno.EIO, "owner directory close failed after durable abort")
+            return None
+        return real_close(fd)
+
+    monkeypatch.setattr(os, "close", fail_abort_directory_close)
+
+    message = spindle._persist_codex_sandbox_refusal(
+        spool_id,
+        "REFUSED: codex sandbox is unavailable",
+        sandbox="workspace-write",
+        permission="careful",
+        codex_bin="/usr/bin/codex",
+        codex_version="1.0",
+    )
+
+    record = episode_store.read(spool_id)
+    assert message == f"Error: REFUSED: codex sandbox is unavailable (spool {spool_id})"
+    assert directory_closes == 2
+    assert record["status"] == "pending"
+    assert record[EPISODE_KEY]["phase"] == "aborted"
+    assert record[EPISODE_KEY]["failure"]["detail"] == "REFUSED: codex sandbox is unavailable"
+    assert "sandbox_error" not in record
+
+
 def test_sandbox_refusal_episode_path_is_utf8_independent_of_text_defaults(episode_store, monkeypatch):
     spool_id = "writer-sandbox-refusal-utf8"
     reserved = make_episode("reserved", generation=2, path="before_watchdog")

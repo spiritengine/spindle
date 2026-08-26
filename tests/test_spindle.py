@@ -8500,6 +8500,27 @@ class TestCodexSandboxEnforcement:
         assert f"(spool {spool_id})" not in result
         assert path.read_bytes() == invalid_record
 
+    @pytest.mark.parametrize("encoding", ["utf-16", "utf-32"])
+    def test_refusal_persistence_rejects_non_utf8_json_encodings(self, tmp_path, encoding):
+        spool_id = f"codex-{encoding}-refusal"
+        path = tmp_path / f"{spool_id}.json"
+        original_bytes = '{"status":"pending","prompt":"occupied"}'.encode(encoding)
+        path.write_bytes(original_bytes)
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            result = spindle._persist_codex_sandbox_refusal(
+                spool_id,
+                "REFUSED: sandbox unavailable",
+                sandbox="read-only",
+                permission="readonly",
+                codex_bin="/fake/bin/codex",
+                codex_version="0.149.0",
+            )
+
+        assert "refusal persistence failed: existing spool record contains invalid UTF-8" in result
+        assert f"(spool {spool_id})" not in result
+        assert path.read_bytes() == original_bytes
+
     def test_refusal_reread_and_write_are_utf8_independent_of_text_defaults(self, tmp_path):
         spool_id = "codex-valid-utf8-refusal"
         path = tmp_path / f"{spool_id}.json"
@@ -8549,6 +8570,23 @@ class TestCodexSandboxEnforcement:
         with patch("spindle.SPINDLE_DIR", tmp_path):
             with patch("spindle.json.loads", side_effect=decoder_error):
                 with pytest.raises(type(decoder_error), match=str(decoder_error)):
+                    spindle._read_spool_for_codex_sandbox_refusal(spool_id)
+
+    @pytest.mark.parametrize(
+        "callback,payload",
+        [
+            ("_parse_refusal_record_int", b'{"status":"pending","value":1}'),
+            ("_reject_refusal_record_constant", b'{"status":"pending","value":NaN}'),
+        ],
+        ids=("integer", "constant"),
+    )
+    def test_refusal_record_reader_does_not_swallow_callback_runtime_errors(self, tmp_path, callback, payload):
+        spool_id = "codex-callback-runtime-error"
+        (tmp_path / f"{spool_id}.json").write_bytes(payload)
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch(f"spindle.{callback}", side_effect=RuntimeError("callback runtime failed")):
+                with pytest.raises(RuntimeError, match="callback runtime failed"):
                     spindle._read_spool_for_codex_sandbox_refusal(spool_id)
 
     def test_refusal_record_read_error_survives_close_error(self, tmp_path):
@@ -8621,8 +8659,11 @@ class TestCodexSandboxEnforcement:
                     + b"}"
                 ),
             ),
+            ("codex-nan-refusal", lambda: b'{"status":"pending","value":NaN}'),
+            ("codex-infinity-refusal", lambda: b'{"status":"pending","value":Infinity}'),
+            ("codex-negative-infinity-refusal", lambda: b'{"status":"pending","value":-Infinity}'),
         ],
-        ids=("over-limit-integer", "deep-nesting"),
+        ids=("over-limit-integer", "deep-nesting", "nan", "infinity", "negative-infinity"),
     )
     def test_refusal_persistence_preserves_content_rejected_by_json_decoder(self, tmp_path, spool_id, invalid_record):
         if spool_id == "codex-over-limit-integer-refusal" and sys.get_int_max_str_digits() == 0:
@@ -8645,6 +8686,101 @@ class TestCodexSandboxEnforcement:
         assert "refusal persistence failed: existing spool record contains invalid JSON" in result
         assert f"(spool {spool_id})" not in result
         assert path.read_bytes() == original_bytes
+
+    def test_fresh_refusal_returns_spool_after_durable_directory_close_failure(self, tmp_path):
+        spool_id = "codex-refusal-durable-close-failure"
+        real_close = os.close
+        directory = tmp_path.stat()
+
+        def fail_directory_close(fd):
+            opened = os.fstat(fd)
+            if (opened.st_dev, opened.st_ino) == (directory.st_dev, directory.st_ino):
+                real_close(fd)
+                raise OSError(errno.EIO, "directory close failed after durability")
+            return real_close(fd)
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle.os.close", side_effect=fail_directory_close):
+                result = spindle._persist_codex_sandbox_refusal(
+                    spool_id,
+                    "REFUSED: sandbox unavailable",
+                    sandbox="read-only",
+                    permission="readonly",
+                    codex_bin="/fake/bin/codex",
+                    codex_version="0.149.0",
+                )
+            record = spindle._read_spool_for_codex_sandbox_refusal(spool_id)
+
+        assert result == f"Error: REFUSED: sandbox unavailable (spool {spool_id})"
+        assert record is not None
+        assert record["status"] == "error"
+        assert record["sandbox_error"] == "REFUSED: sandbox unavailable"
+
+    def test_fresh_refusal_does_not_claim_spool_when_directory_fsync_fails(self, tmp_path):
+        spool_id = "codex-refusal-directory-fsync-failure"
+        real_fsync = os.fsync
+        directory = tmp_path.stat()
+
+        def fail_directory_fsync(fd):
+            opened = os.fstat(fd)
+            if (opened.st_dev, opened.st_ino) == (directory.st_dev, directory.st_ino):
+                raise OSError(errno.EIO, "directory fsync failed before durability")
+            return real_fsync(fd)
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle.os.fsync", side_effect=fail_directory_fsync):
+                result = spindle._persist_codex_sandbox_refusal(
+                    spool_id,
+                    "REFUSED: sandbox unavailable",
+                    sandbox="read-only",
+                    permission="readonly",
+                    codex_bin="/fake/bin/codex",
+                    codex_version="0.149.0",
+                )
+
+        assert "refusal persistence failed: errno 5: directory fsync failed before durability" in result
+        assert f"(spool {spool_id})" not in result
+
+    @pytest.mark.parametrize("writer", ["direct", "owner"])
+    def test_atomic_writer_preserves_directory_fsync_error_over_close_error(self, tmp_path, writer):
+        import spindle.namespace_owner as namespace_owner
+
+        real_fsync = os.fsync
+        real_close = os.close
+        directory = tmp_path.stat()
+        close_failures = []
+
+        def is_test_directory(fd):
+            opened = os.fstat(fd)
+            return (opened.st_dev, opened.st_ino) == (directory.st_dev, directory.st_ino)
+
+        def fail_directory_fsync(fd):
+            if is_test_directory(fd):
+                raise OSError(errno.EIO, "active directory fsync failure")
+            return real_fsync(fd)
+
+        def fail_directory_close(fd):
+            if is_test_directory(fd):
+                close_failures.append(fd)
+                real_close(fd)
+                raise OSError(errno.EBADF, "secondary directory close failure")
+            return real_close(fd)
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle.os.fsync", side_effect=fail_directory_fsync):
+                with patch("spindle.os.close", side_effect=fail_directory_close):
+                    with pytest.raises(OSError, match="active directory fsync failure") as raised:
+                        if writer == "direct":
+                            spindle._write_spool("dual-failure", {"id": "dual-failure"})
+                        else:
+                            namespace_owner._atomic_json_write(
+                                tmp_path / "dual-failure.json",
+                                {"id": "dual-failure"},
+                            )
+
+        assert type(raised.value) is OSError
+        assert raised.value.errno == errno.EIO
+        assert len(close_failures) == 1
 
     def test_refusal_returns_durable_spool_when_lock_cleanup_fails_after_publication(self, tmp_path):
         spool_id = "codex-refusal-unlock-failure"

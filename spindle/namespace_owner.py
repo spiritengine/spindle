@@ -60,6 +60,27 @@ OWNER_ARTIFACT_SUFFIXES = (
 _close_fd = os.close
 
 
+class _DurablePublicationCleanupError(OSError):
+    """Publication is directory-durable, but closing its directory fd failed."""
+
+
+def _fsync_directory_after_publication(path: Path) -> None:
+    """Make a published pathname durable and preserve fsync over close errors."""
+    directory_fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(directory_fd)
+    except BaseException:
+        try:
+            os.close(directory_fd)
+        except BaseException:
+            pass
+        raise
+    try:
+        os.close(directory_fd)
+    except OSError as exc:
+        raise _DurablePublicationCleanupError(*exc.args) from exc
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -610,11 +631,7 @@ def _atomic_json_write(path: Path, value: dict) -> None:
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
-        directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+        _fsync_directory_after_publication(path.parent)
     finally:
         try:
             os.unlink(temporary)

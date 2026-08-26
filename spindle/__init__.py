@@ -84,6 +84,8 @@ from .namespace_owner import (  # noqa: E402
     NamespaceIdentity,
     ProcessIdentity,
     ReconciliationResult,
+    _DurablePublicationCleanupError,
+    _fsync_directory_after_publication,
     assess_process_liveness,
     capture_pid_namespace,
     classify_owner_episode,
@@ -1416,11 +1418,7 @@ def _write_spool(spool_id: str, data: dict) -> None:
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp_path, path)
-    dir_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-    try:
-        os.fsync(dir_fd)
-    finally:
-        os.close(dir_fd)
+    _fsync_directory_after_publication(path.parent)
 
 
 def _read_spool(spool_id: str) -> Optional[dict]:
@@ -2769,7 +2767,13 @@ def _record_pre_spawn_failure(
         current.pop("launcher_pid", None)
         current.pop("launcher_start_time", None)
         _preserve_failed_spool_shard(current)
-        _write_spool(spool_id, current)
+        try:
+            _write_spool(spool_id, current)
+        except _DurablePublicationCleanupError:
+            # This preparatory snapshot contains no refusal evidence yet. Its
+            # publication succeeded, so continue to the episode transition
+            # that makes the failure claim durable.
+            pass
         episode = current.get("owner_episode") or {}
         if current.get("status") == "pending" and episode.get("phase") == "reserved":
             transition_owner_episode(
@@ -7912,6 +7916,11 @@ def _parse_refusal_record_int(value: str) -> int:
         raise _RefusalRecordContentError from exc
 
 
+def _reject_refusal_record_constant(value: str) -> None:
+    """Reject the non-finite numeric constants accepted by Python's decoder."""
+    raise _RefusalRecordContentError(f"invalid JSON numeric constant: {value}")
+
+
 def _reject_excessive_refusal_record_nesting(content: bytes) -> None:
     """Reject proven excessive JSON nesting without invoking Python recursion.
 
@@ -7971,7 +7980,12 @@ def _read_spool_for_codex_sandbox_refusal(spool_id: str) -> Optional[dict]:
     content = _read_refusal_record_bytes(stream)
     try:
         _reject_excessive_refusal_record_nesting(content)
-        record = json.loads(content, parse_int=_parse_refusal_record_int)
+        text = content.decode("utf-8", errors="strict")
+        record = json.loads(
+            text,
+            parse_int=_parse_refusal_record_int,
+            parse_constant=_reject_refusal_record_constant,
+        )
     except UnicodeDecodeError as exc:
         # The bytes are an occupied, unreadable spool record, not an absent one.
         raise OSError("existing spool record contains invalid UTF-8") from exc
@@ -8060,6 +8074,10 @@ def _persist_codex_sandbox_refusal(
 
             publish_record_updates(spool_id, spool, updates)
             publication_confirmed = True
+        return f"Error: {message} (spool {spool_id})"
+    except _DurablePublicationCleanupError:
+        # Refusal evidence or metadata reached directory durability; a later
+        # directory-fd cleanup failure cannot retract the spool identity.
         return f"Error: {message} (spool {spool_id})"
     except OSError as exc:
         if publication_confirmed:
