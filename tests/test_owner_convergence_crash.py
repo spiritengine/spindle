@@ -472,6 +472,14 @@ def test_concurrent_reconcilers_publish_one_decision(episode_store, tmp_path, mo
     that four threads were started.  A barrier that never trips raises out of
     ``pool.map`` and fails the test - there is no branch here that absorbs it.
 
+    The released-inode observation is made once before the workers start and
+    held fixed for their passes.  A real released-inode probe briefly takes the
+    exact ownership flock; concurrent probes can therefore observe one another
+    as ``held`` and conservatively return before this boundary.  That is a
+    separate observation race, not the capture-to-CAS race exercised here.
+    Freezing one real observation leaves no ownership guard held while the four
+    workers rendezvous.
+
     Every claim is asserted before any further pass runs: a fixed-point repair
     afterwards would quietly rebuild whatever a losing writer had overwritten.
     """
@@ -487,14 +495,26 @@ def test_concurrent_reconcilers_publish_one_decision(episode_store, tmp_path, mo
     boundary = threading.Barrier(workers, action=opened, timeout=30)
     entered: set[int] = set()
     entered_lock = threading.Lock()
+    active = threading.local()
     real_spool_lock = spindle._spool_lock
     real_mailbox_guard = spindle.mailbox_guard
+    real_observation = spindle._owner_episode_observation
+    released_observation = real_observation(episode_store.read(scenario.spool_id))
+    assert (released_observation[0].state, released_observation[1].state) == ("released", "dead")
+
+    def observe_released_inode(record):
+        if record.get("id") == scenario.spool_id:
+            return released_observation
+        return real_observation(record)
 
     def held_nothing_yet() -> bool:
-        """Whether this thread is about to take its pass's outermost guard."""
+        """Whether this submitted reconciliation is at its first guard."""
+        task = getattr(active, "task", None)
+        if task is None:
+            return False
         with entered_lock:
-            first = threading.get_ident() not in entered
-            entered.add(threading.get_ident())
+            first = task not in entered
+            entered.add(task)
         return first
 
     @contextmanager
@@ -511,12 +531,17 @@ def test_concurrent_reconcilers_publish_one_decision(episode_store, tmp_path, mo
         with real_mailbox_guard(root, spool_id):
             yield
 
-    def reconcile(_):
-        converge(scenario.spool_id)
+    def reconcile(task):
+        active.task = task
+        try:
+            converge(scenario.spool_id)
+        finally:
+            del active.task
 
     with monkeypatch.context() as armed:
         armed.setattr(spindle, "_spool_lock", rendezvous_then_lock)
         armed.setattr(spindle, "mailbox_guard", rendezvous_then_guard)
+        armed.setattr(spindle, "_owner_episode_observation", observe_released_inode)
         with ThreadPoolExecutor(max_workers=workers) as pool:
             list(pool.map(reconcile, range(workers)))
 
@@ -524,8 +549,8 @@ def test_concurrent_reconcilers_publish_one_decision(episode_store, tmp_path, mo
         f"only {overlap['at_the_boundary']} of {workers} reconcilers ever reached the "
         f"capture-to-CAS boundary over {scenario.spool_id}; the calls never overlapped"
     )
-    assert len(entered) == workers, (
-        f"only {len(entered)} of {workers} concurrent reconcilers entered the critical region "
+    assert entered == set(range(workers)), (
+        f"only tasks {sorted(entered)} of {workers} concurrent reconcilers entered the critical region "
         f"over {scenario.spool_id}; the rest returned without attempting the decision"
     )
     record = episode_store.read(scenario.spool_id)
