@@ -7897,6 +7897,11 @@ def _read_spool_for_codex_sandbox_refusal(spool_id: str) -> Optional[dict]:
             record = json.load(stream)
     except FileNotFoundError:
         return None
+    except UnicodeDecodeError as exc:
+        # The bytes are an occupied, unreadable spool record, not an absent one.
+        # Translate only the concrete text-decoding failure so the refusal path
+        # preserves those bytes without swallowing unrelated ValueError bugs.
+        raise OSError("existing spool record contains invalid UTF-8") from exc
     except json.JSONDecodeError as exc:
         # A malformed file still occupies this spool ID. Treating it as absent
         # would let refusal persistence replace evidence that needs repair.
@@ -7935,9 +7940,11 @@ def _persist_codex_sandbox_refusal(
     The refusal is visible both ways the brief requires: the returned string, and a
     persisted spool with status "error" plus a `sandbox_error` field so unspool/spool_info
     surface it. status "error" does not count against concurrency, so no slot leaks. If
-    this storage-only path raises OSError, the primary refusal still wins and no spool ID
-    is claimed because durable publication could not be confirmed.
+    this storage-only path raises OSError, the primary refusal still wins. A spool ID is
+    claimed only after durable publication returns successfully; failures before that
+    point receive a bounded persistence diagnostic instead.
     """
+    publication_confirmed = False
     try:
         now = datetime.now().isoformat()
         if _read_spool_for_codex_sandbox_refusal(spool_id) is not None:
@@ -7979,8 +7986,13 @@ def _persist_codex_sandbox_refusal(
             from .owner_episode_convergence import publish_record_updates
 
             publish_record_updates(spool_id, spool, updates)
+            publication_confirmed = True
         return f"Error: {message} (spool {spool_id})"
     except OSError as exc:
+        if publication_confirmed:
+            # The record is already durable and publish_record_updates returned.
+            # A later lock cleanup failure cannot retract that spool identity.
+            return f"Error: {message} (spool {spool_id})"
         return f"Error: {message} ({_codex_refusal_persistence_diagnostic(exc)})"
 
 

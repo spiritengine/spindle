@@ -8393,9 +8393,9 @@ class TestCodexSandboxEnforcement:
         with patch("spindle.SPINDLE_DIR", tmp_path):
             with patch(
                 "spindle._read_spool_for_codex_sandbox_refusal",
-                side_effect=RuntimeError("broken invariant"),
+                side_effect=ValueError("broken invariant"),
             ):
-                with pytest.raises(RuntimeError, match="broken invariant"):
+                with pytest.raises(ValueError, match="broken invariant"):
                     spindle._persist_codex_sandbox_refusal(
                         "codex-programming-error",
                         "REFUSED: sandbox unavailable",
@@ -8425,6 +8425,58 @@ class TestCodexSandboxEnforcement:
         assert "refusal persistence failed: existing spool record contains invalid JSON" in result
         assert f"(spool {spool_id})" not in result
         assert path.read_bytes() == corrupt_record
+
+    def test_refusal_persistence_preserves_invalid_utf8_record(self, tmp_path):
+        spool_id = "codex-invalid-utf8-refusal"
+        path = tmp_path / f"{spool_id}.json"
+        invalid_record = b'{"status":"pending","prompt":"\xff"}'
+        path.write_bytes(invalid_record)
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            result = spindle._persist_codex_sandbox_refusal(
+                spool_id,
+                "REFUSED: sandbox unavailable",
+                sandbox="read-only",
+                permission="readonly",
+                codex_bin="/fake/bin/codex",
+                codex_version="0.149.0",
+            )
+
+        assert result.startswith("Error: REFUSED: sandbox unavailable")
+        diagnostic = result.removeprefix("Error: REFUSED: sandbox unavailable (").removesuffix(")")
+        assert diagnostic == "sandbox refusal persistence failed: existing spool record contains invalid UTF-8"
+        assert len(diagnostic) <= spindle._CODEX_REFUSAL_PERSISTENCE_DIAGNOSTIC_MAX_CHARS
+        assert f"(spool {spool_id})" not in result
+        assert path.read_bytes() == invalid_record
+
+    def test_refusal_returns_durable_spool_when_lock_cleanup_fails_after_publication(self, tmp_path):
+        spool_id = "codex-refusal-unlock-failure"
+        real_spool_lock = spindle._spool_lock
+
+        @contextmanager
+        def fail_after_lock_cleanup(*args, **kwargs):
+            with real_spool_lock(*args, **kwargs) as acquired:
+                yield acquired
+            raise OSError(errno.EIO, "unlock failed after publish")
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle._spool_lock", side_effect=fail_after_lock_cleanup):
+                result = spindle._persist_codex_sandbox_refusal(
+                    spool_id,
+                    "REFUSED: sandbox unavailable",
+                    sandbox="read-only",
+                    permission="readonly",
+                    codex_bin="/fake/bin/codex",
+                    codex_version="0.149.0",
+                )
+            record = spindle._read_spool_for_codex_sandbox_refusal(spool_id)
+
+        assert result == f"Error: REFUSED: sandbox unavailable (spool {spool_id})"
+        assert record is not None
+        assert record["id"] == spool_id
+        assert record["status"] == "error"
+        assert record["error"] == "REFUSED: sandbox unavailable"
+        assert record["sandbox_error"] == "REFUSED: sandbox unavailable"
 
     def test_spin_does_not_refuse_full_access_when_sandbox_not_enforcing(self, tmp_path):
         """danger-full-access asks for no sandbox, so a fail-open probe must not block it."""
