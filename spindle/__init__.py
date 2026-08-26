@@ -7629,6 +7629,10 @@ _CODEX_SANDBOX_PROBE_MARKER = "SPINDLE_CODEX_SANDBOX_PROBE_RAN"
 # nothing to enforce and nothing to refuse.
 _CODEX_RESTRICTIVE_SANDBOX_MODES = frozenset({"read-only", "workspace-write"})
 
+# Persistence failures are secondary to the actionable fail-closed refusal. Keep their
+# operator detail useful without allowing an OS-provided message to grow without bound.
+_CODEX_REFUSAL_PERSISTENCE_DIAGNOSTIC_MAX_CHARS = 180
+
 
 def _process_env(overrides: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     """The exact environment passed to a detached child process."""
@@ -7880,6 +7884,42 @@ def _codex_sandbox_refusal(
     )
 
 
+def _read_spool_for_codex_sandbox_refusal(spool_id: str) -> Optional[dict]:
+    """Read a refusal record without treating storage failure as record absence.
+
+    The general spool reader is deliberately best-effort. Refusal persistence needs a
+    narrower distinction: a missing record is normal for fresh spin, while an unreadable
+    store must surface through the fail-closed persistence diagnostic instead of being
+    mistaken for permission to create or replace a record.
+    """
+    try:
+        with open(_get_spool_path(spool_id)) as stream:
+            record = json.load(stream)
+    except FileNotFoundError:
+        return None
+    except json.JSONDecodeError as exc:
+        # A malformed file still occupies this spool ID. Treating it as absent
+        # would let refusal persistence replace evidence that needs repair.
+        raise OSError("existing spool record contains invalid JSON") from exc
+    if not isinstance(record, dict):
+        raise OSError("existing spool record is not a JSON object")
+    return record
+
+
+def _codex_refusal_persistence_diagnostic(exc: OSError) -> str:
+    """Render a deterministic, single-line, bounded storage diagnostic."""
+    detail = exc.strerror or str(exc) or "storage operation failed"
+    detail = " ".join("".join(ch if ch.isprintable() else " " for ch in str(detail)).split())
+    if isinstance(exc.errno, int):
+        detail = f"errno {exc.errno}: {detail}"
+
+    prefix = "sandbox refusal persistence failed: "
+    available = _CODEX_REFUSAL_PERSISTENCE_DIAGNOSTIC_MAX_CHARS - len(prefix)
+    if len(detail) > available:
+        detail = detail[: max(0, available - 3)] + "..."
+    return prefix + detail
+
+
 def _persist_codex_sandbox_refusal(
     spool_id: str,
     message: str,
@@ -7894,49 +7934,54 @@ def _persist_codex_sandbox_refusal(
 
     The refusal is visible both ways the brief requires: the returned string, and a
     persisted spool with status "error" plus a `sandbox_error` field so unspool/spool_info
-    surface it. status "error" does not count against concurrency, so no slot leaks.
+    surface it. status "error" does not count against concurrency, so no slot leaks. If
+    this storage-only path raises OSError, the primary refusal still wins and no spool ID
+    is claimed because durable publication could not be confirmed.
     """
-    now = datetime.now().isoformat()
-    if _read_spool(spool_id) is not None:
-        _record_pre_spawn_failure(spool_id, message)
-    with _spool_lock(spool_id) as acquired:
-        spool = _read_spool(spool_id) if acquired else None
-        if not acquired or (spool is not None and spool.get("status") != "error"):
-            return f"Error: Spool {spool_id} was finalized before sandbox refusal was recorded"
-        metadata = {
-            "session_id": session_id,
-            "sandbox": sandbox,
-            "permission": permission,
-            "codex_bin": codex_bin,
-            "codex_version": codex_version,
-            "sandbox_error": message,
-            "harness": "codex",
-            "tags": ["codex"],
-            "pid": None,
-        }
-        if spool is None:
-            # No record exists, so this refusal creates one and is its whole
-            # outcome.
-            spool = {"id": spool_id}
-            updates = {
-                **metadata,
-                "status": "error",
-                "result": None,
-                "error": message,
-                "created_at": now,
-                "completed_at": now,
+    try:
+        now = datetime.now().isoformat()
+        if _read_spool_for_codex_sandbox_refusal(spool_id) is not None:
+            _record_pre_spawn_failure(spool_id, message)
+        with _spool_lock(spool_id) as acquired:
+            spool = _read_spool_for_codex_sandbox_refusal(spool_id) if acquired else None
+            if not acquired or (spool is not None and spool.get("status") != "error"):
+                return f"Error: Spool {spool_id} was finalized before sandbox refusal was recorded"
+            metadata = {
+                "session_id": session_id,
+                "sandbox": sandbox,
+                "permission": permission,
+                "codex_bin": codex_bin,
+                "codex_version": codex_version,
+                "sandbox_error": message,
+                "harness": "codex",
+                "tags": ["codex"],
+                "pid": None,
             }
-        else:
-            # _record_pre_spawn_failure already published this same message as
-            # the record's outcome - as episode failure evidence convergence
-            # projected, or as the legacy terminal. Only the sandbox metadata is
-            # still missing; republishing the outcome would move a completion
-            # time that is already settled.
-            updates = metadata
-        from .owner_episode_convergence import publish_record_updates
+            if spool is None:
+                # No record exists, so this refusal creates one and is its whole
+                # outcome.
+                spool = {"id": spool_id}
+                updates = {
+                    **metadata,
+                    "status": "error",
+                    "result": None,
+                    "error": message,
+                    "created_at": now,
+                    "completed_at": now,
+                }
+            else:
+                # _record_pre_spawn_failure already published this same message as
+                # the record's outcome - as episode failure evidence convergence
+                # projected, or as the legacy terminal. Only the sandbox metadata is
+                # still missing; republishing the outcome would move a completion
+                # time that is already settled.
+                updates = metadata
+            from .owner_episode_convergence import publish_record_updates
 
-        publish_record_updates(spool_id, spool, updates)
-    return f"Error: {message} (spool {spool_id})"
+            publish_record_updates(spool_id, spool, updates)
+        return f"Error: {message} (spool {spool_id})"
+    except OSError as exc:
+        return f"Error: {message} ({_codex_refusal_persistence_diagnostic(exc)})"
 
 
 def _codex_bwrap_wrap(

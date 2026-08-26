@@ -497,6 +497,8 @@ def test_a_sandbox_refusal_adds_its_metadata_without_a_second_terminal(episode_s
 
     record = episode_store.read(spool_id)
     assert message in returned
+    assert returned.endswith(f"(spool {spool_id})")
+    assert "refusal persistence failed" not in returned
     assert record["sandbox_error"] == message, "the refusal detail unspool surfaces was not recorded"
     assert record["codex_version"] == "1.0"
     for name in ("status", "error", "error_kind", "completed_at", "terminal_origin", "terminal_provenance"):

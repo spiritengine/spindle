@@ -819,6 +819,8 @@ def test_sandbox_refusal_preserves_and_aborts_the_episode(episode_store):
     record = episode_store.read(spool_id)
     stored = record.get(EPISODE_KEY)
     assert message.startswith("Error:")
+    assert message.endswith(f"(spool {spool_id})")
+    assert "refusal persistence failed" not in message
     assert stored is not None, "sandbox refusal replaced the record and dropped the episode"
     assert (stored["phase"], stored["generation"], stored["revision"]) == ("aborted", 2, 2)
     assert "watchdog" not in stored

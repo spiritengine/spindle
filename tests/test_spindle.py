@@ -2,6 +2,7 @@
 
 import asyncio
 import contextlib
+import errno
 import inspect
 import json
 import logging
@@ -8325,6 +8326,105 @@ class TestCodexSandboxEnforcement:
         assert "REFUSED" in spool["error"]
         assert spool["sandbox"] == sandbox
         assert spool["codex_bin"] == "/fake/bin/codex"
+        assert "refusal persistence failed" not in result
+
+    @pytest.mark.parametrize(
+        "storage_operation,error",
+        [
+            ("builtins.open", PermissionError(errno.EACCES, "denied")),
+            ("pathlib.Path.mkdir", OSError(errno.EROFS, "read-only store")),
+            ("spindle.os.open", OSError(errno.EROFS, "read-only store")),
+            ("spindle.fcntl.flock", PermissionError(errno.EACCES, "denied")),
+            ("record-write", PermissionError(errno.EACCES, "denied")),
+            ("spindle.os.replace", PermissionError(errno.EACCES, "denied")),
+        ],
+        ids=("record-read", "parent-mkdir", "lock-open", "lock-flock", "record-write", "record-publication"),
+    )
+    def test_fresh_spin_refusal_survives_storage_oserror_without_reserving(self, tmp_path, storage_operation, error):
+        """Every refusal persistence stage stays secondary to fail-closed admission."""
+        real_open = open
+
+        def fail_record_write(path, mode="r", *args, **kwargs):
+            if "w" in mode:
+                raise error
+            return real_open(path, mode, *args, **kwargs)
+
+        storage_failure = (
+            patch("builtins.open", side_effect=fail_record_write)
+            if storage_operation == "record-write"
+            else patch(storage_operation, side_effect=error)
+        )
+        with self._captured_codex_spin(tmp_path, enforces=False) as captured_cmd:
+            with patch("spindle._try_reserve_slot_and_create") as reserve:
+                with patch("spindle._spawn_shard") as spawn_shard:
+                    with storage_failure:
+                        result = _codex_spin_sync(
+                            "do work",
+                            str(tmp_path),
+                            None,
+                            "read-only",
+                            None,
+                            None,
+                            None,
+                            shard=True,
+                            permission="readonly",
+                        )
+
+        assert result.startswith("Error: REFUSED: codex sandbox is not enforcing")
+        assert "sandbox refusal persistence failed:" in result
+        assert "(spool codex-" not in result, "an unconfirmed durable record was advertised"
+        assert "Traceback" not in result
+        assert captured_cmd == []
+        reserve.assert_not_called()
+        spawn_shard.assert_not_called()
+        assert list(tmp_path.glob("codex-*.json")) == []
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            assert spindle._count_running() == 0
+
+    def test_refusal_persistence_diagnostic_is_single_line_and_bounded(self):
+        diagnostic = spindle._codex_refusal_persistence_diagnostic(OSError(errno.EIO, "bad\n" + "x" * 1000))
+
+        assert len(diagnostic) <= spindle._CODEX_REFUSAL_PERSISTENCE_DIAGNOSTIC_MAX_CHARS
+        assert "\n" not in diagnostic
+        assert diagnostic.startswith("sandbox refusal persistence failed: errno 5: bad ")
+        assert diagnostic.endswith("...")
+
+    def test_refusal_persistence_does_not_swallow_programming_errors(self, tmp_path):
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch(
+                "spindle._read_spool_for_codex_sandbox_refusal",
+                side_effect=RuntimeError("broken invariant"),
+            ):
+                with pytest.raises(RuntimeError, match="broken invariant"):
+                    spindle._persist_codex_sandbox_refusal(
+                        "codex-programming-error",
+                        "REFUSED: sandbox unavailable",
+                        sandbox="read-only",
+                        permission="readonly",
+                        codex_bin="/fake/bin/codex",
+                        codex_version="0.149.0",
+                    )
+
+    def test_refusal_persistence_preserves_corrupt_existing_record(self, tmp_path):
+        spool_id = "codex-corrupt-refusal"
+        path = tmp_path / f"{spool_id}.json"
+        corrupt_record = b'{"status": "pending"'
+        path.write_bytes(corrupt_record)
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            result = spindle._persist_codex_sandbox_refusal(
+                spool_id,
+                "REFUSED: sandbox unavailable",
+                sandbox="read-only",
+                permission="readonly",
+                codex_bin="/fake/bin/codex",
+                codex_version="0.149.0",
+            )
+
+        assert result.startswith("Error: REFUSED: sandbox unavailable")
+        assert "refusal persistence failed: existing spool record contains invalid JSON" in result
+        assert f"(spool {spool_id})" not in result
+        assert path.read_bytes() == corrupt_record
 
     def test_spin_does_not_refuse_full_access_when_sandbox_not_enforcing(self, tmp_path):
         """danger-full-access asks for no sandbox, so a fail-open probe must not block it."""
@@ -8505,6 +8605,46 @@ class TestCodexSandboxEnforcement:
         assert "REFUSED" in spool["sandbox_error"]
         assert spool["sandbox"] == "read-only"
         assert spool["session_id"] == "sess-refuse"
+
+    def test_respin_refusal_preserves_pre_spawn_failure_when_metadata_publication_fails(self, tmp_path):
+        """A later EROFS cannot mask the refusal or leak the already-reserved slot."""
+        from spindle import owner_episode_convergence
+
+        original = {
+            "id": "codex-orig-refuse-publication",
+            "status": "complete",
+            "session_id": "sess-refuse-publication",
+            "working_dir": str(tmp_path),
+            "sandbox": "read-only",
+            "permission": "readonly",
+            "harness": "codex",
+            "tags": ["codex"],
+        }
+        real_publish = owner_episode_convergence.publish_record_updates
+
+        def fail_refusal_metadata(spool_id, record, updates):
+            if "sandbox_error" in updates:
+                raise PermissionError(errno.EROFS, "read-only store")
+            return real_publish(spool_id, record, updates)
+
+        with patch.object(owner_episode_convergence, "publish_record_updates", side_effect=fail_refusal_metadata):
+            cmd, result, state = self._respin_with_spool(tmp_path, original, enforces=False)
+
+        assert cmd is None
+        assert result.startswith("Error: REFUSED: codex sandbox is not enforcing")
+        assert "sandbox refusal persistence failed: errno 30: read-only store" in result
+        assert "(spool codex-" not in result
+
+        records = [json.loads(path.read_text()) for path in state.glob("codex-*.json")]
+        refused = next(record for record in records if record["id"] != original["id"])
+        assert refused["status"] == "error"
+        assert "REFUSED" in refused["error"]
+        assert refused["owner_episode"]["phase"] == "aborted"
+        assert refused["terminal_origin"] == "launcher_pre_spawn_failure"
+        assert "sandbox_error" not in refused, "the failed metadata publication was presented as durable"
+        assert "shard" not in refused
+        with patch("spindle.SPINDLE_DIR", state):
+            assert spindle._count_running() == 0
 
     def test_respin_does_not_refuse_full_access_when_sandbox_not_enforcing(self, tmp_path):
         """A danger-full-access session respins normally even when the probe reports fail-open."""
