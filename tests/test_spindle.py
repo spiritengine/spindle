@@ -8446,21 +8446,28 @@ class TestCodexSandboxEnforcement:
         assert f"(spool {spool_id})" not in result
         assert path.read_bytes() == corrupt_record
 
-    def test_refusal_persistence_preserves_invalid_utf8_record(self, tmp_path):
+    def test_refusal_persistence_preserves_invalid_utf8_record_independent_of_default_encoding(self, tmp_path):
         spool_id = "codex-invalid-utf8-refusal"
         path = tmp_path / f"{spool_id}.json"
         invalid_record = b'{"status":"pending","prompt":"\xff"}'
         path.write_bytes(invalid_record)
+        real_open = open
+
+        def non_utf8_default_open(file, mode="r", *args, **kwargs):
+            if "b" not in mode and "encoding" not in kwargs:
+                kwargs["encoding"] = "latin-1"
+            return real_open(file, mode, *args, **kwargs)
 
         with patch("spindle.SPINDLE_DIR", tmp_path):
-            result = spindle._persist_codex_sandbox_refusal(
-                spool_id,
-                "REFUSED: sandbox unavailable",
-                sandbox="read-only",
-                permission="readonly",
-                codex_bin="/fake/bin/codex",
-                codex_version="0.149.0",
-            )
+            with patch("builtins.open", side_effect=non_utf8_default_open):
+                result = spindle._persist_codex_sandbox_refusal(
+                    spool_id,
+                    "REFUSED: sandbox unavailable",
+                    sandbox="read-only",
+                    permission="readonly",
+                    codex_bin="/fake/bin/codex",
+                    codex_version="0.149.0",
+                )
 
         assert result.startswith("Error: REFUSED: sandbox unavailable")
         diagnostic = result.removeprefix("Error: REFUSED: sandbox unavailable (").removesuffix(")")
@@ -8468,6 +8475,15 @@ class TestCodexSandboxEnforcement:
         assert len(diagnostic) <= spindle._CODEX_REFUSAL_PERSISTENCE_DIAGNOSTIC_MAX_CHARS
         assert f"(spool {spool_id})" not in result
         assert path.read_bytes() == invalid_record
+
+    def test_refusal_record_reader_does_not_swallow_decoder_value_error(self, tmp_path):
+        spool_id = "codex-decoder-value-error"
+        (tmp_path / f"{spool_id}.json").write_text('{"status":"pending"}', encoding="utf-8")
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle.json.load", side_effect=ValueError("decoder invariant failed")):
+                with pytest.raises(ValueError, match="decoder invariant failed"):
+                    spindle._read_spool_for_codex_sandbox_refusal(spool_id)
 
     @pytest.mark.parametrize(
         "spool_id,invalid_record",
@@ -8478,18 +8494,18 @@ class TestCodexSandboxEnforcement:
             ),
             (
                 "codex-deeply-nested-refusal",
-                lambda: b'{"status":"pending","value":'
-                + b"[" * (sys.getrecursionlimit() * 20)
-                + b"0"
-                + b"]" * (sys.getrecursionlimit() * 20)
-                + b"}",
+                lambda: (
+                    b'{"status":"pending","value":'
+                    + b"[" * (sys.getrecursionlimit() * 20)
+                    + b"0"
+                    + b"]" * (sys.getrecursionlimit() * 20)
+                    + b"}"
+                ),
             ),
         ],
         ids=("over-limit-integer", "deep-nesting"),
     )
-    def test_refusal_persistence_preserves_content_rejected_by_json_decoder(
-        self, tmp_path, spool_id, invalid_record
-    ):
+    def test_refusal_persistence_preserves_content_rejected_by_json_decoder(self, tmp_path, spool_id, invalid_record):
         if spool_id == "codex-over-limit-integer-refusal" and sys.get_int_max_str_digits() == 0:
             pytest.skip("Python integer string conversion limit is disabled")
         path = tmp_path / f"{spool_id}.json"

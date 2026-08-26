@@ -7886,6 +7886,18 @@ def _codex_sandbox_refusal(
     )
 
 
+class _RefusalRecordContentError(ValueError):
+    """A JSON value the refusal-record reader deliberately rejects."""
+
+
+def _parse_refusal_record_int(value: str) -> int:
+    """Parse a JSON integer while identifying Python's digit-limit rejection."""
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise _RefusalRecordContentError from exc
+
+
 def _read_spool_for_codex_sandbox_refusal(spool_id: str) -> Optional[dict]:
     """Read a refusal record without treating storage failure as record absence.
 
@@ -7895,20 +7907,19 @@ def _read_spool_for_codex_sandbox_refusal(spool_id: str) -> Optional[dict]:
     mistaken for permission to create or replace a record.
     """
     try:
-        stream = open(_get_spool_path(spool_id))
+        stream = open(_get_spool_path(spool_id), encoding="utf-8")
     except FileNotFoundError:
         return None
     with stream:
         try:
-            record = json.load(stream)
+            record = json.load(stream, parse_int=_parse_refusal_record_int)
         except UnicodeDecodeError as exc:
             # The bytes are an occupied, unreadable spool record, not an absent one.
             raise OSError("existing spool record contains invalid UTF-8") from exc
-        except (ValueError, RecursionError) as exc:
-            # JSON's decoder also raises content-driven ValueError subclasses for
-            # inputs such as over-limit integers, and RecursionError for excessive
-            # nesting. Translate only failures from this decode call: errors while
-            # opening, closing, or validating the decoded object remain visible.
+        except (json.JSONDecodeError, _RefusalRecordContentError, RecursionError) as exc:
+            # Syntax, Python's integer digit limit, and excessive nesting are all
+            # properties of the stored content. Other ValueError instances from
+            # the decoder are programming/runtime failures and remain visible.
             raise OSError("existing spool record contains invalid JSON") from exc
     if not isinstance(record, dict):
         raise OSError("existing spool record is not a JSON object")
