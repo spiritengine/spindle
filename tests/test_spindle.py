@@ -8576,9 +8576,10 @@ class TestCodexSandboxEnforcement:
         "callback,payload",
         [
             ("_parse_refusal_record_int", b'{"status":"pending","value":1}'),
+            ("_parse_refusal_record_float", b'{"status":"pending","value":1.5}'),
             ("_reject_refusal_record_constant", b'{"status":"pending","value":NaN}'),
         ],
-        ids=("integer", "constant"),
+        ids=("integer", "float", "constant"),
     )
     def test_refusal_record_reader_does_not_swallow_callback_runtime_errors(self, tmp_path, callback, payload):
         spool_id = "codex-callback-runtime-error"
@@ -8662,8 +8663,18 @@ class TestCodexSandboxEnforcement:
             ("codex-nan-refusal", lambda: b'{"status":"pending","value":NaN}'),
             ("codex-infinity-refusal", lambda: b'{"status":"pending","value":Infinity}'),
             ("codex-negative-infinity-refusal", lambda: b'{"status":"pending","value":-Infinity}'),
+            ("codex-positive-float-overflow-refusal", lambda: b'{"status":"pending","value":1e400}'),
+            ("codex-negative-float-overflow-refusal", lambda: b'{"status":"pending","value":-1e400}'),
         ],
-        ids=("over-limit-integer", "deep-nesting", "nan", "infinity", "negative-infinity"),
+        ids=(
+            "over-limit-integer",
+            "deep-nesting",
+            "nan",
+            "infinity",
+            "negative-infinity",
+            "positive-float-overflow",
+            "negative-float-overflow",
+        ),
     )
     def test_refusal_persistence_preserves_content_rejected_by_json_decoder(self, tmp_path, spool_id, invalid_record):
         if spool_id == "codex-over-limit-integer-refusal" and sys.get_int_max_str_digits() == 0:
@@ -8686,6 +8697,17 @@ class TestCodexSandboxEnforcement:
         assert "refusal persistence failed: existing spool record contains invalid JSON" in result
         assert f"(spool {spool_id})" not in result
         assert path.read_bytes() == original_bytes
+
+    @pytest.mark.parametrize("value", [0.0, 1.25, -0.0025, 1e308])
+    def test_refusal_record_reader_accepts_finite_floats(self, tmp_path, value):
+        spool_id = "codex-finite-float-refusal"
+        path = tmp_path / f"{spool_id}.json"
+        path.write_bytes(json.dumps({"status": "pending", "value": value}).encode("utf-8"))
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            record = spindle._read_spool_for_codex_sandbox_refusal(spool_id)
+
+        assert record == {"status": "pending", "value": value}
 
     def test_fresh_refusal_returns_spool_after_durable_directory_close_failure(self, tmp_path):
         spool_id = "codex-refusal-durable-close-failure"

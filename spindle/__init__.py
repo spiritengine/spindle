@@ -16,6 +16,7 @@ import fcntl
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -2747,51 +2748,65 @@ def _record_pre_spawn_failure(
     spool_metadata: Optional[dict] = None,
 ) -> None:
     """Publish launcher failure evidence, then let convergence project it."""
-    with _spool_lock(spool_id) as acquired:
-        if not acquired:
-            return
-        current = _read_spool(spool_id)
-        if not current:
-            return
-        if spool_metadata:
-            for key in (
-                "working_dir",
-                "shard",
-                "shard_created_by_spool",
-                "shard_source_dir",
-                "base_branch",
-                "harness",
-            ):
-                if key in spool_metadata:
-                    current[key] = spool_metadata[key]
-        current.pop("launcher_pid", None)
-        current.pop("launcher_start_time", None)
-        _preserve_failed_spool_shard(current)
-        try:
-            _write_spool(spool_id, current)
-        except _DurablePublicationCleanupError:
-            # This preparatory snapshot contains no refusal evidence yet. Its
-            # publication succeeded, so continue to the episode transition
-            # that makes the failure claim durable.
-            pass
-        episode = current.get("owner_episode") or {}
-        if current.get("status") == "pending" and episode.get("phase") == "reserved":
-            transition_owner_episode(
-                SPINDLE_DIR,
-                spool_id,
-                actor="launcher",
-                destination="aborted",
-                generation=episode.get("generation"),
-                expected_revision=episode.get("revision"),
-                facts={
-                    "failure": {
-                        "kind": "launcher_pre_spawn_failure",
-                        "detail": error,
-                        "observed_at": datetime.now(timezone.utc).isoformat(),
-                    }
-                },
-                record_locked=True,
-            )
+    failure_evidence_durable = False
+    try:
+        with _spool_lock(spool_id) as acquired:
+            if not acquired:
+                return
+            current = _read_spool(spool_id)
+            if not current:
+                return
+            if spool_metadata:
+                for key in (
+                    "working_dir",
+                    "shard",
+                    "shard_created_by_spool",
+                    "shard_source_dir",
+                    "base_branch",
+                    "harness",
+                ):
+                    if key in spool_metadata:
+                        current[key] = spool_metadata[key]
+            current.pop("launcher_pid", None)
+            current.pop("launcher_start_time", None)
+            _preserve_failed_spool_shard(current)
+            try:
+                _write_spool(spool_id, current)
+            except _DurablePublicationCleanupError:
+                # This preparatory snapshot contains no refusal evidence yet. Its
+                # publication succeeded, so continue to the episode transition
+                # that makes the failure claim durable.
+                pass
+            episode = current.get("owner_episode") or {}
+            if current.get("status") == "pending" and episode.get("phase") == "reserved":
+                try:
+                    transitioned = transition_owner_episode(
+                        SPINDLE_DIR,
+                        spool_id,
+                        actor="launcher",
+                        destination="aborted",
+                        generation=episode.get("generation"),
+                        expected_revision=episode.get("revision"),
+                        facts={
+                            "failure": {
+                                "kind": "launcher_pre_spawn_failure",
+                                "detail": error,
+                                "observed_at": datetime.now(timezone.utc).isoformat(),
+                            }
+                        },
+                        record_locked=True,
+                    )
+                    failure_evidence_durable = transitioned.accepted
+                except _DurablePublicationCleanupError:
+                    # The transition's replace and directory fsync completed. The
+                    # cleanup marker proves this failure evidence is durable even
+                    # though the transition could not return its result.
+                    failure_evidence_durable = True
+    except OSError:
+        # Lock cleanup after the accepted/durable transition must not strand its
+        # public projection. Before that proof, retain the storage failure.
+        if not failure_evidence_durable:
+            raise
     current = _read_spool(spool_id)
     if current and "owner_episode" in current:
         from .owner_episode_convergence import ObserverIdentity, converge_owner_episode
@@ -7916,6 +7931,14 @@ def _parse_refusal_record_int(value: str) -> int:
         raise _RefusalRecordContentError from exc
 
 
+def _parse_refusal_record_float(value: str) -> float:
+    """Parse a JSON float while rejecting exponent overflow to infinity."""
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise _RefusalRecordContentError(f"non-finite JSON float: {value}")
+    return parsed
+
+
 def _reject_refusal_record_constant(value: str) -> None:
     """Reject the non-finite numeric constants accepted by Python's decoder."""
     raise _RefusalRecordContentError(f"invalid JSON numeric constant: {value}")
@@ -7984,14 +8007,15 @@ def _read_spool_for_codex_sandbox_refusal(spool_id: str) -> Optional[dict]:
         record = json.loads(
             text,
             parse_int=_parse_refusal_record_int,
+            parse_float=_parse_refusal_record_float,
             parse_constant=_reject_refusal_record_constant,
         )
     except UnicodeDecodeError as exc:
         # The bytes are an occupied, unreadable spool record, not an absent one.
         raise OSError("existing spool record contains invalid UTF-8") from exc
     except (json.JSONDecodeError, _RefusalRecordContentError) as exc:
-        # Syntax, Python's integer digit limit, and proven excessive nesting are
-        # properties of the stored content. Decoder/runtime recursion remains visible.
+        # Syntax, numeric limits, and proven excessive nesting are properties of
+        # the stored content. Decoder/runtime recursion remains visible.
         raise OSError("existing spool record contains invalid JSON") from exc
     if not isinstance(record, dict):
         raise OSError("existing spool record is not a JSON object")
@@ -8028,8 +8052,8 @@ def _persist_codex_sandbox_refusal(
     persisted spool with status "error" plus a `sandbox_error` field so unspool/spool_info
     surface it. status "error" does not count against concurrency, so no slot leaks. If
     this storage-only path raises OSError, the primary refusal still wins. A spool ID is
-    claimed only after durable publication returns successfully; failures before that
-    point receive a bounded persistence diagnostic instead.
+    claimed only after the final record update is proven directory-durable; failures
+    before that point receive a bounded persistence diagnostic instead.
     """
     publication_confirmed = False
     try:
@@ -8072,12 +8096,13 @@ def _persist_codex_sandbox_refusal(
                 updates = metadata
             from .owner_episode_convergence import publish_record_updates
 
-            publish_record_updates(spool_id, spool, updates)
-            publication_confirmed = True
-        return f"Error: {message} (spool {spool_id})"
-    except _DurablePublicationCleanupError:
-        # Refusal evidence or metadata reached directory durability; a later
-        # directory-fd cleanup failure cannot retract the spool identity.
+            try:
+                publish_record_updates(spool_id, spool, updates)
+                publication_confirmed = True
+            except _DurablePublicationCleanupError:
+                # This is the one publication whose durable cleanup marker
+                # confirms the complete public refusal record.
+                publication_confirmed = True
         return f"Error: {message} (spool {spool_id})"
     except OSError as exc:
         if publication_confirmed:

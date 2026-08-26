@@ -826,7 +826,7 @@ def test_sandbox_refusal_preserves_and_aborts_the_episode(episode_store):
     assert "watchdog" not in stored
 
 
-def test_sandbox_refusal_keeps_owner_spool_after_durable_abort_cleanup_failure(episode_store, monkeypatch):
+def test_sandbox_refusal_finishes_after_durable_abort_cleanup_failure(episode_store, monkeypatch):
     spool_id = "writer-sandbox-refusal-durable-abort"
     reserved = make_episode("reserved", generation=2, path="before_watchdog")
     episode_store.write(spool_id, status="pending", episode=reserved)
@@ -858,11 +858,50 @@ def test_sandbox_refusal_keeps_owner_spool_after_durable_abort_cleanup_failure(e
 
     record = episode_store.read(spool_id)
     assert message == f"Error: REFUSED: codex sandbox is unavailable (spool {spool_id})"
-    assert directory_closes == 2
-    assert record["status"] == "pending"
+    assert directory_closes == 4
+    assert record["status"] == "error"
+    assert record["error"] == "REFUSED: codex sandbox is unavailable"
+    assert record["sandbox_error"] == "REFUSED: codex sandbox is unavailable"
     assert record[EPISODE_KEY]["phase"] == "aborted"
     assert record[EPISODE_KEY]["failure"]["detail"] == "REFUSED: codex sandbox is unavailable"
-    assert "sandbox_error" not in record
+    assert spindle._count_running() == 0
+
+
+def test_sandbox_refusal_converges_after_post_abort_lock_cleanup_failure(episode_store, monkeypatch):
+    spool_id = "writer-sandbox-refusal-abort-unlock"
+    reserved = make_episode("reserved", generation=2, path="before_watchdog")
+    episode_store.write(spool_id, status="pending", episode=reserved)
+    real_flock = spindle.fcntl.flock
+    failed_unlocks = 0
+
+    def fail_first_unlock_after_release(fd, operation):
+        nonlocal failed_unlocks
+        result = real_flock(fd, operation)
+        if operation == spindle.fcntl.LOCK_UN and failed_unlocks == 0:
+            failed_unlocks += 1
+            raise OSError(errno.EIO, "record unlock failed after durable abort")
+        return result
+
+    monkeypatch.setattr(spindle.fcntl, "flock", fail_first_unlock_after_release)
+
+    message = spindle._persist_codex_sandbox_refusal(
+        spool_id,
+        "REFUSED: codex sandbox is unavailable",
+        sandbox="workspace-write",
+        permission="careful",
+        codex_bin="/usr/bin/codex",
+        codex_version="1.0",
+    )
+
+    record = episode_store.read(spool_id)
+    assert message == f"Error: REFUSED: codex sandbox is unavailable (spool {spool_id})"
+    assert failed_unlocks == 1
+    assert record["status"] == "error"
+    assert record["sandbox_error"] == "REFUSED: codex sandbox is unavailable"
+    assert record[EPISODE_KEY]["phase"] == "aborted"
+    assert spindle._count_running() == 0
+    with spindle._spool_lock(spool_id, blocking=False) as acquired:
+        assert acquired is True
 
 
 def test_sandbox_refusal_episode_path_is_utf8_independent_of_text_defaults(episode_store, monkeypatch):
