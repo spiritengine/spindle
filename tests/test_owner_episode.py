@@ -826,6 +826,53 @@ def test_sandbox_refusal_preserves_and_aborts_the_episode(episode_store):
     assert "watchdog" not in stored
 
 
+def test_sandbox_refusal_episode_path_is_utf8_independent_of_text_defaults(episode_store, monkeypatch):
+    spool_id = "writer-sandbox-refusal-utf8"
+    reserved = make_episode("reserved", generation=2, path="before_watchdog")
+    record = episode_store.write(spool_id, status="pending", episode=reserved, prompt="caf\u00e9 \u2615")
+    episode_store.spool_path(spool_id).write_bytes(json.dumps(record, ensure_ascii=False).encode("utf-8"))
+    real_open = open
+    real_read_text = Path.read_text
+    real_fdopen = os.fdopen
+
+    def ascii_default_open(file, mode="r", *args, **kwargs):
+        if "b" not in mode and "encoding" not in kwargs:
+            kwargs["encoding"] = "ascii"
+        return real_open(file, mode, *args, **kwargs)
+
+    def ascii_default_read_text(self, *args, **kwargs):
+        if "encoding" not in kwargs:
+            kwargs["encoding"] = "ascii"
+        return real_read_text(self, *args, **kwargs)
+
+    def ascii_default_fdopen(fd, mode="r", *args, **kwargs):
+        if "b" not in mode and "encoding" not in kwargs:
+            kwargs["encoding"] = "ascii"
+        return real_fdopen(fd, mode, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.open", ascii_default_open)
+    monkeypatch.setattr(Path, "read_text", ascii_default_read_text)
+    monkeypatch.setattr(os, "fdopen", ascii_default_fdopen)
+
+    message = spindle._persist_codex_sandbox_refusal(
+        spool_id,
+        "REFUSED: codex sandbox is unavailable",
+        sandbox="workspace-write",
+        permission="careful",
+        codex_bin="/usr/bin/codex",
+        codex_version="1.0",
+    )
+
+    stored_record = json.loads(episode_store.spool_path(spool_id).read_bytes())
+    assert message == f"Error: REFUSED: codex sandbox is unavailable (spool {spool_id})"
+    assert stored_record["status"] == "error"
+    assert stored_record["error"] == "REFUSED: codex sandbox is unavailable"
+    assert stored_record["sandbox_error"] == "REFUSED: codex sandbox is unavailable"
+    assert stored_record["prompt"] == "caf\u00e9 \u2615"
+    assert stored_record[EPISODE_KEY]["phase"] == "aborted"
+    assert "watchdog" not in stored_record[EPISODE_KEY]
+
+
 def test_finalization_persists_release_from_cleanup_proven(episode_store):
     spool_id = "writer-finalization"
     episode = make_episode("cleanup_proven", generation=2)

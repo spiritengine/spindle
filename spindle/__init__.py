@@ -32,7 +32,7 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Callable, Dict, Generator, Optional, Tuple
+from typing import BinaryIO, Callable, Dict, Generator, Optional, Tuple
 
 # The stream driver is a standalone top-level module (not part of this
 # package) so the driver child process can import the shared background-task
@@ -1371,7 +1371,7 @@ def _write_spool(spool_id: str, data: dict) -> None:
     # Metadata writers may have worked from a snapshot while an owner advanced
     # the authoritative episode.  They may never lower or remove that episode.
     try:
-        current = json.loads(path.read_text())
+        current = json.loads(path.read_text(encoding="utf-8"))
     except (FileNotFoundError, OSError, json.JSONDecodeError, TypeError):
         current = None
     current_episode = current.get("owner_episode") if isinstance(current, dict) else None
@@ -1411,7 +1411,7 @@ def _write_spool(spool_id: str, data: dict) -> None:
     # fsync the directory so the rename survives a crash.  Without the fsyncs a
     # later write could silently un-durable an authoritative episode or lifecycle
     # block, and a crash could leave a torn <id>.json.
-    with open(tmp_path, "w") as f:
+    with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
         f.flush()
         os.fsync(f.fileno())
@@ -1430,7 +1430,7 @@ def _read_spool(spool_id: str) -> Optional[dict]:
         return None
 
     try:
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             return json.load(f)
     except (json.JSONDecodeError, IOError):
         return None
@@ -1463,6 +1463,7 @@ def _spool_lock(spool_id: str, blocking: bool = True) -> Generator[bool, None, N
 
     lock_fd = None
     acquired = False
+    active_error = False
     try:
         lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR)
         try:
@@ -1475,15 +1476,25 @@ def _spool_lock(spool_id: str, blocking: bool = True) -> Generator[bool, None, N
         except BlockingIOError:
             # Non-blocking mode and lock not available
             acquired = False
-
         yield acquired
+    except BaseException:
+        active_error = True
+        raise
     finally:
         if lock_fd is not None:
+            cleanup_error = None
             try:
                 if acquired:
                     fcntl.flock(lock_fd, fcntl.LOCK_UN)
-            finally:
+            except BaseException as exc:
+                cleanup_error = exc
+            try:
                 os.close(lock_fd)
+            except BaseException as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
+            if cleanup_error is not None and not active_error:
+                raise cleanup_error
 
 
 def _canonical_worktree_path(worktree_path: Optional[str]) -> Optional[str]:
@@ -7890,12 +7901,59 @@ class _RefusalRecordContentError(ValueError):
     """A JSON value the refusal-record reader deliberately rejects."""
 
 
+_REFUSAL_RECORD_MAX_JSON_DEPTH = 256
+
+
 def _parse_refusal_record_int(value: str) -> int:
     """Parse a JSON integer while identifying Python's digit-limit rejection."""
     try:
         return int(value)
     except ValueError as exc:
         raise _RefusalRecordContentError from exc
+
+
+def _reject_excessive_refusal_record_nesting(content: bytes) -> None:
+    """Reject proven excessive JSON nesting without invoking Python recursion.
+
+    Structural delimiters inside strings do not contribute to depth. Backslash
+    handling is intentionally byte-oriented: JSON syntax bytes are ASCII, while
+    UTF-8 continuation bytes cannot equal a quote, backslash, or delimiter.
+    Syntax validity remains json.loads' responsibility.
+    """
+    depth = 0
+    in_string = False
+    escaped = False
+    for byte in content:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif byte == ord("\\"):
+                escaped = True
+            elif byte == ord('"'):
+                in_string = False
+            continue
+        if byte == ord('"'):
+            in_string = True
+        elif byte in (ord("["), ord("{")):
+            depth += 1
+            if depth > _REFUSAL_RECORD_MAX_JSON_DEPTH:
+                raise _RefusalRecordContentError("existing spool record exceeds maximum JSON depth")
+        elif byte in (ord("]"), ord("}")) and depth:
+            depth -= 1
+
+
+def _read_refusal_record_bytes(stream: BinaryIO) -> bytes:
+    """Read and close a record, preserving an active read exception over close."""
+    try:
+        content = stream.read()
+    except BaseException:
+        try:
+            stream.close()
+        except BaseException:
+            pass
+        raise
+    stream.close()
+    return content
 
 
 def _read_spool_for_codex_sandbox_refusal(spool_id: str) -> Optional[dict]:
@@ -7907,20 +7965,20 @@ def _read_spool_for_codex_sandbox_refusal(spool_id: str) -> Optional[dict]:
     mistaken for permission to create or replace a record.
     """
     try:
-        stream = open(_get_spool_path(spool_id), encoding="utf-8")
+        stream = open(_get_spool_path(spool_id), "rb")
     except FileNotFoundError:
         return None
-    with stream:
-        try:
-            record = json.load(stream, parse_int=_parse_refusal_record_int)
-        except UnicodeDecodeError as exc:
-            # The bytes are an occupied, unreadable spool record, not an absent one.
-            raise OSError("existing spool record contains invalid UTF-8") from exc
-        except (json.JSONDecodeError, _RefusalRecordContentError, RecursionError) as exc:
-            # Syntax, Python's integer digit limit, and excessive nesting are all
-            # properties of the stored content. Other ValueError instances from
-            # the decoder are programming/runtime failures and remain visible.
-            raise OSError("existing spool record contains invalid JSON") from exc
+    content = _read_refusal_record_bytes(stream)
+    try:
+        _reject_excessive_refusal_record_nesting(content)
+        record = json.loads(content, parse_int=_parse_refusal_record_int)
+    except UnicodeDecodeError as exc:
+        # The bytes are an occupied, unreadable spool record, not an absent one.
+        raise OSError("existing spool record contains invalid UTF-8") from exc
+    except (json.JSONDecodeError, _RefusalRecordContentError) as exc:
+        # Syntax, Python's integer digit limit, and proven excessive nesting are
+        # properties of the stored content. Decoder/runtime recursion remains visible.
+        raise OSError("existing spool record contains invalid JSON") from exc
     if not isinstance(record, dict):
         raise OSError("existing spool record is not a JSON object")
     return record

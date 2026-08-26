@@ -444,7 +444,7 @@ def transition_owner_episode(
     guard = nullcontext() if record_locked else _episode_record_guard(root, spool_id)
     with guard:
         try:
-            record = json.loads(spool_path.read_text())
+            record = json.loads(spool_path.read_text(encoding="utf-8"))
         except FileNotFoundError:
             record = {"id": spool_id, "status": "pending", "created_at": _utc_now()}
         current = record.get(OWNER_EPISODE_KEY)
@@ -604,7 +604,7 @@ def _atomic_json_write(path: Path, value: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
     try:
-        with os.fdopen(fd, "w") as stream:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
             json.dump(value, stream, sort_keys=True, separators=(",", ":"))
             stream.write("\n")
             stream.flush()

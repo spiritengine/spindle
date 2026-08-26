@@ -3509,6 +3509,30 @@ class TestSpoolLocking:
                     with _spool_lock("acquisition-error"):
                         pytest.fail("a failed acquisition must not enter the context")
 
+    def test_body_error_survives_unlock_error_and_lock_is_released(self, tmp_path):
+        real_flock = spindle.fcntl.flock
+        failed_unlock_fds = []
+
+        def fail_actual_unlock(lock_fd, operation):
+            if operation == spindle.fcntl.LOCK_UN:
+                os.fstat(lock_fd)
+                failed_unlock_fds.append(lock_fd)
+                raise OSError(errno.EIO, "unlock failed during body error")
+            return real_flock(lock_fd, operation)
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle.fcntl.flock", side_effect=fail_actual_unlock):
+                with pytest.raises(ValueError, match="body invariant failed"):
+                    with _spool_lock("body-and-unlock-error") as acquired:
+                        assert acquired is True
+                        raise ValueError("body invariant failed")
+            assert len(failed_unlock_fds) == 1
+            with pytest.raises(OSError) as closed:
+                os.fstat(failed_unlock_fds[0])
+            assert closed.value.errno == errno.EBADF
+            with _spool_lock("body-and-unlock-error", blocking=False) as reacquired:
+                assert reacquired is True
+
 
 def _write_released_owner_evidence(root: Path, spool_id: str, *, pid: int = 999_999_999, exit_code: int = 0):
     lock_path = root / f"{spool_id}.process-owner"
@@ -8476,14 +8500,109 @@ class TestCodexSandboxEnforcement:
         assert f"(spool {spool_id})" not in result
         assert path.read_bytes() == invalid_record
 
-    def test_refusal_record_reader_does_not_swallow_decoder_value_error(self, tmp_path):
-        spool_id = "codex-decoder-value-error"
+    def test_refusal_reread_and_write_are_utf8_independent_of_text_defaults(self, tmp_path):
+        spool_id = "codex-valid-utf8-refusal"
+        path = tmp_path / f"{spool_id}.json"
+        original = {"id": spool_id, "status": "pending", "prompt": "caf\u00e9 \u2615"}
+        path.write_bytes(json.dumps(original, ensure_ascii=False).encode("utf-8"))
+        real_open = open
+        real_read_text = Path.read_text
+
+        def ascii_default_open(file, mode="r", *args, **kwargs):
+            if "b" not in mode and "encoding" not in kwargs:
+                kwargs["encoding"] = "ascii"
+            return real_open(file, mode, *args, **kwargs)
+
+        def ascii_default_read_text(self, *args, **kwargs):
+            if "encoding" not in kwargs:
+                kwargs["encoding"] = "ascii"
+            return real_read_text(self, *args, **kwargs)
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("builtins.open", side_effect=ascii_default_open):
+                with patch("pathlib.Path.read_text", new=ascii_default_read_text):
+                    result = spindle._persist_codex_sandbox_refusal(
+                        spool_id,
+                        "REFUSED: sandbox unavailable",
+                        sandbox="read-only",
+                        permission="readonly",
+                        codex_bin="/fake/bin/codex",
+                        codex_version="0.149.0",
+                    )
+
+        record = json.loads(path.read_bytes())
+        assert result == f"Error: REFUSED: sandbox unavailable (spool {spool_id})"
+        assert record["status"] == "error"
+        assert record["error"] == "REFUSED: sandbox unavailable"
+        assert record["sandbox_error"] == "REFUSED: sandbox unavailable"
+        assert record["prompt"] == "caf\u00e9 \u2615"
+
+    @pytest.mark.parametrize(
+        "decoder_error",
+        [ValueError("decoder invariant failed"), RecursionError("decoder recursion failed")],
+        ids=("value-error", "recursion-error"),
+    )
+    def test_refusal_record_reader_does_not_swallow_decoder_errors(self, tmp_path, decoder_error):
+        spool_id = "codex-decoder-programming-error"
         (tmp_path / f"{spool_id}.json").write_text('{"status":"pending"}', encoding="utf-8")
 
         with patch("spindle.SPINDLE_DIR", tmp_path):
-            with patch("spindle.json.load", side_effect=ValueError("decoder invariant failed")):
-                with pytest.raises(ValueError, match="decoder invariant failed"):
+            with patch("spindle.json.loads", side_effect=decoder_error):
+                with pytest.raises(type(decoder_error), match=str(decoder_error)):
                     spindle._read_spool_for_codex_sandbox_refusal(spool_id)
+
+    def test_refusal_record_read_error_survives_close_error(self, tmp_path):
+        class DualFailureStream:
+            close_called = False
+
+            def read(self):
+                raise ValueError("stream read invariant failed")
+
+            def close(self):
+                self.close_called = True
+                raise OSError(errno.EIO, "stream close failed")
+
+        stream = DualFailureStream()
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("builtins.open", return_value=stream):
+                with pytest.raises(ValueError, match="stream read invariant failed"):
+                    spindle._read_spool_for_codex_sandbox_refusal("codex-stream-dual-failure")
+        assert stream.close_called is True
+
+    def test_refusal_record_close_error_propagates_before_decode(self, tmp_path):
+        class CloseFailureStream:
+            close_called = False
+
+            def read(self):
+                return b'{"status":"pending"}'
+
+            def close(self):
+                self.close_called = True
+                raise OSError(errno.EIO, "stream close failed")
+
+        stream = CloseFailureStream()
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("builtins.open", return_value=stream):
+                with patch("spindle.json.loads") as decode:
+                    with pytest.raises(OSError, match="stream close failed"):
+                        spindle._read_spool_for_codex_sandbox_refusal("codex-stream-close-failure")
+        assert stream.close_called is True
+        decode.assert_not_called()
+
+    def test_refusal_depth_guard_ignores_delimiters_and_escaped_quotes_in_strings(self, tmp_path):
+        spool_id = "codex-structural-characters-in-string"
+        payload = (
+            "[{" * (spindle._REFUSAL_RECORD_MAX_JSON_DEPTH + 1)
+            + '\\"'
+            + "]}" * (spindle._REFUSAL_RECORD_MAX_JSON_DEPTH + 1)
+        )
+        path = tmp_path / f"{spool_id}.json"
+        path.write_bytes(json.dumps({"status": "pending", "payload": payload}).encode("utf-8"))
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            record = spindle._read_spool_for_codex_sandbox_refusal(spool_id)
+
+        assert record == {"status": "pending", "payload": payload}
 
     @pytest.mark.parametrize(
         "spool_id,invalid_record",
@@ -8563,6 +8682,43 @@ class TestCodexSandboxEnforcement:
         assert record["status"] == "error"
         assert record["error"] == "REFUSED: sandbox unavailable"
         assert record["sandbox_error"] == "REFUSED: sandbox unavailable"
+
+    def test_refusal_body_error_survives_unlock_error_instead_of_being_softened(self, tmp_path):
+        from spindle import owner_episode_convergence
+
+        spool_id = "codex-refusal-body-and-unlock-failure"
+        real_flock = spindle.fcntl.flock
+        failed_unlock_fds = []
+
+        def fail_actual_unlock(lock_fd, operation):
+            if operation == spindle.fcntl.LOCK_UN:
+                os.fstat(lock_fd)
+                failed_unlock_fds.append(lock_fd)
+                raise OSError(errno.EIO, "unlock failed during publication error")
+            return real_flock(lock_fd, operation)
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch.object(
+                owner_episode_convergence,
+                "publish_record_updates",
+                side_effect=ValueError("publication invariant failed"),
+            ):
+                with patch("spindle.fcntl.flock", side_effect=fail_actual_unlock):
+                    with pytest.raises(ValueError, match="publication invariant failed"):
+                        spindle._persist_codex_sandbox_refusal(
+                            spool_id,
+                            "REFUSED: sandbox unavailable",
+                            sandbox="read-only",
+                            permission="readonly",
+                            codex_bin="/fake/bin/codex",
+                            codex_version="0.149.0",
+                        )
+            assert len(failed_unlock_fds) == 1
+            with pytest.raises(OSError) as closed:
+                os.fstat(failed_unlock_fds[0])
+            assert closed.value.errno == errno.EBADF
+            with spindle._spool_lock(spool_id, blocking=False) as reacquired:
+                assert reacquired is True
 
     def test_spin_does_not_refuse_full_access_when_sandbox_not_enforcing(self, tmp_path):
         """danger-full-access asks for no sandbox, so a fail-open probe must not block it."""
