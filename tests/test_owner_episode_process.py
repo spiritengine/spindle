@@ -610,7 +610,13 @@ def test_direct_compatibility_owner_crash_publishes_generation_matched_legacy_ev
         try:
             with ready_fifo.open() as stream:
                 assert stream.readline() == "ready\n"
-            running = spindle._read_spool(spool_id)
+            deadline = time.monotonic() + 8
+            while True:
+                running = spindle._read_spool(spool_id)
+                if running.get("owner_pid") is not None and running.get("owner_generation") is not None:
+                    break
+                assert time.monotonic() < deadline, "owner identity was not published to the spool"
+                time.sleep(0.01)
             assert "owner_episode" not in running
             os.kill(running["owner_pid"], signal.SIGKILL)
             assert watchdog.wait(timeout=8) == 137
