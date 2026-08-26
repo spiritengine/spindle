@@ -31,13 +31,25 @@ MCP server for multi-harness AI agent delegation. Spawn background agents (Claud
   - [Kimi CLI](https://github.com/MoonshotAI/kimi-cli) (`kimi-cli`)
 - Git (for shard/worktree functionality)
 - `bwrap` (bubblewrap), on Linux, for filesystem-contained shards and every
-  non-`full` Kimi launch
+  non-`full` Kimi launch. Bubblewrap does not exist on macOS: shards there are
+  plain git worktrees with no filesystem containment, and `spindle doctor` will
+  say so. Treat `shard` / `careful+shard` as conflict isolation, not a sandbox,
+  on macOS.
 
 ## Install
 
 ```bash
-pip install spindle-mcp
+uv tool install spindle-mcp
 ```
+
+`pip install spindle-mcp` also works, in a virtualenv on Python 3.11+.
+
+> **macOS:** use `uv`. macOS ships Python 3.9 and no `pip` on `PATH`, so the
+> `pip` line above fails before it starts — and `python3 -m pip install
+> spindle-mcp` reports `No matching distribution found`, which looks like the
+> package doesn't exist when it actually means the interpreter is too old.
+> `uv tool install` fetches a suitable Python itself. `brew install python@3.12`
+> and a venv works too.
 
 Check what the install can actually see and do:
 
@@ -60,10 +72,23 @@ Add to Claude Code's MCP config (`~/.claude.json`):
 {
   "mcpServers": {
     "spindle": {
-      "command": "spindle"
+      "command": "spindle",
+      "args": ["serve"]
     }
   }
 }
+```
+
+The `serve` argument is required. Bare `spindle` is a subcommand dispatcher with
+no default: it prints its usage message to stdout — the same pipe the MCP client
+reads — and exits 0, so a config without `args` fails as an unexplained
+`CONNECTION_CLOSED` with nothing logged anywhere.
+
+Or let the CLI write it for you:
+
+```bash
+claude mcp add spindle --scope user -- spindle serve
+claude mcp list   # spindle: ... - Connected
 ```
 
 That runs spindle over stdio, which needs no background service. Run a service
@@ -133,7 +158,7 @@ spin("Set up a new Python project with dependencies", permission="full")
 # Shard: Full access + auto-isolated worktree (common for risky work)
 spin("Refactor the auth system", permission="shard")
 
-# Careful + shard: classifier-vetted, isolated in a bwrap-contained worktree
+# Careful + shard: classifier-vetted, isolated worktree (bwrap-contained on Linux)
 spin("Update configs", permission="careful+shard")
 
 # Research: web/file research routed to a SKEIN site, a single file, or a directory
@@ -144,8 +169,8 @@ Profiles (claude-code harness):
 - `readonly` (alias `manual`): Read, Grep, Glob, safe bash (ls, cat, git status/log/diff). The only tier still governed by an allowlist — no python, no find, no write. This is the tight, inspectable, manual option.
 - `careful` (default): now an alias of `auto`. No allowlist; runs under `--permission-mode auto`, where Claude Code vets each tool call server-side on intent. Use it for most code work including reviews/fells. (It used to be a Bash allowlist that gated capability on command *phrasing*, not security — `auto` removes that gate.)
 - `full`: No restrictions
-- `shard`: Full access + auto-creates isolated worktree (bypass inside the bwrap-contained shard)
-- `careful+shard`: `auto` semantics + auto-creates isolated worktree (bypass inside the bwrap-contained shard)
+- `shard`: Full access + auto-creates isolated worktree (bypass inside the shard; bwrap-contained on Linux only)
+- `careful+shard`: `auto` semantics + auto-creates isolated worktree (bypass inside the shard; bwrap-contained on Linux only)
 - `research`: Read, Grep, Glob, WebFetch, WebSearch, curl, jq, safe bash; no python/find; requires `research_target` (Write/Edit added when target is `file:` or `dir:`)
 - `research+shard`: research tools + auto-creates isolated worktree
 
