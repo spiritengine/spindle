@@ -1479,9 +1479,11 @@ def _spool_lock(spool_id: str, blocking: bool = True) -> Generator[bool, None, N
         yield acquired
     finally:
         if lock_fd is not None:
-            if acquired:
-                fcntl.flock(lock_fd, fcntl.LOCK_UN)
-            os.close(lock_fd)
+            try:
+                if acquired:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            finally:
+                os.close(lock_fd)
 
 
 def _canonical_worktree_path(worktree_path: Optional[str]) -> Optional[str]:
@@ -7893,19 +7895,21 @@ def _read_spool_for_codex_sandbox_refusal(spool_id: str) -> Optional[dict]:
     mistaken for permission to create or replace a record.
     """
     try:
-        with open(_get_spool_path(spool_id)) as stream:
-            record = json.load(stream)
+        stream = open(_get_spool_path(spool_id))
     except FileNotFoundError:
         return None
-    except UnicodeDecodeError as exc:
-        # The bytes are an occupied, unreadable spool record, not an absent one.
-        # Translate only the concrete text-decoding failure so the refusal path
-        # preserves those bytes without swallowing unrelated ValueError bugs.
-        raise OSError("existing spool record contains invalid UTF-8") from exc
-    except json.JSONDecodeError as exc:
-        # A malformed file still occupies this spool ID. Treating it as absent
-        # would let refusal persistence replace evidence that needs repair.
-        raise OSError("existing spool record contains invalid JSON") from exc
+    with stream:
+        try:
+            record = json.load(stream)
+        except UnicodeDecodeError as exc:
+            # The bytes are an occupied, unreadable spool record, not an absent one.
+            raise OSError("existing spool record contains invalid UTF-8") from exc
+        except (ValueError, RecursionError) as exc:
+            # JSON's decoder also raises content-driven ValueError subclasses for
+            # inputs such as over-limit integers, and RecursionError for excessive
+            # nesting. Translate only failures from this decode call: errors while
+            # opening, closing, or validating the decoded object remain visible.
+            raise OSError("existing spool record contains invalid JSON") from exc
     if not isinstance(record, dict):
         raise OSError("existing spool record is not a JSON object")
     return record

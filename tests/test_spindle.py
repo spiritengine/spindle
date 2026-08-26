@@ -3500,6 +3500,15 @@ class TestSpoolLocking:
                 with _spool_lock("spool2", blocking=True) as second:
                     assert second is True
 
+    def test_lock_acquisition_error_remains_visible(self, tmp_path):
+        error = OSError(errno.EIO, "lock acquisition failed")
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle.fcntl.flock", side_effect=error):
+                with pytest.raises(OSError, match="lock acquisition failed"):
+                    with _spool_lock("acquisition-error"):
+                        pytest.fail("a failed acquisition must not enter the context")
+
 
 def _write_released_owner_evidence(root: Path, spool_id: str, *, pid: int = 999_999_999, exit_code: int = 0):
     lock_path = root / f"{spool_id}.process-owner"
@@ -8405,6 +8414,17 @@ class TestCodexSandboxEnforcement:
                         codex_version="0.149.0",
                     )
 
+            with patch("builtins.open", side_effect=ValueError("broken open wrapper")):
+                with pytest.raises(ValueError, match="broken open wrapper"):
+                    spindle._persist_codex_sandbox_refusal(
+                        "codex-open-programming-error",
+                        "REFUSED: sandbox unavailable",
+                        sandbox="read-only",
+                        permission="readonly",
+                        codex_bin="/fake/bin/codex",
+                        codex_version="0.149.0",
+                    )
+
     def test_refusal_persistence_preserves_corrupt_existing_record(self, tmp_path):
         spool_id = "codex-corrupt-refusal"
         path = tmp_path / f"{spool_id}.json"
@@ -8449,18 +8469,62 @@ class TestCodexSandboxEnforcement:
         assert f"(spool {spool_id})" not in result
         assert path.read_bytes() == invalid_record
 
-    def test_refusal_returns_durable_spool_when_lock_cleanup_fails_after_publication(self, tmp_path):
-        spool_id = "codex-refusal-unlock-failure"
-        real_spool_lock = spindle._spool_lock
-
-        @contextmanager
-        def fail_after_lock_cleanup(*args, **kwargs):
-            with real_spool_lock(*args, **kwargs) as acquired:
-                yield acquired
-            raise OSError(errno.EIO, "unlock failed after publish")
+    @pytest.mark.parametrize(
+        "spool_id,invalid_record",
+        [
+            (
+                "codex-over-limit-integer-refusal",
+                lambda: b'{"status":"pending","value":' + b"1" * (sys.get_int_max_str_digits() + 1) + b"}",
+            ),
+            (
+                "codex-deeply-nested-refusal",
+                lambda: b'{"status":"pending","value":'
+                + b"[" * (sys.getrecursionlimit() * 20)
+                + b"0"
+                + b"]" * (sys.getrecursionlimit() * 20)
+                + b"}",
+            ),
+        ],
+        ids=("over-limit-integer", "deep-nesting"),
+    )
+    def test_refusal_persistence_preserves_content_rejected_by_json_decoder(
+        self, tmp_path, spool_id, invalid_record
+    ):
+        if spool_id == "codex-over-limit-integer-refusal" and sys.get_int_max_str_digits() == 0:
+            pytest.skip("Python integer string conversion limit is disabled")
+        path = tmp_path / f"{spool_id}.json"
+        original_bytes = invalid_record()
+        path.write_bytes(original_bytes)
 
         with patch("spindle.SPINDLE_DIR", tmp_path):
-            with patch("spindle._spool_lock", side_effect=fail_after_lock_cleanup):
+            result = spindle._persist_codex_sandbox_refusal(
+                spool_id,
+                "REFUSED: sandbox unavailable",
+                sandbox="read-only",
+                permission="readonly",
+                codex_bin="/fake/bin/codex",
+                codex_version="0.149.0",
+            )
+
+        assert result.startswith("Error: REFUSED: sandbox unavailable")
+        assert "refusal persistence failed: existing spool record contains invalid JSON" in result
+        assert f"(spool {spool_id})" not in result
+        assert path.read_bytes() == original_bytes
+
+    def test_refusal_returns_durable_spool_when_lock_cleanup_fails_after_publication(self, tmp_path):
+        spool_id = "codex-refusal-unlock-failure"
+        real_flock = spindle.fcntl.flock
+        failed_unlock_fds = []
+
+        def fail_actual_unlock(lock_fd, operation):
+            if operation == spindle.fcntl.LOCK_UN:
+                os.fstat(lock_fd)
+                failed_unlock_fds.append(lock_fd)
+                raise OSError(errno.EIO, "unlock failed after publish")
+            return real_flock(lock_fd, operation)
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle.fcntl.flock", side_effect=fail_actual_unlock):
                 result = spindle._persist_codex_sandbox_refusal(
                     spool_id,
                     "REFUSED: sandbox unavailable",
@@ -8470,6 +8534,12 @@ class TestCodexSandboxEnforcement:
                     codex_version="0.149.0",
                 )
             record = spindle._read_spool_for_codex_sandbox_refusal(spool_id)
+            assert len(failed_unlock_fds) == 1
+            with pytest.raises(OSError) as closed:
+                os.fstat(failed_unlock_fds[0])
+            assert closed.value.errno == errno.EBADF
+            with spindle._spool_lock(spool_id, blocking=False) as acquired_after_failed_unlock:
+                assert acquired_after_failed_unlock is True
 
         assert result == f"Error: REFUSED: sandbox unavailable (spool {spool_id})"
         assert record is not None
