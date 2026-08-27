@@ -8343,6 +8343,56 @@ class TestAtomicJsonCreate:
         assert "close secondary" in str(raised.value.__cause__)
         assert list(tmp_path.glob(f".{path.name}.*.tmp")) == []
 
+    @pytest.mark.parametrize(
+        "primary",
+        [OSError(errno.EIO, "body primary"), ValueError("body primary")],
+        ids=("oserror-primary", "non-oserror-primary"),
+    )
+    def test_body_error_remains_primary_when_stream_close_also_fails(self, tmp_path, monkeypatch, primary):
+        import spindle.namespace_owner as namespace_owner
+
+        path = tmp_path / "atomic-body-failure.json"
+        real_fdopen = os.fdopen
+        opened_streams = []
+
+        class CloseFailingStream:
+            def __init__(self, stream):
+                self.stream = stream
+                self.close_called = False
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc_info):
+                self.close()
+
+            def close(self):
+                self.close_called = True
+                self.stream.close()
+                raise OSError(errno.EBADF, "close secondary")
+
+        def close_failing_fdopen(*args, **kwargs):
+            stream = CloseFailingStream(real_fdopen(*args, **kwargs))
+            opened_streams.append(stream)
+            return stream
+
+        def fail_body(*_args, **_kwargs):
+            raise primary
+
+        monkeypatch.setattr(namespace_owner.os, "fdopen", close_failing_fdopen)
+        monkeypatch.setattr(namespace_owner.json, "dump", fail_body)
+
+        with pytest.raises(type(primary), match="body primary") as raised:
+            namespace_owner._atomic_json_create(path, {"id": "ours"})
+
+        assert raised.value is primary
+        assert opened_streams[0].close_called is True
+        assert type(raised.value.__cause__) is OSError
+        assert raised.value.__cause__.errno == errno.EBADF
+        assert "close secondary" in str(raised.value.__cause__)
+        assert not path.exists()
+        assert list(tmp_path.glob(f".{path.name}.*.tmp")) == []
+
 
 class TestCodexSandboxEnforcement:
     """Codex must actually run at the sandbox tier its permission asks for.

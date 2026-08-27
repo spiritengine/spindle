@@ -698,11 +698,24 @@ def _atomic_json_create(path: Path, value: dict) -> bool:
             except BaseException as close_exc:
                 raise exc.with_traceback(primary_traceback) from close_exc
             raise
-        with stream:
+        body_error = None
+        try:
             json.dump(value, stream, sort_keys=True, separators=(",", ":"))
             stream.write("\n")
             stream.flush()
             os.fsync(stream.fileno())
+        except BaseException as exc:
+            body_error = (exc, exc.__traceback__)
+        try:
+            stream.close()
+        except BaseException as close_exc:
+            if body_error is not None:
+                exc, traceback = body_error
+                raise exc.with_traceback(traceback) from close_exc
+            raise
+        if body_error is not None:
+            exc, traceback = body_error
+            raise exc.with_traceback(traceback)
         try:
             os.link(temporary, path)
         except FileExistsError:
