@@ -56,6 +56,21 @@ EPISODE_CAPABILITY = "owner-episode-v1"
 CONVERGENCE_CAPABILITY = "owner-convergence-v1"
 
 
+def _write_codex_respin_reservation(episode_store, spool_id: str, session_id: str, *, episode=None, **fields):
+    episode = episode or make_episode("reserved", generation=1, path="before_watchdog")
+    starter = episode["starter"]
+    return episode_store.write(
+        spool_id,
+        status="pending",
+        episode=episode,
+        tags=["codex", "respin"],
+        launcher_pid=starter["pid"],
+        launcher_namespace=starter["namespace"],
+        _codex_respin_source_session_id=session_id,
+        **fields,
+    )
+
+
 def _row_id(row) -> str:
     actor, source, destination, _facts = row
     return f"{actor}:{source}->{destination}"
@@ -824,10 +839,11 @@ def test_pre_spawn_failure_absorbs_durable_legacy_terminal_cleanup_marker(episod
 
 def test_sandbox_refusal_preserves_and_aborts_the_episode(episode_store):
     spool_id = "writer-sandbox-refusal"
+    session_id = "session-sandbox-refusal"
     reserved = make_episode("reserved", generation=1, path="before_watchdog")
     assert reserved["revision"] == 1
     assert "watchdog" not in reserved
-    episode_store.write(spool_id, status="pending", episode=reserved, tags=["codex", "respin"])
+    _write_codex_respin_reservation(episode_store, spool_id, session_id, episode=reserved)
 
     message = spindle._persist_codex_sandbox_refusal(
         spool_id,
@@ -836,7 +852,7 @@ def test_sandbox_refusal_preserves_and_aborts_the_episode(episode_store):
         permission="careful",
         codex_bin="/usr/bin/codex",
         codex_version="1.0",
-        session_id="session-sandbox-refusal",
+        session_id=session_id,
     )
 
     record = episode_store.read(spool_id)
@@ -851,8 +867,9 @@ def test_sandbox_refusal_preserves_and_aborts_the_episode(episode_store):
 
 def test_sandbox_refusal_finishes_after_durable_abort_cleanup_failure(episode_store, monkeypatch):
     spool_id = "writer-sandbox-refusal-durable-abort"
+    session_id = "session-sandbox-refusal-durable-abort"
     reserved = make_episode("reserved", generation=1, path="before_watchdog")
-    episode_store.write(spool_id, status="pending", episode=reserved, tags=["codex", "respin"])
+    _write_codex_respin_reservation(episode_store, spool_id, session_id, episode=reserved)
     real_close = os.close
     directory = episode_store.root.stat()
     directory_closes = 0
@@ -877,7 +894,7 @@ def test_sandbox_refusal_finishes_after_durable_abort_cleanup_failure(episode_st
         permission="careful",
         codex_bin="/usr/bin/codex",
         codex_version="1.0",
-        session_id="session-sandbox-refusal-durable-abort",
+        session_id=session_id,
     )
 
     record = episode_store.read(spool_id)
@@ -893,8 +910,9 @@ def test_sandbox_refusal_finishes_after_durable_abort_cleanup_failure(episode_st
 
 def test_sandbox_refusal_converges_after_post_abort_lock_cleanup_failure(episode_store, monkeypatch):
     spool_id = "writer-sandbox-refusal-abort-unlock"
+    session_id = "session-sandbox-refusal-abort-unlock"
     reserved = make_episode("reserved", generation=1, path="before_watchdog")
-    episode_store.write(spool_id, status="pending", episode=reserved, tags=["codex", "respin"])
+    _write_codex_respin_reservation(episode_store, spool_id, session_id, episode=reserved)
     real_flock = spindle.fcntl.flock
     unlocks = 0
     failed_unlocks = 0
@@ -918,7 +936,7 @@ def test_sandbox_refusal_converges_after_post_abort_lock_cleanup_failure(episode
         permission="careful",
         codex_bin="/usr/bin/codex",
         codex_version="1.0",
-        session_id="session-sandbox-refusal-abort-unlock",
+        session_id=session_id,
     )
 
     record = episode_store.read(spool_id)
@@ -934,13 +952,14 @@ def test_sandbox_refusal_converges_after_post_abort_lock_cleanup_failure(episode
 
 def test_sandbox_refusal_episode_path_is_utf8_independent_of_text_defaults(episode_store, monkeypatch):
     spool_id = "writer-sandbox-refusal-utf8"
+    session_id = "session-sandbox-refusal-utf8"
     reserved = make_episode("reserved", generation=1, path="before_watchdog")
-    record = episode_store.write(
+    record = _write_codex_respin_reservation(
+        episode_store,
         spool_id,
-        status="pending",
+        session_id,
         episode=reserved,
         prompt="caf\u00e9 \u2615",
-        tags=["codex", "respin"],
     )
     episode_store.spool_path(spool_id).write_bytes(json.dumps(record, ensure_ascii=False).encode("utf-8"))
     real_open = open
@@ -973,7 +992,7 @@ def test_sandbox_refusal_episode_path_is_utf8_independent_of_text_defaults(episo
         permission="careful",
         codex_bin="/usr/bin/codex",
         codex_version="1.0",
-        session_id="session-sandbox-refusal-utf8",
+        session_id=session_id,
     )
 
     stored_record = json.loads(episode_store.spool_path(spool_id).read_bytes())

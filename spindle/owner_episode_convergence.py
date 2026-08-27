@@ -1207,29 +1207,145 @@ def _protected_update_fields(updates: dict | None) -> set:
     return written
 
 
-def protected_update_refusal(record: dict | None, updates: dict | None) -> str | None:
-    """Name the protected fields *updates* may not write on *record*, if any."""
-    episode = (record or {}).get(EPISODE_KEY)
+_CODEX_RESPIN_SESSION_BINDING = "_codex_respin_source_session_id"
+_CODEX_REFUSAL_PROJECTION_KEYS = frozenset(
+    {
+        "codex_bin",
+        "codex_version",
+        "completed_at",
+        "error",
+        "harness",
+        "permission",
+        "pid",
+        "result",
+        "sandbox",
+        "sandbox_error",
+        "session_id",
+        "status",
+        "tags",
+    }
+)
+_CODEX_REFUSAL_FORBIDDEN_RECORD_KEYS = frozenset(
+    {
+        "codex_bin",
+        "codex_version",
+        "completed_at",
+        "error",
+        "error_kind",
+        "exit_code",
+        "harness",
+        "launcher_pid",
+        "launcher_start_time",
+        "lifecycle",
+        "owner_convergence",
+        "permission",
+        "pid",
+        "result",
+        "sandbox",
+        "sandbox_error",
+        "session_id",
+        "terminal_origin",
+        "terminal_provenance",
+    }
+)
+
+
+def _is_real_episode_int(value: object, expected: int) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value == expected
+
+
+def _is_exact_episode_namespace(value: object) -> bool:
+    if not isinstance(value, dict):
+        return False
+    if value.get("status") == "supported":
+        return set(value) == {"status", "device", "inode"} and all(
+            isinstance(value[field], int) and not isinstance(value[field], bool) and value[field] >= 0
+            for field in ("device", "inode")
+        )
+    return (
+        value.get("status") == "unsupported"
+        and set(value) == {"status", "reason"}
+        and isinstance(value.get("reason"), str)
+        and bool(value["reason"])
+    )
+
+
+def _is_exact_episode_starter(value: object) -> bool:
+    return bool(
+        isinstance(value, dict)
+        and set(value) == {"pid", "birth_token", "namespace"}
+        and isinstance(value.get("pid"), int)
+        and not isinstance(value.get("pid"), bool)
+        and value["pid"] > 0
+        and isinstance(value.get("birth_token"), str)
+        and bool(value["birth_token"])
+        and _is_exact_episode_namespace(value.get("namespace"))
+    )
+
+
+def _is_exact_aborted_episode_shape(episode: dict) -> bool:
+    required = {"format", "generation", "revision", "phase", "phase_times", "starter", "failure"}
+    allowed = required | {"deadline"}
+    phase_times = episode.get("phase_times")
+    return bool(
+        frozenset(episode) in {frozenset(required), frozenset(allowed)}
+        and isinstance(phase_times, dict)
+        and set(phase_times) == {"reserved", "aborted"}
+        and all(isinstance(value, str) and bool(value) for value in phase_times.values())
+        and ("deadline" not in episode or isinstance(episode.get("deadline"), str) and bool(episode["deadline"]))
+    )
+
+
+def _is_exact_codex_refusal_projection(record: dict | None, updates: dict | None) -> bool:
+    record = record or {}
+    updates = updates or {}
+    episode = record.get(EPISODE_KEY)
     failure = episode.get("failure") if isinstance(episode, dict) else None
-    protected_fields = _protected_update_fields(updates)
-    exact_pre_spawn_refusal_projection = bool(
-        (record or {}).get("status") == "pending"
+    binding = record.get(_CODEX_RESPIN_SESSION_BINDING)
+    optional_strings = ("sandbox", "permission", "codex_bin", "codex_version")
+    return bool(
+        record.get("status") == "pending"
+        and isinstance(record.get("id"), str)
+        and bool(record["id"])
+        and record.get("tags") == ["codex", "respin"]
+        and isinstance(binding, str)
+        and bool(binding)
+        and not (_CODEX_REFUSAL_FORBIDDEN_RECORD_KEYS & record.keys())
         and isinstance(episode, dict)
         and episode.get("format") == EPISODE_FORMAT
+        and _is_real_episode_int(episode.get("generation"), 1)
+        and _is_real_episode_int(episode.get("revision"), 2)
         and episode.get("phase") == "aborted"
+        and _is_exact_aborted_episode_shape(episode)
+        and _is_exact_episode_starter(episode.get("starter"))
         and isinstance(failure, dict)
+        and set(failure) == {"kind", "detail", "observed_at"}
         and failure.get("kind") == "launcher_pre_spawn_failure"
-        and updates
-        and protected_fields == {"completed_at", "error", "result", "status"}
+        and isinstance(failure.get("detail"), str)
+        and bool(failure["detail"])
+        and isinstance(failure.get("observed_at"), str)
+        and bool(failure["observed_at"])
+        and set(updates) == _CODEX_REFUSAL_PROJECTION_KEYS
+        and updates.get("session_id") == binding
+        and updates.get("harness") == "codex"
+        and updates.get("tags") == ["codex", "respin"]
+        and "pid" in updates
+        and updates.get("pid") is None
         and updates.get("status") == "error"
         and updates.get("error") == failure.get("detail")
-        and "sandbox_error" in updates
         and updates.get("sandbox_error") == failure.get("detail")
         and "result" in updates
         and updates.get("result") is None
-        and bool(updates.get("completed_at"))
+        and isinstance(updates.get("completed_at"), str)
+        and bool(updates["completed_at"])
+        and all(updates.get(name) is None or isinstance(updates.get(name), str) for name in optional_strings)
     )
-    if exact_pre_spawn_refusal_projection:
+
+
+def protected_update_refusal(record: dict | None, updates: dict | None) -> str | None:
+    """Name the protected fields *updates* may not write on *record*, if any."""
+    protected_fields = _protected_update_fields(updates)
+    if _is_exact_codex_refusal_projection(record, updates):
         return None
     if not applicator_owns_outcome(record):
         return None
