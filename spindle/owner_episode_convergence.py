@@ -1296,7 +1296,7 @@ def _is_exact_aborted_episode_shape(episode: dict) -> bool:
     )
 
 
-def _is_exact_codex_refusal_projection(record: dict | None, updates: dict | None) -> bool:
+def _is_exact_codex_refusal_projection(spool_id: str, record: dict | None, updates: dict | None) -> bool:
     record = record or {}
     updates = updates or {}
     episode = record.get(EPISODE_KEY)
@@ -1307,6 +1307,7 @@ def _is_exact_codex_refusal_projection(record: dict | None, updates: dict | None
         record.get("status") == "pending"
         and isinstance(record.get("id"), str)
         and bool(record["id"])
+        and record["id"] == spool_id
         and record.get("tags") == ["codex", "respin"]
         and isinstance(binding, str)
         and bool(binding)
@@ -1342,10 +1343,10 @@ def _is_exact_codex_refusal_projection(record: dict | None, updates: dict | None
     )
 
 
-def protected_update_refusal(record: dict | None, updates: dict | None) -> str | None:
+def protected_update_refusal(spool_id: str, record: dict | None, updates: dict | None) -> str | None:
     """Name the protected fields *updates* may not write on *record*, if any."""
     protected_fields = _protected_update_fields(updates)
-    if _is_exact_codex_refusal_projection(record, updates):
+    if _is_exact_codex_refusal_projection(spool_id, record, updates):
         return None
     if not applicator_owns_outcome(record):
         return None
@@ -1595,7 +1596,7 @@ def publish_record_updates(spool_id: str, record: dict, updates: dict) -> None:
     """
     import spindle
 
-    refusal = protected_update_refusal(record, updates)
+    refusal = protected_update_refusal(spool_id, record, updates)
     if refusal:
         raise ProtectedRecordUpdate(f"{spool_id}: {refusal}")
     value = dict(record)

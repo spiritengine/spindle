@@ -3739,6 +3739,28 @@ class TestConcurrencyLimit:
             assert path.readlink() == Path("missing-target")
         transition.assert_not_called()
 
+    def test_reservation_loses_no_foreign_record_inserted_after_its_occupancy_check(self, tmp_path):
+        spool_id = "reservation-create-race"
+        path = tmp_path / f"{spool_id}.json"
+        foreign_bytes = b'{"id":"foreign","status":"complete","result":"keep me"}\n'
+        real_transition = spindle.transition_owner_episode
+
+        def insert_foreign_record_before_publication(*args, **kwargs):
+            path.write_bytes(foreign_bytes)
+            return real_transition(*args, **kwargs)
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle._count_running", return_value=0):
+                with patch(
+                    "spindle.transition_owner_episode",
+                    side_effect=insert_foreign_record_before_publication,
+                ):
+                    success, error = _try_reserve_slot_and_create(spool_id)
+
+        assert success is False
+        assert "already occupied" in error
+        assert path.read_bytes() == foreign_bytes
+
     def test_concurrent_reservation_respects_limit(self, tmp_path):
         """
         Regression test for TOCTOU race condition (brief-20251229-79ly).
@@ -8433,29 +8455,17 @@ class TestCodexSandboxEnforcement:
     @pytest.mark.parametrize(
         "storage_operation,error",
         [
-            ("builtins.open", PermissionError(errno.EACCES, "denied")),
             ("pathlib.Path.mkdir", OSError(errno.EROFS, "read-only store")),
             ("spindle.os.open", OSError(errno.EROFS, "read-only store")),
             ("spindle.fcntl.flock", PermissionError(errno.EACCES, "denied")),
-            ("record-write", PermissionError(errno.EACCES, "denied")),
-            ("spindle.os.replace", PermissionError(errno.EACCES, "denied")),
+            ("spindle.namespace_owner.json.dump", PermissionError(errno.EACCES, "denied")),
+            ("spindle.namespace_owner.os.link", PermissionError(errno.EACCES, "denied")),
         ],
-        ids=("record-read", "parent-mkdir", "lock-open", "lock-flock", "record-write", "record-publication"),
+        ids=("parent-mkdir", "lock-open", "lock-flock", "record-write", "record-publication"),
     )
     def test_fresh_spin_refusal_survives_storage_oserror_without_reserving(self, tmp_path, storage_operation, error):
         """Every refusal persistence stage stays secondary to fail-closed admission."""
-        real_open = open
-
-        def fail_record_write(path, mode="r", *args, **kwargs):
-            if "w" in mode:
-                raise error
-            return real_open(path, mode, *args, **kwargs)
-
-        storage_failure = (
-            patch("builtins.open", side_effect=fail_record_write)
-            if storage_operation == "record-write"
-            else patch(storage_operation, side_effect=error)
-        )
+        storage_failure = patch(storage_operation, side_effect=error)
         with self._captured_codex_spin(tmp_path, enforces=False) as captured_cmd:
             with patch("spindle._try_reserve_slot_and_create") as reserve:
                 with patch("spindle._spawn_shard") as spawn_shard:
@@ -8494,7 +8504,7 @@ class TestCodexSandboxEnforcement:
     def test_refusal_persistence_does_not_swallow_programming_errors(self, tmp_path):
         with patch("spindle.SPINDLE_DIR", tmp_path):
             with patch(
-                "spindle._read_spool_for_codex_sandbox_refusal",
+                "spindle._atomic_json_create",
                 side_effect=ValueError("broken invariant"),
             ):
                 with pytest.raises(ValueError, match="broken invariant"):
@@ -8507,8 +8517,8 @@ class TestCodexSandboxEnforcement:
                         codex_version="0.149.0",
                     )
 
-            with patch("builtins.open", side_effect=ValueError("broken open wrapper")):
-                with pytest.raises(ValueError, match="broken open wrapper"):
+            with patch("spindle.os.path.lexists", side_effect=ValueError("broken occupancy check")):
+                with pytest.raises(ValueError, match="broken occupancy check"):
                     spindle._persist_codex_sandbox_refusal(
                         "codex-open-programming-error",
                         "REFUSED: sandbox unavailable",
@@ -8535,7 +8545,7 @@ class TestCodexSandboxEnforcement:
             )
 
         assert result.startswith("Error: REFUSED: sandbox unavailable")
-        assert "refusal persistence failed: existing spool record contains invalid JSON" in result
+        assert "fresh sandbox refusal spool ID is already occupied" in result
         assert f"(spool {spool_id})" not in result
         assert path.read_bytes() == corrupt_record
 
@@ -8562,6 +8572,83 @@ class TestCodexSandboxEnforcement:
         assert "fresh sandbox refusal spool ID is already occupied" in result
         assert f"(spool {spool_id})" not in result
         assert path.read_bytes() == original_bytes
+
+    @pytest.mark.parametrize(
+        "kind",
+        ["valid-regular", "invalid-regular", "directory", "symlink", "dangling-symlink"],
+    )
+    def test_fresh_refusal_treats_every_existing_pathname_as_a_collision(self, tmp_path, kind):
+        spool_id = f"codex-fresh-{kind}"
+        path = tmp_path / f"{spool_id}.json"
+        target = tmp_path / f"{spool_id}.target"
+        if kind == "valid-regular":
+            path.write_bytes(b'{"id":"foreign","status":"complete"}\n')
+        elif kind == "invalid-regular":
+            path.write_bytes(b'{"id":"foreign","status":')
+        elif kind == "directory":
+            path.mkdir()
+        elif kind == "symlink":
+            target.write_bytes(b'{"id":"foreign-target","status":"complete"}\n')
+            path.symlink_to(target.name)
+        else:
+            path.symlink_to("missing-target")
+        before = path.lstat()
+        before_target = target.read_bytes() if target.exists() else None
+        before_bytes = path.read_bytes() if path.is_file() else None
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            result = spindle._persist_codex_sandbox_refusal(
+                spool_id,
+                "REFUSED: sandbox unavailable",
+                sandbox="read-only",
+                permission="readonly",
+                codex_bin="/fake/bin/codex",
+                codex_version="0.149.0",
+            )
+
+        assert "already occupied" in result
+        assert f"(spool {spool_id})" not in result
+        after = path.lstat()
+        assert (after.st_dev, after.st_ino, after.st_mode) == (before.st_dev, before.st_ino, before.st_mode)
+        if path.is_symlink():
+            assert path.readlink() == Path(target.name if kind == "symlink" else "missing-target")
+        elif before_bytes is not None:
+            assert path.read_bytes() == before_bytes
+        else:
+            assert path.is_dir()
+        if before_target is not None:
+            assert target.read_bytes() == before_target
+
+    def test_fresh_refusal_loses_no_dangling_symlink_inserted_after_preflight(self, tmp_path):
+        spool_id = "codex-fresh-create-race"
+        path = tmp_path / f"{spool_id}.json"
+        real_lexists = os.path.lexists
+        injected = False
+
+        def insert_after_absence_check(candidate):
+            nonlocal injected
+            if Path(candidate) == path and not injected:
+                injected = True
+                path.symlink_to("foreign-missing-target")
+                return False
+            return real_lexists(candidate)
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle.os.path.lexists", side_effect=insert_after_absence_check):
+                result = spindle._persist_codex_sandbox_refusal(
+                    spool_id,
+                    "REFUSED: sandbox unavailable",
+                    sandbox="read-only",
+                    permission="readonly",
+                    codex_bin="/fake/bin/codex",
+                    codex_version="0.149.0",
+                )
+
+        assert injected is True
+        assert "already occupied" in result
+        assert f"(spool {spool_id})" not in result
+        assert path.is_symlink()
+        assert path.readlink() == Path("foreign-missing-target")
 
     @pytest.mark.parametrize(
         "occupied",
@@ -8790,6 +8877,82 @@ class TestCodexSandboxEnforcement:
         assert "pre-spawn failure transition rejected: stale_revision" in result
         assert f"(spool {spool_id})" not in result
         assert path.read_bytes() == original_bytes
+
+    @pytest.mark.parametrize("mutation", ["revision", "spool-schema-version"])
+    def test_respin_refusal_rejects_type_changed_reservation_after_validation(self, tmp_path, mutation):
+        spool_id = f"codex-respin-type-race-{mutation}"
+        session_id = f"session-type-race-{mutation}"
+        path = tmp_path / f"{spool_id}.json"
+        reservation = self._exact_respin_reservation(spool_id, session_id)
+        path.write_text(json.dumps(reservation), encoding="utf-8")
+        real_read = spindle._read_spool
+        mutated_bytes = None
+
+        def read_after_foreign_type_change(read_spool_id):
+            nonlocal mutated_bytes
+            if read_spool_id == spool_id and mutated_bytes is None:
+                changed = json.loads(path.read_text(encoding="utf-8"))
+                if mutation == "revision":
+                    changed["owner_episode"]["revision"] = True
+                else:
+                    changed["spool_schema_version"] = True
+                mutated_bytes = json.dumps(changed, separators=(",", ":")).encode()
+                path.write_bytes(mutated_bytes)
+            return real_read(read_spool_id)
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle._read_spool", side_effect=read_after_foreign_type_change):
+                result = spindle._persist_codex_sandbox_refusal(
+                    spool_id,
+                    "REFUSED: sandbox unavailable",
+                    sandbox="read-only",
+                    permission="readonly",
+                    codex_bin="/fake/bin/codex",
+                    codex_version="0.149.0",
+                    session_id=session_id,
+                )
+
+        assert mutated_bytes is not None
+        assert "expected spool reservation changed" in result
+        assert f"(spool {spool_id})" not in result
+        assert path.read_bytes() == mutated_bytes
+
+    def test_respin_refusal_rejects_bool_owner_generation_in_terminal_provenance(self, tmp_path):
+        spool_id = "codex-respin-bool-terminal-provenance"
+        session_id = "session-bool-terminal-provenance"
+        message = "REFUSED: sandbox unavailable"
+        path = tmp_path / f"{spool_id}.json"
+        path.write_text(json.dumps(self._exact_respin_reservation(spool_id, session_id)), encoding="utf-8")
+        real_record_failure = spindle._record_pre_spawn_failure
+        mutated_bytes = None
+
+        def publish_terminal_with_bool_provenance(*args, **kwargs):
+            nonlocal mutated_bytes
+            real_record_failure(*args, **kwargs)
+            terminal = json.loads(path.read_text(encoding="utf-8"))
+            terminal["terminal_provenance"]["owner_generation"] = True
+            mutated_bytes = json.dumps(terminal, separators=(",", ":")).encode()
+            path.write_bytes(mutated_bytes)
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch(
+                "spindle._record_pre_spawn_failure",
+                side_effect=publish_terminal_with_bool_provenance,
+            ):
+                result = spindle._persist_codex_sandbox_refusal(
+                    spool_id,
+                    message,
+                    sandbox="read-only",
+                    permission="readonly",
+                    codex_bin="/fake/bin/codex",
+                    codex_version="0.149.0",
+                    session_id=session_id,
+                )
+
+        assert mutated_bytes is not None
+        assert "expected sandbox refusal evidence" in result
+        assert f"(spool {spool_id})" not in result
+        assert path.read_bytes() == mutated_bytes
 
     @pytest.mark.parametrize("final_state", ["terminal", "aborted"], ids=("wrong-terminal", "wrong-abort"))
     def test_respin_refusal_does_not_claim_mismatched_final_evidence(self, tmp_path, final_state):
@@ -9037,7 +9200,7 @@ class TestCodexSandboxEnforcement:
 
         assert result.startswith("Error: REFUSED: sandbox unavailable")
         diagnostic = result.removeprefix("Error: REFUSED: sandbox unavailable (").removesuffix(")")
-        assert diagnostic == "sandbox refusal persistence failed: existing spool record contains invalid UTF-8"
+        assert diagnostic == "sandbox refusal persistence failed: fresh sandbox refusal spool ID is already occupied"
         assert len(diagnostic) <= spindle._CODEX_REFUSAL_PERSISTENCE_DIAGNOSTIC_MAX_CHARS
         assert f"(spool {spool_id})" not in result
         assert path.read_bytes() == invalid_record
@@ -9059,7 +9222,7 @@ class TestCodexSandboxEnforcement:
                 codex_version="0.149.0",
             )
 
-        assert "refusal persistence failed: existing spool record contains invalid UTF-8" in result
+        assert "fresh sandbox refusal spool ID is already occupied" in result
         assert f"(spool {spool_id})" not in result
         assert path.read_bytes() == original_bytes
 
@@ -9235,7 +9398,7 @@ class TestCodexSandboxEnforcement:
             )
 
         assert result.startswith("Error: REFUSED: sandbox unavailable")
-        assert "refusal persistence failed: existing spool record contains invalid JSON" in result
+        assert "fresh sandbox refusal spool ID is already occupied" in result
         assert f"(spool {spool_id})" not in result
         assert path.read_bytes() == original_bytes
 
@@ -9383,8 +9546,6 @@ class TestCodexSandboxEnforcement:
         assert record["sandbox_error"] == "REFUSED: sandbox unavailable"
 
     def test_refusal_body_error_survives_unlock_error_instead_of_being_softened(self, tmp_path):
-        from spindle import owner_episode_convergence
-
         spool_id = "codex-refusal-body-and-unlock-failure"
         real_flock = spindle.fcntl.flock
         failed_unlock_fds = []
@@ -9397,9 +9558,8 @@ class TestCodexSandboxEnforcement:
             return real_flock(lock_fd, operation)
 
         with patch("spindle.SPINDLE_DIR", tmp_path):
-            with patch.object(
-                owner_episode_convergence,
-                "publish_record_updates",
+            with patch(
+                "spindle._atomic_json_create",
                 side_effect=ValueError("publication invariant failed"),
             ):
                 with patch("spindle.fcntl.flock", side_effect=fail_actual_unlock):

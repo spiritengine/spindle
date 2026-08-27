@@ -680,6 +680,54 @@ def test_exact_codex_refusal_projection_rejects_every_identity_or_schema_mismatc
     assert episode_store.spool_path(spool_id).read_bytes() == before
 
 
+def test_exact_codex_refusal_projection_is_bound_to_the_destination_spool_id(episode_store):
+    from spindle.owner_episode_convergence import ProtectedRecordUpdate, publish_record_updates
+
+    source_id = "authorized-refusal-source"
+    destination_id = "protected-refusal-destination"
+    session_id = "session-authorized-refusal"
+    message = "REFUSED: sandbox unavailable"
+    source = episode_store.write(
+        source_id,
+        status="pending",
+        episode=causal_episode(
+            "aborted",
+            generation=1,
+            path="launcher_before_watchdog",
+            failure=failure_fact("launcher_pre_spawn_failure", message),
+        ),
+        tags=["codex", "respin"],
+        _codex_respin_source_session_id=session_id,
+    )
+    destination = episode_store.write(
+        destination_id,
+        status="running",
+        episode=causal_episode("accepted"),
+        result="foreign owner",
+    )
+    before = episode_store.spool_path(destination_id).read_bytes()
+    updates = {
+        "session_id": session_id,
+        "sandbox": "read-only",
+        "permission": "readonly",
+        "codex_bin": "/fake/bin/codex",
+        "codex_version": "0.149.0",
+        "sandbox_error": message,
+        "harness": "codex",
+        "tags": ["codex", "respin"],
+        "pid": None,
+        "status": "error",
+        "result": None,
+        "error": message,
+        "completed_at": "2026-08-27T00:00:00",
+    }
+
+    with pytest.raises(ProtectedRecordUpdate):
+        publish_record_updates(destination["id"], source, updates)
+
+    assert episode_store.spool_path(destination_id).read_bytes() == before
+
+
 def test_the_compatibility_applicator_still_publishes_an_unsettled_legacy_terminal(episode_store):
     """An over-broad refusal would silently delete the path's whole purpose."""
     from spindle.owner_episode_convergence import publish_record_updates

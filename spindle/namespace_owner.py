@@ -85,6 +85,21 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _type_strict_json_equal(left, right) -> bool:
+    """Compare JSON values recursively without Python's bool/int coercion."""
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict):
+        return left.keys() == right.keys() and all(
+            _type_strict_json_equal(value, right[key]) for key, value in left.items()
+        )
+    if isinstance(left, list):
+        return len(left) == len(right) and all(
+            _type_strict_json_equal(left_value, right_value) for left_value, right_value in zip(left, right)
+        )
+    return left == right
+
+
 @dataclass(frozen=True)
 class NamespaceIdentity:
     status: str
@@ -458,23 +473,34 @@ def transition_owner_episode(
     record_updates: Optional[dict] = None,
     record_deletes: Iterable[str] = (),
     record_locked: bool = False,
+    create_only: bool = False,
 ) -> EpisodeTransitionResult:
     """Validate and durably publish one generation-scoped owner transition."""
     root = Path(root)
     spool_path = root / f"{spool_id}.json"
     guard = nullcontext() if record_locked else _episode_record_guard(root, spool_id)
     with guard:
-        try:
-            record = json.loads(spool_path.read_text(encoding="utf-8"))
-        except FileNotFoundError:
+        if create_only:
             record = {"id": spool_id, "status": "pending", "created_at": _utc_now()}
+        else:
+            try:
+                record = json.loads(spool_path.read_text(encoding="utf-8"))
+            except FileNotFoundError:
+                record = {"id": spool_id, "status": "pending", "created_at": _utc_now()}
         current = record.get(OWNER_EPISODE_KEY)
         source = current.get("phase") if isinstance(current, dict) else None
 
+        if create_only and destination != "reserved":
+            raise ValueError("create-only owner episode publication must create an initial reservation")
         if current is not None and current.get("format") != OWNER_EPISODE_FORMAT:
             return EpisodeTransitionResult(False, "unknown_episode_format", current)
         if not isinstance(generation, int) or isinstance(generation, bool) or generation <= 0:
             return EpisodeTransitionResult(False, "stale_generation", current)
+        if current is not None:
+            for name in ("generation", "revision"):
+                value = current.get(name)
+                if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                    return EpisodeTransitionResult(False, f"malformed_current_{name}", current)
 
         reseed = source in {None, "released", "aborted"} and destination == "reserved"
         if source is None:
@@ -528,7 +554,11 @@ def transition_owner_episode(
         if record_updates:
             record.update(record_updates)
         record[OWNER_EPISODE_KEY] = episode
-        _atomic_json_write(spool_path, record)
+        if create_only:
+            if not _atomic_json_create(spool_path, record):
+                return EpisodeTransitionResult(False, "record_occupied", None)
+        else:
+            _atomic_json_write(spool_path, record)
         return EpisodeTransitionResult(True, None, episode)
 
 
@@ -640,11 +670,24 @@ def _atomic_json_write(path: Path, value: dict) -> None:
 
 
 def _atomic_json_create(path: Path, value: dict) -> bool:
-    """Durably publish *value* at *path* only when the pathname is absent."""
+    """Durably publish complete JSON without replacing any pathname.
+
+    The file-synced temporary stays hidden until a same-filesystem hard link
+    atomically claims the destination. Every existing pathname form, including
+    a dangling symlink, is a collision. Directory fsync confirms durability;
+    later cleanup failures use the durable-publication marker.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    collision = False
+    durable = False
     try:
-        with os.fdopen(fd, "w") as stream:
+        try:
+            stream = os.fdopen(fd, "w", encoding="utf-8")
+        except BaseException:
+            os.close(fd)
+            raise
+        with stream:
             json.dump(value, stream, sort_keys=True, separators=(",", ":"))
             stream.write("\n")
             stream.flush()
@@ -652,18 +695,27 @@ def _atomic_json_create(path: Path, value: dict) -> bool:
         try:
             os.link(temporary, path)
         except FileExistsError:
+            collision = True
             return False
-        directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
         try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+            _fsync_directory_after_publication(path.parent)
+        except _DurablePublicationCleanupError:
+            durable = True
+            raise
+        durable = True
         return True
     finally:
         try:
             os.unlink(temporary)
         except FileNotFoundError:
             pass
+        except OSError as exc:
+            if sys.exc_info()[1] is not None or collision:
+                pass
+            elif durable:
+                raise _DurablePublicationCleanupError(*exc.args) from exc
+            else:
+                raise
 
 
 @contextmanager

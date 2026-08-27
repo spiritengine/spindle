@@ -539,6 +539,29 @@ def test_classifier_rejects_malformed_episode_core_fields(episode_api, field, va
     assert "malformed" in classification.reason or field in classification.reason
 
 
+@pytest.mark.parametrize("field", ["generation", "revision"])
+def test_transition_rejects_bool_current_episode_counters_before_arithmetic(episode_api, episode_store, field):
+    spool_id = f"bool-current-{field}"
+    episode = make_episode("reserved", generation=1, path="before_watchdog")
+    episode[field] = True
+    episode_store.write(spool_id, status="pending", episode=episode)
+    before = episode_store.spool_path(spool_id).read_bytes()
+
+    result = episode_api.transition(
+        episode_store.root,
+        spool_id,
+        actor="launcher",
+        destination="aborted",
+        generation=1,
+        expected_revision=1,
+        facts={"failure": FACT_LITERALS["failure"]},
+    )
+
+    assert result.accepted is False
+    assert result.rejection == f"malformed_current_{field}"
+    assert episode_store.spool_path(spool_id).read_bytes() == before
+
+
 @pytest.mark.parametrize("phase", BOUND_PHASES)
 @pytest.mark.parametrize("liveness_state", ["alive", "dead", "unverifiable"])
 def test_bound_phase_classification_never_depends_on_liveness(episode_api, phase, liveness_state):

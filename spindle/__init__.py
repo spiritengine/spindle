@@ -85,8 +85,10 @@ from .namespace_owner import (  # noqa: E402
     NamespaceIdentity,
     ProcessIdentity,
     ReconciliationResult,
+    _atomic_json_create,
     _DurablePublicationCleanupError,
     _fsync_directory_after_publication,
+    _type_strict_json_equal,
     assess_process_liveness,
     capture_pid_namespace,
     classify_owner_episode,
@@ -2690,18 +2692,26 @@ def _try_reserve_slot_and_create(
                 facts = {"starter": _process_fact(os.getpid())}
                 if deadline is not None:
                     facts["deadline"] = deadline
-                reserved = transition_owner_episode(
-                    SPINDLE_DIR,
-                    spool_id,
-                    actor="launcher",
-                    destination="reserved",
-                    generation=1,
-                    expected_revision=None,
-                    facts=facts,
-                    record_updates=spool,
-                    record_locked=True,
-                )
+                try:
+                    reserved = transition_owner_episode(
+                        SPINDLE_DIR,
+                        spool_id,
+                        actor="launcher",
+                        destination="reserved",
+                        generation=1,
+                        expected_revision=None,
+                        facts=facts,
+                        record_updates=spool,
+                        record_locked=True,
+                        create_only=True,
+                    )
+                except _DurablePublicationCleanupError:
+                    # The record and destination entry are durable; only a
+                    # directory-fd or private-temporary cleanup failed.
+                    return True, None
                 if not reserved.accepted:
+                    if reserved.rejection == "record_occupied":
+                        return False, f"Error: Spool ID '{spool_id}' is already occupied"
                     return False, f"Error: Could not reserve owner episode for {spool_id}: {reserved.rejection}"
 
                 return True, None
@@ -2779,7 +2789,7 @@ def _record_pre_spawn_failure(
                 if expected_record is not None:
                     raise OSError("expected spool reservation is missing")
                 return
-            if expected_record is not None and current != expected_record:
+            if expected_record is not None and not _type_strict_json_equal(current, expected_record):
                 raise OSError("expected spool reservation changed before pre-spawn failure")
             if spool_metadata:
                 for key in (
@@ -8179,8 +8189,8 @@ def _is_exact_codex_respin_reservation(spool_id: str, record: Optional[dict], se
         and episode.get("phase") == "reserved"
         and _has_exact_episode_shape(episode, "reserved")
         and _is_exact_starter(starter)
-        and starter.get("pid") == record.get("launcher_pid")
-        and starter.get("namespace") == record.get("launcher_namespace")
+        and _type_strict_json_equal(starter.get("pid"), record.get("launcher_pid"))
+        and _type_strict_json_equal(starter.get("namespace"), record.get("launcher_namespace"))
         and (
             "launcher_start_time" not in record or starter.get("birth_token") == str(record.get("launcher_start_time"))
         )
@@ -8209,7 +8219,7 @@ def _has_exact_codex_refusal_episode(
         and _has_exact_episode_shape(episode, "aborted")
         and _is_exact_starter(episode.get("starter"))
         and isinstance(expected_episode, dict)
-        and episode.get("starter") == expected_episode.get("starter")
+        and _type_strict_json_equal(episode.get("starter"), expected_episode.get("starter"))
         and isinstance(failure, dict)
         and set(failure) == {"kind", "detail", "observed_at"}
         and failure.get("kind") == "launcher_pre_spawn_failure"
@@ -8230,7 +8240,9 @@ def _matches_codex_respin_snapshot(
     if terminal:
         expected_keys.update(_CODEX_RESPIN_CONVERGENCE_FIELDS)
     stable_keys = set(expected_reservation) - removed - {"owner_episode", "status"}
-    return set(record) == expected_keys and all(record.get(key) == expected_reservation[key] for key in stable_keys)
+    return set(record) == expected_keys and all(
+        _type_strict_json_equal(record.get(key), expected_reservation[key]) for key in stable_keys
+    )
 
 
 def _is_exact_pre_spawn_refusal_evidence(
@@ -8270,20 +8282,27 @@ def _is_exact_codex_refusal_terminal(
         and bool(record["completed_at"])
         and record.get("error_kind") == "launcher_pre_spawn_failure"
         and record.get("terminal_origin") == "launcher_pre_spawn_failure"
-        and record.get("terminal_provenance")
-        == {
-            "owner_generation": 1,
-            "episode_revision": 2,
-            "episode_phase": "aborted",
-            "failure_kind": "launcher_pre_spawn_failure",
-        }
-        and record.get("lifecycle")
-        == {
-            "ownership_state": "released",
-            "transport_state": "reaped",
-            "normalized_terminal_kind": "failed",
-        }
-        and record.get("owner_convergence") == {"format": "spindle.owner-convergence/1", "obligations": {}}
+        and _type_strict_json_equal(
+            record.get("terminal_provenance"),
+            {
+                "owner_generation": 1,
+                "episode_revision": 2,
+                "episode_phase": "aborted",
+                "failure_kind": "launcher_pre_spawn_failure",
+            },
+        )
+        and _type_strict_json_equal(
+            record.get("lifecycle"),
+            {
+                "ownership_state": "released",
+                "transport_state": "reaped",
+                "normalized_terminal_kind": "failed",
+            },
+        )
+        and _type_strict_json_equal(
+            record.get("owner_convergence"),
+            {"format": "spindle.owner-convergence/1", "obligations": {}},
+        )
         and not (_CODEX_RESPIN_REFUSAL_METADATA_FIELDS & record.keys())
         and "launcher_pid" not in record
         and "launcher_start_time" not in record
@@ -8323,19 +8342,21 @@ def _persist_codex_sandbox_refusal(
                     raise OSError("occupied spool is not the expected Codex respin reservation")
             _record_pre_spawn_failure(spool_id, message, expected_record=reserved)
         with _spool_lock(spool_id) as acquired:
-            spool = _read_spool_for_codex_sandbox_refusal(spool_id) if acquired else None
             if not acquired:
                 raise OSError("spool record lock unavailable before final refusal publication")
             if session_id is None:
-                if spool is not None:
+                path = _get_spool_path(spool_id)
+                if os.path.lexists(path):
                     raise OSError("fresh sandbox refusal spool ID is already occupied")
                 refusal_state = "fresh"
-            elif _is_exact_codex_refusal_terminal(spool, message, session_id, reserved):
-                refusal_state = "terminal"
-            elif _is_exact_pre_spawn_refusal_evidence(spool, message, session_id, reserved):
-                refusal_state = "aborted"
             else:
-                raise OSError("spool does not contain the expected sandbox refusal evidence")
+                spool = _read_spool_for_codex_sandbox_refusal(spool_id)
+                if _is_exact_codex_refusal_terminal(spool, message, session_id, reserved):
+                    refusal_state = "terminal"
+                elif _is_exact_pre_spawn_refusal_evidence(spool, message, session_id, reserved):
+                    refusal_state = "aborted"
+                else:
+                    raise OSError("spool does not contain the expected sandbox refusal evidence")
             metadata = {
                 "session_id": session_id,
                 "sandbox": sandbox,
@@ -8348,10 +8369,8 @@ def _persist_codex_sandbox_refusal(
                 "pid": None,
             }
             if refusal_state == "fresh":
-                # No record exists, so this refusal creates one and is its whole
-                # outcome.
-                spool = {"id": spool_id}
-                updates = {
+                record = {
+                    "id": spool_id,
                     **metadata,
                     "status": "error",
                     "result": None,
@@ -8359,6 +8378,14 @@ def _persist_codex_sandbox_refusal(
                     "created_at": now,
                     "completed_at": now,
                 }
+                try:
+                    created = _atomic_json_create(path, record)
+                except _DurablePublicationCleanupError:
+                    publication_confirmed = True
+                else:
+                    if not created:
+                        raise OSError("fresh sandbox refusal spool ID is already occupied")
+                    publication_confirmed = True
             elif refusal_state == "aborted":
                 updates = {
                     **metadata,
@@ -8374,15 +8401,16 @@ def _persist_codex_sandbox_refusal(
                 # still missing; republishing the outcome would move a completion
                 # time that is already settled.
                 updates = metadata
-            from .owner_episode_convergence import publish_record_updates
+            if refusal_state != "fresh":
+                from .owner_episode_convergence import publish_record_updates
 
-            try:
-                publish_record_updates(spool_id, spool, updates)
-                publication_confirmed = True
-            except _DurablePublicationCleanupError:
-                # This is the one publication whose durable cleanup marker
-                # confirms the complete public refusal record.
-                publication_confirmed = True
+                try:
+                    publish_record_updates(spool_id, spool, updates)
+                    publication_confirmed = True
+                except _DurablePublicationCleanupError:
+                    # This is the one publication whose durable cleanup marker
+                    # confirms the complete public refusal record.
+                    publication_confirmed = True
         return f"Error: {message} (spool {spool_id})"
     except OSError as exc:
         if publication_confirmed:
