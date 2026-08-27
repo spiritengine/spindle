@@ -20,10 +20,13 @@ import pytest
 import spindle
 from spindle.namespace_owner import (
     OWNER_ARTIFACT_SUFFIXES,
+    ControlReceipt,
+    ControlRequest,
     EpisodeTransitionResult,
     LegacyAuthority,
     LivenessEvidence,
     LockEvidence,
+    MalformedControlReceipt,
     NamespaceIdentity,
     ProcessIdentity,
     acquire_ownership_lock,
@@ -32,9 +35,12 @@ from spindle.namespace_owner import (
     capture_pid_namespace,
     create_control_request,
     iter_control_requests,
+    mailbox_path,
     parse_proc_stat_starttime,
     probe_ownership_lock,
+    read_control_receipt,
     reconcile_owner_episode,
+    update_control_receipt,
     write_control_receipt,
 )
 
@@ -313,6 +319,300 @@ def test_duplicate_request_writers_are_atomic_and_conflicts_fail(tmp_path):
     assert "different payload" in errors[0]
     stored = list(iter_control_requests(tmp_path, "spool-a"))
     assert stored == outcomes
+
+
+def _valid_request_payload(**changes):
+    value = {
+        "request_id": "request-1",
+        "kind": "cancel",
+        "desired_terminal_kind": "cancelled",
+        "owner_generation": 1,
+        "requested_at": "2026-08-27T00:00:00+00:00",
+        "requested_by": "unit-test",
+        "observer_pid": 42,
+        "observer_namespace": {"status": "supported", "device": 0, "inode": 7},
+        "reason": None,
+        "deadline": None,
+    }
+    value.update(changes)
+    return value
+
+
+def _valid_receipt_payload(**changes):
+    value = {
+        "request_id": "request-1",
+        "owner_generation": 1,
+        "owner_acknowledged_at": None,
+        "provider_cancel_attempted_at": None,
+        "provider_acknowledged_at": None,
+        "terminal_observed_at": None,
+        "forced_cleanup_started_at": None,
+        "forced_cleanup_completed_at": None,
+        "child_exit_observed_at": None,
+        "cleanup_outcome": "rejected_stale_generation",
+    }
+    value.update(changes)
+    return value
+
+
+@pytest.mark.parametrize(
+    "encoded,expected",
+    [
+        ({"status": "supported", "device": 0, "inode": 9}, NamespaceIdentity.supported(0, 9)),
+        ({"status": "unsupported", "reason": "no proc"}, NamespaceIdentity.unsupported("no proc")),
+    ],
+)
+def test_namespace_identity_strict_decoder_preserves_valid_encodings(encoded, expected):
+    assert NamespaceIdentity.from_dict(encoded) == expected
+    assert expected.to_dict() == encoded
+
+
+@pytest.mark.parametrize(
+    "encoded",
+    [
+        None,
+        {},
+        {"status": "supported", "device": 1},
+        {"status": "supported", "device": 1, "inode": 2, "extra": None},
+        {"status": "supported", "device": True, "inode": 2},
+        {"status": "supported", "device": 1.0, "inode": 2},
+        {"status": "supported", "device": "1", "inode": 2},
+        {"status": "supported", "device": None, "inode": 2},
+        {"status": "supported", "device": -1, "inode": 2},
+        {"status": "unsupported"},
+        {"status": "unsupported", "reason": ""},
+        {"status": "unsupported", "reason": None},
+        {"status": "unsupported", "reason": "why", "device": 1},
+        {"status": "unknown", "reason": "why"},
+    ],
+)
+def test_namespace_identity_rejects_coercions_and_malformed_shapes(encoded):
+    with pytest.raises(ValueError):
+        NamespaceIdentity.from_dict(encoded)
+
+
+@pytest.mark.parametrize("field", ["owner_generation", "observer_pid"])
+@pytest.mark.parametrize("invalid", [True, False, 1.0, "1", None, 0, -1])
+def test_control_request_rejects_nonpositive_or_nonplain_integer_fields(field, invalid):
+    with pytest.raises(ValueError):
+        ControlRequest.from_dict(_valid_request_payload(**{field: invalid}))
+
+
+@pytest.mark.parametrize("invalid", [True, 1.0, "1", None, -1])
+def test_control_request_rejects_nested_namespace_integer_coercions(invalid):
+    namespace = {"status": "supported", "device": invalid, "inode": 7}
+    with pytest.raises(ValueError):
+        ControlRequest.from_dict(_valid_request_payload(observer_namespace=namespace))
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"request_id": ""},
+        {"request_id": "../escape"},
+        {"kind": "timeout"},
+        {"requested_at": ""},
+        {"requested_by": None},
+        {"reason": 1},
+        {"deadline": False},
+    ],
+)
+def test_control_request_rejects_invalid_identity_relationship_and_strings(changes):
+    with pytest.raises(ValueError):
+        ControlRequest.from_dict(_valid_request_payload(**changes))
+
+
+@pytest.mark.parametrize("shape", ["missing", "extra"])
+def test_control_request_requires_exact_shape(shape):
+    payload = _valid_request_payload()
+    if shape == "missing":
+        payload.pop("deadline")
+    else:
+        payload["extra"] = None
+    with pytest.raises(ValueError):
+        ControlRequest.from_dict(payload)
+
+
+@pytest.mark.parametrize("field,invalid", [("owner_generation", True), ("observer_pid", 1.0)])
+def test_create_control_request_validates_without_coercion(tmp_path, field, invalid):
+    arguments = {"owner_generation": 1, "observer_pid": 42}
+    arguments[field] = invalid
+    with pytest.raises(ValueError):
+        create_control_request(tmp_path, "spool-a", "cancel", requested_by="test", **arguments)
+    assert not mailbox_path(tmp_path, "spool-a").exists()
+
+
+def test_malformed_lexical_first_request_is_preserved_and_does_not_hide_valid_sibling(tmp_path):
+    valid = create_control_request(
+        tmp_path,
+        "spool-a",
+        "drop",
+        1,
+        "test",
+        request_id="zzz-valid",
+        observer_pid=42,
+        observer_namespace=NamespaceIdentity.supported(1, 2),
+    )
+    damaged_path = mailbox_path(tmp_path, "spool-a") / "000-damaged.request"
+    damaged_path.write_text(json.dumps(_valid_request_payload(request_id="payload-id")))
+    damaged_bytes = damaged_path.read_bytes()
+
+    assert list(iter_control_requests(tmp_path, "spool-a")) == [valid]
+    assert damaged_path.read_bytes() == damaged_bytes
+
+
+@pytest.mark.parametrize("poison", [True, 1.0], ids=["true-vs-1", "1.0-vs-1"])
+def test_malformed_request_collision_is_preserved_and_not_idempotent(tmp_path, poison):
+    request_id = "collided-request"
+    path = mailbox_path(tmp_path, "spool-a") / f"{request_id}.request"
+    path.parent.mkdir()
+    path.write_text(json.dumps(_valid_request_payload(request_id=request_id, owner_generation=poison)))
+    original = path.read_bytes()
+
+    with pytest.raises(ValueError):
+        create_control_request(
+            tmp_path,
+            "spool-a",
+            "cancel",
+            1,
+            "unit-test",
+            request_id=request_id,
+            observer_pid=42,
+            observer_namespace=NamespaceIdentity.supported(0, 7),
+        )
+
+    assert path.read_bytes() == original
+
+
+@pytest.mark.parametrize("invalid", [True, False, 1.0, "1", None, 0, -1])
+def test_control_receipt_rejects_nonpositive_or_nonplain_generation(invalid):
+    with pytest.raises(ValueError):
+        ControlReceipt.from_dict(_valid_receipt_payload(owner_generation=invalid))
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"request_id": ""},
+        {"request_id": "../escape"},
+        {"cleanup_outcome": False},
+        {"owner_acknowledged_at": 1},
+    ],
+)
+def test_control_receipt_rejects_invalid_identity_and_fact_types(changes):
+    with pytest.raises(ValueError):
+        ControlReceipt.from_dict(_valid_receipt_payload(**changes))
+
+
+@pytest.mark.parametrize("shape", ["missing", "extra"])
+def test_control_receipt_requires_exact_shape(shape):
+    payload = _valid_receipt_payload()
+    if shape == "missing":
+        payload.pop("cleanup_outcome")
+    else:
+        payload["extra"] = None
+    with pytest.raises(ValueError):
+        ControlReceipt.from_dict(payload)
+
+
+@pytest.mark.parametrize(
+    "mismatch",
+    [
+        {"request_id": "other-request"},
+        {"owner_generation": 2},
+    ],
+    ids=["request-id", "owner-generation"],
+)
+def test_existing_receipt_identity_mismatch_is_preserved_and_rejected(tmp_path, mismatch):
+    request = create_control_request(
+        tmp_path,
+        "spool-a",
+        "cancel",
+        1,
+        "unit-test",
+        request_id="request-1",
+        observer_pid=42,
+        observer_namespace=NamespaceIdentity.supported(0, 7),
+    )
+    path = mailbox_path(tmp_path, "spool-a") / "request-1.receipt"
+    path.write_text(json.dumps(_valid_receipt_payload(**mismatch)))
+    original = path.read_bytes()
+
+    with pytest.raises(MalformedControlReceipt):
+        read_control_receipt(tmp_path, "spool-a", request.request_id)
+    with pytest.raises(MalformedControlReceipt):
+        write_control_receipt(tmp_path, "spool-a", request, current_generation=1)
+    assert path.read_bytes() == original
+
+
+def test_write_control_receipt_rejects_request_generation_not_bound_to_mailbox(tmp_path):
+    create_control_request(
+        tmp_path,
+        "spool-a",
+        "cancel",
+        1,
+        "unit-test",
+        request_id="request-1",
+        observer_pid=42,
+        observer_namespace=NamespaceIdentity.supported(0, 7),
+    )
+    mismatched = ControlRequest.from_dict(_valid_request_payload(owner_generation=2))
+
+    with pytest.raises(ValueError):
+        write_control_receipt(tmp_path, "spool-a", mismatched, current_generation=2)
+
+    assert not (mailbox_path(tmp_path, "spool-a") / "request-1.receipt").exists()
+
+
+@pytest.mark.parametrize("accepted", [0, 1, "true", 1.0])
+def test_write_control_receipt_requires_bool_or_none_accepted(tmp_path, accepted):
+    request = create_control_request(tmp_path, "spool-a", "cancel", 1, "unit-test")
+    with pytest.raises(ValueError):
+        write_control_receipt(tmp_path, "spool-a", request, current_generation=1, accepted=accepted)
+    assert read_control_receipt(tmp_path, "spool-a", request.request_id) is None
+
+
+@pytest.mark.parametrize("current_generation", [True, 1.0, "1", None, 0, -1])
+def test_write_control_receipt_requires_positive_plain_current_generation(tmp_path, current_generation):
+    request = create_control_request(tmp_path, "spool-a", "cancel", 1, "unit-test")
+    with pytest.raises(ValueError):
+        write_control_receipt(tmp_path, "spool-a", request, current_generation=current_generation)
+    assert read_control_receipt(tmp_path, "spool-a", request.request_id) is None
+
+
+@pytest.mark.parametrize("rejection_outcome", [False, 1, 1.0])
+def test_write_control_receipt_rejects_nonstring_rejection_outcome(tmp_path, rejection_outcome):
+    request = create_control_request(tmp_path, "spool-a", "cancel", 1, "unit-test")
+    with pytest.raises(ValueError):
+        write_control_receipt(
+            tmp_path,
+            "spool-a",
+            request,
+            current_generation=1,
+            accepted=False,
+            rejection_outcome=rejection_outcome,
+        )
+    assert read_control_receipt(tmp_path, "spool-a", request.request_id) is None
+
+
+@pytest.mark.parametrize("field,value", [("owner_generation", 2), ("cleanup_outcome", False)])
+def test_rejected_receipt_updates_preserve_published_bytes(tmp_path, field, value):
+    request = create_control_request(tmp_path, "spool-a", "cancel", 1, "unit-test")
+    write_control_receipt(tmp_path, "spool-a", request, current_generation=1)
+    path = mailbox_path(tmp_path, "spool-a") / f"{request.request_id}.receipt"
+    original = path.read_bytes()
+
+    with pytest.raises(ValueError):
+        update_control_receipt(tmp_path, "spool-a", request.request_id, **{field: value})
+
+    assert path.read_bytes() == original
+
+
+def test_valid_stale_generation_receipt_keeps_existing_disposition(tmp_path):
+    request = create_control_request(tmp_path, "spool-a", "cancel", 1, "unit-test")
+    receipt = write_control_receipt(tmp_path, "spool-a", request, current_generation=2)
+    assert receipt.cleanup_outcome == "rejected_stale_generation"
+    assert read_control_receipt(tmp_path, "spool-a", request.request_id) == receipt
 
 
 def test_every_owner_exit_code_is_disjoint_from_watchdog_crash_channel():

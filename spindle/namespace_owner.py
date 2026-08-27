@@ -102,6 +102,49 @@ def _type_strict_json_equal(left, right) -> bool:
     return left == right
 
 
+def _positive_json_integer(value, field: str) -> int:
+    """Return a plain positive JSON integer, rejecting Python coercions."""
+    if type(value) is not int or value <= 0:
+        raise ValueError(f"{field} must be a positive integer")
+    return value
+
+
+def _nonnegative_json_integer(value, field: str) -> int:
+    """Return a plain nonnegative JSON integer, rejecting Python coercions."""
+    if type(value) is not int or value < 0:
+        raise ValueError(f"{field} must be a nonnegative integer")
+    return value
+
+
+def _nonempty_string(value, field: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{field} must be a nonempty string")
+    return value
+
+
+def _optional_string(value, field: str) -> Optional[str]:
+    if value is not None and not isinstance(value, str):
+        raise ValueError(f"{field} must be a string or null")
+    return value
+
+
+def _filename_identity(value, field: str) -> str:
+    value = _nonempty_string(value, field)
+    if value in {".", ".."} or Path(value).name != value or "\x00" in value:
+        raise ValueError(f"{field} must be a safe filename identity")
+    return value
+
+
+def _require_exact_fields(value, expected: frozenset[str], record: str) -> None:
+    if type(value) is not dict:
+        raise ValueError(f"{record} must be a JSON object")
+    observed = frozenset(value)
+    if observed != expected:
+        missing = sorted(expected - observed)
+        extra = sorted(observed - expected)
+        raise ValueError(f"{record} has invalid fields (missing={missing}, extra={extra})")
+
+
 @dataclass(frozen=True)
 class NamespaceIdentity:
     status: str
@@ -111,11 +154,15 @@ class NamespaceIdentity:
 
     @classmethod
     def supported(cls, device: int, inode: int) -> "NamespaceIdentity":
-        return cls("supported", int(device), int(inode))
+        return cls(
+            "supported",
+            _nonnegative_json_integer(device, "namespace device"),
+            _nonnegative_json_integer(inode, "namespace inode"),
+        )
 
     @classmethod
     def unsupported(cls, reason: str = "unsupported") -> "NamespaceIdentity":
-        return cls("unsupported", reason=reason)
+        return cls("unsupported", reason=_nonempty_string(reason, "namespace reason"))
 
     @property
     def is_supported(self) -> bool:
@@ -136,9 +183,15 @@ class NamespaceIdentity:
 
     @classmethod
     def from_dict(cls, value: dict) -> "NamespaceIdentity":
+        if type(value) is not dict:
+            raise ValueError("namespace identity must be a JSON object")
         if value.get("status") == "supported":
+            _require_exact_fields(value, frozenset({"status", "device", "inode"}), "supported namespace identity")
             return cls.supported(value["device"], value["inode"])
-        return cls.unsupported(value.get("reason", "unsupported"))
+        if value.get("status") == "unsupported":
+            _require_exact_fields(value, frozenset({"status", "reason"}), "unsupported namespace identity")
+            return cls.unsupported(value["reason"])
+        raise ValueError("namespace status must be 'supported' or 'unsupported'")
 
 
 def capture_pid_namespace(path: str | os.PathLike[str] = "/proc/self/ns/pid") -> NamespaceIdentity:
@@ -771,16 +824,56 @@ class ControlRequest:
     reason: Optional[str] = None
     deadline: Optional[str] = None
 
+    _FIELDS = frozenset(
+        {
+            "request_id",
+            "kind",
+            "desired_terminal_kind",
+            "owner_generation",
+            "requested_at",
+            "requested_by",
+            "observer_pid",
+            "observer_namespace",
+            "reason",
+            "deadline",
+        }
+    )
+
     def to_dict(self) -> dict:
         value = asdict(self)
         value["observer_namespace"] = self.observer_namespace.to_dict()
         return value
 
     @classmethod
-    def from_dict(cls, value: dict) -> "ControlRequest":
-        data = dict(value)
-        data["observer_namespace"] = NamespaceIdentity.from_dict(data["observer_namespace"])
-        return cls(**data)
+    def from_dict(cls, value: dict, *, expected_request_id: Optional[str] = None) -> "ControlRequest":
+        _require_exact_fields(value, cls._FIELDS, "control request")
+        request_id = _filename_identity(value["request_id"], "request_id")
+        if expected_request_id is not None and request_id != expected_request_id:
+            raise ValueError(f"control request ID {request_id!r} does not match filename {expected_request_id!r}")
+        kind = value["kind"]
+        terminal_by_kind = {"cancel": "cancelled", "timeout": "timeout", "drop": "cancelled"}
+        if not isinstance(kind, str) or kind not in terminal_by_kind:
+            raise ValueError(f"unsupported control request kind: {kind!r}")
+        desired_terminal_kind = value["desired_terminal_kind"]
+        if desired_terminal_kind != terminal_by_kind[kind]:
+            raise ValueError(f"invalid desired terminal kind for {kind}: {desired_terminal_kind!r}")
+        return cls(
+            request_id=request_id,
+            kind=kind,
+            desired_terminal_kind=desired_terminal_kind,
+            owner_generation=_positive_json_integer(value["owner_generation"], "owner_generation"),
+            requested_at=_nonempty_string(value["requested_at"], "requested_at"),
+            requested_by=_nonempty_string(value["requested_by"], "requested_by"),
+            observer_pid=_positive_json_integer(value["observer_pid"], "observer_pid"),
+            observer_namespace=NamespaceIdentity.from_dict(value["observer_namespace"]),
+            reason=_optional_string(value["reason"], "reason"),
+            deadline=_optional_string(value["deadline"], "deadline"),
+        )
+
+
+def _load_control_request(path: Path) -> ControlRequest:
+    request_id = path.name.removesuffix(".request")
+    return ControlRequest.from_dict(json.loads(path.read_text()), expected_request_id=request_id)
 
 
 def create_control_request(
@@ -797,34 +890,37 @@ def create_control_request(
     deadline: Optional[str] = None,
     mailbox_locked: bool = False,
 ) -> ControlRequest:
-    if kind not in {"cancel", "timeout", "drop"}:
-        raise ValueError(f"unsupported control request kind: {kind}")
-    request_id = request_id or uuid.uuid4().hex
+    request_id = uuid.uuid4().hex if request_id is None else request_id
+    request_id = _filename_identity(request_id, "request_id")
     path = mailbox_path(root, spool_id) / f"{request_id}.request"
-    request = ControlRequest(
+    terminal_by_kind = {"cancel": "cancelled", "timeout": "timeout", "drop": "cancelled"}
+    if not isinstance(kind, str) or kind not in terminal_by_kind:
+        raise ValueError(f"unsupported control request kind: {kind!r}")
+    candidate = ControlRequest(
         request_id=request_id,
         kind=kind,
-        desired_terminal_kind="timeout" if kind == "timeout" else "cancelled",
-        owner_generation=int(owner_generation),
+        desired_terminal_kind=terminal_by_kind[kind],
+        owner_generation=owner_generation,
         requested_at=_utc_now(),
         requested_by=requested_by,
-        observer_pid=os.getpid() if observer_pid is None else int(observer_pid),
-        observer_namespace=observer_namespace or capture_pid_namespace(),
+        observer_pid=os.getpid() if observer_pid is None else observer_pid,
+        observer_namespace=capture_pid_namespace() if observer_namespace is None else observer_namespace,
         reason=reason,
         deadline=deadline,
     )
+    request = ControlRequest.from_dict(candidate.to_dict(), expected_request_id=request_id)
     guard = nullcontext() if mailbox_locked else mailbox_guard(root, spool_id)
     with guard:
         if _atomic_json_create(path, request.to_dict()):
             return request
-        existing = ControlRequest.from_dict(json.loads(path.read_text()))
+        existing = _load_control_request(path)
         expected = request.to_dict()
         observed = existing.to_dict()
         # The first durable publication owns its timestamp. Reusing the ID is
         # idempotent only when every caller-controlled field agrees.
         expected.pop("requested_at", None)
         observed.pop("requested_at", None)
-        if observed != expected:
+        if not _type_strict_json_equal(observed, expected):
             raise ValueError(f"control request ID {request_id!r} already has a different payload")
         return existing
 
@@ -836,7 +932,7 @@ def iter_control_requests(root: str | os.PathLike[str], spool_id: str) -> Iterab
     requests = []
     for path in sorted(mailbox.glob("*.request")):
         try:
-            requests.append(ControlRequest.from_dict(json.loads(path.read_text())))
+            requests.append(_load_control_request(path))
         except (FileNotFoundError, json.JSONDecodeError, KeyError, TypeError, ValueError):
             # Mailboxes survive rolling upgrades and interrupted atomic writes.
             # One entry without a usable request identity has no duty we can
@@ -858,9 +954,35 @@ class ControlReceipt:
     child_exit_observed_at: Optional[str] = None
     cleanup_outcome: Optional[str] = None
 
+    _FIELDS = frozenset(
+        {
+            "request_id",
+            "owner_generation",
+            "owner_acknowledged_at",
+            "provider_cancel_attempted_at",
+            "provider_acknowledged_at",
+            "terminal_observed_at",
+            "forced_cleanup_started_at",
+            "forced_cleanup_completed_at",
+            "child_exit_observed_at",
+            "cleanup_outcome",
+        }
+    )
+    _FACT_FIELDS = _FIELDS - {"request_id", "owner_generation"}
+
     @classmethod
-    def from_dict(cls, value: dict) -> "ControlReceipt":
-        return cls(**value)
+    def from_dict(cls, value: dict, *, expected_request_id: Optional[str] = None) -> "ControlReceipt":
+        _require_exact_fields(value, cls._FIELDS, "control receipt")
+        request_id = _filename_identity(value["request_id"], "request_id")
+        if expected_request_id is not None and request_id != expected_request_id:
+            raise ValueError(f"control receipt ID {request_id!r} does not match filename {expected_request_id!r}")
+        data = {
+            "request_id": request_id,
+            "owner_generation": _positive_json_integer(value["owner_generation"], "owner_generation"),
+        }
+        for field in cls._FACT_FIELDS:
+            data[field] = _optional_string(value[field], field)
+        return cls(**data)
 
 
 class MalformedControlReceipt(ValueError):
@@ -872,9 +994,16 @@ class MalformedControlReceipt(ValueError):
         super().__init__(f"malformed control receipt {path.name}: {type(cause).__name__}: {cause}")
 
 
-def _load_control_receipt(path: Path) -> ControlReceipt:
+def _load_control_receipt(path: Path, *, request: Optional[ControlRequest] = None) -> ControlReceipt:
     try:
-        return ControlReceipt.from_dict(json.loads(path.read_text()))
+        request_id = path.name.removesuffix(".receipt")
+        receipt = ControlReceipt.from_dict(json.loads(path.read_text()), expected_request_id=request_id)
+        if request is not None and (
+            receipt.request_id != request.request_id
+            or not _type_strict_json_equal(receipt.owner_generation, request.owner_generation)
+        ):
+            raise ValueError("control receipt identity does not match its associated request")
+        return receipt
     except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
         raise MalformedControlReceipt(path, exc) from exc
 
@@ -890,10 +1019,25 @@ def write_control_receipt(
     owner_acknowledged_at: Optional[str] = None,
     **facts,
 ) -> ControlReceipt:
+    request = ControlRequest.from_dict(request.to_dict(), expected_request_id=request.request_id)
+    stored_request = _load_control_request(mailbox_path(root, spool_id) / f"{request.request_id}.request")
+    if stored_request.request_id != request.request_id or not _type_strict_json_equal(
+        stored_request.owner_generation, request.owner_generation
+    ):
+        raise ValueError("control request identity does not match its durable mailbox record")
+    current_generation = _positive_json_integer(current_generation, "current_generation")
+    if accepted is not None and type(accepted) is not bool:
+        raise ValueError("accepted must be a boolean or null")
+    for field, fact in facts.items():
+        if field not in ControlReceipt._FACT_FIELDS:
+            raise ValueError(f"unknown receipt fact: {field}")
+        _optional_string(fact, field)
+    owner_acknowledged_at = _optional_string(owner_acknowledged_at, "owner_acknowledged_at")
+    rejection_outcome = _optional_string(rejection_outcome, "rejection_outcome")
     path = mailbox_path(root, spool_id) / f"{request.request_id}.receipt"
     if path.exists():
-        return _load_control_receipt(path)
-    generation_matches = request.owner_generation == current_generation
+        return _load_control_receipt(path, request=request)
+    generation_matches = _type_strict_json_equal(request.owner_generation, current_generation)
     if accepted is None:
         accepted = generation_matches
     accepted = bool(accepted and generation_matches)
@@ -909,7 +1053,7 @@ def write_control_receipt(
     )
     if _atomic_json_create(path, asdict(receipt)):
         return receipt
-    return _load_control_receipt(path)
+    return _load_control_receipt(path, request=request)
 
 
 def read_control_receipt(
@@ -917,11 +1061,20 @@ def read_control_receipt(
     spool_id: str,
     request_id: str,
 ) -> Optional[ControlReceipt]:
+    request_id = _filename_identity(request_id, "request_id")
     path = mailbox_path(root, spool_id) / f"{request_id}.receipt"
     try:
-        return _load_control_receipt(path)
+        receipt = _load_control_receipt(path)
     except FileNotFoundError:
         return None
+    request_path = mailbox_path(root, spool_id) / f"{request_id}.request"
+    try:
+        request = _load_control_request(request_path)
+        if not _type_strict_json_equal(receipt.owner_generation, request.owner_generation):
+            raise ValueError("control receipt generation does not match its associated request")
+    except (json.JSONDecodeError, KeyError, OSError, TypeError, ValueError) as exc:
+        raise MalformedControlReceipt(path, exc) from exc
+    return receipt
 
 
 def update_control_receipt(
@@ -930,14 +1083,16 @@ def update_control_receipt(
     request_id: str,
     **facts,
 ) -> ControlReceipt:
+    request_id = _filename_identity(request_id, "request_id")
     path = mailbox_path(root, spool_id) / f"{request_id}.receipt"
     current = read_control_receipt(root, spool_id, request_id)
     if current is None:
         raise FileNotFoundError(path)
     value = asdict(current)
     for key, fact in facts.items():
-        if key not in value:
+        if key not in ControlReceipt._FACT_FIELDS:
             raise ValueError(f"unknown receipt fact: {key}")
+        _optional_string(fact, key)
         value[key] = fact
     updated = ControlReceipt.from_dict(value)
     _atomic_json_write(path, asdict(updated))
