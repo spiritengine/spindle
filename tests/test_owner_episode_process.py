@@ -437,9 +437,11 @@ def test_evidence_grace_lets_an_adopted_descendant_settle_after_the_wrapper_exit
     )
     ready_path = owner.store / f"{owner.spool_id}.descendant-ready"
     boundary = time.monotonic() + 5
-    while time.monotonic() < boundary and not ready_path.exists():
+    while time.monotonic() < boundary and (not ready_path.exists() or ready_path.stat().st_size == 0):
         time.sleep(0.01)
-    assert ready_path.exists(), "the wrapper never forked the descendant this case is about"
+    assert ready_path.exists() and ready_path.stat().st_size > 0, (
+        "the wrapper never published the descendant PID this case is about"
+    )
     descendant = int(ready_path.read_text())
 
     request = create_control_request(
