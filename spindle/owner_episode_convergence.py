@@ -1209,9 +1209,31 @@ def _protected_update_fields(updates: dict | None) -> set:
 
 def protected_update_refusal(record: dict | None, updates: dict | None) -> str | None:
     """Name the protected fields *updates* may not write on *record*, if any."""
+    episode = (record or {}).get(EPISODE_KEY)
+    failure = episode.get("failure") if isinstance(episode, dict) else None
+    protected_fields = _protected_update_fields(updates)
+    exact_pre_spawn_refusal_projection = bool(
+        (record or {}).get("status") == "pending"
+        and isinstance(episode, dict)
+        and episode.get("format") == EPISODE_FORMAT
+        and episode.get("phase") == "aborted"
+        and isinstance(failure, dict)
+        and failure.get("kind") == "launcher_pre_spawn_failure"
+        and updates
+        and protected_fields == {"completed_at", "error", "result", "status"}
+        and updates.get("status") == "error"
+        and updates.get("error") == failure.get("detail")
+        and "sandbox_error" in updates
+        and updates.get("sandbox_error") == failure.get("detail")
+        and "result" in updates
+        and updates.get("result") is None
+        and bool(updates.get("completed_at"))
+    )
+    if exact_pre_spawn_refusal_projection:
+        return None
     if not applicator_owns_outcome(record):
         return None
-    refused = sorted(_protected_update_fields(updates))
+    refused = sorted(protected_fields)
     if not refused:
         return None
     subject = "an owner-episode record" if isinstance((record or {}).get(EPISODE_KEY), dict) else "a settled record"

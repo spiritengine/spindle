@@ -800,12 +800,34 @@ def test_pre_spawn_failure_aborts_the_reservation_it_finalizes(episode_store):
     assert stored["failure"]
 
 
+def test_pre_spawn_failure_absorbs_durable_legacy_terminal_cleanup_marker(episode_store, monkeypatch):
+    from spindle import owner_episode_convergence
+
+    spool_id = "writer-pre-spawn-failure-legacy-cleanup"
+    message = "spawn failed: legacy launcher"
+    episode_store.write(spool_id, status="pending", prompt="legacy")
+    real_publish = owner_episode_convergence.publish_record_updates
+
+    def publish_then_fail_cleanup(published_spool_id, record, updates):
+        real_publish(published_spool_id, record, updates)
+        raise spindle._DurablePublicationCleanupError(errno.EIO, "legacy directory close failed")
+
+    monkeypatch.setattr(owner_episode_convergence, "publish_record_updates", publish_then_fail_cleanup)
+
+    spindle._record_pre_spawn_failure(spool_id, message)
+
+    record = episode_store.read(spool_id)
+    assert record["status"] == "error"
+    assert record["error"] == message
+    assert record["completed_at"]
+
+
 def test_sandbox_refusal_preserves_and_aborts_the_episode(episode_store):
     spool_id = "writer-sandbox-refusal"
-    reserved = make_episode("reserved", generation=2, path="before_watchdog")
+    reserved = make_episode("reserved", generation=1, path="before_watchdog")
     assert reserved["revision"] == 1
     assert "watchdog" not in reserved
-    episode_store.write(spool_id, status="pending", episode=reserved)
+    episode_store.write(spool_id, status="pending", episode=reserved, tags=["codex", "respin"])
 
     message = spindle._persist_codex_sandbox_refusal(
         spool_id,
@@ -814,6 +836,7 @@ def test_sandbox_refusal_preserves_and_aborts_the_episode(episode_store):
         permission="careful",
         codex_bin="/usr/bin/codex",
         codex_version="1.0",
+        session_id="session-sandbox-refusal",
     )
 
     record = episode_store.read(spool_id)
@@ -822,14 +845,14 @@ def test_sandbox_refusal_preserves_and_aborts_the_episode(episode_store):
     assert message.endswith(f"(spool {spool_id})")
     assert "refusal persistence failed" not in message
     assert stored is not None, "sandbox refusal replaced the record and dropped the episode"
-    assert (stored["phase"], stored["generation"], stored["revision"]) == ("aborted", 2, 2)
+    assert (stored["phase"], stored["generation"], stored["revision"]) == ("aborted", 1, 2)
     assert "watchdog" not in stored
 
 
 def test_sandbox_refusal_finishes_after_durable_abort_cleanup_failure(episode_store, monkeypatch):
     spool_id = "writer-sandbox-refusal-durable-abort"
-    reserved = make_episode("reserved", generation=2, path="before_watchdog")
-    episode_store.write(spool_id, status="pending", episode=reserved)
+    reserved = make_episode("reserved", generation=1, path="before_watchdog")
+    episode_store.write(spool_id, status="pending", episode=reserved, tags=["codex", "respin"])
     real_close = os.close
     directory = episode_store.root.stat()
     directory_closes = 0
@@ -854,11 +877,12 @@ def test_sandbox_refusal_finishes_after_durable_abort_cleanup_failure(episode_st
         permission="careful",
         codex_bin="/usr/bin/codex",
         codex_version="1.0",
+        session_id="session-sandbox-refusal-durable-abort",
     )
 
     record = episode_store.read(spool_id)
     assert message == f"Error: REFUSED: codex sandbox is unavailable (spool {spool_id})"
-    assert directory_closes == 4
+    assert directory_closes == 3
     assert record["status"] == "error"
     assert record["error"] == "REFUSED: codex sandbox is unavailable"
     assert record["sandbox_error"] == "REFUSED: codex sandbox is unavailable"
@@ -869,15 +893,18 @@ def test_sandbox_refusal_finishes_after_durable_abort_cleanup_failure(episode_st
 
 def test_sandbox_refusal_converges_after_post_abort_lock_cleanup_failure(episode_store, monkeypatch):
     spool_id = "writer-sandbox-refusal-abort-unlock"
-    reserved = make_episode("reserved", generation=2, path="before_watchdog")
-    episode_store.write(spool_id, status="pending", episode=reserved)
+    reserved = make_episode("reserved", generation=1, path="before_watchdog")
+    episode_store.write(spool_id, status="pending", episode=reserved, tags=["codex", "respin"])
     real_flock = spindle.fcntl.flock
+    unlocks = 0
     failed_unlocks = 0
 
     def fail_first_unlock_after_release(fd, operation):
-        nonlocal failed_unlocks
+        nonlocal failed_unlocks, unlocks
         result = real_flock(fd, operation)
-        if operation == spindle.fcntl.LOCK_UN and failed_unlocks == 0:
+        if operation == spindle.fcntl.LOCK_UN:
+            unlocks += 1
+        if operation == spindle.fcntl.LOCK_UN and unlocks == 2 and failed_unlocks == 0:
             failed_unlocks += 1
             raise OSError(errno.EIO, "record unlock failed after durable abort")
         return result
@@ -891,6 +918,7 @@ def test_sandbox_refusal_converges_after_post_abort_lock_cleanup_failure(episode
         permission="careful",
         codex_bin="/usr/bin/codex",
         codex_version="1.0",
+        session_id="session-sandbox-refusal-abort-unlock",
     )
 
     record = episode_store.read(spool_id)
@@ -906,8 +934,14 @@ def test_sandbox_refusal_converges_after_post_abort_lock_cleanup_failure(episode
 
 def test_sandbox_refusal_episode_path_is_utf8_independent_of_text_defaults(episode_store, monkeypatch):
     spool_id = "writer-sandbox-refusal-utf8"
-    reserved = make_episode("reserved", generation=2, path="before_watchdog")
-    record = episode_store.write(spool_id, status="pending", episode=reserved, prompt="caf\u00e9 \u2615")
+    reserved = make_episode("reserved", generation=1, path="before_watchdog")
+    record = episode_store.write(
+        spool_id,
+        status="pending",
+        episode=reserved,
+        prompt="caf\u00e9 \u2615",
+        tags=["codex", "respin"],
+    )
     episode_store.spool_path(spool_id).write_bytes(json.dumps(record, ensure_ascii=False).encode("utf-8"))
     real_open = open
     real_read_text = Path.read_text
@@ -939,6 +973,7 @@ def test_sandbox_refusal_episode_path_is_utf8_independent_of_text_defaults(episo
         permission="careful",
         codex_bin="/usr/bin/codex",
         codex_version="1.0",
+        session_id="session-sandbox-refusal-utf8",
     )
 
     stored_record = json.loads(episode_store.spool_path(spool_id).read_bytes())

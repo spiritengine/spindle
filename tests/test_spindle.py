@@ -8124,6 +8124,25 @@ class TestCodexSandboxEnforcement:
     the record, and the tier surviving a respin.
     """
 
+    @staticmethod
+    def _exact_respin_reservation(spool_id):
+        return {
+            "id": spool_id,
+            "status": "pending",
+            "created_at": "2026-08-27T00:00:00",
+            "spool_schema_version": 1,
+            "launcher_pid": os.getpid(),
+            "tags": ["codex", "respin"],
+            "owner_episode": {
+                "format": "spindle.owner-episode/1",
+                "generation": 1,
+                "revision": 1,
+                "phase": "reserved",
+                "phase_times": {"reserved": "2026-08-27T00:00:00+00:00"},
+                "starter": spindle._process_fact(os.getpid()),
+            },
+        }
+
     @contextmanager
     def _captured_codex_spin(self, tmp_path, enforces=True, auth_mode="chatgpt"):
         """Run _codex_spin_sync with a stable codex binary, capturing the spawned argv.
@@ -8470,6 +8489,219 @@ class TestCodexSandboxEnforcement:
         assert f"(spool {spool_id})" not in result
         assert path.read_bytes() == corrupt_record
 
+    def test_fresh_refusal_preserves_occupied_terminal_bytes_and_does_not_claim_id(self, tmp_path):
+        spool_id = "codex-fresh-terminal-collision"
+        path = tmp_path / f"{spool_id}.json"
+        original_bytes = (
+            b'{ "id": "codex-fresh-terminal-collision", "status": "error", '
+            b'"error": "unrelated durable failure", "completed_at": "already-settled" }\n'
+        )
+        path.write_bytes(original_bytes)
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            result = spindle._persist_codex_sandbox_refusal(
+                spool_id,
+                "REFUSED: sandbox unavailable",
+                sandbox="read-only",
+                permission="readonly",
+                codex_bin="/fake/bin/codex",
+                codex_version="0.149.0",
+            )
+
+        assert result.startswith("Error: REFUSED: sandbox unavailable")
+        assert "fresh sandbox refusal spool ID is already occupied" in result
+        assert f"(spool {spool_id})" not in result
+        assert path.read_bytes() == original_bytes
+
+    @pytest.mark.parametrize(
+        "occupied",
+        [
+            {
+                "status": "error",
+                "error": "unrelated terminal",
+                "completed_at": "already-settled",
+                "tags": ["codex", "respin"],
+            },
+            {
+                "status": "pending",
+                "tags": ["codex", "other"],
+                "owner_episode": {
+                    "format": "spindle.owner-episode/1",
+                    "generation": 1,
+                    "revision": 1,
+                    "phase": "reserved",
+                    "starter": {},
+                },
+            },
+        ],
+        ids=("terminal", "unrelated-reservation"),
+    )
+    def test_respin_refusal_preserves_unrelated_occupied_record_bytes(self, tmp_path, occupied):
+        spool_id = "codex-respin-collision"
+        path = tmp_path / f"{spool_id}.json"
+        original = {"id": spool_id, **occupied}
+        original_bytes = (json.dumps(original, separators=(",", ":")) + "\n").encode()
+        path.write_bytes(original_bytes)
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            result = spindle._persist_codex_sandbox_refusal(
+                spool_id,
+                "REFUSED: sandbox unavailable",
+                sandbox="read-only",
+                permission="readonly",
+                codex_bin="/fake/bin/codex",
+                codex_version="0.149.0",
+                session_id="session-collision",
+            )
+
+        assert result.startswith("Error: REFUSED: sandbox unavailable")
+        assert "occupied spool is not the expected Codex respin reservation" in result
+        assert f"(spool {spool_id})" not in result
+        assert path.read_bytes() == original_bytes
+
+    def test_respin_refusal_rejects_unaccepted_abort_transition_without_claiming_id(self, tmp_path):
+        spool_id = "codex-respin-transition-rejected"
+        path = tmp_path / f"{spool_id}.json"
+        original_bytes = json.dumps(self._exact_respin_reservation(spool_id), indent=2).encode()
+        path.write_bytes(original_bytes)
+        rejected = MagicMock(accepted=False, rejection="stale_revision")
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle.transition_owner_episode", return_value=rejected):
+                result = spindle._persist_codex_sandbox_refusal(
+                    spool_id,
+                    "REFUSED: sandbox unavailable",
+                    sandbox="read-only",
+                    permission="readonly",
+                    codex_bin="/fake/bin/codex",
+                    codex_version="0.149.0",
+                    session_id="session-transition-rejected",
+                )
+
+        assert result.startswith("Error: REFUSED: sandbox unavailable")
+        assert "pre-spawn failure transition rejected: stale_revision" in result
+        assert f"(spool {spool_id})" not in result
+        assert path.read_bytes() == original_bytes
+
+    @pytest.mark.parametrize("final_state", ["terminal", "aborted"], ids=("wrong-terminal", "wrong-abort"))
+    def test_respin_refusal_does_not_claim_mismatched_final_evidence(self, tmp_path, final_state):
+        spool_id = f"codex-respin-mismatched-{final_state}"
+        path = tmp_path / f"{spool_id}.json"
+        reservation = self._exact_respin_reservation(spool_id)
+        path.write_text(json.dumps(reservation), encoding="utf-8")
+        if final_state == "terminal":
+            mismatched = {**reservation, "status": "error", "error": "unrelated terminal"}
+        else:
+            mismatched = dict(reservation)
+            mismatched["owner_episode"] = {
+                **reservation["owner_episode"],
+                "revision": 2,
+                "phase": "aborted",
+                "failure": {
+                    "kind": "launcher_pre_spawn_failure",
+                    "detail": "different refusal",
+                    "observed_at": "2026-08-27T00:00:01+00:00",
+                },
+            }
+        mismatched_bytes = json.dumps(mismatched, separators=(",", ":")).encode()
+
+        def publish_mismatched_evidence(*_args, **_kwargs):
+            path.write_bytes(mismatched_bytes)
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle._record_pre_spawn_failure", side_effect=publish_mismatched_evidence):
+                result = spindle._persist_codex_sandbox_refusal(
+                    spool_id,
+                    "REFUSED: sandbox unavailable",
+                    sandbox="read-only",
+                    permission="readonly",
+                    codex_bin="/fake/bin/codex",
+                    codex_version="0.149.0",
+                    session_id=f"session-mismatched-{final_state}",
+                )
+
+        assert result.startswith("Error: REFUSED: sandbox unavailable")
+        assert "spool does not contain the expected sandbox refusal evidence" in result
+        assert f"(spool {spool_id})" not in result
+        assert path.read_bytes() == mismatched_bytes
+
+    def test_respin_refusal_projects_aborted_evidence_when_mailbox_is_unavailable(self, tmp_path):
+        from spindle import owner_episode_convergence
+
+        spool_id = "codex-respin-mailbox-unavailable"
+        message = "REFUSED: sandbox unavailable"
+        path = tmp_path / f"{spool_id}.json"
+        path.write_text(json.dumps(self._exact_respin_reservation(spool_id)), encoding="utf-8")
+        real_publish = owner_episode_convergence.publish_record_updates
+        final_updates = []
+
+        def capture_publish(published_spool_id, record, updates):
+            final_updates.append(dict(updates))
+            return real_publish(published_spool_id, record, updates)
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch.object(
+                owner_episode_convergence,
+                "converge_owner_episode",
+                return_value=owner_episode_convergence.MailboxUnavailable("mailbox unreadable"),
+            ):
+                with patch.object(owner_episode_convergence, "publish_record_updates", side_effect=capture_publish):
+                    result = spindle._persist_codex_sandbox_refusal(
+                        spool_id,
+                        message,
+                        sandbox="read-only",
+                        permission="readonly",
+                        codex_bin="/fake/bin/codex",
+                        codex_version="0.149.0",
+                        session_id="session-mailbox-unavailable",
+                    )
+            record = spindle._read_spool_for_codex_sandbox_refusal(spool_id)
+            assert spindle._count_running() == 0
+
+        assert result == f"Error: {message} (spool {spool_id})"
+        assert len(final_updates) == 1
+        assert final_updates[0]["status"] == "error"
+        assert final_updates[0]["error"] == message
+        assert final_updates[0]["result"] is None
+        assert final_updates[0]["sandbox_error"] == message
+        assert final_updates[0]["completed_at"]
+        assert record["status"] == "error"
+        assert record["error"] == message
+        assert record["sandbox_error"] == message
+        assert record["owner_episode"]["phase"] == "aborted"
+
+    def test_respin_refusal_absorbs_intermediate_convergence_cleanup_marker(self, tmp_path):
+        from spindle import owner_episode_convergence
+
+        spool_id = "codex-respin-convergence-cleanup"
+        message = "REFUSED: sandbox unavailable"
+        path = tmp_path / f"{spool_id}.json"
+        path.write_text(json.dumps(self._exact_respin_reservation(spool_id)), encoding="utf-8")
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch.object(
+                owner_episode_convergence,
+                "converge_owner_episode",
+                side_effect=spindle._DurablePublicationCleanupError(errno.EIO, "intermediate close failed"),
+            ):
+                result = spindle._persist_codex_sandbox_refusal(
+                    spool_id,
+                    message,
+                    sandbox="read-only",
+                    permission="readonly",
+                    codex_bin="/fake/bin/codex",
+                    codex_version="0.149.0",
+                    session_id="session-convergence-cleanup",
+                )
+            record = spindle._read_spool_for_codex_sandbox_refusal(spool_id)
+            assert spindle._count_running() == 0
+
+        assert result == f"Error: {message} (spool {spool_id})"
+        assert record["status"] == "error"
+        assert record["error"] == message
+        assert record["sandbox_error"] == message
+        assert record["owner_episode"]["phase"] == "aborted"
+
     def test_refusal_persistence_preserves_invalid_utf8_record_independent_of_default_encoding(self, tmp_path):
         spool_id = "codex-invalid-utf8-refusal"
         path = tmp_path / f"{spool_id}.json"
@@ -8525,7 +8757,8 @@ class TestCodexSandboxEnforcement:
         spool_id = "codex-valid-utf8-refusal"
         path = tmp_path / f"{spool_id}.json"
         original = {"id": spool_id, "status": "pending", "prompt": "caf\u00e9 \u2615"}
-        path.write_bytes(json.dumps(original, ensure_ascii=False).encode("utf-8"))
+        original_bytes = json.dumps(original, ensure_ascii=False).encode("utf-8")
+        path.write_bytes(original_bytes)
         real_open = open
         real_read_text = Path.read_text
 
@@ -8551,12 +8784,10 @@ class TestCodexSandboxEnforcement:
                         codex_version="0.149.0",
                     )
 
-        record = json.loads(path.read_bytes())
-        assert result == f"Error: REFUSED: sandbox unavailable (spool {spool_id})"
-        assert record["status"] == "error"
-        assert record["error"] == "REFUSED: sandbox unavailable"
-        assert record["sandbox_error"] == "REFUSED: sandbox unavailable"
-        assert record["prompt"] == "caf\u00e9 \u2615"
+        assert result.startswith("Error: REFUSED: sandbox unavailable")
+        assert "fresh sandbox refusal spool ID is already occupied" in result
+        assert f"(spool {spool_id})" not in result
+        assert path.read_bytes() == original_bytes
 
     @pytest.mark.parametrize(
         "decoder_error",
@@ -9054,9 +9285,13 @@ class TestCodexSandboxEnforcement:
         with patch("spindle.SPINDLE_DIR", state):
             spool = _read_spool(spool_id)
         assert spool["status"] == "error"
+        assert spool["error"] == spool["sandbox_error"]
         assert "REFUSED" in spool["sandbox_error"]
         assert spool["sandbox"] == "read-only"
         assert spool["session_id"] == "sess-refuse"
+        assert spool["tags"] == ["codex", "respin"]
+        with patch("spindle.SPINDLE_DIR", state):
+            assert spindle._count_running() == 0
 
     def test_respin_refusal_preserves_pre_spawn_failure_when_metadata_publication_fails(self, tmp_path):
         """A later EROFS cannot mask the refusal or leak the already-reserved slot."""

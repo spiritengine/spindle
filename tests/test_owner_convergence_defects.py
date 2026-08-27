@@ -462,7 +462,7 @@ def test_retention_never_retires_a_record_whose_obligations_are_pending(episode_
 # --- defect 8: compatibility updates on a record convergence owns ------------
 
 
-def test_a_sandbox_refusal_adds_its_metadata_without_a_second_terminal(episode_store):
+def test_a_sandbox_refusal_adds_its_metadata_without_a_second_terminal(episode_store, monkeypatch):
     """The refusal is already the record's outcome; only its detail is missing.
 
     ``_persist_codex_sandbox_refusal`` runs after the launcher published this
@@ -475,16 +475,21 @@ def test_a_sandbox_refusal_adds_its_metadata_without_a_second_terminal(episode_s
     episode_store.write(
         spool_id,
         status="pending",
-        episode=causal_episode("reserved"),
+        episode=causal_episode("reserved", generation=1, path="before_watchdog"),
         created_at="2026-08-01T00:00:00",
-        harness="codex",
+        tags=["codex", "respin"],
         timeout=TIMEOUT_SECONDS,
     )
-    spindle._record_pre_spawn_failure(spool_id, message)
-    published = episode_store.read(spool_id)
-    assert published["terminal_origin"] == "launcher_pre_spawn_failure", (
-        f"the launcher failure was never projected into a terminal (status={published.get('status')!r})"
-    )
+    from spindle import owner_episode_convergence
+
+    real_publish = owner_episode_convergence.publish_record_updates
+    snapshots = []
+
+    def capture_final_publish(published_spool_id, record, updates):
+        snapshots.append(dict(record))
+        return real_publish(published_spool_id, record, updates)
+
+    monkeypatch.setattr(owner_episode_convergence, "publish_record_updates", capture_final_publish)
 
     returned = spindle._persist_codex_sandbox_refusal(
         spool_id,
@@ -493,9 +498,15 @@ def test_a_sandbox_refusal_adds_its_metadata_without_a_second_terminal(episode_s
         permission="careful",
         codex_bin="/usr/bin/codex",
         codex_version="1.0",
+        session_id="session-sandbox-refusal-settled",
     )
 
     record = episode_store.read(spool_id)
+    assert len(snapshots) == 1
+    published = snapshots[0]
+    assert published["terminal_origin"] == "launcher_pre_spawn_failure", (
+        f"the launcher failure was never projected into a terminal (status={published.get('status')!r})"
+    )
     assert message in returned
     assert returned.endswith(f"(spool {spool_id})")
     assert "refusal persistence failed" not in returned
@@ -547,6 +558,38 @@ def test_the_compatibility_applicator_refuses_a_protected_update_on_a_settled_re
     assert episode_store.spool_path(scenario.spool_id).read_bytes() == before, (
         "the refused update was written to the record anyway"
     )
+
+
+def test_pre_spawn_refusal_projection_cannot_smuggle_another_protected_field(episode_store):
+    from spindle.owner_episode_convergence import ProtectedRecordUpdate, publish_record_updates
+
+    message = "REFUSED: sandbox unavailable"
+    record = episode_store.write(
+        "refusal-projection-extra-field",
+        status="pending",
+        episode=causal_episode(
+            "aborted",
+            generation=1,
+            failure=failure_fact("launcher_pre_spawn_failure", message),
+        ),
+    )
+    before = episode_store.spool_path("refusal-projection-extra-field").read_bytes()
+
+    with pytest.raises(ProtectedRecordUpdate):
+        publish_record_updates(
+            "refusal-projection-extra-field",
+            record,
+            {
+                "status": "error",
+                "error": message,
+                "result": None,
+                "completed_at": "2026-08-27T00:00:00",
+                "sandbox_error": message,
+                "terminal_origin": "rewritten",
+            },
+        )
+
+    assert episode_store.spool_path("refusal-projection-extra-field").read_bytes() == before
 
 
 def test_the_compatibility_applicator_still_publishes_an_unsettled_legacy_terminal(episode_store):

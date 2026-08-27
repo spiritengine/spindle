@@ -2746,16 +2746,29 @@ def _record_pre_spawn_failure(
     spool_id: str,
     error: str,
     spool_metadata: Optional[dict] = None,
+    *,
+    expected_record: Optional[dict] = None,
 ) -> None:
-    """Publish launcher failure evidence, then let convergence project it."""
+    """Publish launcher failure evidence, then let convergence project it.
+
+    ``expected_record`` makes a caller's reservation claim collision-safe.  The
+    guarded record must still be that exact snapshot before this writer may
+    remove launcher metadata or publish an abort.
+    """
     failure_evidence_durable = False
     try:
         with _spool_lock(spool_id) as acquired:
             if not acquired:
+                if expected_record is not None:
+                    raise OSError("spool record lock unavailable before pre-spawn failure")
                 return
             current = _read_spool(spool_id)
             if not current:
+                if expected_record is not None:
+                    raise OSError("expected spool reservation is missing")
                 return
+            if expected_record is not None and current != expected_record:
+                raise OSError("expected spool reservation changed before pre-spawn failure")
             if spool_metadata:
                 for key in (
                     "working_dir",
@@ -2770,16 +2783,11 @@ def _record_pre_spawn_failure(
             current.pop("launcher_pid", None)
             current.pop("launcher_start_time", None)
             _preserve_failed_spool_shard(current)
-            try:
-                _write_spool(spool_id, current)
-            except _DurablePublicationCleanupError:
-                # This preparatory snapshot contains no refusal evidence yet. Its
-                # publication succeeded, so continue to the episode transition
-                # that makes the failure claim durable.
-                pass
             episode = current.get("owner_episode") or {}
             if current.get("status") == "pending" and episode.get("phase") == "reserved":
                 try:
+                    record_updates = dict(current)
+                    record_updates.pop("owner_episode", None)
                     transitioned = transition_owner_episode(
                         SPINDLE_DIR,
                         spool_id,
@@ -2794,14 +2802,25 @@ def _record_pre_spawn_failure(
                                 "observed_at": datetime.now(timezone.utc).isoformat(),
                             }
                         },
+                        record_updates=record_updates,
+                        record_deletes=("launcher_pid", "launcher_start_time"),
                         record_locked=True,
                     )
-                    failure_evidence_durable = transitioned.accepted
+                    if not transitioned.accepted:
+                        raise OSError(f"pre-spawn failure transition rejected: {transitioned.rejection}")
+                    failure_evidence_durable = True
                 except _DurablePublicationCleanupError:
                     # The transition's replace and directory fsync completed. The
                     # cleanup marker proves this failure evidence is durable even
                     # though the transition could not return its result.
                     failure_evidence_durable = True
+            else:
+                try:
+                    _write_spool(spool_id, current)
+                except _DurablePublicationCleanupError:
+                    # This preparatory snapshot contains no refusal evidence yet.
+                    # Continue to the legacy terminal publication below.
+                    pass
     except OSError:
         # Lock cleanup after the accepted/durable transition must not strand its
         # public projection. Before that proof, retain the storage failure.
@@ -2811,15 +2830,25 @@ def _record_pre_spawn_failure(
     if current and "owner_episode" in current:
         from .owner_episode_convergence import ObserverIdentity, converge_owner_episode
 
-        converge_owner_episode(spool_id, ObserverIdentity.for_this_process())
+        try:
+            converge_owner_episode(spool_id, ObserverIdentity.for_this_process())
+        except _DurablePublicationCleanupError:
+            # Convergence's projection is durable.  Its directory-fd cleanup is
+            # intermediate to the caller's final public record publication.
+            pass
     elif current and current.get("status") == "pending":
         from .owner_episode_convergence import publish_record_updates
 
-        publish_record_updates(
-            spool_id,
-            current,
-            {"status": "error", "error": error, "completed_at": datetime.now().isoformat()},
-        )
+        try:
+            publish_record_updates(
+                spool_id,
+                current,
+                {"status": "error", "error": error, "completed_at": datetime.now().isoformat()},
+            )
+        except _DurablePublicationCleanupError:
+            # The legacy terminal is durable.  The sandbox refusal caller still
+            # has metadata to add before it may advertise the spool ID.
+            pass
 
 
 def _publish_spawned_process(spool_id: str, pid: int, *, record_locked: bool = False) -> bool:
@@ -8036,6 +8065,43 @@ def _codex_refusal_persistence_diagnostic(exc: OSError) -> str:
     return prefix + detail
 
 
+def _is_exact_codex_respin_reservation(spool_id: str, record: Optional[dict]) -> bool:
+    """Whether *record* is the untouched reservation made by Codex respin."""
+    if not isinstance(record, dict):
+        return False
+    episode = record.get("owner_episode")
+    return bool(
+        record.get("id") == spool_id
+        and record.get("status") == "pending"
+        and record.get("tags") == ["codex", "respin"]
+        and "error" not in record
+        and "sandbox_error" not in record
+        and isinstance(episode, dict)
+        and episode.get("format") == "spindle.owner-episode/1"
+        and episode.get("generation") == 1
+        and episode.get("revision") == 1
+        and episode.get("phase") == "reserved"
+        and isinstance(episode.get("starter"), dict)
+        and "failure" not in episode
+    )
+
+
+def _is_exact_pre_spawn_refusal_evidence(record: Optional[dict], message: str) -> bool:
+    """Whether an unsettled record authoritatively proves this exact refusal."""
+    if not isinstance(record, dict) or record.get("status") != "pending":
+        return False
+    episode = record.get("owner_episode")
+    failure = episode.get("failure") if isinstance(episode, dict) else None
+    return bool(
+        isinstance(episode, dict)
+        and episode.get("format") == "spindle.owner-episode/1"
+        and episode.get("phase") == "aborted"
+        and isinstance(failure, dict)
+        and failure.get("kind") == "launcher_pre_spawn_failure"
+        and failure.get("detail") == message
+    )
+
+
 def _persist_codex_sandbox_refusal(
     spool_id: str,
     message: str,
@@ -8058,12 +8124,28 @@ def _persist_codex_sandbox_refusal(
     publication_confirmed = False
     try:
         now = datetime.now().isoformat()
-        if _read_spool_for_codex_sandbox_refusal(spool_id) is not None:
-            _record_pre_spawn_failure(spool_id, message)
+        if session_id is not None:
+            with _spool_lock(spool_id) as acquired:
+                reserved = _read_spool_for_codex_sandbox_refusal(spool_id) if acquired else None
+                if not acquired:
+                    raise OSError("spool record lock unavailable before refusal validation")
+                if not _is_exact_codex_respin_reservation(spool_id, reserved):
+                    raise OSError("occupied spool is not the expected Codex respin reservation")
+            _record_pre_spawn_failure(spool_id, message, expected_record=reserved)
         with _spool_lock(spool_id) as acquired:
             spool = _read_spool_for_codex_sandbox_refusal(spool_id) if acquired else None
-            if not acquired or (spool is not None and spool.get("status") != "error"):
-                return f"Error: Spool {spool_id} was finalized before sandbox refusal was recorded"
+            if not acquired:
+                raise OSError("spool record lock unavailable before final refusal publication")
+            if session_id is None:
+                if spool is not None:
+                    raise OSError("fresh sandbox refusal spool ID is already occupied")
+                refusal_state = "fresh"
+            elif spool is not None and spool.get("status") == "error" and spool.get("error") == message:
+                refusal_state = "terminal"
+            elif _is_exact_pre_spawn_refusal_evidence(spool, message):
+                refusal_state = "aborted"
+            else:
+                raise OSError("spool does not contain the expected sandbox refusal evidence")
             metadata = {
                 "session_id": session_id,
                 "sandbox": sandbox,
@@ -8072,10 +8154,10 @@ def _persist_codex_sandbox_refusal(
                 "codex_version": codex_version,
                 "sandbox_error": message,
                 "harness": "codex",
-                "tags": ["codex"],
+                "tags": ["codex", "respin"] if session_id is not None else ["codex"],
                 "pid": None,
             }
-            if spool is None:
+            if refusal_state == "fresh":
                 # No record exists, so this refusal creates one and is its whole
                 # outcome.
                 spool = {"id": spool_id}
@@ -8085,6 +8167,14 @@ def _persist_codex_sandbox_refusal(
                     "result": None,
                     "error": message,
                     "created_at": now,
+                    "completed_at": now,
+                }
+            elif refusal_state == "aborted":
+                updates = {
+                    **metadata,
+                    "status": "error",
+                    "result": None,
+                    "error": message,
                     "completed_at": now,
                 }
             else:
