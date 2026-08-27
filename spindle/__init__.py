@@ -8320,16 +8320,23 @@ def _persist_codex_sandbox_refusal(
     codex_bin: Optional[str],
     codex_version: Optional[str],
     session_id: Optional[str] = None,
+    source_session_id: Optional[str] = None,
 ) -> str:
     """Record a refused (would-be-unsandboxed) launch as an error spool and return the error.
 
     The refusal is visible both ways the brief requires: the returned string, and a
     persisted spool with status "error" plus a `sandbox_error` field so unspool/spool_info
-    surface it. status "error" does not count against concurrency, so no slot leaks. If
-    this storage-only path raises OSError, the primary refusal still wins. A spool ID is
-    claimed only after the final record update is proven directory-durable; failures
-    before that point receive a bounded persistence diagnostic instead.
+    surface it. ``session_id`` selects the legacy reserved-respin mode: that reservation
+    is first terminalized and then annotated. ``source_session_id`` records the session
+    on a create-only terminal refusal without implying that a reservation exists. status
+    "error" does not count against concurrency, so no slot leaks. If this storage-only
+    path raises OSError, the primary refusal still wins. A spool ID is claimed only after
+    the final record update is proven directory-durable; failures before that point
+    receive a bounded persistence diagnostic instead.
     """
+    if session_id is not None and source_session_id is not None:
+        raise ValueError("sandbox refusal cannot use reserved and source-session modes together")
+    recorded_session_id = session_id if session_id is not None else source_session_id
     publication_confirmed = False
     try:
         now = datetime.now().isoformat()
@@ -8358,14 +8365,14 @@ def _persist_codex_sandbox_refusal(
                 else:
                     raise OSError("spool does not contain the expected sandbox refusal evidence")
             metadata = {
-                "session_id": session_id,
+                "session_id": recorded_session_id,
                 "sandbox": sandbox,
                 "permission": permission,
                 "codex_bin": codex_bin,
                 "codex_version": codex_version,
                 "sandbox_error": message,
                 "harness": "codex",
-                "tags": ["codex", "respin"] if session_id is not None else ["codex"],
+                "tags": ["codex", "respin"] if recorded_session_id is not None else ["codex"],
                 "pid": None,
             }
             if refusal_state == "fresh":
@@ -8798,10 +8805,34 @@ def _codex_respin_sync(session_id: str, prompt: str) -> str:
     # Generate spool ID
     spool_id = "codex-" + str(uuid.uuid4())[:8]
 
-    # Resolve the source before reserving so the new owner episode receives its
-    # complete effective timeout and freezes a fresh absolute deadline.
+    # Resolve every input to restrictive sandbox admission from the source
+    # before reserving. A refusal can then publish only its create-only terminal
+    # record; it never creates pending ownership or consumes capacity.
     original_spool = _find_spool_by_session(session_id)
     respin_timeout, timeout_disabled = _replay_launch_timeout(original_spool or {})
+
+    working_dir = original_spool.get("working_dir") if original_spool else os.getcwd()
+    env = original_spool.get("env") if original_spool else None
+    shard_info = original_spool.get("shard") if original_spool else None
+
+    # Continue at the tier the session was spun with — a respin must not widen it.
+    permission = original_spool.get("permission") if original_spool else None
+    sandbox = _codex_respin_sandbox(original_spool)
+
+    process_env = _process_env(env)
+    codex_bin = _resolve_codex_binary(process_env)
+    codex_version = _codex_cli_version(codex_bin, process_env)
+    refusal = _codex_sandbox_refusal(sandbox, permission, codex_bin, codex_version, process_env)
+    if refusal:
+        return _persist_codex_sandbox_refusal(
+            spool_id,
+            refusal,
+            sandbox=sandbox,
+            permission=permission,
+            codex_bin=codex_bin,
+            codex_version=codex_version,
+            source_session_id=session_id,
+        )
 
     # Atomically check concurrency limit and create initial spool entry
     success, error_msg = _try_reserve_slot_and_create(
@@ -8816,33 +8847,6 @@ def _codex_respin_sync(session_id: str, prompt: str) -> str:
     )
     if not success:
         return error_msg
-
-    # Get working_dir, env, and shard info from original spool if possible
-    working_dir = original_spool.get("working_dir") if original_spool else os.getcwd()
-    env = original_spool.get("env") if original_spool else None
-    shard_info = original_spool.get("shard") if original_spool else None
-
-    # Continue at the tier the session was spun with — a respin must not widen it.
-    permission = original_spool.get("permission") if original_spool else None
-    sandbox = _codex_respin_sandbox(original_spool)
-
-    process_env = _process_env(env)
-    codex_bin = _resolve_codex_binary(process_env)
-    codex_version = _codex_cli_version(codex_bin, process_env)
-    # Fail closed: a respin at a restrictive tier is refused when the binary does not enforce
-    # its sandbox, exactly like a fresh spin. The reserved slot is reused for the error
-    # record (status "error" frees it), so no slot leaks.
-    refusal = _codex_sandbox_refusal(sandbox, permission, codex_bin, codex_version, process_env)
-    if refusal:
-        return _persist_codex_sandbox_refusal(
-            spool_id,
-            refusal,
-            sandbox=sandbox,
-            permission=permission,
-            codex_bin=codex_bin,
-            codex_version=codex_version,
-            session_id=session_id,
-        )
 
     # Re-grant the original run's writable research target; `resume` inherits neither the
     # sandbox tier nor its --add-dir grants, so without this a research respin runs

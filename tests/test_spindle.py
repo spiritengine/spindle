@@ -9869,8 +9869,12 @@ class TestCodexSandboxEnforcement:
             path = state / f"{spool_id}.json"
             path.write_bytes(occupied_bytes)
             with patch("spindle.uuid.uuid4", return_value="deadbeef-collision"):
-                with patch("spindle._count_running", side_effect=AssertionError("collision must not consume capacity")):
-                    result = _codex_respin_sync(original["session_id"], "follow up")
+                with patch("spindle._codex_sandbox_enforces", return_value=True):
+                    with patch(
+                        "spindle._count_running",
+                        side_effect=AssertionError("collision must not consume capacity"),
+                    ):
+                        result = _codex_respin_sync(original["session_id"], "follow up")
 
         occupied = json.loads(occupied_bytes)
         assert result == f"Error: Spool ID '{spool_id}' is already occupied"
@@ -9978,7 +9982,7 @@ class TestCodexSandboxEnforcement:
         assert cmd[cmd.index("--sandbox") + 1] == "danger-full-access", f"got {cmd!r}"
 
     def test_respin_refuses_restrictive_tier_when_sandbox_not_enforcing(self, tmp_path):
-        """A respin of a readonly session on a fail-open codex must refuse, like a fresh spin."""
+        """A restrictive respin refuses with terminal evidence but no owner episode."""
         original = {
             "id": "codex-orig-refuse",
             "status": "complete",
@@ -9989,7 +9993,11 @@ class TestCodexSandboxEnforcement:
             "harness": "codex",
             "tags": ["codex"],
         }
-        cmd, result, state = self._respin_with_spool(tmp_path, original, enforces=False)
+        with patch(
+            "spindle._try_reserve_slot_and_create",
+            side_effect=AssertionError("refusal must precede reservation"),
+        ):
+            cmd, result, state = self._respin_with_spool(tmp_path, original, enforces=False)
 
         assert cmd is None, f"expected no launch on refusal, got {cmd!r}"
         assert "REFUSED" in result
@@ -10002,48 +10010,262 @@ class TestCodexSandboxEnforcement:
         assert spool["sandbox"] == "read-only"
         assert spool["session_id"] == "sess-refuse"
         assert spool["tags"] == ["codex", "respin"]
+        assert spool["completed_at"]
+        assert "owner_episode" not in spool
+        assert spindle._CODEX_RESPIN_SESSION_BINDING not in spool
         with patch("spindle.SPINDLE_DIR", state):
             assert spindle._count_running() == 0
 
-    def test_respin_refusal_preserves_pre_spawn_failure_when_metadata_publication_fails(self, tmp_path):
-        """A later EROFS cannot mask the refusal or leak the already-reserved slot."""
-        from spindle import owner_episode_convergence
-
+    def test_respin_refusal_is_returned_at_full_capacity_without_capacity_admission(self, tmp_path):
         original = {
-            "id": "codex-orig-refuse-publication",
+            "id": "codex-orig-refuse-full-capacity",
             "status": "complete",
-            "session_id": "sess-refuse-publication",
+            "session_id": "sess-refuse-full-capacity",
             "working_dir": str(tmp_path),
             "sandbox": "read-only",
             "permission": "readonly",
             "harness": "codex",
             "tags": ["codex"],
         }
-        real_publish = owner_episode_convergence.publish_record_updates
-
-        def fail_refusal_metadata(spool_id, record, updates):
-            if "sandbox_error" in updates:
-                raise PermissionError(errno.EROFS, "read-only store")
-            return real_publish(spool_id, record, updates)
-
-        with patch.object(owner_episode_convergence, "publish_record_updates", side_effect=fail_refusal_metadata):
-            cmd, result, state = self._respin_with_spool(tmp_path, original, enforces=False)
+        with patch("spindle._count_running", return_value=MAX_CONCURRENT) as count_running:
+            with patch(
+                "spindle._try_reserve_slot_and_create",
+                side_effect=AssertionError("capacity admission must not run for a refusal"),
+            ):
+                cmd, result, state = self._respin_with_spool(tmp_path, original, enforces=False)
 
         assert cmd is None
-        assert result.startswith("Error: REFUSED: codex sandbox is not enforcing")
-        assert "sandbox refusal persistence failed: errno 30: read-only store" in result
-        assert "(spool codex-" not in result
-
-        records = [json.loads(path.read_text()) for path in state.glob("codex-*.json")]
-        refused = next(record for record in records if record["id"] != original["id"])
+        assert "REFUSED" in result
+        count_running.assert_not_called()
+        spool_id = result.split("spool ")[-1].rstrip(")")
+        with patch("spindle.SPINDLE_DIR", state):
+            refused = _read_spool(spool_id)
         assert refused["status"] == "error"
-        assert "REFUSED" in refused["error"]
-        assert refused["owner_episode"]["phase"] == "aborted"
-        assert refused["terminal_origin"] == "launcher_pre_spawn_failure"
-        assert "sandbox_error" not in refused, "the failed metadata publication was presented as durable"
-        assert "shard" not in refused
+        assert "owner_episode" not in refused
+
+    @pytest.mark.parametrize(
+        "storage_operation,error",
+        [
+            ("pathlib.Path.mkdir", OSError(errno.EROFS, "read-only store")),
+            ("spindle.os.open", OSError(errno.EROFS, "read-only store")),
+            ("spindle.fcntl.flock", PermissionError(errno.EACCES, "denied")),
+            ("spindle.namespace_owner.json.dump", PermissionError(errno.EACCES, "denied")),
+            ("spindle.namespace_owner.os.link", PermissionError(errno.EACCES, "denied")),
+        ],
+        ids=("parent-mkdir", "lock-open", "lock-flock", "record-write", "record-publication"),
+    )
+    def test_respin_refusal_survives_create_only_storage_failures(
+        self,
+        tmp_path,
+        storage_operation,
+        error,
+    ):
+        """Every create-only persistence failure stays secondary to the refusal."""
+        original = {
+            "id": "codex-orig-refuse-storage",
+            "status": "complete",
+            "session_id": "sess-refuse-storage",
+            "working_dir": str(tmp_path),
+            "sandbox": "read-only",
+            "permission": "readonly",
+            "harness": "codex",
+            "tags": ["codex"],
+        }
+        state = tmp_path / "spindle_state"
+        state.mkdir()
+        with patch("spindle.SPINDLE_DIR", state):
+            _write_spool(original["id"], original)
+            with patch("spindle._resolve_codex_binary", return_value="/fake/bin/codex"):
+                with patch("spindle._codex_cli_version", return_value="0.125.0"):
+                    with patch("spindle._codex_sandbox_enforces", return_value=False):
+                        with patch(
+                            "spindle._try_reserve_slot_and_create",
+                            side_effect=AssertionError("refusal must not reserve"),
+                        ):
+                            with patch(storage_operation, side_effect=error):
+                                result = _codex_respin_sync(original["session_id"], "follow up")
+
+        assert result.startswith("Error: REFUSED: codex sandbox is not enforcing")
+        assert "sandbox refusal persistence failed:" in result
+        assert "(spool codex-" not in result
+        assert "Traceback" not in result
+        assert [path.name for path in state.glob("codex-*.json")] == [f"{original['id']}.json"]
         with patch("spindle.SPINDLE_DIR", state):
             assert spindle._count_running() == 0
+
+    @pytest.mark.parametrize(
+        "kind",
+        ["valid-regular", "invalid-regular", "directory", "symlink", "dangling-symlink"],
+    )
+    def test_preadmission_respin_refusal_treats_every_pathname_as_a_collision(self, tmp_path, kind):
+        spool_id = f"codex-respin-source-{kind}"
+        path = tmp_path / f"{spool_id}.json"
+        target = tmp_path / f"{spool_id}.target"
+        if kind == "valid-regular":
+            path.write_bytes(b'{"id":"foreign","status":"complete"}\n')
+        elif kind == "invalid-regular":
+            path.write_bytes(b'{"id":"foreign","status":')
+        elif kind == "directory":
+            path.mkdir()
+        elif kind == "symlink":
+            target.write_bytes(b'{"id":"foreign-target","status":"complete"}\n')
+            path.symlink_to(target.name)
+        else:
+            path.symlink_to("missing-target")
+        before = path.lstat()
+        before_target = target.read_bytes() if target.exists() else None
+        before_bytes = path.read_bytes() if path.is_file() else None
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            result = spindle._persist_codex_sandbox_refusal(
+                spool_id,
+                "REFUSED: sandbox unavailable",
+                sandbox="read-only",
+                permission="readonly",
+                codex_bin="/fake/bin/codex",
+                codex_version="0.149.0",
+                source_session_id="session-source-collision",
+            )
+
+        assert "already occupied" in result
+        assert f"(spool {spool_id})" not in result
+        after = path.lstat()
+        assert (after.st_dev, after.st_ino, after.st_mode) == (before.st_dev, before.st_ino, before.st_mode)
+        if path.is_symlink():
+            assert path.readlink() == Path(target.name if kind == "symlink" else "missing-target")
+        elif before_bytes is not None:
+            assert path.read_bytes() == before_bytes
+        else:
+            assert path.is_dir()
+        if before_target is not None:
+            assert target.read_bytes() == before_target
+
+    def test_preadmission_respin_refusal_loses_no_racing_dangling_symlink(self, tmp_path):
+        spool_id = "codex-respin-source-create-race"
+        path = tmp_path / f"{spool_id}.json"
+        real_lexists = os.path.lexists
+        injected = False
+
+        def insert_after_absence_check(candidate):
+            nonlocal injected
+            if Path(candidate) == path and not injected:
+                injected = True
+                path.symlink_to("foreign-missing-target")
+                return False
+            return real_lexists(candidate)
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle.os.path.lexists", side_effect=insert_after_absence_check):
+                result = spindle._persist_codex_sandbox_refusal(
+                    spool_id,
+                    "REFUSED: sandbox unavailable",
+                    sandbox="read-only",
+                    permission="readonly",
+                    codex_bin="/fake/bin/codex",
+                    codex_version="0.149.0",
+                    source_session_id="session-source-race",
+                )
+
+        assert injected is True
+        assert "already occupied" in result
+        assert f"(spool {spool_id})" not in result
+        assert path.is_symlink()
+        assert path.readlink() == Path("foreign-missing-target")
+
+    def test_respin_admission_precedes_timeout_reservation(self, tmp_path):
+        original = {
+            "id": "codex-original-timeout-order",
+            "status": "complete",
+            "session_id": "session-timeout-order",
+            "working_dir": str(tmp_path),
+            "sandbox": "read-only",
+            "permission": "readonly",
+            "timeout": 37,
+            "harness": "codex",
+            "tags": ["codex"],
+        }
+        events = []
+        captured = {}
+
+        def admit(*_args):
+            events.append("admission")
+            return None
+
+        def reserve(_spool_id, initial_status="pending", reservation_metadata=None):
+            events.append("reservation")
+            captured.update(reservation_metadata or {})
+            return False, "captured"
+
+        with patch("spindle._find_spool_by_session", return_value=original):
+            with patch("spindle._resolve_codex_binary", return_value="/resolved/codex"):
+                with patch("spindle._codex_cli_version", return_value="9.9.9"):
+                    with patch("spindle._codex_sandbox_refusal", side_effect=admit):
+                        with patch("spindle._try_reserve_slot_and_create", side_effect=reserve):
+                            result = _codex_respin_sync(original["session_id"], "continue")
+
+        assert result == "captured"
+        assert events == ["admission", "reservation"]
+        assert captured["timeout"] == 37
+        assert captured["timeout_disabled"] is False
+        assert "wall_deadline_at" not in captured
+
+    def test_successful_respin_reuses_admitted_binary_and_environment_for_launch(self, tmp_path):
+        original = {
+            "id": "codex-original-exact-launch-inputs",
+            "status": "complete",
+            "session_id": "session-exact-launch-inputs",
+            "working_dir": str(tmp_path),
+            "sandbox": "read-only",
+            "permission": "readonly",
+            "env": {"PATH": "/caller/bin", "CODEX_HOME": "/caller/codex-home"},
+            "harness": "codex",
+            "tags": ["codex"],
+        }
+        process_env = {"PATH": "/effective/bin", "CODEX_HOME": "/effective/codex-home"}
+        observed = {}
+
+        def resolve(env):
+            observed["resolve_env"] = env
+            return "/resolved/codex"
+
+        def version(binary, env):
+            observed["version_inputs"] = (binary, env)
+            return "9.9.9"
+
+        def admit(sandbox, permission, binary, version_value, env):
+            observed["admission_inputs"] = (sandbox, permission, binary, version_value, env)
+            return None
+
+        def spawn(_spool_id, cmd, _cwd, env=None):
+            observed["launch"] = (list(cmd), env)
+            return 99999
+
+        state = tmp_path / "spindle_state"
+        state.mkdir()
+        with patch("spindle.SPINDLE_DIR", state):
+            _write_spool(original["id"], original)
+            with patch("spindle._process_env", return_value=process_env):
+                with patch("spindle._resolve_codex_binary", side_effect=resolve):
+                    with patch("spindle._codex_cli_version", side_effect=version):
+                        with patch("spindle._codex_sandbox_refusal", side_effect=admit):
+                            with patch("spindle._count_running", return_value=0):
+                                with patch("spindle._spawn_detached", side_effect=spawn):
+                                    result = _codex_respin_sync(original["session_id"], "continue")
+
+        cmd, launch_env = observed["launch"]
+        assert result.startswith("codex-")
+        assert observed["resolve_env"] is process_env
+        assert observed["version_inputs"] == ("/resolved/codex", process_env)
+        assert observed["admission_inputs"] == (
+            "read-only",
+            "readonly",
+            "/resolved/codex",
+            "9.9.9",
+            process_env,
+        )
+        assert cmd[0] == "/resolved/codex"
+        assert cmd[-4:] == ["resume", original["session_id"], "--json", "continue"]
+        assert launch_env is process_env
 
     def test_respin_does_not_refuse_full_access_when_sandbox_not_enforcing(self, tmp_path):
         """A danger-full-access session respins normally even when the probe reports fail-open."""
