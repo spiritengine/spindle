@@ -19,9 +19,10 @@ Boundaries this module keeps deliberately narrow:
   (``protocol_terminal_kind``). The public/job terminal (``status``,
   ``normalized_terminal_kind``) stays with the reconciler (DECISIONS #30). A
   driver translates wire events into this envelope; it does not decide job state.
-- Privacy: events carry identifiers, statuses, timestamps, bounded summaries, and
-  structured errors only -- never prompts, model prose, tool inputs, or raw tool
-  output. The envelope constructor enforces an allowlist and byte caps.
+- Privacy: provider drivers build summaries from explicit scalar allowlists and
+  must never pass prompts, model prose, tool inputs, or raw tool output. The
+  envelope constructor enforces its field and nested-mapping allowlists and byte
+  caps; it does not classify the contents of summary strings.
 
 Durability point: an event is durably applied when ``apply_event`` returns.
 Recovery is simply reading the last durable snapshot; there is no journal replay,
