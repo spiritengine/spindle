@@ -8811,28 +8811,30 @@ def _codex_respin_sync(session_id: str, prompt: str) -> str:
     original_spool = _find_spool_by_session(session_id)
     respin_timeout, timeout_disabled = _replay_launch_timeout(original_spool or {})
 
-    working_dir = original_spool.get("working_dir") if original_spool else os.getcwd()
-    env = original_spool.get("env") if original_spool else None
-    shard_info = original_spool.get("shard") if original_spool else None
-
     # Continue at the tier the session was spun with — a respin must not widen it.
     permission = original_spool.get("permission") if original_spool else None
     sandbox = _codex_respin_sandbox(original_spool)
 
-    process_env = _process_env(env)
-    codex_bin = _resolve_codex_binary(process_env)
-    codex_version = _codex_cli_version(codex_bin, process_env)
-    refusal = _codex_sandbox_refusal(sandbox, permission, codex_bin, codex_version, process_env)
-    if refusal:
-        return _persist_codex_sandbox_refusal(
-            spool_id,
-            refusal,
-            sandbox=sandbox,
-            permission=permission,
-            codex_bin=codex_bin,
-            codex_version=codex_version,
-            source_session_id=session_id,
-        )
+    env = None
+    process_env = None
+    codex_bin = None
+    codex_version = None
+    if sandbox in _CODEX_RESTRICTIVE_SANDBOX_MODES:
+        env = original_spool.get("env") if original_spool else None
+        process_env = _process_env(env)
+        codex_bin = _resolve_codex_binary(process_env)
+        codex_version = _codex_cli_version(codex_bin, process_env)
+        refusal = _codex_sandbox_refusal(sandbox, permission, codex_bin, codex_version, process_env)
+        if refusal:
+            return _persist_codex_sandbox_refusal(
+                spool_id,
+                refusal,
+                sandbox=sandbox,
+                permission=permission,
+                codex_bin=codex_bin,
+                codex_version=codex_version,
+                source_session_id=session_id,
+            )
 
     # Atomically check concurrency limit and create initial spool entry
     success, error_msg = _try_reserve_slot_and_create(
@@ -8847,6 +8849,14 @@ def _codex_respin_sync(session_id: str, prompt: str) -> str:
     )
     if not success:
         return error_msg
+
+    working_dir = original_spool.get("working_dir") if original_spool else os.getcwd()
+    shard_info = original_spool.get("shard") if original_spool else None
+    if process_env is None:
+        env = original_spool.get("env") if original_spool else None
+        process_env = _process_env(env)
+        codex_bin = _resolve_codex_binary(process_env)
+        codex_version = _codex_cli_version(codex_bin, process_env)
 
     # Re-grant the original run's writable research target; `resume` inherits neither the
     # sandbox tier nor its --add-dir grants, so without this a research respin runs

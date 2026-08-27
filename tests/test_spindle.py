@@ -10209,6 +10209,101 @@ class TestCodexSandboxEnforcement:
         assert captured["timeout_disabled"] is False
         assert "wall_deadline_at" not in captured
 
+    def test_full_access_respin_capacity_rejection_precedes_launch_preparation(self):
+        original = {
+            "id": "codex-original-full-capacity-order",
+            "status": "complete",
+            "session_id": "session-full-capacity-order",
+            "working_dir": "/source/worktree",
+            "sandbox": "danger-full-access",
+            "permission": "full",
+            "timeout": 41,
+            "env": {"PATH": "/source/bin"},
+            "harness": "codex",
+            "tags": ["codex"],
+        }
+        capacity_error = f"Error: Max {MAX_CONCURRENT} concurrent spools. Wait for some to complete."
+
+        with patch("spindle._find_spool_by_session", return_value=original):
+            with patch("spindle._try_reserve_slot_and_create", return_value=(False, capacity_error)) as reserve:
+                with patch("spindle._process_env", side_effect=AssertionError("must reserve before environment")):
+                    with patch(
+                        "spindle._resolve_codex_binary",
+                        side_effect=AssertionError("must reserve before binary resolution"),
+                    ):
+                        with patch(
+                            "spindle._codex_cli_version",
+                            side_effect=AssertionError("must reserve before version execution"),
+                        ):
+                            result = _codex_respin_sync(original["session_id"], "continue")
+
+        assert result == capacity_error
+        reservation_metadata = reserve.call_args.kwargs["reservation_metadata"]
+        assert reservation_metadata["timeout"] == 41
+        assert reservation_metadata["timeout_disabled"] is False
+
+    def test_full_access_respin_reserves_and_freezes_deadline_before_version(self, tmp_path):
+        original = {
+            "id": "codex-original-full-deadline-order",
+            "status": "complete",
+            "session_id": "session-full-deadline-order",
+            "working_dir": str(tmp_path),
+            "sandbox": "danger-full-access",
+            "permission": "full",
+            "timeout": 37,
+            "env": {"PATH": "/source/bin"},
+            "harness": "codex",
+            "tags": ["codex"],
+        }
+        process_env = {"PATH": "/effective/bin"}
+        events = []
+        reservation_window = {}
+        real_reserve = _try_reserve_slot_and_create
+
+        def reserve(*args, **kwargs):
+            reservation_window["before"] = datetime.now(timezone.utc)
+            result = real_reserve(*args, **kwargs)
+            reservation_window["after"] = datetime.now(timezone.utc)
+            reserved = _read_spool(args[0])
+            reservation_window["deadline"] = datetime.fromisoformat(reserved["owner_episode"]["deadline"])
+            events.append("reservation")
+            return result
+
+        def prepare_env(env):
+            events.append("environment")
+            assert env is original["env"]
+            return process_env
+
+        def resolve(env):
+            events.append("binary")
+            assert env is process_env
+            return "/resolved/codex"
+
+        def version(binary, env):
+            events.append("version")
+            assert (binary, env) == ("/resolved/codex", process_env)
+            return "9.9.9"
+
+        def start(*_args):
+            events.append("start")
+            return "captured"
+
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            with patch("spindle._find_spool_by_session", return_value=original):
+                with patch("spindle._ensure_store_supervisor_locked", return_value=(True, None)):
+                    with patch("spindle._count_running", return_value=0):
+                        with patch("spindle._try_reserve_slot_and_create", side_effect=reserve):
+                            with patch("spindle._process_env", side_effect=prepare_env):
+                                with patch("spindle._resolve_codex_binary", side_effect=resolve):
+                                    with patch("spindle._codex_cli_version", side_effect=version):
+                                        with patch("spindle._start_spool_process", side_effect=start):
+                                            result = _codex_respin_sync(original["session_id"], "continue")
+
+        assert result == "captured"
+        assert events == ["reservation", "environment", "binary", "version", "start"]
+        assert reservation_window["before"] + timedelta(seconds=37) <= reservation_window["deadline"]
+        assert reservation_window["deadline"] <= reservation_window["after"] + timedelta(seconds=37)
+
     def test_successful_respin_reuses_admitted_binary_and_environment_for_launch(self, tmp_path):
         original = {
             "id": "codex-original-exact-launch-inputs",
