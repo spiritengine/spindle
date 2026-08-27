@@ -8186,6 +8186,164 @@ class TestCodexRespinPreservesGitAccess:
         assert out in add_dirs, f"codex must --add-dir the research output dir {out}: {add_dirs!r}"
 
 
+class TestAtomicJsonCreate:
+    @pytest.mark.parametrize("collision", [False, True], ids=("publication", "collision"))
+    def test_temp_cleanup_precedes_directory_fsync(self, tmp_path, monkeypatch, collision):
+        import spindle.namespace_owner as namespace_owner
+
+        path = tmp_path / "atomic.json"
+        foreign_bytes = b"foreign\n"
+        if collision:
+            path.write_bytes(foreign_bytes)
+        events = []
+        real_unlink = os.unlink
+
+        def traced_unlink(candidate):
+            events.append("unlink")
+            return real_unlink(candidate)
+
+        def traced_directory_fsync(directory, *, publication):
+            assert directory == tmp_path
+            assert publication is not collision
+            assert list(tmp_path.glob(f".{path.name}.*.tmp")) == []
+            events.append("directory-fsync")
+
+        monkeypatch.setattr(namespace_owner.os, "unlink", traced_unlink)
+        monkeypatch.setattr(namespace_owner, "_fsync_directory_after_publication", traced_directory_fsync)
+
+        created = namespace_owner._atomic_json_create(path, {"id": "ours"})
+
+        assert created is not collision
+        assert events == ["unlink", "directory-fsync"]
+        assert list(tmp_path.glob(f".{path.name}.*.tmp")) == []
+        if collision:
+            assert path.read_bytes() == foreign_bytes
+        else:
+            assert json.loads(path.read_text(encoding="utf-8")) == {"id": "ours"}
+
+    @pytest.mark.parametrize("collision", [False, True], ids=("publication", "collision"))
+    def test_temp_unlink_failure_is_not_silently_swallowed(self, tmp_path, monkeypatch, collision):
+        import spindle.namespace_owner as namespace_owner
+
+        path = tmp_path / "atomic-unlink-failure.json"
+        if collision:
+            path.write_text("foreign\n", encoding="utf-8")
+        directory_fsyncs = []
+
+        def fail_temp_unlink(candidate):
+            raise OSError(errno.EPERM, f"cannot unlink {candidate}")
+
+        monkeypatch.setattr(namespace_owner.os, "unlink", fail_temp_unlink)
+        monkeypatch.setattr(
+            namespace_owner,
+            "_fsync_directory_after_publication",
+            lambda directory, *, publication: directory_fsyncs.append((directory, publication)),
+        )
+
+        with pytest.raises(OSError, match="cannot unlink") as raised:
+            namespace_owner._atomic_json_create(path, {"id": "ours"})
+
+        assert isinstance(raised.value, OSError)
+        assert not isinstance(raised.value, spindle._DurablePublicationCleanupError)
+        assert raised.value.errno == errno.EPERM
+        assert directory_fsyncs == []
+        assert len(list(tmp_path.glob(f".{path.name}.*.tmp"))) == 1
+
+    @pytest.mark.parametrize("collision", [False, True], ids=("publication", "collision"))
+    def test_directory_fsync_error_follows_temp_cleanup_and_is_pre_durability(self, tmp_path, monkeypatch, collision):
+        import spindle.namespace_owner as namespace_owner
+
+        path = tmp_path / "atomic-fsync-failure.json"
+        if collision:
+            path.write_text("foreign\n", encoding="utf-8")
+
+        def fail_directory_fsync(directory, *, publication):
+            assert directory == tmp_path
+            assert publication is not collision
+            assert list(tmp_path.glob(f".{path.name}.*.tmp")) == []
+            raise OSError(errno.EIO, "directory fsync failed")
+
+        monkeypatch.setattr(namespace_owner, "_fsync_directory_after_publication", fail_directory_fsync)
+
+        with pytest.raises(OSError, match="directory fsync failed") as raised:
+            namespace_owner._atomic_json_create(path, {"id": "ours"})
+
+        assert type(raised.value) is OSError
+        assert raised.value.errno == errno.EIO
+
+    @pytest.mark.parametrize(
+        ("collision", "expected_type"),
+        [(False, spindle._DurablePublicationCleanupError), (True, OSError)],
+        ids=("durable-publication", "collision"),
+    )
+    def test_directory_close_error_uses_durable_marker_only_after_publication(
+        self, tmp_path, monkeypatch, collision, expected_type
+    ):
+        import spindle.namespace_owner as namespace_owner
+
+        path = tmp_path / "atomic-directory-close-failure.json"
+        if collision:
+            path.write_text("foreign\n", encoding="utf-8")
+
+        def fail_directory_close(_directory, *, publication):
+            error_type = namespace_owner._DurablePublicationCleanupError if publication else OSError
+            raise error_type(errno.EBADF, "directory close failed")
+
+        monkeypatch.setattr(namespace_owner, "_fsync_directory_after_publication", fail_directory_close)
+
+        with pytest.raises(expected_type, match="directory close failed") as raised:
+            namespace_owner._atomic_json_create(path, {"id": "ours"})
+
+        assert type(raised.value) is expected_type
+
+    def test_publication_error_remains_primary_when_temp_unlink_also_fails(self, tmp_path, monkeypatch):
+        import spindle.namespace_owner as namespace_owner
+
+        path = tmp_path / "atomic-dual-failure.json"
+
+        def fail_link(_source, _destination):
+            raise OSError(errno.EIO, "link primary")
+
+        def fail_unlink(_temporary):
+            raise OSError(errno.EPERM, "unlink secondary")
+
+        monkeypatch.setattr(namespace_owner.os, "link", fail_link)
+        monkeypatch.setattr(namespace_owner.os, "unlink", fail_unlink)
+
+        with pytest.raises(OSError, match="link primary") as raised:
+            namespace_owner._atomic_json_create(path, {"id": "ours"})
+
+        assert type(raised.value) is OSError
+        assert raised.value.errno == errno.EIO
+        assert isinstance(raised.value.__cause__, OSError)
+        assert raised.value.__cause__.errno == errno.EPERM
+        assert "unlink secondary" in str(raised.value.__cause__)
+
+    def test_fdopen_error_remains_primary_when_raw_fd_close_also_fails(self, tmp_path, monkeypatch):
+        import spindle.namespace_owner as namespace_owner
+
+        path = tmp_path / "atomic-fdopen-failure.json"
+        real_close = os.close
+
+        def fail_fdopen(*_args, **_kwargs):
+            raise ValueError("fdopen primary")
+
+        def close_then_fail(fd):
+            real_close(fd)
+            raise OSError(errno.EBADF, "close secondary")
+
+        monkeypatch.setattr(namespace_owner.os, "fdopen", fail_fdopen)
+        monkeypatch.setattr(namespace_owner.os, "close", close_then_fail)
+
+        with pytest.raises(ValueError, match="fdopen primary") as raised:
+            namespace_owner._atomic_json_create(path, {"id": "ours"})
+
+        assert isinstance(raised.value.__cause__, OSError)
+        assert raised.value.__cause__.errno == errno.EBADF
+        assert "close secondary" in str(raised.value.__cause__)
+        assert list(tmp_path.glob(f".{path.name}.*.tmp")) == []
+
+
 class TestCodexSandboxEnforcement:
     """Codex must actually run at the sandbox tier its permission asks for.
 

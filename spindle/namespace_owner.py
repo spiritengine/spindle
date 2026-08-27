@@ -61,11 +61,11 @@ _close_fd = os.close
 
 
 class _DurablePublicationCleanupError(OSError):
-    """Publication is directory-durable, but closing its directory fd failed."""
+    """Publication and private cleanup are durable, but a later close failed."""
 
 
-def _fsync_directory_after_publication(path: Path) -> None:
-    """Make a published pathname durable and preserve fsync over close errors."""
+def _fsync_directory_after_publication(path: Path, *, publication: bool = True) -> None:
+    """Make a directory update durable and preserve fsync over close errors."""
     directory_fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
     try:
         os.fsync(directory_fd)
@@ -78,7 +78,9 @@ def _fsync_directory_after_publication(path: Path) -> None:
     try:
         os.close(directory_fd)
     except OSError as exc:
-        raise _DurablePublicationCleanupError(*exc.args) from exc
+        if publication:
+            raise _DurablePublicationCleanupError(*exc.args) from exc
+        raise
 
 
 def _utc_now() -> str:
@@ -444,7 +446,7 @@ def _valid_cleanup(value) -> bool:
 
 def _facts_are_consistent(current: dict, facts: dict) -> bool:
     for name, value in facts.items():
-        if name in current and current[name] != value:
+        if name in current and not _type_strict_json_equal(current[name], value):
             return False
     cleanup = facts.get("cleanup")
     if cleanup is not None and not _valid_cleanup(cleanup):
@@ -454,7 +456,7 @@ def _facts_are_consistent(current: dict, facts: dict) -> bool:
     if release is not None:
         if not isinstance(lock, dict) or not isinstance(release, dict):
             return False
-        if (release.get("device"), release.get("inode")) != (lock.get("device"), lock.get("inode")):
+        if not all(_type_strict_json_equal(release.get(name), lock.get(name)) for name in ("device", "inode")):
             return False
         if release.get("proved_by") != "reconciler" or not release.get("released_at"):
             return False
@@ -501,6 +503,10 @@ def transition_owner_episode(
                 value = current.get(name)
                 if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
                     return EpisodeTransitionResult(False, f"malformed_current_{name}", current)
+        if expected_revision is not None and (
+            not isinstance(expected_revision, int) or isinstance(expected_revision, bool) or expected_revision <= 0
+        ):
+            return EpisodeTransitionResult(False, "stale_revision", current)
 
         reseed = source in {None, "released", "aborted"} and destination == "reserved"
         if source is None:
@@ -674,18 +680,23 @@ def _atomic_json_create(path: Path, value: dict) -> bool:
 
     The file-synced temporary stays hidden until a same-filesystem hard link
     atomically claims the destination. Every existing pathname form, including
-    a dangling symlink, is a collision. Directory fsync confirms durability;
-    later cleanup failures use the durable-publication marker.
+    a dangling symlink, is a collision. The private link is removed before the
+    final directory fsync, which makes both publication (when one occurred) and
+    cleanup durable together.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
-    collision = False
-    durable = False
+    published = False
+    primary = None
     try:
         try:
             stream = os.fdopen(fd, "w", encoding="utf-8")
-        except BaseException:
-            os.close(fd)
+        except BaseException as exc:
+            primary_traceback = exc.__traceback__
+            try:
+                os.close(fd)
+            except BaseException as close_exc:
+                raise exc.with_traceback(primary_traceback) from close_exc
             raise
         with stream:
             json.dump(value, stream, sort_keys=True, separators=(",", ":"))
@@ -695,27 +706,30 @@ def _atomic_json_create(path: Path, value: dict) -> bool:
         try:
             os.link(temporary, path)
         except FileExistsError:
-            collision = True
-            return False
-        try:
-            _fsync_directory_after_publication(path.parent)
-        except _DurablePublicationCleanupError:
-            durable = True
-            raise
-        durable = True
-        return True
-    finally:
-        try:
-            os.unlink(temporary)
-        except FileNotFoundError:
             pass
-        except OSError as exc:
-            if sys.exc_info()[1] is not None or collision:
-                pass
-            elif durable:
-                raise _DurablePublicationCleanupError(*exc.args) from exc
-            else:
-                raise
+        else:
+            published = True
+    except BaseException as exc:
+        primary = (exc, exc.__traceback__)
+
+    cleanup_error = None
+    try:
+        os.unlink(temporary)
+    except FileNotFoundError:
+        pass
+    except BaseException as exc:
+        cleanup_error = exc
+
+    if primary is not None:
+        exc, traceback = primary
+        if cleanup_error is not None:
+            raise exc.with_traceback(traceback) from cleanup_error
+        raise exc.with_traceback(traceback)
+    if cleanup_error is not None:
+        raise cleanup_error
+
+    _fsync_directory_after_publication(path.parent, publication=published)
+    return published
 
 
 @contextmanager

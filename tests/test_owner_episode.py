@@ -330,6 +330,27 @@ def test_transition_with_a_stale_revision_is_rejected(episode_api, episode_store
     assert episode_store.spool_path(spool_id).read_bytes() == before
 
 
+@pytest.mark.parametrize("expected_revision", [True, False, 0, -1, 1.0, "1"])
+def test_transition_rejects_invalid_expected_revision_without_rewriting(episode_api, episode_store, expected_revision):
+    spool_id = f"invalid-expected-revision-{expected_revision!r}"
+    episode = _seed(episode_store, spool_id, "reserved", path="before_watchdog")
+    before = episode_store.spool_path(spool_id).read_bytes()
+
+    result = _transition(
+        episode_api,
+        episode_store,
+        spool_id,
+        "launcher",
+        "reserved",
+        "aborted",
+        expected_revision=expected_revision,
+    )
+
+    assert episode["revision"] == 1
+    assert (result.accepted, result.rejection) == (False, "stale_revision")
+    assert episode_store.spool_path(spool_id).read_bytes() == before
+
+
 def test_first_reserve_refuses_a_supplied_revision(episode_api, episode_store):
     spool_id = "first-reserve"
     _seed(episode_store, spool_id, ABSENT)
@@ -376,6 +397,52 @@ def test_transition_contradicting_a_durable_fact_is_rejected(
         source,
         destination,
         facts={**facts_for(*required_facts(actor, source, destination)), **contradiction},
+    )
+
+    assert (result.accepted, result.rejection) == (False, "contradictory_facts")
+    assert episode_store.spool_path(spool_id).read_bytes() == before
+
+
+def test_transition_rejects_bool_nested_in_an_existing_fact_without_rewriting(episode_api, episode_store):
+    spool_id = "bool-existing-fact-identity"
+    episode = _seed(episode_store, spool_id, "accepted")
+    episode["owner"]["namespace"]["device"] = 1
+    episode_store.write(spool_id, status="running", episode=episode)
+    before = episode_store.spool_path(spool_id).read_bytes()
+    changed_owner = {
+        **episode["owner"],
+        "namespace": {**episode["owner"]["namespace"], "device": True},
+    }
+
+    result = _transition(
+        episode_api,
+        episode_store,
+        spool_id,
+        "owner",
+        "accepted",
+        "cleanup_proven",
+        facts={"cleanup": FACT_LITERALS["cleanup"], "owner": changed_owner},
+    )
+
+    assert (result.accepted, result.rejection) == (False, "contradictory_facts")
+    assert episode_store.spool_path(spool_id).read_bytes() == before
+
+
+def test_transition_rejects_bool_release_identity_without_rewriting(episode_api, episode_store):
+    spool_id = "bool-release-identity"
+    episode = _seed(episode_store, spool_id, "cleanup_proven")
+    episode["lock"] = {"device": 1, "inode": 987}
+    episode_store.write(spool_id, status="running", episode=episode)
+    before = episode_store.spool_path(spool_id).read_bytes()
+
+    result = _transition(
+        episode_api,
+        episode_store,
+        spool_id,
+        "reconciler",
+        "cleanup_proven",
+        "released",
+        facts={"release": {**FACT_LITERALS["release"], "device": True}},
     )
 
     assert (result.accepted, result.rejection) == (False, "contradictory_facts")
