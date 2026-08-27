@@ -56,6 +56,21 @@ EPISODE_CAPABILITY = "owner-episode-v1"
 CONVERGENCE_CAPABILITY = "owner-convergence-v1"
 
 
+def _write_codex_respin_reservation(episode_store, spool_id: str, session_id: str, *, episode=None, **fields):
+    episode = episode or make_episode("reserved", generation=1, path="before_watchdog")
+    starter = episode["starter"]
+    return episode_store.write(
+        spool_id,
+        status="pending",
+        episode=episode,
+        tags=["codex", "respin"],
+        launcher_pid=starter["pid"],
+        launcher_namespace=starter["namespace"],
+        _codex_respin_source_session_id=session_id,
+        **fields,
+    )
+
+
 def _row_id(row) -> str:
     actor, source, destination, _facts = row
     return f"{actor}:{source}->{destination}"
@@ -315,6 +330,27 @@ def test_transition_with_a_stale_revision_is_rejected(episode_api, episode_store
     assert episode_store.spool_path(spool_id).read_bytes() == before
 
 
+@pytest.mark.parametrize("expected_revision", [True, False, 0, -1, 1.0, "1"])
+def test_transition_rejects_invalid_expected_revision_without_rewriting(episode_api, episode_store, expected_revision):
+    spool_id = f"invalid-expected-revision-{expected_revision!r}"
+    episode = _seed(episode_store, spool_id, "reserved", path="before_watchdog")
+    before = episode_store.spool_path(spool_id).read_bytes()
+
+    result = _transition(
+        episode_api,
+        episode_store,
+        spool_id,
+        "launcher",
+        "reserved",
+        "aborted",
+        expected_revision=expected_revision,
+    )
+
+    assert episode["revision"] == 1
+    assert (result.accepted, result.rejection) == (False, "stale_revision")
+    assert episode_store.spool_path(spool_id).read_bytes() == before
+
+
 def test_first_reserve_refuses_a_supplied_revision(episode_api, episode_store):
     spool_id = "first-reserve"
     _seed(episode_store, spool_id, ABSENT)
@@ -361,6 +397,52 @@ def test_transition_contradicting_a_durable_fact_is_rejected(
         source,
         destination,
         facts={**facts_for(*required_facts(actor, source, destination)), **contradiction},
+    )
+
+    assert (result.accepted, result.rejection) == (False, "contradictory_facts")
+    assert episode_store.spool_path(spool_id).read_bytes() == before
+
+
+def test_transition_rejects_bool_nested_in_an_existing_fact_without_rewriting(episode_api, episode_store):
+    spool_id = "bool-existing-fact-identity"
+    episode = _seed(episode_store, spool_id, "accepted")
+    episode["owner"]["namespace"]["device"] = 1
+    episode_store.write(spool_id, status="running", episode=episode)
+    before = episode_store.spool_path(spool_id).read_bytes()
+    changed_owner = {
+        **episode["owner"],
+        "namespace": {**episode["owner"]["namespace"], "device": True},
+    }
+
+    result = _transition(
+        episode_api,
+        episode_store,
+        spool_id,
+        "owner",
+        "accepted",
+        "cleanup_proven",
+        facts={"cleanup": FACT_LITERALS["cleanup"], "owner": changed_owner},
+    )
+
+    assert (result.accepted, result.rejection) == (False, "contradictory_facts")
+    assert episode_store.spool_path(spool_id).read_bytes() == before
+
+
+def test_transition_rejects_bool_release_identity_without_rewriting(episode_api, episode_store):
+    spool_id = "bool-release-identity"
+    episode = _seed(episode_store, spool_id, "cleanup_proven")
+    episode["lock"] = {"device": 1, "inode": 987}
+    episode_store.write(spool_id, status="running", episode=episode)
+    before = episode_store.spool_path(spool_id).read_bytes()
+
+    result = _transition(
+        episode_api,
+        episode_store,
+        spool_id,
+        "reconciler",
+        "cleanup_proven",
+        "released",
+        facts={"release": {**FACT_LITERALS["release"], "device": True}},
     )
 
     assert (result.accepted, result.rejection) == (False, "contradictory_facts")
@@ -522,6 +604,29 @@ def test_classifier_rejects_malformed_episode_core_fields(episode_api, field, va
 
     assert classification.state == "unhealthy"
     assert "malformed" in classification.reason or field in classification.reason
+
+
+@pytest.mark.parametrize("field", ["generation", "revision"])
+def test_transition_rejects_bool_current_episode_counters_before_arithmetic(episode_api, episode_store, field):
+    spool_id = f"bool-current-{field}"
+    episode = make_episode("reserved", generation=1, path="before_watchdog")
+    episode[field] = True
+    episode_store.write(spool_id, status="pending", episode=episode)
+    before = episode_store.spool_path(spool_id).read_bytes()
+
+    result = episode_api.transition(
+        episode_store.root,
+        spool_id,
+        actor="launcher",
+        destination="aborted",
+        generation=1,
+        expected_revision=1,
+        facts={"failure": FACT_LITERALS["failure"]},
+    )
+
+    assert result.accepted is False
+    assert result.rejection == f"malformed_current_{field}"
+    assert episode_store.spool_path(spool_id).read_bytes() == before
 
 
 @pytest.mark.parametrize("phase", BOUND_PHASES)
@@ -800,12 +905,35 @@ def test_pre_spawn_failure_aborts_the_reservation_it_finalizes(episode_store):
     assert stored["failure"]
 
 
+def test_pre_spawn_failure_absorbs_durable_legacy_terminal_cleanup_marker(episode_store, monkeypatch):
+    from spindle import owner_episode_convergence
+
+    spool_id = "writer-pre-spawn-failure-legacy-cleanup"
+    message = "spawn failed: legacy launcher"
+    episode_store.write(spool_id, status="pending", prompt="legacy")
+    real_publish = owner_episode_convergence.publish_record_updates
+
+    def publish_then_fail_cleanup(published_spool_id, record, updates):
+        real_publish(published_spool_id, record, updates)
+        raise spindle._DurablePublicationCleanupError(errno.EIO, "legacy directory close failed")
+
+    monkeypatch.setattr(owner_episode_convergence, "publish_record_updates", publish_then_fail_cleanup)
+
+    spindle._record_pre_spawn_failure(spool_id, message)
+
+    record = episode_store.read(spool_id)
+    assert record["status"] == "error"
+    assert record["error"] == message
+    assert record["completed_at"]
+
+
 def test_sandbox_refusal_preserves_and_aborts_the_episode(episode_store):
     spool_id = "writer-sandbox-refusal"
-    reserved = make_episode("reserved", generation=2, path="before_watchdog")
+    session_id = "session-sandbox-refusal"
+    reserved = make_episode("reserved", generation=1, path="before_watchdog")
     assert reserved["revision"] == 1
     assert "watchdog" not in reserved
-    episode_store.write(spool_id, status="pending", episode=reserved)
+    _write_codex_respin_reservation(episode_store, spool_id, session_id, episode=reserved)
 
     message = spindle._persist_codex_sandbox_refusal(
         spool_id,
@@ -814,14 +942,157 @@ def test_sandbox_refusal_preserves_and_aborts_the_episode(episode_store):
         permission="careful",
         codex_bin="/usr/bin/codex",
         codex_version="1.0",
+        session_id=session_id,
     )
 
     record = episode_store.read(spool_id)
     stored = record.get(EPISODE_KEY)
     assert message.startswith("Error:")
+    assert message.endswith(f"(spool {spool_id})")
+    assert "refusal persistence failed" not in message
     assert stored is not None, "sandbox refusal replaced the record and dropped the episode"
-    assert (stored["phase"], stored["generation"], stored["revision"]) == ("aborted", 2, 2)
+    assert (stored["phase"], stored["generation"], stored["revision"]) == ("aborted", 1, 2)
     assert "watchdog" not in stored
+
+
+def test_sandbox_refusal_finishes_after_durable_abort_cleanup_failure(episode_store, monkeypatch):
+    spool_id = "writer-sandbox-refusal-durable-abort"
+    session_id = "session-sandbox-refusal-durable-abort"
+    reserved = make_episode("reserved", generation=1, path="before_watchdog")
+    _write_codex_respin_reservation(episode_store, spool_id, session_id, episode=reserved)
+    real_close = os.close
+    directory = episode_store.root.stat()
+    directory_closes = 0
+
+    def fail_abort_directory_close(fd):
+        nonlocal directory_closes
+        opened = os.fstat(fd)
+        if (opened.st_dev, opened.st_ino) == (directory.st_dev, directory.st_ino):
+            directory_closes += 1
+            real_close(fd)
+            if directory_closes == 2:
+                raise OSError(errno.EIO, "owner directory close failed after durable abort")
+            return None
+        return real_close(fd)
+
+    monkeypatch.setattr(os, "close", fail_abort_directory_close)
+
+    message = spindle._persist_codex_sandbox_refusal(
+        spool_id,
+        "REFUSED: codex sandbox is unavailable",
+        sandbox="workspace-write",
+        permission="careful",
+        codex_bin="/usr/bin/codex",
+        codex_version="1.0",
+        session_id=session_id,
+    )
+
+    record = episode_store.read(spool_id)
+    assert message == f"Error: REFUSED: codex sandbox is unavailable (spool {spool_id})"
+    assert directory_closes == 3
+    assert record["status"] == "error"
+    assert record["error"] == "REFUSED: codex sandbox is unavailable"
+    assert record["sandbox_error"] == "REFUSED: codex sandbox is unavailable"
+    assert record[EPISODE_KEY]["phase"] == "aborted"
+    assert record[EPISODE_KEY]["failure"]["detail"] == "REFUSED: codex sandbox is unavailable"
+    assert spindle._count_running() == 0
+
+
+def test_sandbox_refusal_converges_after_post_abort_lock_cleanup_failure(episode_store, monkeypatch):
+    spool_id = "writer-sandbox-refusal-abort-unlock"
+    session_id = "session-sandbox-refusal-abort-unlock"
+    reserved = make_episode("reserved", generation=1, path="before_watchdog")
+    _write_codex_respin_reservation(episode_store, spool_id, session_id, episode=reserved)
+    real_flock = spindle.fcntl.flock
+    unlocks = 0
+    failed_unlocks = 0
+
+    def fail_first_unlock_after_release(fd, operation):
+        nonlocal failed_unlocks, unlocks
+        result = real_flock(fd, operation)
+        if operation == spindle.fcntl.LOCK_UN:
+            unlocks += 1
+        if operation == spindle.fcntl.LOCK_UN and unlocks == 2 and failed_unlocks == 0:
+            failed_unlocks += 1
+            raise OSError(errno.EIO, "record unlock failed after durable abort")
+        return result
+
+    monkeypatch.setattr(spindle.fcntl, "flock", fail_first_unlock_after_release)
+
+    message = spindle._persist_codex_sandbox_refusal(
+        spool_id,
+        "REFUSED: codex sandbox is unavailable",
+        sandbox="workspace-write",
+        permission="careful",
+        codex_bin="/usr/bin/codex",
+        codex_version="1.0",
+        session_id=session_id,
+    )
+
+    record = episode_store.read(spool_id)
+    assert message == f"Error: REFUSED: codex sandbox is unavailable (spool {spool_id})"
+    assert failed_unlocks == 1
+    assert record["status"] == "error"
+    assert record["sandbox_error"] == "REFUSED: codex sandbox is unavailable"
+    assert record[EPISODE_KEY]["phase"] == "aborted"
+    assert spindle._count_running() == 0
+    with spindle._spool_lock(spool_id, blocking=False) as acquired:
+        assert acquired is True
+
+
+def test_sandbox_refusal_episode_path_is_utf8_independent_of_text_defaults(episode_store, monkeypatch):
+    spool_id = "writer-sandbox-refusal-utf8"
+    session_id = "session-sandbox-refusal-utf8"
+    reserved = make_episode("reserved", generation=1, path="before_watchdog")
+    record = _write_codex_respin_reservation(
+        episode_store,
+        spool_id,
+        session_id,
+        episode=reserved,
+        prompt="caf\u00e9 \u2615",
+    )
+    episode_store.spool_path(spool_id).write_bytes(json.dumps(record, ensure_ascii=False).encode("utf-8"))
+    real_open = open
+    real_read_text = Path.read_text
+    real_fdopen = os.fdopen
+
+    def ascii_default_open(file, mode="r", *args, **kwargs):
+        if "b" not in mode and "encoding" not in kwargs:
+            kwargs["encoding"] = "ascii"
+        return real_open(file, mode, *args, **kwargs)
+
+    def ascii_default_read_text(self, *args, **kwargs):
+        if "encoding" not in kwargs:
+            kwargs["encoding"] = "ascii"
+        return real_read_text(self, *args, **kwargs)
+
+    def ascii_default_fdopen(fd, mode="r", *args, **kwargs):
+        if "b" not in mode and "encoding" not in kwargs:
+            kwargs["encoding"] = "ascii"
+        return real_fdopen(fd, mode, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.open", ascii_default_open)
+    monkeypatch.setattr(Path, "read_text", ascii_default_read_text)
+    monkeypatch.setattr(os, "fdopen", ascii_default_fdopen)
+
+    message = spindle._persist_codex_sandbox_refusal(
+        spool_id,
+        "REFUSED: codex sandbox is unavailable",
+        sandbox="workspace-write",
+        permission="careful",
+        codex_bin="/usr/bin/codex",
+        codex_version="1.0",
+        session_id=session_id,
+    )
+
+    stored_record = json.loads(episode_store.spool_path(spool_id).read_bytes())
+    assert message == f"Error: REFUSED: codex sandbox is unavailable (spool {spool_id})"
+    assert stored_record["status"] == "error"
+    assert stored_record["error"] == "REFUSED: codex sandbox is unavailable"
+    assert stored_record["sandbox_error"] == "REFUSED: codex sandbox is unavailable"
+    assert stored_record["prompt"] == "caf\u00e9 \u2615"
+    assert stored_record[EPISODE_KEY]["phase"] == "aborted"
+    assert "watchdog" not in stored_record[EPISODE_KEY]
 
 
 def test_finalization_persists_release_from_cleanup_proven(episode_store):

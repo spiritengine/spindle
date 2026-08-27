@@ -60,8 +60,46 @@ OWNER_ARTIFACT_SUFFIXES = (
 _close_fd = os.close
 
 
+class _DurablePublicationCleanupError(OSError):
+    """Publication and private cleanup are durable, but a later close failed."""
+
+
+def _fsync_directory_after_publication(path: Path, *, publication: bool = True) -> None:
+    """Make a directory update durable and preserve fsync over close errors."""
+    directory_fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(directory_fd)
+    except BaseException:
+        try:
+            os.close(directory_fd)
+        except BaseException:
+            pass
+        raise
+    try:
+        os.close(directory_fd)
+    except OSError as exc:
+        if publication:
+            raise _DurablePublicationCleanupError(*exc.args) from exc
+        raise
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _type_strict_json_equal(left, right) -> bool:
+    """Compare JSON values recursively without Python's bool/int coercion."""
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict):
+        return left.keys() == right.keys() and all(
+            _type_strict_json_equal(value, right[key]) for key, value in left.items()
+        )
+    if isinstance(left, list):
+        return len(left) == len(right) and all(
+            _type_strict_json_equal(left_value, right_value) for left_value, right_value in zip(left, right)
+        )
+    return left == right
 
 
 @dataclass(frozen=True)
@@ -408,7 +446,7 @@ def _valid_cleanup(value) -> bool:
 
 def _facts_are_consistent(current: dict, facts: dict) -> bool:
     for name, value in facts.items():
-        if name in current and current[name] != value:
+        if name in current and not _type_strict_json_equal(current[name], value):
             return False
     cleanup = facts.get("cleanup")
     if cleanup is not None and not _valid_cleanup(cleanup):
@@ -418,7 +456,7 @@ def _facts_are_consistent(current: dict, facts: dict) -> bool:
     if release is not None:
         if not isinstance(lock, dict) or not isinstance(release, dict):
             return False
-        if (release.get("device"), release.get("inode")) != (lock.get("device"), lock.get("inode")):
+        if not all(_type_strict_json_equal(release.get(name), lock.get(name)) for name in ("device", "inode")):
             return False
         if release.get("proved_by") != "reconciler" or not release.get("released_at"):
             return False
@@ -437,23 +475,38 @@ def transition_owner_episode(
     record_updates: Optional[dict] = None,
     record_deletes: Iterable[str] = (),
     record_locked: bool = False,
+    create_only: bool = False,
 ) -> EpisodeTransitionResult:
     """Validate and durably publish one generation-scoped owner transition."""
     root = Path(root)
     spool_path = root / f"{spool_id}.json"
     guard = nullcontext() if record_locked else _episode_record_guard(root, spool_id)
     with guard:
-        try:
-            record = json.loads(spool_path.read_text())
-        except FileNotFoundError:
+        if create_only:
             record = {"id": spool_id, "status": "pending", "created_at": _utc_now()}
+        else:
+            try:
+                record = json.loads(spool_path.read_text(encoding="utf-8"))
+            except FileNotFoundError:
+                record = {"id": spool_id, "status": "pending", "created_at": _utc_now()}
         current = record.get(OWNER_EPISODE_KEY)
         source = current.get("phase") if isinstance(current, dict) else None
 
+        if create_only and destination != "reserved":
+            raise ValueError("create-only owner episode publication must create an initial reservation")
         if current is not None and current.get("format") != OWNER_EPISODE_FORMAT:
             return EpisodeTransitionResult(False, "unknown_episode_format", current)
         if not isinstance(generation, int) or isinstance(generation, bool) or generation <= 0:
             return EpisodeTransitionResult(False, "stale_generation", current)
+        if current is not None:
+            for name in ("generation", "revision"):
+                value = current.get(name)
+                if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                    return EpisodeTransitionResult(False, f"malformed_current_{name}", current)
+        if expected_revision is not None and (
+            not isinstance(expected_revision, int) or isinstance(expected_revision, bool) or expected_revision <= 0
+        ):
+            return EpisodeTransitionResult(False, "stale_revision", current)
 
         reseed = source in {None, "released", "aborted"} and destination == "reserved"
         if source is None:
@@ -507,7 +560,11 @@ def transition_owner_episode(
         if record_updates:
             record.update(record_updates)
         record[OWNER_EPISODE_KEY] = episode
-        _atomic_json_write(spool_path, record)
+        if create_only:
+            if not _atomic_json_create(spool_path, record):
+                return EpisodeTransitionResult(False, "record_occupied", None)
+        else:
+            _atomic_json_write(spool_path, record)
         return EpisodeTransitionResult(True, None, episode)
 
 
@@ -604,17 +661,13 @@ def _atomic_json_write(path: Path, value: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
     try:
-        with os.fdopen(fd, "w") as stream:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
             json.dump(value, stream, sort_keys=True, separators=(",", ":"))
             stream.write("\n")
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
-        directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+        _fsync_directory_after_publication(path.parent)
     finally:
         try:
             os.unlink(temporary)
@@ -623,30 +676,73 @@ def _atomic_json_write(path: Path, value: dict) -> None:
 
 
 def _atomic_json_create(path: Path, value: dict) -> bool:
-    """Durably publish *value* at *path* only when the pathname is absent."""
+    """Durably publish complete JSON without replacing any pathname.
+
+    The file-synced temporary stays hidden until a same-filesystem hard link
+    atomically claims the destination. Every existing pathname form, including
+    a dangling symlink, is a collision. The private link is removed before the
+    final directory fsync, which makes both publication (when one occurred) and
+    cleanup durable together.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    published = False
+    primary = None
     try:
-        with os.fdopen(fd, "w") as stream:
+        try:
+            stream = os.fdopen(fd, "w", encoding="utf-8")
+        except BaseException as exc:
+            primary_traceback = exc.__traceback__
+            try:
+                os.close(fd)
+            except BaseException as close_exc:
+                raise exc.with_traceback(primary_traceback) from close_exc
+            raise
+        body_error = None
+        try:
             json.dump(value, stream, sort_keys=True, separators=(",", ":"))
             stream.write("\n")
             stream.flush()
             os.fsync(stream.fileno())
+        except BaseException as exc:
+            body_error = (exc, exc.__traceback__)
+        try:
+            stream.close()
+        except BaseException as close_exc:
+            if body_error is not None:
+                exc, traceback = body_error
+                raise exc.with_traceback(traceback) from close_exc
+            raise
+        if body_error is not None:
+            exc, traceback = body_error
+            raise exc.with_traceback(traceback)
         try:
             os.link(temporary, path)
         except FileExistsError:
-            return False
-        directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
-        return True
-    finally:
-        try:
-            os.unlink(temporary)
-        except FileNotFoundError:
             pass
+        else:
+            published = True
+    except BaseException as exc:
+        primary = (exc, exc.__traceback__)
+
+    cleanup_error = None
+    try:
+        os.unlink(temporary)
+    except FileNotFoundError:
+        pass
+    except BaseException as exc:
+        cleanup_error = exc
+
+    if primary is not None:
+        exc, traceback = primary
+        if cleanup_error is not None:
+            raise exc.with_traceback(traceback) from cleanup_error
+        raise exc.with_traceback(traceback)
+    if cleanup_error is not None:
+        raise cleanup_error
+
+    _fsync_directory_after_publication(path.parent, publication=published)
+    return published
 
 
 @contextmanager
