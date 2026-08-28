@@ -41,9 +41,9 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/smythp/spindle"
-Repository = "https://github.com/smythp/spindle"
-Issues = "https://github.com/smythp/spindle/issues"
+Homepage = "https://github.com/spiritengine/spindle"
+Repository = "https://github.com/spiritengine/spindle"
+Issues = "https://github.com/spiritengine/spindle/issues"
 
 [project.scripts]
 spindle = "spindle:main"
