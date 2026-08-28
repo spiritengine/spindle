@@ -190,10 +190,16 @@ the namespace-safe shared owner primitive.
 36. Abandoned custody settlement: only explicit spindle repair with
     --attest-dead, or the spindle_repair MCP tool with attest_dead=true, may
     advance the strictly diagnosed state in decision 35 to abandoned. The gate
-    and terminal write share the episode record lock. The retained record
-    carries the attester, timestamp, exact lock and process-liveness evidence,
-    and an indeterminate terminal; it never fabricates cleanup or provider
-    outcome. Because cleanup was never proven, the settled record releases
-    capacity but is not retireable: retention keeps it and destructive shard
-    actions stay refused. Doctor reports unsettled records as warnings with
-    the repair command. They do not make the store unhealthy or block launches.
+    and terminal write share the episode record lock. Settlement releases
+    capacity, so unlike the diagnosis it also refuses while the recorded
+    provider is observably alive; dead and unverifiable provider liveness stay
+    under the attestation, which names owner, watchdog, and provider. It
+    refuses, rather than raising, on a record that already published a
+    terminal outcome and on any malformed mapping it reads before writing.
+    The retained record carries the attester, timestamp, exact lock and
+    process-liveness evidence, and an indeterminate terminal; it never
+    fabricates cleanup or provider outcome. Because cleanup was never proven,
+    the settled record releases capacity but is not retireable: retention
+    keeps it and destructive shard actions stay refused. Doctor reports
+    unsettled records as warnings with the repair command. They do not make
+    the store unhealthy or block launches.

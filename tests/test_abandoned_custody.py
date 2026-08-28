@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import threading
 from contextlib import contextmanager
 from copy import deepcopy
@@ -18,8 +19,8 @@ from tests.owner_episode_fixtures import CLEANUP, CONTAINMENT, make_episode
 
 ABANDONED_REASON = "custody_abandoned_without_cleanup_proof"
 ATTESTATION = (
-    "I attest that the recorded owner and watchdog are dead and cleanup cannot be proven; "
-    "settle this spool as indeterminate abandonment."
+    "I attest that the recorded owner, watchdog, and provider processes are dead and cleanup "
+    "cannot be proven; settle this spool as indeterminate abandonment."
 )
 
 
@@ -458,6 +459,29 @@ def test_cli_and_mcp_repair_entrypoints_settle_records(episode_store, monkeypatc
     assert episode_store.read(mcp_record["id"])["status"] == "abandoned"
 
 
+@pytest.mark.parametrize(
+    ("environment", "expected"),
+    (({}, "unknown"), ({"USER": "operator"}, "operator"), ({"LOGNAME": "operator"}, "operator")),
+    ids=("no_account_name", "user_env", "logname_env"),
+)
+def test_repair_attests_on_a_host_without_a_passwd_entry(episode_store, monkeypatch, environment, expected):
+    def no_passwd_entry():
+        raise KeyError("getpwuid(): uid not found: 1000")
+
+    monkeypatch.setattr(spindle.getpass, "getuser", no_passwd_entry)
+    for variable in ("USER", "LOGNAME"):
+        monkeypatch.delenv(variable, raising=False)
+    for variable, value in environment.items():
+        monkeypatch.setenv(variable, value)
+    record = _abandoned_record(episode_store)
+
+    output = spindle._repair_abandoned_custody(record["id"], attest_dead=True, source="test")
+
+    attester = episode_store.read(record["id"])["owner_episode"]["abandonment"]["attester"]
+    assert output == f"Spool {record['id']} settled as indeterminate abandonment."
+    assert attester["user"] == expected
+
+
 @pytest.mark.parametrize("phase", ("reserved", "aborted", "cleanup_proven", "released"))
 def test_repair_refuses_wrong_episode_phase_without_mutation(episode_store, phase):
     spool_id = f"wrong-phase-{phase}"
@@ -583,6 +607,98 @@ def test_repair_refuses_contradictory_or_malformed_episode_shape_without_mutatio
     spindle._write_spool(record["id"], current)
 
     _assert_repair_refused_without_mutation(episode_store, record["id"], expected)
+
+
+def test_repair_refuses_a_live_recorded_provider_without_mutation(episode_store):
+    record = _abandoned_record(episode_store)
+    current = episode_store.read(record["id"])
+    live = live_process_fact()
+    current["owner_episode"]["provider"] = {**live, "pgid": os.getpgid(0)}
+    spindle._write_spool(record["id"], current)
+
+    assert spindle._abandoned_custody_reason(episode_store.read(record["id"])) == ABANDONED_REASON, (
+        "the shared diagnosis must still match, or this refusal proves nothing about settlement"
+    )
+    _assert_repair_refused_without_mutation(
+        episode_store, record["id"], f"recorded provider pid {live['pid']} is alive"
+    )
+    assert spindle._count_running() == 1, "settlement released capacity while the recorded provider was running"
+
+
+def test_repair_settles_when_only_provider_liveness_is_unverifiable(episode_store, monkeypatch):
+    record = _abandoned_record(episode_store)
+    provider_pid = record["owner_episode"]["provider"]["pid"]
+    real_liveness = spindle.assess_process_liveness
+
+    def liveness(identity):
+        if identity.pid == provider_pid:
+            return spindle.LivenessEvidence("unverifiable", "namespace_unavailable")
+        return real_liveness(identity)
+
+    monkeypatch.setattr(spindle, "assess_process_liveness", liveness)
+
+    output = spindle._repair_abandoned_custody(record["id"], attest_dead=True, source="test")
+
+    assert output == f"Spool {record['id']} settled as indeterminate abandonment."
+    assert episode_store.read(record["id"])["status"] == "abandoned"
+
+
+def test_repair_refuses_a_record_that_already_published_a_terminal(episode_store):
+    record = _abandoned_record(episode_store)
+    current = episode_store.read(record["id"])
+    episode = current["owner_episode"]
+    current.update(
+        terminal_origin="natural_success",
+        terminal_provenance={
+            "owner_generation": episode["generation"],
+            "episode_revision": episode["revision"],
+            "provider_exit_carrier": "episode_cleanup",
+        },
+        result="the provider finished",
+        exit_code=0,
+        completed_at="2026-08-11T00:00:07+00:00",
+    )
+    spindle._write_spool(record["id"], current)
+
+    assert current["status"] == "running", "the status mirror must disagree with the published terminal"
+    assert spindle._abandoned_custody_reason(episode_store.read(record["id"])) == ABANDONED_REASON
+
+    _assert_repair_refused_without_mutation(
+        episode_store, record["id"], "record already published terminal outcome 'natural_success'"
+    )
+    assert episode_store.read(record["id"])["result"] == "the provider finished"
+
+
+@pytest.mark.parametrize(
+    ("field", "expected"),
+    (
+        ("lifecycle", "record lifecycle is malformed"),
+        ("winning_request", "owner episode winning_request is malformed"),
+    ),
+)
+def test_repair_refuses_malformed_mappings_it_reads_before_writing(episode_store, field, expected):
+    record = _abandoned_record(episode_store)
+    current = episode_store.read(record["id"])
+    if field == "lifecycle":
+        current["lifecycle"] = "corrupted"
+    else:
+        current["owner_episode"]["winning_request"] = "corrupted"
+    spindle._write_spool(record["id"], current)
+
+    assert spindle._abandoned_custody_reason(episode_store.read(record["id"])) == ABANDONED_REASON
+
+    _assert_repair_refused_without_mutation(episode_store, record["id"], expected)
+
+
+def test_repair_refuses_a_record_that_is_not_a_json_object(episode_store):
+    record = _abandoned_record(episode_store)
+    path = episode_store.spool_path(record["id"])
+    path.write_text("17", encoding="utf-8")
+
+    output = spindle._repair_abandoned_custody(record["id"], attest_dead=True, source="test")
+
+    assert output == f"Error: Refusing to repair spool {record['id']!r}: record is not a JSON object."
+    assert path.read_text(encoding="utf-8") == "17"
 
 
 def test_repair_is_idempotent_after_first_settlement(episode_store):
@@ -734,3 +850,37 @@ def test_repair_gate_and_terminal_write_share_episode_writer_lock(episode_store,
     assert writer_result[0].accepted is False
     assert writer_result[0].rejection in {"illegal_transition", "stale_revision"}
     assert episode_store.read(record["id"])["owner_episode"]["phase"] == "abandoned"
+
+
+def test_mcp_repair_settles_without_holding_the_event_loop(episode_store):
+    record = _abandoned_record(episode_store)
+    holding = threading.Event()
+    release = threading.Event()
+
+    def hold_record_lock():
+        with spindle._spool_lock(record["id"]) as acquired:
+            assert acquired
+            holding.set()
+            release.wait(5)
+
+    holder = threading.Thread(target=hold_record_lock)
+    holder.start()
+    try:
+        assert holding.wait(5)
+
+        async def repair_while_the_loop_keeps_running():
+            task = asyncio.create_task(spindle.spindle_repair.fn(record["id"], attest_dead=True))
+            for _ in range(5):
+                await asyncio.sleep(0.01)
+            still_waiting = not task.done()
+            release.set()
+            return await asyncio.wait_for(task, 10), still_waiting
+
+        output, still_waiting = asyncio.run(repair_while_the_loop_keeps_running())
+    finally:
+        release.set()
+        holder.join(10)
+
+    assert still_waiting, "the tool settled inline, so the loop was frozen until the record lock cleared"
+    assert output == f"Spool {record['id']} settled as indeterminate abandonment."
+    assert episode_store.read(record["id"])["status"] == "abandoned"

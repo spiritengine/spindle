@@ -1280,6 +1280,8 @@ def _abandoned_custody_refusal(record: dict) -> str:
 
 def _abandoned_custody_identity_refusal(spool_id: str, record: dict) -> str | None:
     """Refuse a record whose embedded id does not name the requested spool."""
+    if not isinstance(record, dict):
+        return "record is not a JSON object"
     if "id" not in record:
         return "record id is missing"
     embedded = record["id"]
@@ -1305,6 +1307,42 @@ def _abandoned_custody_shape_refusal(episode: dict) -> str | None:
     return None
 
 
+def _published_terminal_refusal(record: dict) -> str | None:
+    """Refuse a record whose public outcome another writer already published.
+
+    The status mirror is not the terminal.  A record can carry a settled
+    outcome - terminal_origin, its provenance, and the published result - while
+    the mirror still reads "running", because a partial or interrupted
+    projection leaves the two disagreeing.  Reading only the mirror would let
+    abandonment overwrite proven meaning.  A mirror that does name a terminal
+    status is refused by the ordinary diagnosis, which reports that status.
+    """
+    if record.get("status") not in NONTERMINAL_STATUSES or not has_published_terminal(record):
+        return None
+    return f"record already published terminal outcome {record.get('terminal_origin')!r}"
+
+
+def _abandoned_custody_mapping_refusal(record: dict, episode: dict) -> str | None:
+    """Refuse malformed mappings the repair write path reads outside the diagnosis.
+
+    Repair refuses, never crashes, on any malformed mapping field it reads
+    before writing.  The diagnosis already proves every mapping inside the
+    episode identity it adjudicates - lock, owner, watchdog, phase_times - and
+    the contradiction check proves cleanup, release, and abandonment absent.
+    The two remaining mappings the terminal projection reads are checked here:
+    the record's lifecycle mirror, copied into the settled lifecycle, and the
+    episode's winning_request, quoted by the terminal provenance.  Absent is
+    not malformed; both are optional.
+    """
+    lifecycle = record.get("lifecycle")
+    if lifecycle is not None and not isinstance(lifecycle, dict):
+        return "record lifecycle is malformed"
+    winning_request = episode.get("winning_request")
+    if winning_request is not None and not isinstance(winning_request, dict):
+        return "owner episode winning_request is malformed"
+    return None
+
+
 def settle_abandoned_custody(spool_id: str, attester: dict) -> str:
     """Human-attested terminalization of one strictly diagnosed abandoned episode.
 
@@ -1325,14 +1363,17 @@ def settle_abandoned_custody(spool_id: str, attester: dict) -> str:
             return f"Error: Refusing to repair spool {spool_id!r}: {identity_refusal}."
         if _is_abandoned_custody_terminal(record):
             return f"Spool {spool_id} was already settled as indeterminate abandonment."
+        published_refusal = _published_terminal_refusal(record)
+        if published_refusal:
+            return f"Error: Refusing to repair spool {spool_id!r}: {published_refusal}."
         if spindle._abandoned_custody_reason(record) != "custody_abandoned_without_cleanup_proof":
             detail = _abandoned_custody_refusal(record)
             return f"Error: Refusing to repair spool {spool_id!r}: {detail}."
 
         episode = record[EPISODE_KEY]
-        shape_refusal = _abandoned_custody_shape_refusal(episode)
-        if shape_refusal:
-            return f"Error: Refusing to repair spool {spool_id!r}: {shape_refusal}."
+        refusal = _abandoned_custody_shape_refusal(episode) or _abandoned_custody_mapping_refusal(record, episode)
+        if refusal:
+            return f"Error: Refusing to repair spool {spool_id!r}: {refusal}."
         lock, owner_liveness = spindle._owner_episode_observation(record)
         watchdog = spindle._episode_process_identity(episode, "watchdog")
         watchdog_liveness = spindle.assess_process_liveness(watchdog) if watchdog is not None else None
@@ -1347,6 +1388,20 @@ def settle_abandoned_custody(spool_id: str, attester: dict) -> str:
         ):
             detail = _abandoned_custody_refusal(record)
             return f"Error: Refusing to repair spool {spool_id!r}: {detail}."
+        # The diagnosis deliberately excludes the provider: no provider or
+        # process-group observation can prove descendant cleanup, so none may
+        # participate in it.  Settlement is a different act - it publishes a
+        # terminal and releases the record's capacity - and a provider proven
+        # to be running now is proof that the work this record accounts for is
+        # not over.  Dead or unverifiable provider liveness stays under the
+        # operator's attestation; positive life overrides it.
+        provider = spindle._episode_process_identity(episode, "provider")
+        provider_liveness = spindle.assess_process_liveness(provider) if provider is not None else None
+        if provider_liveness is not None and provider_liveness.state == "alive":
+            return (
+                f"Error: Refusing to repair spool {spool_id!r}: recorded provider pid {provider.pid} "
+                f"is alive ({provider_liveness.reason})."
+            )
 
         completed_at = datetime.now(timezone.utc).isoformat()
         evidence = {

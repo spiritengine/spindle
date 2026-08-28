@@ -2617,16 +2617,34 @@ def _serialized_abandoned_custody_reason(spool_id: str) -> Optional[str]:
 
 
 REPAIR_DEAD_ATTESTATION = (
-    "I attest that the recorded owner and watchdog are dead and cleanup cannot be proven; "
-    "settle this spool as indeterminate abandonment."
+    "I attest that the recorded owner, watchdog, and provider processes are dead and cleanup "
+    "cannot be proven; settle this spool as indeterminate abandonment."
 )
+
+
+def _local_user_name() -> str:
+    """Name the local account without letting a missing passwd entry raise.
+
+    getpass.getuser() raises when the uid has no passwd entry and no login
+    variable is set, which happens in containers and under some systemd units.
+    Capturing the attester must never turn a refusal into a traceback.
+    """
+    try:
+        return getpass.getuser()
+    except (KeyError, OSError):
+        pass
+    for variable in ("USER", "LOGNAME"):
+        value = os.environ.get(variable)
+        if value:
+            return value
+    return "unknown"
 
 
 def _repair_attester_identity(source: str) -> dict:
     """Identify the local human account making the explicit repair request."""
     return {
         "kind": "local_user",
-        "user": getpass.getuser(),
+        "user": _local_user_name(),
         "uid": os.getuid() if hasattr(os, "getuid") else None,
         "source": source,
     }
@@ -5377,10 +5395,13 @@ def _unspool_sync(spool_id: str) -> str:
 async def spindle_repair(spool_id: str, attest_dead: bool) -> str:
     """Settle one strictly diagnosed abandoned-custody spool as indeterminate.
 
-    attest_dead must be true. It attests that the recorded owner and watchdog
-    are dead and that cleanup cannot be proven.
+    attest_dead must be true. It attests that the recorded owner, watchdog, and
+    provider processes are dead and that cleanup cannot be proven.
     """
-    return _repair_abandoned_custody(spool_id, attest_dead=attest_dead, source="mcp")
+    # Settlement takes the record lock in blocking mode before it can diagnose
+    # anything, so a spool id naming a live or contended record would otherwise
+    # stall every other tool sharing this event loop.
+    return await asyncio.to_thread(_repair_abandoned_custody, spool_id, attest_dead=attest_dead, source="mcp")
 
 
 @mcp.tool()
@@ -12223,8 +12244,8 @@ def main():
         "--attest-dead",
         action="store_true",
         help=(
-            "Attest that the recorded owner and watchdog are dead, cleanup cannot be proven, "
-            "and settlement must be indeterminate"
+            "Attest that the recorded owner, watchdog, and provider processes are dead, cleanup "
+            "cannot be proven, and settlement must be indeterminate"
         ),
     )
 

@@ -487,8 +487,12 @@ human-attested indeterminate settlement.
 
 Both repair entry points refuse unless the owner episode is lock_bound or
 accepted, its exact lock inode is released, and the recorded owner and
-watchdog are affirmatively dead. The attestation does not claim cleanup or a
-provider outcome; the retained spool records an indeterminate abandonment.
+watchdog are affirmatively dead. Settlement also refuses while the recorded
+provider process is observably alive, because it releases the spool's
+capacity and a running provider means the work is not over. The attestation
+covers the owner, watchdog, and provider; it claims neither cleanup nor a
+provider outcome, and the retained spool records an indeterminate
+abandonment.
 
 **spin() parameters:**
 - `prompt` (required): The task for the agent
