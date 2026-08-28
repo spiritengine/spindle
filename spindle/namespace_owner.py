@@ -25,7 +25,9 @@ from typing import Iterable, Optional
 OWNER_EPISODE_FORMAT = "spindle.owner-episode/1"
 OWNER_EPISODE_KEY = "owner_episode"
 
-_EPISODE_PHASES = frozenset({"reserved", "lock_bound", "accepted", "cleanup_proven", "released", "aborted"})
+_EPISODE_PHASES = frozenset(
+    {"reserved", "lock_bound", "accepted", "cleanup_proven", "released", "aborted", "abandoned"}
+)
 _EPISODE_TRANSITIONS = {
     ("launcher", None, "reserved"): ("starter",),
     ("launcher", "released", "reserved"): ("starter",),
@@ -865,7 +867,71 @@ def _episode_required_facts(episode: dict) -> tuple[str, ...]:
         return common + route + (("release",) if phase == "released" else ())
     if phase == "aborted":
         return ("starter", "watchdog", "failure") if episode.get("revision", 0) >= 3 else ("starter", "failure")
+    if phase == "abandoned":
+        abandonment = episode.get("abandonment")
+        evidence = abandonment.get("evidence") if isinstance(abandonment, dict) else None
+        prior_phase = evidence.get("episode_phase") if isinstance(evidence, dict) else None
+        route = ("provider", "provider_custody") if prior_phase == "accepted" else ()
+        return ("starter", "watchdog", "owner", "lock") + route + ("abandonment",)
     return ()
+
+
+def _valid_abandonment(episode: dict) -> bool:
+    """Validate the durable human attestation without reinterpreting it as cleanup."""
+    abandonment = episode.get("abandonment")
+    if not isinstance(abandonment, dict):
+        return False
+    if abandonment.get("reason") != "custody_abandoned_without_cleanup_proof":
+        return False
+    # Abandonment is only ever recorded because cleanup could not be proven; a
+    # cleanup or release fact beside it is a contradiction, not extra evidence.
+    if "cleanup" in episode or "release" in episode:
+        return False
+    if not isinstance(abandonment.get("attested_at"), str) or not abandonment["attested_at"]:
+        return False
+    attester = abandonment.get("attester")
+    if (
+        not isinstance(attester, dict)
+        or attester.get("kind") != "local_user"
+        or not isinstance(attester.get("user"), str)
+        or not attester["user"]
+        or not isinstance(attester.get("source"), str)
+        or not attester["source"]
+    ):
+        return False
+    uid = attester.get("uid")
+    if uid is not None and (not isinstance(uid, int) or isinstance(uid, bool) or uid < 0):
+        return False
+    evidence = abandonment.get("evidence")
+    if not isinstance(evidence, dict) or evidence.get("episode_phase") not in {"lock_bound", "accepted"}:
+        return False
+    lock = evidence.get("lock")
+    episode_lock = episode.get("lock")
+    if (
+        not isinstance(lock, dict)
+        or lock.get("state") != "released"
+        or not _type_strict_json_equal(
+            {"device": lock.get("device"), "inode": lock.get("inode")},
+            episode_lock,
+        )
+    ):
+        return False
+    for role in ("owner", "watchdog"):
+        observed = evidence.get(role)
+        recorded = episode.get(role)
+        liveness = observed.get("liveness") if isinstance(observed, dict) else None
+        if (
+            not isinstance(observed, dict)
+            or not isinstance(recorded, dict)
+            or not _type_strict_json_equal(observed.get("pid"), recorded.get("pid"))
+            or not _type_strict_json_equal(observed.get("birth_token"), recorded.get("birth_token"))
+            or not isinstance(liveness, dict)
+            or liveness.get("state") != "dead"
+            or not isinstance(liveness.get("reason"), str)
+            or not liveness["reason"]
+        ):
+            return False
+    return True
 
 
 def _episode_malformed_reason(episode) -> Optional[str]:
@@ -915,6 +981,8 @@ def _episode_malformed_reason(episode) -> Optional[str]:
             return "malformed_failure_identity"
     if phase in {"cleanup_proven", "released"} and not _valid_cleanup(episode.get("cleanup")):
         return "malformed_cleanup_fact"
+    if phase == "abandoned" and not _valid_abandonment(episode):
+        return "malformed_abandonment_fact"
     lock = episode.get("lock")
     release = episode.get("release")
     if phase == "released" and not _facts_are_consistent({"lock": lock}, {"release": release}):
@@ -938,6 +1006,15 @@ def classify_owner_episode(
         return EpisodeClassification("unhealthy", malformed)
 
     phase = episode["phase"]
+    if phase == "abandoned":
+        lifecycle = record.get("lifecycle")
+        if (
+            record.get("status") != "abandoned"
+            or not isinstance(lifecycle, dict)
+            or lifecycle.get("normalized_terminal_kind") != "indeterminate"
+        ):
+            return EpisodeClassification("unhealthy", "abandoned_episode_missing_indeterminate_terminal")
+        return EpisodeClassification("retireable", "human_attested_abandonment")
     if phase == "reserved":
         if lock.state != "absent_legacy":
             return EpisodeClassification("unhealthy", "reserved_has_unexpected_lock")

@@ -92,6 +92,9 @@ spindle peek <spool_id> -n 100
 spindle wait <id1>,<id2> --mode yield
 spindle drop <spool_id>
 
+# Settle custody only when doctor reports an abandoned owner episode
+spindle repair <spool_id> --attest-dead
+
 # This install
 spindle --version
 spindle doctor [--smoke] [--json] [--port N]
@@ -478,6 +481,14 @@ for a worked example and the full schema reference.
 | `spin(prompt, permission?, shard?, system_prompt?, working_dir?, allowed_tools?, tags?, model?, timeout?, harness?)` | Spawn agent, return spool_id |
 | `unspool(spool_id, full?, offset?, limit?)` | Get result (auto-detects harness, non-blocking; truncates huge results to head+tail by default) |
 | `respin(session_id, prompt)` | Continue session (auto-detects harness) |
+
+The MCP tool spindle_repair(spool_id, attest_dead) provides the same
+human-attested indeterminate settlement.
+
+Both repair entry points refuse unless the owner episode is lock_bound or
+accepted, its exact lock inode is released, and the recorded owner and
+watchdog are affirmatively dead. The attestation does not claim cleanup or a
+provider outcome; the retained spool records an indeterminate abandonment.
 
 **spin() parameters:**
 - `prompt` (required): The task for the agent
