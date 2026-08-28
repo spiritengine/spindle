@@ -136,6 +136,40 @@ and run alongside another install without confusing the two.
   line; a genuine stat error still warns. No change to the probe's verdict.
 - Importing spindle no longer prints authlib's deprecation warning (three lines
   of stderr ahead of every CLI command's output).
+- Codex spools launch with `--skip-git-repo-check`, so a working directory that
+  is not a git repository still runs. codex 0.145.0 refuses to start outside a
+  repo (`Not inside a trusted directory and --skip-git-repo-check was not
+  specified`) unless that exact path is listed under `[projects]` in
+  `~/.codex/config.toml`, which made whether a spool could run depend on the
+  operator's personal config — `spindle doctor --smoke`, which runs in a temp
+  dir, failed its codex leg on every machine. Both the fresh spin and the
+  `resume` path pass it. Containment is unchanged: the sandbox tier is still
+  pinned by `--sandbox` plus a matching `-c sandbox_mode`, and the git check
+  only ever gated startup.
+- `docs/CODEX_SETUP.md`'s "Verify Sandbox Enforcement" recipe no longer passes
+  itself when nothing was enforced. It ran `codex exec --sandbox read-only` from
+  `/tmp` and called "no file appeared" a pass — but on codex 0.145.0 that
+  invocation exits before the first model turn (`/tmp` is not a repo), and a
+  binary enforcing nothing leaves no file either. The only check is now the
+  deterministic no-model `codex sandbox` probe, run twice against one fresh
+  directory — refuse-the-write leg and allow-the-write control on the same
+  target, the shell command Spindle's own probe uses, with the marker emitted
+  after the write so it proves the attempt completed. The doc documents no
+  `codex exec` pass condition at all: on 0.145.0 the model
+  will not perform a write it expects to fail (one execution in 14 attempts),
+  so such a check can only return "cannot tell" at an API call apiece, and the
+  evidence it would need is not the marker but the `command_execution` item's
+  `command` plus a non-zero `exit_code` — a model asked to `echo` the refusal
+  string satisfies any marker-based criterion with nothing sandboxed. What the
+  section keeps is the reasoning: narration is never proof, and
+  `spindle doctor --smoke --harness codex` is the end-to-end check of the spool
+  path.
+- The other `codex exec` snippets in `docs/CODEX_SETUP.md` pass
+  `--skip-git-repo-check` too, so they no longer die outside a git repo. The
+  post-install "Verify authentication" step was the worst of these: it failed
+  with a trusted-directory error that reads as broken credentials. Those
+  snippets also now say `--sandbox workspace-write` instead of `--full-auto`,
+  which the same page warns silently overrides `--sandbox`.
 
 ### Changed
 

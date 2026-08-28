@@ -80,6 +80,10 @@ result = unspool(spool_id)
 The harness uses `codex exec` with the following flags:
 - `--json`: Structured JSON output for parsing
 - `--sandbox <mode>`: the tier the spool's permission maps to, always passed explicitly
+- `--skip-git-repo-check`: a spool's working dir need not be a repo (a doctor smoke's temp
+  dir, a scratch research dir). Without it codex refuses to start outside a git repo unless
+  the path is listed under `[projects]` in `~/.codex/config.toml`, which would make whether
+  a spool runs depend on the operator's personal config. Containment stays with `--sandbox`.
 
 `--full-auto` is deliberately not used. It combines a workspace-write sandbox with
 on-failure approvals, and that bundled tier silently overrides `--sandbox` regardless of

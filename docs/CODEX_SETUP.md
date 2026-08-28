@@ -38,8 +38,11 @@ This will:
 
 Verify authentication:
 ```bash
-codex exec "print('Hello from Codex')"
+codex exec --skip-git-repo-check "print('Hello from Codex')"
 ```
+`--skip-git-repo-check` keeps this from failing for a reason that has nothing to do with auth:
+outside a git repo (and outside `[projects]` in `~/.codex/config.toml`) codex 0.145.0 exits
+with `Not inside a trusted directory` before it ever checks your credentials.
 
 If successful, you'll see Codex execute the command.
 
@@ -78,11 +81,18 @@ file or directory` (fails closed — nothing escapes, but nothing runs either).
 Spindle always passes the tier explicitly:
 
 ```bash
-codex exec --json --sandbox <mode> "your task"
+codex exec --json --skip-git-repo-check --sandbox <mode> "your task"
 ```
 
 `--full-auto` is never passed: it carries its own workspace-write tier that overrides
 `--sandbox` regardless of order, and `codex exec` is already non-interactive without it.
+
+`--skip-git-repo-check` is always passed because a working dir is not always a repo — a
+`spindle doctor --smoke` temp dir, a scratch research dir. Without it codex refuses to start
+there (`Not inside a trusted directory and --skip-git-repo-check was not specified`) unless
+that exact path is listed under `[projects]` in `~/.codex/config.toml`, so whether a spool
+could run would depend on the operator's personal config. It relaxes no containment: the
+sandbox tier above is the boundary, and the git check only ever gated startup.
 
 ### Sandbox Policies
 
@@ -327,7 +337,7 @@ npm update -g @openai/codex
 
 Verify Spindle compatibility:
 ```bash
-codex exec --json --full-auto "print('test')"
+codex exec --json --skip-git-repo-check --sandbox workspace-write "print('test')"
 ```
 
 If the JSON format changed, Spindle may need updates to parsing logic.
@@ -367,14 +377,84 @@ print(f"enforces sandbox: {_codex_sandbox_enforces(binary)}")
 If that prints `False`, spindle will refuse `readonly`/`careful` (and other restrictive)
 codex spools rather than run them unsandboxed.
 
-To confirm enforcement end-to-end, ask a read-only run to write and check nothing appears:
+To confirm enforcement by hand, run the no-model probe. It is deterministic, costs nothing, and
+cannot be argued out of a verdict. This is the shell command Spindle's own probe runs
+(`_codex_sandbox_probe`), against a fresh directory, twice: once at a tier that must refuse the
+write and once at a tier that must allow it. No model in the loop, and no
+`--skip-git-repo-check` needed, since `codex sandbox` does no git-repo check.
 ```bash
-cd /tmp && rm -f /tmp/probe.txt
-codex exec --sandbox read-only "run: echo x > /tmp/probe.txt ; report the literal error"
-ls /tmp/probe.txt   # must not exist
+d=$(mktemp -d) && cd "$d"
+
+# Leg 1 — read-only: the write must be refused.
+codex -c sandbox_mode=read-only sandbox -- \
+  /bin/sh -c 'printf BROKEN > probe.txt; write_rc=$?; echo PROBE_RAN; exit $write_rc'
+ls probe.txt   # must NOT exist
+
+# Leg 2 — positive control: same command, same directory, same target, at a tier that allows it.
+codex -c sandbox_mode=workspace-write sandbox -- \
+  /bin/sh -c 'printf BROKEN > probe.txt; write_rc=$?; echo PROBE_RAN; exit $write_rc'
+ls probe.txt   # must exist
 ```
-Expected: `zsh:1: read-only file system: /tmp/probe.txt`, and no file. If the file appears,
-this codex is not enforcing `--sandbox` — do not use it for readonly spools.
+All three of these must hold. Check them; do not eyeball the output.
+
+1. **Both legs print `PROBE_RAN`.** The marker is emitted *after* the write is attempted, so it
+   proves the attempt ran to completion inside the sandbox. No marker means the command never
+   ran at all — wrong CLI shape for this version, or codex failed to start — and the leg
+   decides nothing either way.
+2. **Leg 1 leaves no `probe.txt`, and exits non-zero** (observed: exit 2, `/bin/sh: 1: cannot
+   create probe.txt: Read-only file system`). The directory is fresh, so nothing pre-exists
+   there and any `probe.txt` afterwards was written by leg 1 — if one appears, this codex is
+   not enforcing its sandbox, and must not be used for readonly spools.
+3. **Leg 2 creates `probe.txt`, and exits 0.** Same directory and same filename as leg 1, which
+   is the point: it certifies that *this exact path* was writable, so leg 1's empty result was
+   the sandbox's doing.
+
+Leg 2 is not a formality, and it has to use leg 1's own target. A control that writes somewhere
+else certifies nothing about the probe's path, and plenty of things refuse a write without any
+sandbox involved — directory permissions, a read-only mount, a quota, a stale file. Verified on
+0.145.0: with the target's parent directory set to mode 555, leg 1 behaves exactly like a clean
+pass (marker, exit 2, `Read-only file system`, no file) at *both* tiers, including the one that
+permits writes. Only the failing control distinguishes that from real enforcement.
+
+`codex sandbox` takes the tier only via `-c`, never `--sandbox`. On codex ~0.125.x the
+subcommand nested under the platform (`... sandbox linux -- ...`); on 0.145.0 that form is
+gone and panics with `Failed to execvp linux: No such file or directory` (exit 101), because
+`linux` is read as the command. Spindle tries both shapes for this reason.
+
+There is deliberately **no `codex exec` version of this check**. On 0.145.0 the model will not
+perform a write it expects to fail: across 14 read-only attempts under several phrasings —
+including one explicitly demanding the shell tool be used — exactly one actually ran the
+command. The rest exited 0, emitted no `command_execution` item at all, and fabricated the
+transcript — marker, exact error text and all. Control prompts that attempt no write (`pwd`, or
+an `echo` of the error text)
+executed on the first try, so this is specific to the doomed write, not general flakiness. A
+recipe here would answer "cannot tell" on nearly every run at an API call apiece, and repeated
+"cannot tell" reads as a broken binary rather than a model that declined.
+
+Two traps if you write your own anyway, both observed on 0.145.0:
+
+- Narration is not evidence. All nine captured fabrications contain both the marker and the
+  exact error string, so no grep of the reported text distinguishes them from a real refusal.
+  Without `--json` the transcript also echoes your prompt back, so a marker grep matches even
+  when auth fails and no model turn happens at all (observed: exit 1, HTTP 401, marker present
+  from the echo alone).
+- A marker in `--json`'s `command_execution.aggregated_output` is not enough either. Asked to
+  `echo` the error text instead of attempting the write, the model produced
+  `aggregated_output: 'PROBE_RAN\nzsh:1: read-only file system: /tmp/probe.txt\n'` with
+  `exit_code: 0` and no write attempted — indistinguishable from a refusal on the marker
+  alone. Telling them apart needs the item's `command` field to contain the redirect *and* a
+  non-zero `exit_code` (the one genuine refusal exited 1). Also note `command_execution` is
+  emitted twice per command — `item.started`, then `item.completed`, sharing an `id` — so
+  count only `item.completed`, or a single command reads as two.
+
+For an end-to-end check of the path spools actually take, use `spindle doctor --smoke --harness
+codex`: it spawns a real read-only codex spool and checks the answer comes back. That proves
+the spool path runs; the probe above is the verdict on whether the sandbox holds.
+
+Spindle passes `--skip-git-repo-check` on every codex `exec` launch (spin and respin), so
+spools are spawned the way this section describes. Its four non-`exec` codex calls — `codex
+--version` twice (`_codex_cli_version`, and `_probe_command` for `doctor`'s harness check),
+`codex login status`, and the `codex sandbox` probe — neither pass it nor need it.
 
 ### Test Codex Manually
 
@@ -382,13 +462,20 @@ Isolate Spindle vs Codex issues:
 
 ```bash
 # Direct Codex test
-codex exec --json --full-auto "create a hello world script"
+codex exec --json --skip-git-repo-check --sandbox workspace-write "create a hello world script"
 
 # With bypass (for older kernels)
-codex exec --json --dangerously-bypass-approvals-and-sandbox "create a hello world script"
+codex exec --json --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox \
+  "create a hello world script"
 ```
 
 If manual execution fails, the issue is with Codex CLI setup, not Spindle.
+
+These pass `--sandbox workspace-write` rather than `--full-auto`. The two grant the same
+writable tier, but `--full-auto` carries a tier of its own that overrides any `--sandbox`
+alongside it (see above), which is a poor habit to pick up from a troubleshooting snippet.
+`--skip-git-repo-check` is here for the same reason as everywhere else on this page: without
+it, none of these run outside a git repo.
 
 ## Security Considerations
 
