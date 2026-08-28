@@ -13,6 +13,10 @@ from pathlib import Path
 from .namespace_owner import (
     _atomic_json_write,
     _cleanup_locked_fd,
+    _owner_exit_from_dict,
+    _positive_json_integer,
+    _process_identity_sidecar_from_dict,
+    _type_strict_json_equal,
     _utc_now,
     read_proc_starttime,
     transition_owner_episode,
@@ -21,6 +25,7 @@ from .namespace_owner_process import (
     AUTHORITY_LOST_DISPOSITION,
     CONTAINMENT_BOUND_SECONDS,
     DEFAULT_CONTAINMENT_BOUND_SECONDS,
+    _parse_generation_argument,
     _set_subreaper,
 )
 from .namespace_owner_process import main as owner_main
@@ -100,8 +105,17 @@ def _record_guard(store: Path, spool_id: str):
 def _load(path: Path) -> dict | None:
     try:
         return json.loads(path.read_text())
-    except (FileNotFoundError, OSError, json.JSONDecodeError, TypeError):
+    except (FileNotFoundError, OSError, RecursionError, TypeError, ValueError):
         return None
+
+
+def _same_generation(recorded, expected) -> bool:
+    try:
+        recorded = _positive_json_integer(recorded, "recorded owner generation")
+        expected = _positive_json_integer(expected, "expected owner generation")
+    except ValueError:
+        return False
+    return _type_strict_json_equal(recorded, expected)
 
 
 def _record_preacceptance_failure(
@@ -116,7 +130,7 @@ def _record_preacceptance_failure(
     spool_path = store / f"{spool_id}.json"
     spool = _load(spool_path) or {}
     episode = spool.get("owner_episode") or {}
-    if episode.get("generation") != owner_generation or episode.get("phase") != "reserved":
+    if not _same_generation(episode.get("generation"), owner_generation) or episode.get("phase") != "reserved":
         return False
     detail = "logical owner exited before binding"
     result = transition_owner_episode(
@@ -154,15 +168,23 @@ def _record_owner_crash(
 ) -> None:
     process_path = store / f"{spool_id}.process-identity"
     exit_path = store / f"{spool_id}.owner-exit"
-    process = _load(process_path) or {}
-    existing_exit = _load(exit_path)
+    raw_process = _load(process_path)
+    try:
+        process = _process_identity_sidecar_from_dict(raw_process) if raw_process is not None else {}
+    except (TypeError, ValueError):
+        process = None
+    raw_existing_exit = _load(exit_path)
+    try:
+        existing_exit = _owner_exit_from_dict(raw_existing_exit) if raw_existing_exit is not None else None
+    except (TypeError, ValueError):
+        existing_exit = None
     owner_signal = os.WTERMSIG(status) if os.WIFSIGNALED(status) else None
     owner_exit_code = os.WEXITSTATUS(status) if os.WIFEXITED(status) else None
 
     spool = _load(store / f"{spool_id}.json") or {}
     episode = spool.get("owner_episode") or {}
     if episode:
-        if episode.get("generation") != owner_generation:
+        if not _same_generation(episode.get("generation"), owner_generation):
             return
         if episode.get("phase") == "reserved":
             published = _record_preacceptance_failure(
@@ -185,7 +207,11 @@ def _record_owner_crash(
                 spindle.SPINDLE_DIR = store
                 converge_owner_episode(spool_id, ObserverIdentity.for_this_process())
             return
-    elif spool.get("owner_generation") != owner_generation or process.get("owner_generation") != owner_generation:
+    elif (
+        process is None
+        or not _same_generation(spool.get("owner_generation"), owner_generation)
+        or not _same_generation(process.get("owner_generation"), owner_generation)
+    ):
         # Direct/internal compatibility owners deliberately have no episode.
         # Retain the same generation guard using their durable flat/process
         # mirrors, then publish the legacy evidence reconciliation consumes.
@@ -227,7 +253,7 @@ def _record_owner_crash(
         )
 
     generation = owner_generation
-    if existing_exit and existing_exit.get("owner_generation") == generation:
+    if existing_exit and _same_generation(existing_exit.get("owner_generation"), generation):
         evidence = dict(existing_exit)
         evidence.update(
             {
@@ -242,7 +268,10 @@ def _record_owner_crash(
         evidence = {
             "owner_pid": owner_pid,
             "owner_generation": generation,
-            "provider_pid": process.get("provider_pid"),
+            # A malformed sidecar carries no usable identity evidence.  The
+            # episode transition above still records the crash and containment
+            # result; do not recover one field by partially trusting it.
+            "provider_pid": process.get("provider_pid") if process is not None else None,
             "provider_exit_code": None,
             "provider_reaped": contained,
             "adopted_children_reaped": None,
@@ -289,7 +318,7 @@ def main(argv=None) -> int:
     raw = list(sys.argv[1:] if args is None else args)
     store = Path(raw[raw.index("--store") + 1]).resolve()
     spool_id = raw[raw.index("--spool-id") + 1]
-    owner_generation = int(raw[raw.index("--generation") + 1]) if "--generation" in raw else 1
+    owner_generation = _parse_generation_argument(raw[raw.index("--generation") + 1]) if "--generation" in raw else 1
     error_read, error_write = os.pipe()
     watchdog_read, watchdog_write = os.pipe()
     disposition_read, disposition_write = os.pipe()

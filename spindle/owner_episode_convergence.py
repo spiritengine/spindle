@@ -17,7 +17,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .namespace_owner import MalformedControlReceipt, NamespaceIdentity
+from .namespace_owner import (
+    MalformedControlReceipt,
+    NamespaceIdentity,
+    _owner_exit_from_dict,
+    _process_fact_from_dict,
+    _type_strict_json_equal,
+)
 
 CONVERGENCE_FORMAT = "spindle.owner-convergence/1"
 EPISODE_FORMAT = "spindle.owner-episode/1"
@@ -154,19 +160,15 @@ def _same_namespace(episode: dict, observer: ObserverIdentity) -> bool:
 
 
 def _normalise_exit(code: Any) -> int | None:
-    if code is None or isinstance(code, bool):
+    if code is None or type(code) is not int:
         return None
-    try:
-        value = int(code)
-    except (TypeError, ValueError):
-        return None
-    return 128 + abs(value) if value < 0 else value
+    return 128 + abs(code) if code < 0 else code
 
 
 def _read_json(path: Path) -> dict | None:
     try:
         value = json.loads(path.read_text())
-    except (FileNotFoundError, OSError, json.JSONDecodeError, TypeError):
+    except (FileNotFoundError, OSError, RecursionError, TypeError, ValueError):
         return None
     return value if isinstance(value, dict) else None
 
@@ -177,12 +179,32 @@ def _exit_evidence(spool_id: str, record: dict, episode: dict) -> tuple[int | No
 
     generation = episode.get("generation")
     values: list[tuple[str, int]] = []
-    cleanup_code = _normalise_exit((episode.get("cleanup") or {}).get("provider_exit_code"))
-    if cleanup_code is not None:
-        values.append(("episode_cleanup", cleanup_code))
+    cleanup = episode.get("cleanup")
+    if isinstance(cleanup, dict) and "provider_exit_code" in cleanup:
+        cleanup_code = cleanup["provider_exit_code"]
+        if cleanup_code is not None:
+            if type(cleanup_code) is not int:
+                return None, None, "episode_cleanup_malformed"
+            values.append(("episode_cleanup", _normalise_exit(cleanup_code)))
 
-    sidecar = _read_json(spindle._get_owner_exit_path(spool_id))
-    if sidecar and sidecar.get("owner_generation") == generation:
+    sidecar_path = spindle._get_owner_exit_path(spool_id)
+    try:
+        raw_sidecar = json.loads(sidecar_path.read_text())
+    except FileNotFoundError:
+        sidecar = None
+    except (OSError, RecursionError, TypeError, ValueError):
+        return None, None, "owner_exit_malformed"
+    else:
+        if not isinstance(raw_sidecar, dict):
+            return None, None, "owner_exit_malformed"
+        if not _type_strict_json_equal(raw_sidecar.get("owner_generation"), generation):
+            sidecar = None
+        else:
+            try:
+                sidecar = _owner_exit_from_dict(raw_sidecar, require_core=False)
+            except (TypeError, ValueError):
+                return None, None, "owner_exit_malformed"
+    if sidecar and _type_strict_json_equal(sidecar["owner_generation"], generation):
         sidecar_code = _normalise_exit(sidecar.get("provider_exit_code"))
         if sidecar_code is not None:
             values.append(("owner_exit", sidecar_code))
@@ -289,7 +311,7 @@ def _current_generation_requests(spool_id: str, generation: int | None) -> tuple
         return tuple(
             request
             for request in spindle.iter_control_requests(spindle.SPINDLE_DIR, spool_id)
-            if request.owner_generation == generation
+            if _type_strict_json_equal(request.owner_generation, generation)
         )
     except OSError as exc:
         return MailboxUnavailable(f"{type(exc).__name__}: {exc}")
@@ -323,7 +345,11 @@ def _capture(
             receipt_errors[request.request_id] = str(exc)
         except OSError as exc:
             return MailboxUnavailable(f"{type(exc).__name__}: {exc}")
-    owner_exit = _read_json(spindle._get_owner_exit_path(spool_id))
+    raw_owner_exit = _read_json(spindle._get_owner_exit_path(spool_id))
+    try:
+        owner_exit = _owner_exit_from_dict(raw_owner_exit, require_core=False) if raw_owner_exit is not None else None
+    except (TypeError, ValueError):
+        owner_exit = None
     stdout_path = spindle._get_output_path(spool_id)
     stderr_path = spindle._get_stderr_path(spool_id)
     try:
@@ -566,7 +592,9 @@ def _origin(captured: CapturedOwnerEpisodeEvidence) -> tuple[str, str | None, st
         if failure_kind in compatibility_mapping:
             return compatibility_mapping[failure_kind], None, failure_kind
         owner_exit = captured.sidecars.get("owner_exit") or {}
-        if owner_exit.get("owner_generation") == episode.get("generation") and owner_exit.get("owner_crashed"):
+        if _type_strict_json_equal(owner_exit.get("owner_generation"), episode.get("generation")) and owner_exit.get(
+            "owner_crashed"
+        ):
             return "owner_crash_before_cleanup", None, "owner_crash"
         if winning and acknowledged:
             kind = winning.get("kind")
@@ -761,7 +789,9 @@ def _status_only_obligations(captured: CapturedOwnerEpisodeEvidence) -> dict:
     episode = captured.episode or {}
     generation = episode.get("generation")
     requests = {
-        request.request_id: request.kind for request in captured.requests if request.owner_generation == generation
+        request.request_id: request.kind
+        for request in captured.requests
+        if _type_strict_json_equal(request.owner_generation, generation)
     }
     entries = {}
     if requests:
@@ -995,7 +1025,7 @@ def _receipt_settles(receipt, request_id: str, intent: dict) -> bool:
     it carries the disposition the intent assigned it, and its cleanup fields
     are terminal.
     """
-    if receipt.owner_generation != intent.get("owner_generation"):
+    if not _type_strict_json_equal(receipt.owner_generation, intent.get("owner_generation")):
         return False
     if receipt.cleanup_outcome in _UNSETTLED_CLEANUP_OUTCOMES:
         return False
@@ -1090,7 +1120,7 @@ def _run_obligations(spool_id: str, record: dict) -> dict:
                 # this episode, but the established mailbox protocol still
                 # gives them their generation-scoped rejection when observed.
                 for request in requests.values():
-                    if request.owner_generation == generation:
+                    if _type_strict_json_equal(request.owner_generation, generation):
                         continue
                     try:
                         receipt = spindle.read_control_receipt(spindle.SPINDLE_DIR, spool_id, request.request_id)
@@ -1255,32 +1285,19 @@ def _is_real_episode_int(value: object, expected: int) -> bool:
 
 
 def _is_exact_episode_namespace(value: object) -> bool:
-    if not isinstance(value, dict):
+    try:
+        NamespaceIdentity.from_dict(value)
+    except (TypeError, ValueError):
         return False
-    if value.get("status") == "supported":
-        return set(value) == {"status", "device", "inode"} and all(
-            isinstance(value[field], int) and not isinstance(value[field], bool) and value[field] >= 0
-            for field in ("device", "inode")
-        )
-    return (
-        value.get("status") == "unsupported"
-        and set(value) == {"status", "reason"}
-        and isinstance(value.get("reason"), str)
-        and bool(value["reason"])
-    )
+    return True
 
 
 def _is_exact_episode_starter(value: object) -> bool:
-    return bool(
-        isinstance(value, dict)
-        and set(value) == {"pid", "birth_token", "namespace"}
-        and isinstance(value.get("pid"), int)
-        and not isinstance(value.get("pid"), bool)
-        and value["pid"] > 0
-        and isinstance(value.get("birth_token"), str)
-        and bool(value["birth_token"])
-        and _is_exact_episode_namespace(value.get("namespace"))
-    )
+    try:
+        _process_fact_from_dict(value, record="starter fact")
+    except (TypeError, ValueError):
+        return False
+    return True
 
 
 def _is_exact_aborted_episode_shape(episode: dict) -> bool:

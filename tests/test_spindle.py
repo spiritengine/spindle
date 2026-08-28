@@ -8187,6 +8187,116 @@ class TestCodexRespinPreservesGitAccess:
 
 
 class TestAtomicJsonCreate:
+    def test_new_recursive_parents_are_durable_before_file_publication(self, tmp_path, monkeypatch):
+        import spindle.namespace_owner as namespace_owner
+
+        path = tmp_path / "mailboxes" / "nested" / "request.json"
+        events = []
+        real_fsync = namespace_owner._fsync_directory_after_publication
+
+        def traced_directory_fsync(directory, *, publication):
+            events.append((Path(directory), publication, path.exists()))
+            return real_fsync(directory, publication=publication)
+
+        monkeypatch.setattr(namespace_owner, "_fsync_directory_after_publication", traced_directory_fsync)
+
+        assert namespace_owner._atomic_json_create(path, {"id": "request"}) is True
+
+        assert events == [
+            (tmp_path, False, False),
+            (tmp_path / "mailboxes", False, False),
+            (tmp_path / "mailboxes" / "nested", True, True),
+        ]
+        assert json.loads(path.read_text(encoding="utf-8")) == {"id": "request"}
+
+    def test_existing_parent_preserves_atomic_create_ordering(self, tmp_path, monkeypatch):
+        import spindle.namespace_owner as namespace_owner
+
+        path = tmp_path / "request.json"
+        events = []
+        real_link = os.link
+        real_unlink = os.unlink
+
+        def traced_link(source, destination):
+            events.append("link")
+            return real_link(source, destination)
+
+        def traced_unlink(candidate):
+            events.append("unlink")
+            return real_unlink(candidate)
+
+        def traced_directory_fsync(directory, *, publication):
+            events.append(("fsync", Path(directory), publication))
+
+        monkeypatch.setattr(namespace_owner.os, "link", traced_link)
+        monkeypatch.setattr(namespace_owner.os, "unlink", traced_unlink)
+        monkeypatch.setattr(namespace_owner, "_fsync_directory_after_publication", traced_directory_fsync)
+
+        assert namespace_owner._atomic_json_create(path, {"id": "request"}) is True
+        assert events == ["link", "unlink", ("fsync", tmp_path, True)]
+
+    def test_parent_directory_fsync_failure_precedes_any_file_publication(self, tmp_path, monkeypatch):
+        import spindle.namespace_owner as namespace_owner
+
+        path = tmp_path / "mailbox" / "request.json"
+
+        def fail_parent_fsync(directory, *, publication):
+            assert directory == tmp_path
+            assert publication is False
+            assert not path.exists()
+            raise OSError(errno.EIO, "parent directory fsync failed")
+
+        monkeypatch.setattr(namespace_owner, "_fsync_directory_after_publication", fail_parent_fsync)
+
+        with pytest.raises(OSError, match="parent directory fsync failed") as raised:
+            namespace_owner._atomic_json_create(path, {"id": "request"})
+
+        assert raised.value.errno == errno.EIO
+        assert path.parent.is_dir()
+        assert not path.exists()
+        assert list(path.parent.iterdir()) == []
+
+    def test_parent_fsync_error_remains_primary_when_directory_close_also_fails(self, tmp_path, monkeypatch):
+        import spindle.namespace_owner as namespace_owner
+
+        path = tmp_path / "mailbox" / "request.json"
+        real_close = os.close
+
+        def fail_parent_fsync(_fd):
+            raise OSError(errno.EIO, "parent fsync primary")
+
+        def close_then_fail(fd):
+            real_close(fd)
+            raise OSError(errno.EBADF, "parent close secondary")
+
+        monkeypatch.setattr(namespace_owner.os, "fsync", fail_parent_fsync)
+        monkeypatch.setattr(namespace_owner.os, "close", close_then_fail)
+
+        with pytest.raises(OSError, match="parent fsync primary") as raised:
+            namespace_owner._atomic_json_create(path, {"id": "request"})
+
+        assert raised.value.errno == errno.EIO
+        assert not path.exists()
+
+    def test_first_control_request_durably_creates_and_reads_its_mailbox(self, tmp_path):
+        import spindle.namespace_owner as namespace_owner
+
+        spool_id = "first-mailbox-request"
+        mailbox = namespace_owner.mailbox_path(tmp_path, spool_id)
+        assert not mailbox.exists()
+
+        request = namespace_owner.create_control_request(
+            tmp_path,
+            spool_id,
+            "cancel",
+            1,
+            "unit-test",
+            request_id="first-request",
+        )
+
+        assert mailbox.is_dir()
+        assert list(namespace_owner.iter_control_requests(tmp_path, spool_id)) == [request]
+
     @pytest.mark.parametrize("collision", [False, True], ids=("publication", "collision"))
     def test_temp_cleanup_precedes_directory_fsync(self, tmp_path, monkeypatch, collision):
         import spindle.namespace_owner as namespace_owner
