@@ -659,9 +659,32 @@ def test_identity_loaders_treat_over_limit_json_integers_as_malformed(tmp_path, 
 
 
 @pytest.mark.parametrize("loader", ["watchdog", "convergence", "owner"])
+def test_identity_loaders_treat_non_object_json_as_malformed(tmp_path, loader):
+    path = tmp_path / "non-object.json"
+    path.write_text("[]", encoding="utf-8")
+
+    if loader == "watchdog":
+        assert owner_watchdog._load(path) is None
+    elif loader == "convergence":
+        assert owner_episode_convergence._read_json(path) is None
+    else:
+        owner = object.__new__(LogicalOwner)
+        owner.spool_path = path
+        owner.spool_id = "non-object"
+        record = owner._read_spool()
+        assert record["id"] == "non-object"
+        assert record["status"] == "pending"
+        assert isinstance(record["created_at"], str) and record["created_at"]
+
+
+@pytest.mark.parametrize("loader", ["watchdog", "convergence", "owner"])
 def test_identity_loaders_contain_deep_json_recursion(tmp_path, loader):
     path = tmp_path / "deep.json"
-    path.write_text("[" * 2000 + "0" + "]" * 2000, encoding="utf-8")
+    depth = max(100_000, sys.getrecursionlimit() * 2)
+    path.write_text("[" * depth + "0" + "]" * depth, encoding="utf-8")
+
+    with pytest.raises(RecursionError):
+        json.loads(path.read_text(encoding="utf-8"))
 
     if loader == "watchdog":
         assert owner_watchdog._load(path) is None

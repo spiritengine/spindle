@@ -104,9 +104,10 @@ def _record_guard(store: Path, spool_id: str):
 
 def _load(path: Path) -> dict | None:
     try:
-        return json.loads(path.read_text())
+        value = json.loads(path.read_text())
     except (FileNotFoundError, OSError, RecursionError, TypeError, ValueError):
         return None
+    return value if isinstance(value, dict) else None
 
 
 def _same_generation(recorded, expected) -> bool:

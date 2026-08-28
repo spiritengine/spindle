@@ -586,9 +586,12 @@ class LogicalOwner:
 
     def _read_spool(self) -> dict:
         try:
-            return json.loads(self.spool_path.read_text())
+            value = json.loads(self.spool_path.read_text())
         except (FileNotFoundError, RecursionError, ValueError):
-            return {"id": self.spool_id, "status": "pending", "created_at": _utc_now()}
+            value = None
+        if isinstance(value, dict):
+            return value
+        return {"id": self.spool_id, "status": "pending", "created_at": _utc_now()}
 
     def _write_spool_unlocked(self, spool: dict) -> None:
         _atomic_json_write(self.spool_path, spool)
