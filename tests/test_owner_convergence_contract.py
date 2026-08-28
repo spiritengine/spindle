@@ -348,15 +348,54 @@ def test_the_causal_invariant_accepts_the_episode_the_transition_writer_really_b
     monkeypatch.setattr("spindle.namespace_owner._utc_now", lambda: next(commit_times))
 
     transitions = (
-        ("launcher", "reserved", None, {"starter": {"pid": 1}}),
-        ("launcher", "reserved", 1, {"watchdog": {"pid": 2}}),
-        ("owner", "lock_bound", 2, {"owner": {"pid": 3}, "lock": {"device": 4, "inode": 5}}),
+        (
+            "launcher",
+            "reserved",
+            None,
+            {
+                "starter": {
+                    "pid": 1,
+                    "birth_token": "1",
+                    "namespace": {"status": "supported", "device": 7, "inode": 11},
+                }
+            },
+        ),
+        (
+            "launcher",
+            "reserved",
+            1,
+            {
+                "watchdog": {
+                    "pid": 2,
+                    "birth_token": "2",
+                    "namespace": {"status": "supported", "device": 7, "inode": 11},
+                }
+            },
+        ),
+        (
+            "owner",
+            "lock_bound",
+            2,
+            {
+                "owner": {
+                    "pid": 3,
+                    "birth_token": "3",
+                    "namespace": {"status": "supported", "device": 7, "inode": 11},
+                },
+                "lock": {"device": 4, "inode": 5},
+            },
+        ),
         (
             "owner",
             "accepted",
             3,
             {
-                "provider": {"pid": 6},
+                "provider": {
+                    "pid": 6,
+                    "pgid": 6,
+                    "birth_token": "6",
+                    "namespace": {"status": "supported", "device": 7, "inode": 11},
+                },
                 "provider_custody": custody_fact(),
             },
         ),

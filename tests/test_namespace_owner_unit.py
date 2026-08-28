@@ -2061,6 +2061,7 @@ def _fake_provider_start(monkeypatch, *, spawn_error=None):
         return _FakeProvider()
 
     monkeypatch.setattr("spindle.namespace_owner_process.subprocess.Popen", fake_popen)
+    monkeypatch.setattr("spindle.namespace_owner_process.os.getpgid", lambda _pid: _FakeProvider.pid)
     monkeypatch.setattr("spindle.namespace_owner_process._starttime", lambda _pid: "test-start")
     monkeypatch.setattr(
         "spindle.namespace_owner_process.os.pidfd_open",
@@ -2068,6 +2069,53 @@ def _fake_provider_start(monkeypatch, *, spawn_error=None):
         raising=False,
     )
     return started
+
+
+def test_provider_start_persists_the_observed_process_group(tmp_path, monkeypatch):
+    owner = _spawning_owner(tmp_path, "observed-provider-pgid")
+    started = _fake_provider_start(monkeypatch)
+    observed_pgid = _FakeProvider.pid + 17
+    monkeypatch.setattr("spindle.namespace_owner_process.os.getpgid", lambda pid: observed_pgid)
+
+    try:
+        assert owner._spawn_provider() is None
+        assert len(started) == 1
+        assert owner.provider_pgid == observed_pgid
+        process_identity = json.loads(owner.process_identity_path.read_text())
+        assert process_identity["provider_pgid"] == observed_pgid
+        assert json.loads(owner.spool_path.read_text())["provider_process_group_id"] == observed_pgid
+    finally:
+        owner.control.close()
+        owner.lock.close()
+
+
+@pytest.mark.parametrize("observed", [OSError("getpgid failed"), 0, -4242, 2**31, True])
+def test_unverified_provider_group_uses_only_bounded_child_custody(tmp_path, monkeypatch, observed):
+    from spindle.namespace_owner_process import CONTAINMENT_BOUND_SECONDS
+
+    owner = _spawning_owner(tmp_path, "unverified-provider-pgid")
+    _fake_provider_start(monkeypatch)
+    custody_passes = []
+    owner._contain_own_children = lambda bound: custody_passes.append(bound) or True
+    monkeypatch.setattr(
+        "spindle.namespace_owner_process.os.getpgid",
+        lambda _pid: (_ for _ in ()).throw(observed) if isinstance(observed, OSError) else observed,
+    )
+    monkeypatch.setattr(
+        "spindle.namespace_owner_process.os.killpg",
+        lambda *_args: pytest.fail("an unverified provider group was signalled"),
+    )
+
+    try:
+        with pytest.raises(RuntimeError, match="process group could not be verified"):
+            owner._spawn_provider()
+        assert owner.provider_pgid is None
+        assert custody_passes == [CONTAINMENT_BOUND_SECONDS]
+        assert owner.control is None
+        assert not owner.process_identity_path.exists()
+        assert json.loads(owner.spool_path.read_text())["status"] == "pending"
+    finally:
+        owner.lock.close()
 
 
 def test_pre_popen_reverify_retries_recoverable_unreadable_before_provider_start(tmp_path, monkeypatch):

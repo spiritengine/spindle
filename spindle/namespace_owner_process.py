@@ -8,6 +8,7 @@ import fcntl
 import json
 import math
 import os
+import re
 import select
 import signal
 import socket
@@ -25,6 +26,8 @@ from .namespace_owner import (
     ProcessIdentity,
     _atomic_json_write,
     _cleanup_locked_fd,
+    _pgid_json_integer,
+    _positive_json_integer,
     _utc_now,
     acquire_ownership_lock,
     capture_pid_namespace,
@@ -56,6 +59,14 @@ PR_SET_CHILD_SUBREAPER = 36
 # number so a provider that ignores SIGTERM cannot hold a deadline open - the
 # SIGKILL that follows is unconditional.
 DEFAULT_EVIDENCE_PRESERVATION_GRACE_SECONDS = 5.0
+
+_CANONICAL_GENERATION = re.compile(r"[1-9][0-9]*\Z")
+
+
+def _parse_generation_argument(value: str) -> int:
+    if not _CANONICAL_GENERATION.fullmatch(value):
+        raise ValueError("generation must be an ASCII decimal integer without sign or leading zero")
+    return int(value)
 
 
 def _resolve_evidence_grace_seconds() -> float:
@@ -276,7 +287,7 @@ class LogicalOwner:
         self.provider_pgid: Optional[int] = None
         self.provider_birth: Optional[str] = None
         self.control: Optional[socket.socket] = None
-        self.generation = int(args.generation)
+        self.generation = args.generation
         self.checkpoints = Checkpoints(args.checkpoint_fd, args.pause_checkpoint, self.generation)
         self.clock = OwnerClock(args.clock_fd)
         self.adopted_reaped = 0
@@ -575,9 +586,12 @@ class LogicalOwner:
 
     def _read_spool(self) -> dict:
         try:
-            return json.loads(self.spool_path.read_text())
-        except (FileNotFoundError, json.JSONDecodeError):
-            return {"id": self.spool_id, "status": "pending", "created_at": _utc_now()}
+            value = json.loads(self.spool_path.read_text())
+        except (FileNotFoundError, RecursionError, ValueError):
+            value = None
+        if isinstance(value, dict):
+            return value
+        return {"id": self.spool_id, "status": "pending", "created_at": _utc_now()}
 
     def _write_spool_unlocked(self, spool: dict) -> None:
         _atomic_json_write(self.spool_path, spool)
@@ -676,9 +690,15 @@ class LogicalOwner:
         if self.episode_mode:
             return
         try:
-            previous = json.loads(self.owner_identity_path.read_text()).get("owner_generation", 0)
-        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            encoded = self.owner_identity_path.read_text()
+        except OSError:
             previous = 0
+        else:
+            try:
+                previous = ProcessIdentity.from_dict(json.loads(encoded)).owner_generation
+            except (RecursionError, TypeError, ValueError) as exc:
+                raise ValueError("malformed owner identity prevents generation allocation") from exc
+        self.generation = _positive_json_integer(self.generation, "logical owner generation")
         if self.generation <= previous:
             self.generation = previous + 1
             self.checkpoints.generation = self.generation
@@ -1077,7 +1097,22 @@ class LogicalOwner:
             return EPISODE_UNSETTLEABLE_EXIT_CODE
         self.control = owner_end
         self.control.setblocking(False)
-        self.provider_pgid = self.provider.pid
+        try:
+            self.provider_pgid = _pgid_json_integer(os.getpgid(self.provider.pid), "observed provider process group")
+        except (OSError, ValueError) as exc:
+            # Popen proves this process is our child, but a failed/invalid PGID
+            # observation gives no authority to signal a process group.  Use
+            # only live kernel parentage for one bounded containment pass; the
+            # packaged watchdog takes custody of anything left when this
+            # exceptional owner exit reparents it.
+            self.provider_pgid = None
+            try:
+                self.control.close()
+            except OSError:
+                pass
+            self.control = None
+            self._contain_own_children(CONTAINMENT_BOUND_SECONDS)
+            raise RuntimeError("provider process group could not be verified") from exc
         self.provider_birth = _starttime(self.provider.pid)
         # The packaged watchdog is already the primary containment parent.
         # This checkpoint exercises owner death in the narrow interval before
@@ -1785,7 +1820,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--store", required=True)
     parser.add_argument("--spool-id", required=True)
-    parser.add_argument("--generation", type=int, default=1)
+    parser.add_argument("--generation", type=_parse_generation_argument, default=1)
     parser.add_argument("--ready-fd", type=int)
     parser.add_argument("--launch-barrier-fd", type=int)
     parser.add_argument("--checkpoint-fd", type=int)

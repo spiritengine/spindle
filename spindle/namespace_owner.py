@@ -57,6 +57,9 @@ OWNER_ARTIFACT_SUFFIXES = (
     ".journal-guard",
 )
 
+_PID_T_MAX = 2**31 - 1
+_IDENTITY_COORDINATE_MAX = 2**64 - 1
+
 _close_fd = os.close
 
 
@@ -81,6 +84,28 @@ def _fsync_directory_after_publication(path: Path, *, publication: bool = True) 
         if publication:
             raise _DurablePublicationCleanupError(*exc.args) from exc
         raise
+
+
+def _create_parent_directories_durably(directory: Path) -> None:
+    """Create missing ancestors and durably publish each new directory entry."""
+    missing = []
+    probe = directory
+    while not probe.exists():
+        missing.append(probe)
+        if probe.parent == probe:
+            break
+        probe = probe.parent
+    if not missing:
+        # Preserve mkdir's existing non-directory and symlink behavior.
+        directory.mkdir(parents=True, exist_ok=True)
+        return
+    for new_directory in reversed(missing):
+        try:
+            new_directory.mkdir()
+        except FileExistsError:
+            if not new_directory.is_dir():
+                raise
+        _fsync_directory_after_publication(new_directory.parent, publication=False)
 
 
 def _utc_now() -> str:
@@ -109,6 +134,26 @@ def _positive_json_integer(value, field: str) -> int:
     return value
 
 
+def _pid_json_integer(value, field: str) -> int:
+    value = _positive_json_integer(value, field)
+    if value > _PID_T_MAX:
+        raise ValueError(f"{field} must fit signed pid_t")
+    return value
+
+
+def _optional_pid_json_integer(value, field: str) -> Optional[int]:
+    return None if value is None else _pid_json_integer(value, field)
+
+
+def _pgid_json_integer(value, field: str) -> int:
+    """Return a persisted process-group ID, never kill(2) selector syntax."""
+    return _pid_json_integer(value, field)
+
+
+def _optional_pgid_json_integer(value, field: str) -> Optional[int]:
+    return None if value is None else _pgid_json_integer(value, field)
+
+
 def _nonnegative_json_integer(value, field: str) -> int:
     """Return a plain nonnegative JSON integer, rejecting Python coercions."""
     if type(value) is not int or value < 0:
@@ -116,9 +161,33 @@ def _nonnegative_json_integer(value, field: str) -> int:
     return value
 
 
+def _identity_coordinate(value, field: str) -> int:
+    value = _nonnegative_json_integer(value, field)
+    if value > _IDENTITY_COORDINATE_MAX:
+        raise ValueError(f"{field} must fit an unsigned 64-bit identity coordinate")
+    return value
+
+
+def _optional_identity_coordinate(value, field: str) -> Optional[int]:
+    return None if value is None else _identity_coordinate(value, field)
+
+
+def _exact_json_bool(value, field: str) -> bool:
+    if type(value) is not bool:
+        raise ValueError(f"{field} must be a boolean")
+    return value
+
+
 def _nonempty_string(value, field: str) -> str:
     if not isinstance(value, str) or not value:
         raise ValueError(f"{field} must be a nonempty string")
+    return value
+
+
+def _birth_token(value, field: str) -> str:
+    value = _nonempty_string(value, field)
+    if "\x00" in value:
+        raise ValueError(f"{field} must not contain NUL")
     return value
 
 
@@ -156,8 +225,8 @@ class NamespaceIdentity:
     def supported(cls, device: int, inode: int) -> "NamespaceIdentity":
         return cls(
             "supported",
-            _nonnegative_json_integer(device, "namespace device"),
-            _nonnegative_json_integer(inode, "namespace inode"),
+            _identity_coordinate(device, "namespace device"),
+            _identity_coordinate(inode, "namespace inode"),
         )
 
     @classmethod
@@ -240,9 +309,137 @@ class ProcessIdentity:
 
     @classmethod
     def from_dict(cls, value: dict) -> "ProcessIdentity":
-        data = dict(value)
-        data["namespace"] = NamespaceIdentity.from_dict(data["namespace"])
-        return cls(**data)
+        fields = frozenset(
+            {
+                "pid",
+                "birth_token",
+                "namespace",
+                "owner_generation",
+                "child_pgid",
+                "lock_device",
+                "lock_inode",
+                "lock_created",
+                "legacy_service_identity",
+            }
+        )
+        _require_exact_fields(value, fields, "process identity")
+        lock_device = _optional_identity_coordinate(value["lock_device"], "process identity lock_device")
+        lock_inode = _optional_identity_coordinate(value["lock_inode"], "process identity lock_inode")
+        if (lock_device is None) != (lock_inode is None):
+            raise ValueError("process identity lock_device and lock_inode must be jointly null or present")
+        lock_created = _exact_json_bool(value["lock_created"], "process identity lock_created")
+        if lock_created and lock_device is None:
+            raise ValueError("process identity lock_created requires lock coordinates")
+        legacy = value["legacy_service_identity"]
+        if legacy is not None:
+            legacy = _nonempty_string(legacy, "process identity legacy_service_identity")
+        return cls(
+            pid=_pid_json_integer(value["pid"], "process identity pid"),
+            birth_token=_birth_token(value["birth_token"], "process identity birth_token"),
+            namespace=NamespaceIdentity.from_dict(value["namespace"]),
+            owner_generation=_positive_json_integer(value["owner_generation"], "process identity owner_generation"),
+            child_pgid=_optional_pgid_json_integer(value["child_pgid"], "process identity child_pgid"),
+            lock_device=lock_device,
+            lock_inode=lock_inode,
+            lock_created=lock_created,
+            legacy_service_identity=legacy,
+        )
+
+
+def _process_fact_from_dict(value: dict, *, record: str = "process fact") -> dict:
+    _require_exact_fields(value, frozenset({"pid", "birth_token", "namespace"}), record)
+    return {
+        "pid": _pid_json_integer(value["pid"], f"{record} pid"),
+        "birth_token": _birth_token(value["birth_token"], f"{record} birth_token"),
+        "namespace": NamespaceIdentity.from_dict(value["namespace"]).to_dict(),
+    }
+
+
+def _provider_fact_from_dict(value: dict) -> dict:
+    _require_exact_fields(value, frozenset({"pid", "pgid", "birth_token", "namespace"}), "provider fact")
+    result = _process_fact_from_dict(
+        {name: value[name] for name in ("pid", "birth_token", "namespace")}, record="provider fact"
+    )
+    result["pgid"] = _pgid_json_integer(value["pgid"], "provider fact pgid")
+    return result
+
+
+def _lock_fact_from_dict(value: dict) -> dict:
+    _require_exact_fields(value, frozenset({"device", "inode"}), "lock fact")
+    return {
+        "device": _identity_coordinate(value["device"], "lock fact device"),
+        "inode": _identity_coordinate(value["inode"], "lock fact inode"),
+    }
+
+
+def _owner_exit_from_dict(value: dict, *, require_core: bool = True) -> dict:
+    if type(value) is not dict:
+        raise ValueError("owner exit must be a JSON object")
+    required = frozenset({"owner_generation", "provider_reaped", "cleanup_outcome"})
+    missing = required - value.keys() if require_core else frozenset({"owner_generation"}) - value.keys()
+    if missing:
+        raise ValueError(f"owner exit is missing required fields: {sorted(missing)}")
+    result = dict(value)
+    result["owner_generation"] = _positive_json_integer(value["owner_generation"], "owner exit owner_generation")
+    if "provider_reaped" in value:
+        result["provider_reaped"] = _exact_json_bool(value["provider_reaped"], "owner exit provider_reaped")
+    if "cleanup_outcome" in value:
+        result["cleanup_outcome"] = _nonempty_string(value["cleanup_outcome"], "owner exit cleanup_outcome")
+    for field in ("owner_pid", "provider_pid"):
+        if field in value:
+            result[field] = _optional_pid_json_integer(value[field], f"owner exit {field}")
+    for field in ("provider_exit_code", "adopted_children_reaped", "owner_signal", "owner_exit_code"):
+        if field in value:
+            result[field] = (
+                None if value[field] is None else _nonnegative_json_integer(value[field], f"owner exit {field}")
+            )
+    for field in ("observed_at", "child_exit_observed_at", "watchdog_observed_at"):
+        if field in value:
+            result[field] = _nonempty_string(value[field], f"owner exit {field}")
+    for field in (
+        "owner_crashed",
+        "watchdog_contained",
+        "watchdog_parent_lost",
+        "owner_crashed_after_cleanup",
+    ):
+        if field in value:
+            result[field] = _exact_json_bool(value[field], f"owner exit {field}")
+    return result
+
+
+def _process_identity_sidecar_from_dict(value: dict) -> dict:
+    if type(value) is not dict:
+        raise ValueError("process identity sidecar must be a JSON object")
+    for field in ("owner_generation", "provider_pid"):
+        if field not in value:
+            raise ValueError(f"process identity sidecar is missing {field}")
+    result = dict(value)
+    result["owner_generation"] = _positive_json_integer(
+        value["owner_generation"], "process identity sidecar owner_generation"
+    )
+    result["provider_pid"] = _optional_pid_json_integer(value["provider_pid"], "process identity sidecar provider_pid")
+    if "owner_pid" in value:
+        result["owner_pid"] = _pid_json_integer(value["owner_pid"], "process identity sidecar owner_pid")
+    if "owner_namespace" in value:
+        result["owner_namespace"] = NamespaceIdentity.from_dict(value["owner_namespace"]).to_dict()
+    if "provider_pgid" in value:
+        result["provider_pgid"] = _optional_pid_json_integer(
+            value["provider_pgid"], "process identity sidecar provider_pgid"
+        )
+    if "provider_birth_token" in value:
+        result["provider_birth_token"] = _birth_token(
+            value["provider_birth_token"], "process identity sidecar provider_birth_token"
+        )
+    if "provider_pidfd_acquired" in value:
+        result["provider_pidfd_acquired"] = _exact_json_bool(
+            value["provider_pidfd_acquired"], "process identity sidecar provider_pidfd_acquired"
+        )
+    for field in ("lock_device", "lock_inode"):
+        if field in value:
+            result[field] = _identity_coordinate(value[field], f"process identity sidecar {field}")
+    if ("lock_device" in value) != ("lock_inode" in value):
+        raise ValueError("process identity sidecar lock coordinates must be jointly present")
+    return result
 
 
 @dataclass(frozen=True)
@@ -297,7 +494,11 @@ def assess_process_liveness(identity: ProcessIdentity, *, ops=None) -> LivenessE
             if exc.errno in {errno.ENOENT, errno.EACCES, errno.EPERM}:
                 return LivenessEvidence("unverifiable", "proc_unavailable")
             return LivenessEvidence("unverifiable", "proc_error")
-        if str(observed_birth) != str(identity.birth_token):
+        if (
+            type(observed_birth) is not str
+            or type(identity.birth_token) is not str
+            or observed_birth != identity.birth_token
+        ):
             return LivenessEvidence("unverifiable", "identity_mismatch")
         if ops.pidfd_is_readable(pidfd):
             return LivenessEvidence("dead", "pidfd_exited")
@@ -486,7 +687,7 @@ def _episode_rejection(actor: str, source: Optional[str], destination: str) -> s
 
 
 def _valid_cleanup(value) -> bool:
-    return (
+    if not (
         isinstance(value, dict)
         and value.get("provider_reaped") is True
         and isinstance(value.get("adopted_children_reaped"), int)
@@ -494,7 +695,13 @@ def _valid_cleanup(value) -> bool:
         and value["adopted_children_reaped"] >= 0
         and bool(value.get("child_exit_observed_at"))
         and bool(value.get("outcome"))
-    )
+        and "provider_exit_code" in value
+    ):
+        return False
+    provider_exit_code = value["provider_exit_code"]
+    if provider_exit_code is not None and type(provider_exit_code) is not int:
+        return False
+    return True
 
 
 def _facts_are_consistent(current: dict, facts: dict) -> bool:
@@ -505,6 +712,25 @@ def _facts_are_consistent(current: dict, facts: dict) -> bool:
     if cleanup is not None and not _valid_cleanup(cleanup):
         return False
     lock = facts.get("lock", current.get("lock"))
+    try:
+        for role in ("starter", "watchdog", "owner"):
+            if role in facts:
+                _process_fact_from_dict(facts[role], record=f"{role} fact")
+        if "provider" in facts:
+            _provider_fact_from_dict(facts["provider"])
+        if "lock" in facts:
+            _lock_fact_from_dict(facts["lock"])
+        failure = facts.get("failure")
+        if isinstance(failure, dict):
+            if "owner_pid" in failure:
+                _pid_json_integer(failure["owner_pid"], "failure owner_pid")
+            if "owner_birth_token" in failure:
+                _birth_token(failure["owner_birth_token"], "failure owner_birth_token")
+        custody = facts.get("provider_custody")
+        if isinstance(custody, dict) and "pidfd_acquired" in custody:
+            _exact_json_bool(custody["pidfd_acquired"], "provider custody pidfd_acquired")
+    except (KeyError, TypeError, ValueError):
+        return False
     release = facts.get("release")
     if release is not None:
         if not isinstance(lock, dict) or not isinstance(release, dict):
@@ -660,6 +886,33 @@ def _episode_malformed_reason(episode) -> Optional[str]:
     missing = [name for name in _episode_required_facts(episode) if name not in episode]
     if missing:
         return f"missing_phase_fact:{missing[0]}"
+    for role in ("starter", "watchdog", "owner"):
+        if role in episode:
+            try:
+                _process_fact_from_dict(episode[role], record=f"{role} fact")
+            except (KeyError, TypeError, ValueError):
+                if role == "owner":
+                    return "ownership_identity_mismatch"
+                return f"malformed_{role}_identity"
+    if "provider" in episode:
+        try:
+            _provider_fact_from_dict(episode["provider"])
+        except (KeyError, TypeError, ValueError):
+            return "malformed_provider_identity"
+    if "lock" in episode:
+        try:
+            _lock_fact_from_dict(episode["lock"])
+        except (KeyError, TypeError, ValueError):
+            return "malformed_lock_identity"
+    failure = episode.get("failure")
+    if isinstance(failure, dict):
+        try:
+            if "owner_pid" in failure:
+                _pid_json_integer(failure["owner_pid"], "failure owner_pid")
+            if "owner_birth_token" in failure:
+                _birth_token(failure["owner_birth_token"], "failure owner_birth_token")
+        except (KeyError, TypeError, ValueError):
+            return "malformed_failure_identity"
     if phase in {"cleanup_proven", "released"} and not _valid_cleanup(episode.get("cleanup")):
         return "malformed_cleanup_fact"
     lock = episode.get("lock")
@@ -737,7 +990,7 @@ def _atomic_json_create(path: Path, value: dict) -> bool:
     final directory fsync, which makes both publication (when one occurred) and
     cleanup durable together.
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
+    _create_parent_directories_durably(path.parent)
     fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
     published = False
     primary = None
@@ -1152,17 +1405,20 @@ def active_spool_count(spools: Iterable[dict]) -> int:
     for spool in spools:
         episode = spool.get(OWNER_EPISODE_KEY)
         if isinstance(episode, dict) and episode.get("phase") == "reserved":
-            starter = episode.get("starter") or {}
             try:
-                identity = ProcessIdentity(
-                    pid=starter["pid"],
-                    birth_token=starter["birth_token"],
-                    namespace=NamespaceIdentity.from_dict(starter["namespace"]),
-                    owner_generation=episode.get("generation", 0),
-                    child_pgid=None,
-                    lock_device=None,
-                    lock_inode=None,
-                    lock_created=False,
+                starter = _process_fact_from_dict(episode["starter"], record="starter fact")
+                identity = ProcessIdentity.from_dict(
+                    {
+                        "pid": starter["pid"],
+                        "birth_token": starter["birth_token"],
+                        "namespace": starter["namespace"],
+                        "owner_generation": _positive_json_integer(episode["generation"], "owner episode generation"),
+                        "child_pgid": None,
+                        "lock_device": None,
+                        "lock_inode": None,
+                        "lock_created": False,
+                        "legacy_service_identity": None,
+                    }
                 )
                 liveness = assess_process_liveness(identity)
             except (KeyError, TypeError, ValueError):

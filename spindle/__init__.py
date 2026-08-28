@@ -86,8 +86,15 @@ from .namespace_owner import (  # noqa: E402
     ProcessIdentity,
     ReconciliationResult,
     _atomic_json_create,
+    _birth_token,
     _DurablePublicationCleanupError,
     _fsync_directory_after_publication,
+    _lock_fact_from_dict,
+    _owner_exit_from_dict,
+    _pid_json_integer,
+    _positive_json_integer,
+    _process_fact_from_dict,
+    _provider_fact_from_dict,
     _type_strict_json_equal,
     assess_process_liveness,
     capture_pid_namespace,
@@ -2389,16 +2396,24 @@ def _count_running() -> int:
 
 def _next_owner_generation(spool_id: str) -> int:
     generations = [0]
-    spool = _read_spool(spool_id) or {}
+    spool_path = _get_spool_path(spool_id)
+    spool = _read_spool(spool_id)
+    if spool is None:
+        if spool_path.exists():
+            raise ValueError(f"malformed spool record prevents generation allocation for {spool_id}")
+    elif "owner_generation" in spool:
+        generations.append(_positive_json_integer(spool["owner_generation"], "spool owner_generation"))
+    identity_path = _get_owner_identity_path(spool_id)
     try:
-        generations.append(int(spool.get("owner_generation") or 0))
-    except (TypeError, ValueError):
-        pass
-    try:
-        identity = json.loads(_get_owner_identity_path(spool_id).read_text())
-        generations.append(int(identity.get("owner_generation") or 0))
-    except (FileNotFoundError, OSError, json.JSONDecodeError, TypeError, ValueError):
-        pass
+        encoded_identity = identity_path.read_text()
+    except FileNotFoundError:
+        encoded_identity = None
+    if encoded_identity is not None:
+        try:
+            identity = ProcessIdentity.from_dict(json.loads(encoded_identity))
+        except (RecursionError, TypeError, ValueError) as exc:
+            raise ValueError(f"malformed owner identity prevents generation allocation for {spool_id}") from exc
+        generations.append(identity.owner_generation)
     return max(generations) + 1
 
 
@@ -2406,26 +2421,32 @@ def _process_fact(pid: int) -> dict:
     birth = _process_start_time(pid)
     return {
         "pid": pid,
-        "birth_token": str(birth) if birth is not None else "unavailable",
+        "birth_token": birth if birth is not None else "unavailable",
         "namespace": capture_pid_namespace().to_dict(),
     }
 
 
 def _episode_process_identity(episode: dict, role: str) -> Optional[ProcessIdentity]:
     fact = episode.get(role)
-    if not isinstance(fact, dict):
-        return None
-    lock = episode.get("lock") or {}
     try:
-        return ProcessIdentity(
-            pid=int(fact["pid"]),
-            birth_token=str(fact["birth_token"]),
-            namespace=NamespaceIdentity.from_dict(fact["namespace"]),
-            owner_generation=int(episode["generation"]),
-            child_pgid=None,
-            lock_device=lock.get("device"),
-            lock_inode=lock.get("inode"),
-            lock_created=role == "owner",
+        decoded_fact = (
+            _provider_fact_from_dict(fact)
+            if role == "provider"
+            else _process_fact_from_dict(fact, record=f"{role} fact")
+        )
+        lock = _lock_fact_from_dict(episode["lock"]) if "lock" in episode else {"device": None, "inode": None}
+        return ProcessIdentity.from_dict(
+            {
+                "pid": decoded_fact["pid"],
+                "birth_token": decoded_fact["birth_token"],
+                "namespace": decoded_fact["namespace"],
+                "owner_generation": _positive_json_integer(episode["generation"], "owner episode generation"),
+                "child_pgid": decoded_fact.get("pgid"),
+                "lock_device": lock["device"],
+                "lock_inode": lock["inode"],
+                "lock_created": role == "owner",
+                "legacy_service_identity": None,
+            }
         )
     except (KeyError, TypeError, ValueError):
         return None
@@ -2889,7 +2910,7 @@ def _publish_spawned_process(spool_id: str, pid: int, *, record_locked: bool = F
             launch_birth = _process_start_time(pid)
             launch_fact = {
                 "pid": pid,
-                "birth_token": str(launch_birth) if launch_birth is not None else "unavailable",
+                "birth_token": launch_birth if launch_birth is not None else "unavailable",
                 "namespace": capture_pid_namespace().to_dict(),
             }
             if current and current.get("status") in {"pending", "running"} and episode.get("phase") == "reserved":
@@ -2905,7 +2926,9 @@ def _publish_spawned_process(spool_id: str, pid: int, *, record_locked: bool = F
                 )
                 if published_episode.accepted:
                     current = _read_spool(spool_id)
-                    if not current or current.get("owner_episode", {}).get("generation") != episode.get("generation"):
+                    if not current or not _type_strict_json_equal(
+                        current.get("owner_episode", {}).get("generation"), episode.get("generation")
+                    ):
                         return False
                     current["watchdog_pid"] = pid
                     current["watchdog_start_time"] = launch_fact["birth_token"]
@@ -3263,20 +3286,24 @@ def _process_start_time(pid: int) -> Optional[str]:
 def _read_current_owner_identity(spool_id: str) -> Optional[ProcessIdentity]:
     try:
         return ProcessIdentity.from_dict(json.loads(_get_owner_identity_path(spool_id).read_text()))
-    except (FileNotFoundError, OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+    except (FileNotFoundError, OSError, RecursionError, KeyError, TypeError, ValueError):
         return None
 
 
 def _owner_exit_evidence(spool_id: str, owner_generation: int) -> tuple[bool, bool]:
     """Return generation-matched exit and cleanup evidence for one owner."""
     try:
-        evidence = json.loads(_get_owner_exit_path(spool_id).read_text())
-    except (FileNotFoundError, OSError, json.JSONDecodeError, TypeError, ValueError):
+        evidence = _owner_exit_from_dict(json.loads(_get_owner_exit_path(spool_id).read_text()))
+    except (FileNotFoundError, OSError, RecursionError, TypeError, ValueError):
         return False, False
-    if evidence.get("owner_generation") != owner_generation:
+    try:
+        expected_generation = _positive_json_integer(owner_generation, "expected owner generation")
+    except ValueError:
         return False, False
-    provider_reaped = bool(evidence.get("provider_reaped"))
-    cleanup_complete = provider_reaped and bool(evidence.get("cleanup_outcome"))
+    if not _type_strict_json_equal(evidence["owner_generation"], expected_generation):
+        return False, False
+    provider_reaped = evidence["provider_reaped"] is True
+    cleanup_complete = provider_reaped and bool(evidence["cleanup_outcome"])
     return provider_reaped, cleanup_complete
 
 
@@ -3297,38 +3324,54 @@ def _reconcile_spool_ownership(spool: dict) -> ReconciliationResult:
         return ReconciliationResult(state, meaning.reason, meaning.liveness, meaning.lock)
 
     if spool.get("status") == "pending":
-        launcher_pid = spool.get("launcher_pid") or spool.get("watchdog_pid")
-        launcher_birth = spool.get("launcher_start_time") or spool.get("watchdog_start_time")
-        launcher_namespace = spool.get("launcher_namespace") or spool.get("watchdog_namespace")
-        if not launcher_pid:
+        role = next(
+            (
+                candidate
+                for candidate in ("watchdog", "launcher")
+                if any(f"{candidate}_{suffix}" in spool for suffix in ("pid", "start_time", "namespace"))
+            ),
+            None,
+        )
+        if role is None:
             return ReconciliationResult(
                 "terminalizable",
                 "pending_provider_never_started",
                 LivenessEvidence("dead", "no_launcher_pid"),
                 missing,
             )
-        if launcher_birth is None or not isinstance(launcher_namespace, dict):
+        fields = tuple(f"{role}_{suffix}" for suffix in ("pid", "start_time", "namespace"))
+        if any(field not in spool for field in fields):
             return ReconciliationResult(
                 "unverifiable",
-                "pending_launcher_identity_incomplete",
-                LivenessEvidence("unverifiable", "launcher_identity_incomplete"),
+                f"pending_{role}_identity_incomplete",
+                LivenessEvidence("unverifiable", f"{role}_identity_incomplete"),
                 missing,
             )
-        identity = ProcessIdentity(
-            pid=int(launcher_pid),
-            birth_token=str(launcher_birth),
-            namespace=NamespaceIdentity.from_dict(launcher_namespace),
-            owner_generation=0,
-            child_pgid=None,
-            lock_device=None,
-            lock_inode=None,
-            lock_created=False,
-        )
+        try:
+            identity = ProcessIdentity.from_dict(
+                {
+                    "pid": spool[fields[0]],
+                    "birth_token": spool[fields[1]],
+                    "namespace": spool[fields[2]],
+                    "owner_generation": 1,
+                    "child_pgid": None,
+                    "lock_device": None,
+                    "lock_inode": None,
+                    "lock_created": False,
+                    "legacy_service_identity": None,
+                }
+            )
+        except (KeyError, TypeError, ValueError):
+            return ReconciliationResult(
+                "unverifiable",
+                f"pending_{role}_identity_malformed",
+                LivenessEvidence("unverifiable", f"{role}_identity_malformed"),
+                missing,
+            )
         liveness = assess_process_liveness(identity)
         state = (
             "active" if liveness.state == "alive" else "terminalizable" if liveness.state == "dead" else "unverifiable"
         )
-        role = "watchdog" if spool.get("watchdog_pid") else "launcher"
         return ReconciliationResult(state, f"pending_{role}_{liveness.reason}", liveness, missing)
 
     if spool_id:
@@ -3467,8 +3510,12 @@ def _request_owner_stop_locked(spool: dict, kind: str, requested_by: str) -> tup
         # reach this branch.
         generation = spool.get("owner_generation")
         deadline = spool.get("wall_deadline_at")
-    if not generation:
+    if generation is None:
         return None, "logical owner generation is not published"
+    try:
+        generation = _positive_json_integer(generation, "logical owner generation")
+    except ValueError:
+        return None, "logical owner generation is malformed"
     request = create_control_request(
         SPINDLE_DIR,
         spool["id"],
@@ -3517,12 +3564,17 @@ def _spool_blocks_destructive_action(spool: dict) -> bool:
 
 def _spool_process_identity_matches(spool: dict) -> bool:
     """Prove that a stored PID still names the process Spindle launched."""
-    pid = spool.get("pid")
-    if not pid:
+    try:
+        pid = _pid_json_integer(spool.get("pid"), "spool pid")
+    except ValueError:
         return False
     expected_start_time = spool.get("process_start_time")
     if expected_start_time is not None:
-        return _process_start_time(pid) == str(expected_start_time)
+        try:
+            expected_start_time = _birth_token(expected_start_time, "spool process_start_time")
+        except ValueError:
+            return False
+        return _process_start_time(pid) == expected_start_time
     if _process_identity_lock_is_held(spool.get("id")):
         return _is_pid_alive(pid)
     proc = _PROC_HANDLES.get(spool.get("id"))
@@ -3556,14 +3608,19 @@ def _spool_process_group_identity_matches(spool: dict) -> bool:
     PID as a new group leader until the old group disappears. A live leader
     must still match its recorded birth token (or a live local Popen handle).
     """
-    pid = spool.get("pid")
-    if not pid:
+    try:
+        pid = _pid_json_integer(spool.get("pid"), "spool pid")
+    except ValueError:
         return False
     expected_start_time = spool.get("process_start_time")
     if expected_start_time is not None:
+        try:
+            expected_start_time = _birth_token(expected_start_time, "spool process_start_time")
+        except ValueError:
+            return False
         current_start_time = _process_start_time(pid)
         if current_start_time is not None:
-            return current_start_time == str(expected_start_time)
+            return current_start_time == expected_start_time
         return not _is_pid_alive(pid) and _is_process_group_alive(pid)
     if _process_identity_lock_is_held(spool.get("id")):
         return _is_pid_alive(pid)
@@ -3576,8 +3633,11 @@ def _spool_process_group_identity_matches(spool: dict) -> bool:
 
 def _spool_process_group_is_alive(spool: dict) -> bool:
     """Whether a spool's recorded leader or any member of its group is alive."""
-    pid = spool.get("pid")
-    return bool(pid) and (_is_pid_alive(pid) or _is_process_group_alive(pid))
+    try:
+        pid = _pid_json_integer(spool.get("pid"), "spool pid")
+    except ValueError:
+        return False
+    return _is_pid_alive(pid) or _is_process_group_alive(pid)
 
 
 def _resolve_spool_process_group(spool: dict, grace_seconds: float) -> str:
@@ -4591,7 +4651,11 @@ def _spawn_detached(
     else:
         generation = episode.get("generation")
         deadline = episode.get("deadline")
-    if not generation or (episode and episode.get("phase") != "reserved"):
+    try:
+        generation = _positive_json_integer(generation, "logical owner generation")
+    except ValueError as exc:
+        raise RuntimeError("logical owner generation is malformed") from exc
+    if episode and episode.get("phase") != "reserved":
         raise RuntimeError("owner episode is not reserved")
     barrier_read_fd, barrier_write_fd = os.pipe()
     owner_cmd = [
@@ -8093,32 +8157,19 @@ def _is_real_int(value: object, expected: int) -> bool:
 
 
 def _is_exact_process_namespace(value: object) -> bool:
-    if not isinstance(value, dict):
+    try:
+        NamespaceIdentity.from_dict(value)
+    except (TypeError, ValueError):
         return False
-    if value.get("status") == "supported":
-        return set(value) == {"status", "device", "inode"} and all(
-            isinstance(value[field], int) and not isinstance(value[field], bool) and value[field] >= 0
-            for field in ("device", "inode")
-        )
-    return (
-        value.get("status") == "unsupported"
-        and set(value) == {"status", "reason"}
-        and isinstance(value.get("reason"), str)
-        and bool(value["reason"])
-    )
+    return True
 
 
 def _is_exact_starter(value: object) -> bool:
-    return bool(
-        isinstance(value, dict)
-        and set(value) == {"pid", "birth_token", "namespace"}
-        and isinstance(value.get("pid"), int)
-        and not isinstance(value.get("pid"), bool)
-        and value["pid"] > 0
-        and isinstance(value.get("birth_token"), str)
-        and bool(value["birth_token"])
-        and _is_exact_process_namespace(value.get("namespace"))
-    )
+    try:
+        _process_fact_from_dict(value, record="starter fact")
+    except (TypeError, ValueError):
+        return False
+    return True
 
 
 def _has_exact_episode_shape(episode: dict, phase: str) -> bool:
@@ -8192,7 +8243,8 @@ def _is_exact_codex_respin_reservation(spool_id: str, record: Optional[dict], se
         and _type_strict_json_equal(starter.get("pid"), record.get("launcher_pid"))
         and _type_strict_json_equal(starter.get("namespace"), record.get("launcher_namespace"))
         and (
-            "launcher_start_time" not in record or starter.get("birth_token") == str(record.get("launcher_start_time"))
+            "launcher_start_time" not in record
+            or _type_strict_json_equal(starter.get("birth_token"), record.get("launcher_start_time"))
         )
         and "failure" not in episode
     )
