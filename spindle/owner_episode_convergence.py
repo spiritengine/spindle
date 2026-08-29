@@ -1322,24 +1322,49 @@ def _published_terminal_refusal(record: dict) -> str | None:
     return f"record already published terminal outcome {record.get('terminal_origin')!r}"
 
 
-def _abandoned_custody_mapping_refusal(record: dict, episode: dict) -> str | None:
-    """Refuse malformed mappings the repair write path reads outside the diagnosis.
+def _abandoned_custody_malformed_refusal(record: dict) -> str | None:
+    """Prove, in one place, the type of every value settlement reads or writes.
 
-    Repair refuses, never crashes, on any malformed mapping field it reads
-    before writing.  The diagnosis already proves every mapping inside the
-    episode identity it adjudicates - lock, owner, watchdog, phase_times - and
-    the contradiction check proves cleanup, release, and abandonment absent.
-    The two remaining mappings the terminal projection reads are checked here:
-    the record's lifecycle mirror, copied into the settled lifecycle, and the
-    episode's winning_request, quoted by the terminal provenance.  Absent is
-    not malformed; both are optional.
+    Repair refuses, never crashes, on a malformed field at any depth of the
+    record it reads or writes.  The diagnosis and the classifier prove the
+    episode identity they adjudicate - generation, revision, phase_times, lock,
+    owner, watchdog, provider - but they reach it through the status mirror and
+    the episode phase, which they test by set membership: an unhashable JSON
+    container in either raises instead of refusing.  The terminal projection
+    then copies the lifecycle mirror and quotes the episode's winning_request,
+    and the durable writer orders the reduced provider block by comparing its
+    monotonic sequence.  Those are the values proved here, once, ahead of every
+    read of them.  Absent is not malformed; each one is optional, and a phase
+    or status that is merely missing is reported by the ordinary diagnosis.
     """
+    status = record.get("status")
+    if status is not None and not isinstance(status, str):
+        return "record status is malformed"
+    episode = record.get(EPISODE_KEY)
+    if isinstance(episode, dict):
+        # A non-mapping episode needs no field proof: the diagnosis refuses it
+        # as missing or malformed without reading into it.
+        phase = episode.get("phase")
+        if phase is not None and not isinstance(phase, str):
+            return "owner episode phase is malformed"
+        winning_request = episode.get("winning_request")
+        if winning_request is not None and not isinstance(winning_request, dict):
+            return "owner episode winning_request is malformed"
     lifecycle = record.get("lifecycle")
-    if lifecycle is not None and not isinstance(lifecycle, dict):
-        return "record lifecycle is malformed"
-    winning_request = episode.get("winning_request")
-    if winning_request is not None and not isinstance(winning_request, dict):
-        return "owner episode winning_request is malformed"
+    if lifecycle is not None:
+        if not isinstance(lifecycle, dict):
+            return "record lifecycle is malformed"
+        provider = lifecycle.get("provider")
+        if provider is not None:
+            if not isinstance(provider, dict):
+                return "record lifecycle provider is malformed"
+            # An absent sequence is ordered by the writer's own defaults; a
+            # present one is compared against the durable block, so null or any
+            # other non-integer is the malformed case.
+            if "sequence" in provider and (
+                not isinstance(provider["sequence"], int) or isinstance(provider["sequence"], bool)
+            ):
+                return "record lifecycle provider sequence is malformed"
     return None
 
 
@@ -1363,6 +1388,9 @@ def settle_abandoned_custody(spool_id: str, attester: dict) -> str:
             return f"Error: Refusing to repair spool {spool_id!r}: {identity_refusal}."
         if _is_abandoned_custody_terminal(record):
             return f"Spool {spool_id} was already settled as indeterminate abandonment."
+        malformed_refusal = _abandoned_custody_malformed_refusal(record)
+        if malformed_refusal:
+            return f"Error: Refusing to repair spool {spool_id!r}: {malformed_refusal}."
         published_refusal = _published_terminal_refusal(record)
         if published_refusal:
             return f"Error: Refusing to repair spool {spool_id!r}: {published_refusal}."
@@ -1371,7 +1399,7 @@ def settle_abandoned_custody(spool_id: str, attester: dict) -> str:
             return f"Error: Refusing to repair spool {spool_id!r}: {detail}."
 
         episode = record[EPISODE_KEY]
-        refusal = _abandoned_custody_shape_refusal(episode) or _abandoned_custody_mapping_refusal(record, episode)
+        refusal = _abandoned_custody_shape_refusal(episode)
         if refusal:
             return f"Error: Refusing to repair spool {spool_id!r}: {refusal}."
         lock, owner_liveness = spindle._owner_episode_observation(record)

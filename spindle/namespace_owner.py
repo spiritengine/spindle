@@ -903,7 +903,13 @@ def _valid_abandonment(episode: dict) -> bool:
     if uid is not None and (not isinstance(uid, int) or isinstance(uid, bool) or uid < 0):
         return False
     evidence = abandonment.get("evidence")
-    if not isinstance(evidence, dict) or evidence.get("episode_phase") not in {"lock_bound", "accepted"}:
+    if not isinstance(evidence, dict):
+        return False
+    # Prove the type before the membership test: an unhashable JSON container
+    # here would raise out of every classifier consumer instead of reporting
+    # this one record as malformed.
+    prior_phase = evidence.get("episode_phase")
+    if not isinstance(prior_phase, str) or prior_phase not in {"lock_bound", "accepted"}:
         return False
     lock = evidence.get("lock")
     episode_lock = episode.get("lock")

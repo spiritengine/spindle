@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import threading
 from contextlib import contextmanager
@@ -464,9 +465,16 @@ def test_cli_and_mcp_repair_entrypoints_settle_records(episode_store, monkeypatc
     (({}, "unknown"), ({"USER": "operator"}, "operator"), ({"LOGNAME": "operator"}, "operator")),
     ids=("no_account_name", "user_env", "logname_env"),
 )
-def test_repair_attests_on_a_host_without_a_passwd_entry(episode_store, monkeypatch, environment, expected):
+@pytest.mark.parametrize(
+    "raised",
+    # 3.13 raises OSError when no login name can be found at all; older
+    # versions raise KeyError for a uid with no passwd entry.
+    (KeyError("getpwuid(): uid not found: 1000"), OSError("No such file or directory")),
+    ids=("no_passwd_entry", "no_login_name"),
+)
+def test_repair_attests_on_a_host_without_a_passwd_entry(episode_store, monkeypatch, environment, expected, raised):
     def no_passwd_entry():
-        raise KeyError("getpwuid(): uid not found: 1000")
+        raise raised
 
     monkeypatch.setattr(spindle.getpass, "getuser", no_passwd_entry)
     for variable in ("USER", "LOGNAME"):
@@ -670,24 +678,180 @@ def test_repair_refuses_a_record_that_already_published_a_terminal(episode_store
 
 
 @pytest.mark.parametrize(
-    ("field", "expected"),
+    ("field", "value", "expected"),
     (
-        ("lifecycle", "record lifecycle is malformed"),
-        ("winning_request", "owner episode winning_request is malformed"),
+        ("lifecycle", "corrupted", "record lifecycle is malformed"),
+        ("lifecycle", 17, "record lifecycle is malformed"),
+        ("winning_request", "corrupted", "owner episode winning_request is malformed"),
+        ("provider", "corrupted", "record lifecycle provider is malformed"),
+        ("provider_sequence", None, "record lifecycle provider sequence is malformed"),
+        ("provider_sequence", {}, "record lifecycle provider sequence is malformed"),
+        ("provider_sequence", [], "record lifecycle provider sequence is malformed"),
+        ("provider_sequence", "3", "record lifecycle provider sequence is malformed"),
+        ("provider_sequence", True, "record lifecycle provider sequence is malformed"),
+    ),
+    ids=(
+        "lifecycle_string",
+        "lifecycle_integer",
+        "winning_request",
+        "provider_block",
+        "provider_sequence_null",
+        "provider_sequence_object",
+        "provider_sequence_array",
+        "provider_sequence_string",
+        "provider_sequence_bool",
     ),
 )
-def test_repair_refuses_malformed_mappings_it_reads_before_writing(episode_store, field, expected):
+def test_repair_refuses_malformed_mappings_it_reads_before_writing(episode_store, field, value, expected):
+    """Every mapping the settlement reads or carries through, at any depth.
+
+    The nested provider block is the durable writer's monotonic order key: it
+    compares the incoming sequence against the published one, so a null or
+    otherwise non-integer sequence raises inside the write rather than at any
+    check before it.  Settlement must refuse it while refusal is still free.
+    """
     record = _abandoned_record(episode_store)
     current = episode_store.read(record["id"])
     if field == "lifecycle":
-        current["lifecycle"] = "corrupted"
+        current["lifecycle"] = value
+    elif field == "winning_request":
+        current["owner_episode"]["winning_request"] = value
+    elif field == "provider":
+        current["lifecycle"]["provider"] = value
     else:
-        current["owner_episode"]["winning_request"] = "corrupted"
+        current["lifecycle"]["provider"] = {"sequence": value, "connection_state": "closed"}
     spindle._write_spool(record["id"], current)
 
-    assert spindle._abandoned_custody_reason(episode_store.read(record["id"])) == ABANDONED_REASON
+    assert spindle._abandoned_custody_reason(episode_store.read(record["id"])) == ABANDONED_REASON, (
+        "the shared diagnosis must still match, or this refusal proves nothing about settlement"
+    )
 
     _assert_repair_refused_without_mutation(episode_store, record["id"], expected)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "expected"),
+    (
+        ("status", [], "record status is malformed"),
+        ("status", {}, "record status is malformed"),
+        ("status", 17, "record status is malformed"),
+        ("phase", [], "owner episode phase is malformed"),
+        ("phase", {}, "owner episode phase is malformed"),
+        ("phase", 17, "owner episode phase is malformed"),
+    ),
+    ids=(
+        "status_array",
+        "status_object",
+        "status_integer",
+        "phase_array",
+        "phase_object",
+        "phase_integer",
+    ),
+)
+def test_repair_refuses_malformed_status_and_phase_before_comparing_them(episode_store, field, value, expected):
+    """Prove the type before the membership test that would otherwise raise.
+
+    The diagnosis and the published-terminal check both ask whether the status
+    mirror and the episode phase are members of a set, which raises on an
+    unhashable JSON container instead of refusing.  Settlement proves both
+    types first, so a corrupted record is refused and left untouched.
+    """
+    record = _abandoned_record(episode_store)
+    current = episode_store.read(record["id"])
+    if field == "status":
+        current["status"] = value
+    else:
+        current["owner_episode"]["phase"] = value
+    spindle._write_spool(record["id"], current)
+
+    _assert_repair_refused_without_mutation(episode_store, record["id"], expected)
+
+
+def test_repair_settles_a_record_carrying_a_reduced_provider_block(episode_store):
+    """A well-formed provider block is carried through settlement, not refused."""
+    record = _abandoned_record(episode_store)
+    current = episode_store.read(record["id"])
+    current["lifecycle"]["provider"] = {"sequence": 4, "connection_state": "closed"}
+    spindle._write_spool(record["id"], current)
+
+    output = spindle._repair_abandoned_custody(record["id"], attest_dead=True, source="test")
+
+    settled = episode_store.read(record["id"])
+    assert output == f"Spool {record['id']} settled as indeterminate abandonment."
+    assert settled["status"] == "abandoned"
+    assert settled["lifecycle"]["provider"] == {"sequence": 4, "connection_state": "closed"}
+    assert settled["lifecycle"]["normalized_terminal_kind"] == "indeterminate"
+
+
+MALFORMED_VALUES = (None, [], {}, 17, True, "corrupted", "__ABSENT__")
+
+
+def _mapping_paths(value, prefix=()):
+    """Every path into *value*, walking into nested mappings."""
+    paths = []
+    for key, nested in value.items():
+        paths.append(prefix + (key,))
+        if isinstance(nested, dict):
+            paths.extend(_mapping_paths(nested, prefix + (key,)))
+    return paths
+
+
+def test_repair_refuses_every_malformed_field_without_raising_or_mutating(episode_store):
+    """The settlement invariant, swept over the whole record it reads and writes.
+
+    Each field of a record that otherwise satisfies the gate - at every depth,
+    including the episode identity and the reduced provider block - is replaced
+    by each JSON shape it is not, and removed.  Repair must answer every one:
+    settle, or refuse and leave the durable bytes exactly as they were.  It may
+    never raise, and a record it does settle may never make a store consumer
+    raise either.
+    """
+    spool_id = "malformed-sweep"
+    episode = localize_identities(make_episode("accepted"))
+    episode_store.bind_lock(spool_id, episode)
+    base = deepcopy(
+        episode_store.write(
+            spool_id,
+            status="running",
+            episode=episode,
+            prompt="work whose custody was lost",
+            lifecycle={
+                "ownership_state": "held",
+                "transport_state": "connected",
+                "provider": {"sequence": 3, "connection_state": "closed"},
+            },
+        )
+    )
+    settlements = 0
+
+    for path in _mapping_paths(base):
+        for value in MALFORMED_VALUES:
+            record = deepcopy(base)
+            episode_store.bind_lock(spool_id, record["owner_episode"])
+            cursor = record
+            for key in path[:-1]:
+                cursor = cursor[key]
+            if value == "__ABSENT__":
+                cursor.pop(path[-1], None)
+            else:
+                cursor[path[-1]] = value
+            episode_store.spool_path(spool_id).write_text(json.dumps(record), encoding="utf-8")
+            before = episode_store.spool_path(spool_id).read_bytes()
+            case = f"{'.'.join(path)}={value!r}"
+
+            output = spindle._repair_abandoned_custody(spool_id, attest_dead=True, source="test")
+
+            if output.startswith("Error"):
+                assert output.startswith(f"Error: Refusing to repair spool {spool_id!r}: "), case
+                assert episode_store.spool_path(spool_id).read_bytes() == before, f"mutated on refusal: {case}"
+            else:
+                settlements += 1
+                assert spindle._count_running() == 0, case
+                assert spindle._store_health_failures() == [], case
+                assert spindle._doctor_abandoned_custody_check()["data"]["spool_ids"] == [], case
+            episode_store.spool_path(spool_id).unlink()
+
+    assert settlements > 0, "a sweep that only ever refuses proves nothing about settlement"
 
 
 def test_repair_refuses_a_record_that_is_not_a_json_object(episode_store):
@@ -753,6 +917,56 @@ def test_malformed_abandonment_fact_is_unhealthy_instead_of_crashing_consumers(e
     assert reconciliation.reason == "malformed_abandonment_fact"
     assert [failure["spool_id"] for failure in failures] == [record["id"]]
     assert storage["status"] == "fail"
+
+
+@pytest.mark.parametrize("corruption", ([], {}, 17), ids=("array", "object", "integer"))
+def test_malformed_abandonment_evidence_phase_is_unhealthy_instead_of_crashing_consumers(
+    episode_store, monkeypatch, corruption
+):
+    """One corrupted settled record may not take the whole store down.
+
+    The abandonment validator asks whether the recorded prior phase is one of
+    the two bound phases.  On an unhashable JSON container that question raises
+    out of the classifier, and with it out of capacity counting, store health,
+    admission, doctor, and /health - every consumer of every record.  The
+    record must classify as unhealthy instead.
+    """
+    record = _abandoned_record(episode_store)
+    spindle._repair_abandoned_custody(record["id"], attest_dead=True, source="test")
+    current = episode_store.read(record["id"])
+    current["owner_episode"]["abandonment"]["evidence"]["episode_phase"] = corruption
+    spindle._write_spool(record["id"], current)
+    monkeypatch.setattr(spindle, "MAX_CONCURRENT", 4)
+
+    reconciliation = spindle._reconcile_spool_ownership(episode_store.read(record["id"]))
+    failures = spindle._store_health_failures()
+    storage = spindle._doctor_storage_check()
+    # _count_running is what /health reports and what admission checks after it.
+    running = spindle._count_running()
+    reserved, error = spindle._try_reserve_slot_and_create("fresh-after-corrupted-evidence")
+
+    assert reconciliation.state == "store_unhealthy"
+    assert reconciliation.reason == "malformed_abandonment_fact"
+    assert [failure["spool_id"] for failure in failures] == [record["id"]]
+    assert storage["status"] == "fail"
+    assert running == 1
+    assert reserved is False
+    assert "Spool store unhealthy" in error
+
+
+def test_doctor_advisory_skips_malformed_neighbours_without_crashing(episode_store):
+    """The advisory scan reads every record in the store, sound or not."""
+    record = _abandoned_record(episode_store)
+    episode_store.write("container-status", status=[], episode=localize_identities(make_episode("accepted")))
+    phase_corrupted = localize_identities(make_episode("accepted"))
+    phase_corrupted["phase"] = {}
+    episode_store.write("container-phase", status="running", episode=phase_corrupted)
+    episode_store.spool_path("scalar-record").write_text("17", encoding="utf-8")
+
+    check = spindle._doctor_abandoned_custody_check()
+
+    assert check["status"] == "warn"
+    assert check["data"]["spool_ids"] == [record["id"]]
 
 
 def test_doctor_warns_about_abandoned_custody_without_marking_store_unhealthy(episode_store):

@@ -195,11 +195,13 @@ the namespace-safe shared owner primitive.
     provider is observably alive; dead and unverifiable provider liveness stay
     under the attestation, which names owner, watchdog, and provider. It
     refuses, rather than raising, on a record that already published a
-    terminal outcome and on any malformed mapping it reads before writing.
-    The retained record carries the attester, timestamp, exact lock and
-    process-liveness evidence, and an indeterminate terminal; it never
-    fabricates cleanup or provider outcome. Because cleanup was never proven,
-    the settled record releases capacity but is not retireable: retention
-    keeps it and destructive shard actions stay refused. Doctor reports
-    unsettled records as warnings with the repair command. They do not make
-    the store unhealthy or block launches.
+    terminal outcome and on any malformed field, at any depth, that it reads
+    or writes: status, episode phase, winning_request, the lifecycle mirror,
+    and the reduced provider block it carries through. The retained record
+    carries the attester, timestamp, exact lock and process-liveness evidence,
+    and an indeterminate terminal; it never fabricates cleanup or provider
+    outcome. Because cleanup was never proven, the settled record releases
+    capacity but is not retireable: retention keeps it and destructive shard
+    actions stay refused. Doctor reports unsettled records as warnings with
+    the repair command. They do not make the store unhealthy or block
+    launches.

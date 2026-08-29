@@ -10667,13 +10667,22 @@ def _doctor_abandoned_custody_check() -> dict:
     """Advise on repairable phantoms without making the store unhealthy."""
     spool_ids = []
     for observed in _list_spools():
+        # An advisory scan reads whatever the store holds, so prove each value's
+        # type before comparing it: a non-object record, or an unhashable JSON
+        # container in status or phase, must skip this record rather than raise
+        # out of the whole doctor report.
+        if not isinstance(observed, dict):
+            continue
         spool_id = observed.get("id")
+        status = observed.get("status")
         episode = observed.get("owner_episode")
+        phase = episode.get("phase") if isinstance(episode, dict) else None
         if (
             not spool_id
-            or observed.get("status") not in {"pending", "running"}
-            or not isinstance(episode, dict)
-            or episode.get("phase") not in {"lock_bound", "accepted"}
+            or not isinstance(status, str)
+            or status not in {"pending", "running"}
+            or not isinstance(phase, str)
+            or phase not in {"lock_bound", "accepted"}
         ):
             continue
         if _serialized_abandoned_custody_reason(str(spool_id)):
