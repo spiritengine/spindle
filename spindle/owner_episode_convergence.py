@@ -29,7 +29,7 @@ CONVERGENCE_FORMAT = "spindle.owner-convergence/1"
 EPISODE_FORMAT = "spindle.owner-episode/1"
 EPISODE_KEY = "owner_episode"
 CONVERGENCE_KEY = "owner_convergence"
-TERMINAL_STATUSES = {"complete", "error", "timeout"}
+TERMINAL_STATUSES = {"complete", "error", "timeout", "abandoned"}
 NONTERMINAL_STATUSES = {"pending", "running"}
 
 #: Public outcome fields only this module may publish.  Phase 1's closed-writer
@@ -280,6 +280,18 @@ def classify_owner_episode_record(record: dict, observer: ObserverIdentity | Non
         return _Meaning(state, reason, False, "owner episode is still active", lock, liveness)
 
     if classification.state == "retireable":
+        # A human-attested abandonment ends the episode without ever proving
+        # descendant cleanup.  Capacity is released, but nothing can authorize
+        # retirement or a destructive shard action from that record.
+        if phase == "abandoned":
+            return _Meaning(
+                "unverifiable",
+                "abandoned_custody_cleanup_unproven",
+                False,
+                "human-attested abandonment never proved provider cleanup",
+                lock,
+                liveness,
+            )
         # cleanup_proven still needs an exact-inode release act.  A foreign PID
         # namespace may understand its meaning but cannot perform that act.
         if phase == "cleanup_proven" and not local:
@@ -1208,6 +1220,291 @@ def has_published_terminal(record: dict | None) -> bool:
     # status still names an outcome; the compatibility path may not replace it
     # merely because the record is malformed or incomplete.
     return record.get("status") in TERMINAL_STATUSES
+
+
+def _is_abandoned_custody_terminal(record: dict | None) -> bool:
+    import spindle
+
+    record = record or {}
+    episode = record.get(EPISODE_KEY)
+    lifecycle = record.get("lifecycle")
+    abandonment = episode.get("abandonment") if isinstance(episode, dict) else None
+    structurally_repaired = (
+        record.get("status") == "abandoned"
+        and record.get("error_kind") == "custody_abandoned_without_cleanup_proof"
+        and isinstance(episode, dict)
+        and episode.get("phase") == "abandoned"
+        and isinstance(abandonment, dict)
+        and abandonment.get("reason") == "custody_abandoned_without_cleanup_proof"
+        and isinstance(lifecycle, dict)
+        and lifecycle.get("normalized_terminal_kind") == "indeterminate"
+    )
+    if not structurally_repaired:
+        return False
+    classification = spindle.classify_owner_episode(
+        record,
+        spindle.LockEvidence("released"),
+        spindle.LivenessEvidence("dead", "terminal_record"),
+    )
+    return classification.state == "retireable" and classification.reason == "human_attested_abandonment"
+
+
+def _abandoned_custody_refusal(record: dict) -> str:
+    """Explain why a fresh locked snapshot is outside the repair authority."""
+    import spindle
+
+    status = record.get("status")
+    if status not in NONTERMINAL_STATUSES:
+        return f"record is already terminal with status {status or 'missing'}"
+    episode = record.get(EPISODE_KEY)
+    if not isinstance(episode, dict):
+        return "owner episode is missing or malformed"
+    phase = episode.get("phase")
+    if phase not in {"lock_bound", "accepted"}:
+        return f"owner episode phase is {phase or 'missing'}"
+    lock, owner_liveness = spindle._owner_episode_observation(record)
+    if lock.state != "released":
+        if lock.state == "held":
+            return "ownership lock is held"
+        return f"ownership lock is {lock.state}" + (f" ({lock.detail})" if lock.detail else "")
+    if owner_liveness.state != "dead":
+        return f"owner liveness is {owner_liveness.state} ({owner_liveness.reason})"
+    watchdog = spindle._episode_process_identity(episode, "watchdog")
+    if watchdog is None:
+        return "watchdog liveness is unverifiable (malformed_watchdog_identity)"
+    watchdog_liveness = spindle.assess_process_liveness(watchdog)
+    if watchdog_liveness.state != "dead":
+        return f"watchdog liveness is {watchdog_liveness.state} ({watchdog_liveness.reason})"
+    return "record does not satisfy exact abandoned-custody identity requirements"
+
+
+def _abandoned_custody_identity_refusal(spool_id: str, record: dict) -> str | None:
+    """Refuse a record whose embedded id does not name the requested spool."""
+    if not isinstance(record, dict):
+        return "record is not a JSON object"
+    if "id" not in record:
+        return "record id is missing"
+    embedded = record["id"]
+    if not isinstance(embedded, str) or not embedded:
+        return "record id is malformed"
+    if embedded != spool_id:
+        return f"record id {embedded!r} does not match requested spool id {spool_id!r}"
+    return None
+
+
+def _abandoned_custody_shape_refusal(episode: dict) -> str | None:
+    """Refuse an episode carrying facts that contradict abandonment without proof."""
+    if "cleanup" in episode:
+        return "owner episode carries cleanup proof"
+    if "release" in episode:
+        return "owner episode carries a release fact"
+    if "abandonment" in episode:
+        return "owner episode carries an abandonment fact"
+    times = episode.get("phase_times")
+    phase_time = times.get(episode.get("phase")) if isinstance(times, dict) else None
+    if not isinstance(phase_time, str) or not phase_time:
+        return "current phase timestamp is malformed"
+    return None
+
+
+def _published_terminal_refusal(record: dict) -> str | None:
+    """Refuse a record whose public outcome another writer already published.
+
+    The status mirror is not the terminal.  A record can carry a settled
+    outcome - terminal_origin, its provenance, and the published result - while
+    the mirror still reads "running", because a partial or interrupted
+    projection leaves the two disagreeing.  Reading only the mirror would let
+    abandonment overwrite proven meaning.  A mirror that does name a terminal
+    status is refused by the ordinary diagnosis, which reports that status.
+    """
+    if record.get("status") not in NONTERMINAL_STATUSES or not has_published_terminal(record):
+        return None
+    return f"record already published terminal outcome {record.get('terminal_origin')!r}"
+
+
+def _abandoned_custody_malformed_refusal(record: dict) -> str | None:
+    """Prove, in one place, the type of every value settlement reads or writes.
+
+    Repair refuses, never crashes, on a malformed field at any depth of the
+    record it reads or writes.  The diagnosis and the classifier prove the
+    episode identity they adjudicate - generation, revision, phase_times, lock,
+    owner, watchdog, provider - but they reach it through the status mirror and
+    the episode phase, which they test by set membership: an unhashable JSON
+    container in either raises instead of refusing.  The terminal projection
+    then copies the lifecycle mirror and quotes the episode's winning_request,
+    and the durable writer orders the reduced provider block by comparing its
+    monotonic sequence.  Those are the values proved here, once, ahead of every
+    read of them.  Absent is not malformed; each one is optional, and a phase
+    or status that is merely missing is reported by the ordinary diagnosis.
+    """
+    status = record.get("status")
+    if status is not None and not isinstance(status, str):
+        return "record status is malformed"
+    episode = record.get(EPISODE_KEY)
+    if isinstance(episode, dict):
+        # A non-mapping episode needs no field proof: the diagnosis refuses it
+        # as missing or malformed without reading into it.
+        phase = episode.get("phase")
+        if phase is not None and not isinstance(phase, str):
+            return "owner episode phase is malformed"
+        winning_request = episode.get("winning_request")
+        if winning_request is not None and not isinstance(winning_request, dict):
+            return "owner episode winning_request is malformed"
+    lifecycle = record.get("lifecycle")
+    if lifecycle is not None:
+        if not isinstance(lifecycle, dict):
+            return "record lifecycle is malformed"
+        provider = lifecycle.get("provider")
+        if provider is not None:
+            if not isinstance(provider, dict):
+                return "record lifecycle provider is malformed"
+            # An absent sequence is ordered by the writer's own defaults; a
+            # present one is compared against the durable block, so null or any
+            # other non-integer is the malformed case.
+            if "sequence" in provider and (
+                not isinstance(provider["sequence"], int) or isinstance(provider["sequence"], bool)
+            ):
+                return "record lifecycle provider sequence is malformed"
+    return None
+
+
+def settle_abandoned_custody(spool_id: str, attester: dict) -> str:
+    """Human-attested terminalization of one strictly diagnosed abandoned episode.
+
+    The gate, evidence capture, episode advance, and terminal projection share
+    the same per-record lock as every episode writer. No cleanup, release, or
+    provider outcome is inferred.
+    """
+    import spindle
+
+    with spindle._spool_lock(spool_id) as acquired:
+        if not acquired:
+            return f"Error: Refusing to repair spool {spool_id!r}: record lock is unavailable."
+        record = spindle._read_spool(spool_id)
+        if record is None:
+            return f"Error: Refusing to repair spool {spool_id!r}: record is missing."
+        identity_refusal = _abandoned_custody_identity_refusal(spool_id, record)
+        if identity_refusal:
+            return f"Error: Refusing to repair spool {spool_id!r}: {identity_refusal}."
+        if _is_abandoned_custody_terminal(record):
+            return f"Spool {spool_id} was already settled as indeterminate abandonment."
+        malformed_refusal = _abandoned_custody_malformed_refusal(record)
+        if malformed_refusal:
+            return f"Error: Refusing to repair spool {spool_id!r}: {malformed_refusal}."
+        published_refusal = _published_terminal_refusal(record)
+        if published_refusal:
+            return f"Error: Refusing to repair spool {spool_id!r}: {published_refusal}."
+        if spindle._abandoned_custody_reason(record) != "custody_abandoned_without_cleanup_proof":
+            detail = _abandoned_custody_refusal(record)
+            return f"Error: Refusing to repair spool {spool_id!r}: {detail}."
+
+        episode = record[EPISODE_KEY]
+        refusal = _abandoned_custody_shape_refusal(episode)
+        if refusal:
+            return f"Error: Refusing to repair spool {spool_id!r}: {refusal}."
+        lock, owner_liveness = spindle._owner_episode_observation(record)
+        watchdog = spindle._episode_process_identity(episode, "watchdog")
+        watchdog_liveness = spindle.assess_process_liveness(watchdog) if watchdog is not None else None
+        # Re-observe immediately before publication. This is deliberately
+        # redundant with the public diagnosis above: the persisted provenance
+        # must describe the evidence that authorized this exact write.
+        if (
+            lock.state != "released"
+            or owner_liveness.state != "dead"
+            or watchdog_liveness is None
+            or watchdog_liveness.state != "dead"
+        ):
+            detail = _abandoned_custody_refusal(record)
+            return f"Error: Refusing to repair spool {spool_id!r}: {detail}."
+        # The diagnosis deliberately excludes the provider: no provider or
+        # process-group observation can prove descendant cleanup, so none may
+        # participate in it.  Settlement is a different act - it publishes a
+        # terminal and releases the record's capacity - and a provider proven
+        # to be running now is proof that the work this record accounts for is
+        # not over.  Dead or unverifiable provider liveness stays under the
+        # operator's attestation; positive life overrides it.
+        provider = spindle._episode_process_identity(episode, "provider")
+        provider_liveness = spindle.assess_process_liveness(provider) if provider is not None else None
+        if provider_liveness is not None and provider_liveness.state == "alive":
+            return (
+                f"Error: Refusing to repair spool {spool_id!r}: recorded provider pid {provider.pid} "
+                f"is alive ({provider_liveness.reason})."
+            )
+
+        completed_at = datetime.now(timezone.utc).isoformat()
+        evidence = {
+            "episode_phase": episode["phase"],
+            "lock": {
+                "state": lock.state,
+                "device": lock.observed_device,
+                "inode": lock.observed_inode,
+                "detail": lock.detail,
+            },
+            "owner": {
+                "pid": episode["owner"]["pid"],
+                "birth_token": episode["owner"]["birth_token"],
+                "liveness": asdict(owner_liveness),
+            },
+            "watchdog": {
+                "pid": episode["watchdog"]["pid"],
+                "birth_token": episode["watchdog"]["birth_token"],
+                "liveness": asdict(watchdog_liveness),
+            },
+        }
+        abandonment = {
+            "reason": "custody_abandoned_without_cleanup_proof",
+            "attester": dict(attester),
+            "attested_at": completed_at,
+            "evidence": evidence,
+        }
+        repaired_episode = copy.deepcopy(episode)
+        repaired_episode["revision"] = episode["revision"] + 1
+        repaired_episode["phase"] = "abandoned"
+        repaired_episode.setdefault("phase_times", {})["abandoned"] = completed_at
+        repaired_episode["abandonment"] = abandonment
+
+        lifecycle = dict(record.get("lifecycle") or {})
+        lifecycle.update(
+            ownership_state="released",
+            transport_state="lost",
+            normalized_terminal_kind="indeterminate",
+        )
+        lifecycle.pop("public_stop_state", None)
+        winning_request = episode.get("winning_request") or {}
+        terminal_provenance = {
+            "owner_generation": episode.get("generation"),
+            "episode_revision": repaired_episode["revision"],
+            "episode_phase": "abandoned",
+            "request_id": winning_request.get("request_id"),
+            "request_kind": winning_request.get("kind"),
+            "provider_exit_carrier": None,
+            "failure_kind": None,
+            "abandonment": abandonment,
+        }
+        repaired = dict(record)
+        repaired.update(
+            status="abandoned",
+            error=(
+                "Custody was abandoned after the recorded owner and watchdog died "
+                "without durable cleanup proof; provider outcome is indeterminate."
+            ),
+            error_kind="custody_abandoned_without_cleanup_proof",
+            result="Spool custody was abandoned without cleanup proof; provider outcome is indeterminate.",
+            exit_code=None,
+            completed_at=completed_at,
+            terminal_origin="human_attested_abandoned_custody",
+            terminal_provenance=terminal_provenance,
+            lifecycle=lifecycle,
+            owner_episode=repaired_episode,
+        )
+        try:
+            spindle._write_spool(spool_id, repaired)
+        except spindle._DurablePublicationCleanupError:
+            # Atomic replace and directory fsync already completed; only private
+            # descriptor cleanup failed, so reporting refusal would lie about
+            # the durable terminal now in the store.
+            pass
+    return f"Spool {spool_id} settled as indeterminate abandonment."
 
 
 def applicator_owns_outcome(record: dict | None) -> bool:

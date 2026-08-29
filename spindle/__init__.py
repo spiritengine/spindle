@@ -13,6 +13,7 @@ A per-store supervisor reconciles durable spool state after callers exit.
 
 import asyncio
 import fcntl
+import getpass
 import hashlib
 import json
 import logging
@@ -2615,6 +2616,52 @@ def _serialized_abandoned_custody_reason(spool_id: str) -> Optional[str]:
         return _abandoned_custody_reason(spool) if spool is not None else None
 
 
+REPAIR_DEAD_ATTESTATION = (
+    "I attest that the recorded owner, watchdog, and provider processes are dead and cleanup "
+    "cannot be proven; settle this spool as indeterminate abandonment."
+)
+
+
+def _local_user_name() -> str:
+    """Name the local account without letting a missing passwd entry raise.
+
+    getpass.getuser() raises when the uid has no passwd entry and no login
+    variable is set, which happens in containers and under some systemd units.
+    Capturing the attester must never turn a refusal into a traceback.
+    """
+    try:
+        return getpass.getuser()
+    except (KeyError, OSError):
+        pass
+    for variable in ("USER", "LOGNAME"):
+        value = os.environ.get(variable)
+        if value:
+            return value
+    return "unknown"
+
+
+def _repair_attester_identity(source: str) -> dict:
+    """Identify the local human account making the explicit repair request."""
+    return {
+        "kind": "local_user",
+        "user": _local_user_name(),
+        "uid": os.getuid() if hasattr(os, "getuid") else None,
+        "source": source,
+    }
+
+
+def _repair_abandoned_custody(spool_id: str, *, attest_dead: bool, source: str) -> str:
+    """Settle one abandoned-custody episode, never guessing cleanup or outcome."""
+    if not attest_dead:
+        return (
+            f"Error: Refusing to repair spool {spool_id!r} without --attest-dead. "
+            f"The operator must attest exactly: {REPAIR_DEAD_ATTESTATION}"
+        )
+    from .owner_episode_convergence import settle_abandoned_custody
+
+    return settle_abandoned_custody(spool_id, _repair_attester_identity(source))
+
+
 def _drain_blockers() -> list[DrainBlocker]:
     """Return non-progressing records which make an unforced drain impossible."""
     blockers = []
@@ -3102,6 +3149,8 @@ def _format_spool_failure(spool_id: str, spool: dict) -> str:
     """
     err = spool.get("error", "Unknown error")
     kind = spool.get("error_kind")
+    if kind == "custody_abandoned_without_cleanup_proof":
+        return f"Spool {spool_id} INDETERMINATE ABANDONMENT: {err}"
     if kind == "fable_gate":
         category = spool.get("gate_category", "unknown")
         return (
@@ -5343,6 +5392,19 @@ def _unspool_sync(spool_id: str) -> str:
 
 
 @mcp.tool()
+async def spindle_repair(spool_id: str, attest_dead: bool) -> str:
+    """Settle one strictly diagnosed abandoned-custody spool as indeterminate.
+
+    attest_dead must be true. It attests that the recorded owner, watchdog, and
+    provider processes are dead and that cleanup cannot be proven.
+    """
+    # Settlement takes the record lock in blocking mode before it can diagnose
+    # anything, so a spool id naming a live or contended record would otherwise
+    # stall every other tool sharing this event loop.
+    return await asyncio.to_thread(_repair_abandoned_custody, spool_id, attest_dead=attest_dead, source="mcp")
+
+
+@mcp.tool()
 async def unspool(
     spool_id: str,
     full: bool = False,
@@ -5569,6 +5631,16 @@ def _spin_wait_sync(
                             "remaining": remaining,
                         }
                     )
+                elif spool.get("status") == "abandoned":
+                    remaining = [s for s in ids if s != spool_id]
+                    return json.dumps(
+                        {
+                            "spool_id": spool_id,
+                            "error": spool.get("error"),
+                            "terminal_kind": "indeterminate",
+                            "remaining": remaining,
+                        }
+                    )
 
             if timeout:
                 elapsed = (datetime.now() - start_time).total_seconds()
@@ -5595,6 +5667,9 @@ def _spin_wait_sync(
                     pending.remove(spool_id)
                 elif spool.get("status") == "timeout":
                     results[spool_id] = f"Error: {spool.get('error', 'Spool timed out')}"
+                    pending.remove(spool_id)
+                elif spool.get("status") == "abandoned":
+                    results[spool_id] = f"Indeterminate abandonment: {spool.get('error', 'custody abandoned')}"
                     pending.remove(spool_id)
 
             if not pending:
@@ -6083,6 +6158,16 @@ async def spin_wait(
                             "remaining": remaining_ids,
                         }
                     )
+                elif spool.get("status") == "abandoned":
+                    remaining_ids = [s for s in ids if s != spool_id]
+                    return json.dumps(
+                        {
+                            "spool_id": spool_id,
+                            "error": spool.get("error"),
+                            "terminal_kind": "indeterminate",
+                            "remaining": remaining_ids,
+                        }
+                    )
 
             if timeout:
                 elapsed = (datetime.now() - start_time).total_seconds()
@@ -6119,6 +6204,9 @@ async def spin_wait(
                     pending.remove(spool_id)
                 elif spool.get("status") == "timeout":
                     results[spool_id] = f"Error: {spool.get('error', 'Spool timed out')}"
+                    pending.remove(spool_id)
+                elif spool.get("status") == "abandoned":
+                    results[spool_id] = f"Indeterminate abandonment: {spool.get('error', 'custody abandoned')}"
                     pending.remove(spool_id)
 
             if not pending:
@@ -8848,6 +8936,8 @@ def _codex_unspool_sync(spool_id: str) -> str:
         return _running_spool_message(spool)
     elif status == "complete":
         return spool.get("result", "No result")
+    elif status == "abandoned":
+        return _format_spool_failure(spool_id, spool)
     else:
         return f"Spool {spool_id} failed: {spool.get('error', 'Unknown error')}"
 
@@ -9663,6 +9753,8 @@ def _gemini_unspool_sync(spool_id: str) -> str:
         return _running_spool_message(spool)
     elif status == "complete":
         return spool.get("result", "No result")
+    elif status == "abandoned":
+        return _format_spool_failure(spool_id, spool)
     else:
         return f"Spool {spool_id} failed: {spool.get('error', 'Unknown error')}"
 
@@ -10130,6 +10222,8 @@ def _kimi_unspool_sync(spool_id: str) -> str:
         return _running_spool_message(spool)
     elif status == "complete":
         return spool.get("result", "No result")
+    elif status == "abandoned":
+        return _format_spool_failure(spool_id, spool)
     else:
         return f"Spool {spool_id} failed: {spool.get('error', 'Unknown error')}"
 
@@ -10249,7 +10343,7 @@ DOCTOR_SMOKE_PROMPT = f"Reply with exactly this token and nothing else: {DOCTOR_
 DOCTOR_SMOKE_HARNESSES = ("claude-code", "codex")
 
 # Statuses that end a spool, i.e. stop the smoke's poll loop.
-_TERMINAL_SPOOL_STATUSES = {"complete", "error", "killed", "timeout"}
+_TERMINAL_SPOOL_STATUSES = {"complete", "error", "killed", "timeout", "abandoned"}
 
 
 def _doctor_result(name: str, status: str, detail: str, lines: Optional[list] = None, **data) -> dict:
@@ -10566,6 +10660,48 @@ def _doctor_storage_check() -> dict:
         ],
         spool_dir=str(store),
         spools=count,
+    )
+
+
+def _doctor_abandoned_custody_check() -> dict:
+    """Advise on repairable phantoms without making the store unhealthy."""
+    spool_ids = []
+    for observed in _list_spools():
+        # An advisory scan reads whatever the store holds, so prove each value's
+        # type before comparing it: a non-object record, or an unhashable JSON
+        # container in status or phase, must skip this record rather than raise
+        # out of the whole doctor report.
+        if not isinstance(observed, dict):
+            continue
+        spool_id = observed.get("id")
+        status = observed.get("status")
+        episode = observed.get("owner_episode")
+        phase = episode.get("phase") if isinstance(episode, dict) else None
+        if (
+            not spool_id
+            or not isinstance(status, str)
+            or status not in {"pending", "running"}
+            or not isinstance(phase, str)
+            or phase not in {"lock_bound", "accepted"}
+        ):
+            continue
+        if _serialized_abandoned_custody_reason(str(spool_id)):
+            spool_ids.append(str(spool_id))
+    spool_ids.sort()
+    if not spool_ids:
+        return _doctor_result(
+            "abandoned-custody",
+            "ok",
+            "no owner episodes abandoned without cleanup proof",
+            spool_ids=[],
+        )
+    lines = [f"{spool_id} — run: spindle repair {spool_id} --attest-dead" for spool_id in spool_ids]
+    return _doctor_result(
+        "abandoned-custody",
+        "warn",
+        f"{len(spool_ids)} spool(s) require explicit indeterminate settlement",
+        lines,
+        spool_ids=spool_ids,
     )
 
 
@@ -11664,6 +11800,7 @@ def _doctor_run(
         _doctor_cli_check(),
         service,
         _doctor_storage_check(),
+        _doctor_abandoned_custody_check(),
         _doctor_harness_check(service_path=service_path, service_name=service_name, service_port=port),
         _doctor_shard_check(),
     ]
@@ -12109,6 +12246,18 @@ def main():
     drop_parser.add_argument("spool_id", help="The spool ID to cancel")
     drop_parser.add_argument("--human", action="store_true", help="Human-readable output instead of JSON")
 
+    # repair command - human-attested settlement of abandoned custody
+    repair_parser = subparsers.add_parser("repair", help="Settle one strictly diagnosed abandoned-custody spool")
+    repair_parser.add_argument("spool_id", help="The abandoned spool ID to settle")
+    repair_parser.add_argument(
+        "--attest-dead",
+        action="store_true",
+        help=(
+            "Attest that the recorded owner, watchdog, and provider processes are dead, cleanup "
+            "cannot be proven, and settlement must be indeterminate"
+        ),
+    )
+
     # peek command - see partial output
     peek_parser = subparsers.add_parser("peek", help="See partial output of a running spool")
     peek_parser.add_argument("spool_id", help="The spool ID to peek at")
@@ -12451,6 +12600,12 @@ def main():
             else:
                 print(json.dumps({"dropped": args.spool_id}))
         sys.exit(0)
+
+    elif args.command == "repair":
+        result = _repair_abandoned_custody(args.spool_id, attest_dead=args.attest_dead, source="cli")
+        stream = sys.stderr if result.startswith("Error:") else sys.stdout
+        print(result, file=stream)
+        sys.exit(1 if result.startswith("Error:") else 0)
 
     elif args.command == "peek":
         result = _spool_peek_sync(args.spool_id, lines=args.lines)
