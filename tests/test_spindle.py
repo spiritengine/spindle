@@ -5968,6 +5968,11 @@ class TestSpinHarnesses:
         result = _get_harnesses()
         assert result["claude-code"]["default_model"] == "sonnet"
 
+    def test_codex_advertises_astra_without_changing_default(self):
+        result = _get_harnesses()["codex"]
+        assert result["models"]["astra"] == "gpt-6-astra"
+        assert result["default_model"] == "gpt-5.6-sol"
+
     def test_unknown_harness_returns_error(self):
         """spin() should return error JSON for unknown harness names."""
         # spin may be a FunctionTool (with .fn) or a plain function depending on fastmcp version
@@ -8616,6 +8621,16 @@ class TestCodexSandboxEnforcement:
         assert cmd[cmd.index("--model") + 1] == expected
         spool = json.loads(next(tmp_path.glob("codex-*.json")).read_text())
         assert spool["model"] == expected
+
+    def test_astra_alias_normalizes_to_supported_codex_model(self, tmp_path):
+        with self._captured_codex_spin(tmp_path) as captured_cmd:
+            with patch("spindle.threading.Thread"):
+                _codex_spin_sync("do work", str(tmp_path), "astra", "read-only", None, None, None)
+
+        cmd = captured_cmd[0]
+        assert cmd[cmd.index("--model") + 1] == "gpt-6-astra"
+        spool = json.loads(next(tmp_path.glob("codex-*.json")).read_text())
+        assert spool["model"] == "gpt-6-astra"
 
     @pytest.mark.parametrize("auth_mode", ["api", "unknown"])
     def test_explicit_gpt_56_is_preserved_outside_chatgpt_auth(self, tmp_path, auth_mode):

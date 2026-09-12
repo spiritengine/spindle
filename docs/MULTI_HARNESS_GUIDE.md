@@ -58,7 +58,7 @@ spin("Refactor auth to use dependency injection")
 ### Codex CLI
 
 **CLI:** `codex` (OpenAI's Codex CLI)
-**Models:** GPT-5 Codex
+**Models:** GPT-6 Astra and GPT-5 Codex (`astra` selects `gpt-6-astra`)
 **Startup time:** ~10 seconds to first response
 **Strengths:** Speed, quick edits, prototyping
 

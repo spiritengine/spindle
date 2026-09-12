@@ -316,10 +316,11 @@ Spindle supports multiple AI agent harnesses, allowing you to choose the best to
 - Slower startup (~3-4 minutes to first response)
 - Use `harness="claude-code"` or omit harness parameter
 
-**Codex CLI** - OpenAI's GPT-5 Codex models via `codex` CLI
+**Codex CLI** - OpenAI models via `codex` CLI
 - Extremely fast startup (~10 seconds to first response)
 - Good for quick edits, simple tasks, prototyping
 - Requires ChatGPT Plus/Pro/Enterprise
+- Models include `"astra"` (`gpt-6-astra`), `"sol"`, `"terra"`, `"luna"`, or any full model name
 - Use `harness="codex"`
 
 **Gemini CLI** - Google's Gemini models via `gemini` CLI
@@ -499,7 +500,7 @@ abandonment.
 - `harness` (optional): "claude-code" (default), "codex", "gemini", or "kimi"
 - `working_dir` (optional for Claude, required for Codex/Gemini/Kimi): Project directory
 - `permission` (optional): "readonly" (alias "manual"), "careful" (default, = auto), "full", "shard", "careful+shard", "research", "research+shard", "auto", "auto+shard" (readonly/manual cannot be combined with shard intent; `auto` variants are Claude-only; other names map to harness-specific enforcement, and Kimi accepts them for compatibility but has no "careful" approval mode)
-- `model` (optional): Model to use ("sonnet", "opus", "opus-5", "haiku" for Claude; "flash", "pro" for Gemini; "k3", "latest", "thinking", "k2.7-code", "k2.6", "k2.5" for Kimi)
+- `model` (optional): Model to use ("sonnet", "opus", "opus-5", "haiku" for Claude; "astra", "sol", "terra", "luna" for Codex; "flash", "pro" for Gemini; "k3", "latest", "thinking", "k2.7-code", "k2.6", "k2.5" for Kimi)
 - `timeout` (optional): Auto-kill after N seconds
 - `tags` (optional): Comma-separated tags for organization
 - `shard` (optional): Create isolated git worktree (can also use `permission="shard"`)

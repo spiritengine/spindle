@@ -5129,6 +5129,7 @@ async def spin(
         allowed_tools: Override permission profile with explicit tool list
         tags: Comma-separated tags for organizing spools (e.g. "batch-1,triage")
         model: Model to use - for Claude: "haiku", "sonnet", "opus", "fable" (claude-fable-5, access ends 2026-07-12), or versioned aliases like "opus-5";
+               for Codex: "astra" (gpt-6-astra), "sol", "terra", "luna", or a full model name;
                for Gemini: "flash", "pro", or full model names like "gemini-2.5-pro";
                for Kimi: "k3"/"latest"/"thinking" (K3, always thinking), "k2.6", "k2.5", "k2.7-code"/"code" (coding-focused, thinking-only), "highspeed", or full model names.
                Use spin_harnesses() to see all available models.
@@ -9130,6 +9131,7 @@ CLAUDE_MODEL_ALIASES = {
 #   node ~/.codex/skills/.system/openai-docs/scripts/resolve-latest-model-info.js
 #
 # ACCESS REALITY (ChatGPT-account auth on this box):
+#   * gpt-6-astra: LIVE (verified 2026-09-11 on codex 0.154.0).
 #   * gpt-5.6-sol/terra/luna: LIVE and the default (verified 2026-07-17 on codex
 #     0.144.4). Earlier (2026-07-09) codex 0.144.0 400'd with "requires a newer
 #     version of Codex", so 5.6 was staged; 0.144.4 speaks it. Gotcha: the 400
@@ -9141,6 +9143,8 @@ CLAUDE_MODEL_ALIASES = {
 #     using Codex with a ChatGPT account" — unusable on this auth.
 #   * gpt-5.5: works; prior default, kept as an alias.
 CODEX_MODEL_ALIASES = {
+    # GPT-6 Astra — explicit frontier model; keep the stable default unchanged.
+    "astra": "gpt-6-astra",
     # GPT-5.6 series (Sol/Terra/Luna) — LIVE on codex 0.144.4 (see access note
     # above). Sol/Terra/Luna are durable capability tiers (flagship /
     # balanced mini-like / fast nano-like); no separate "-codex" variant.

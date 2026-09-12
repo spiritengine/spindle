@@ -123,6 +123,7 @@ spin(
 ```
 
 Available models:
+- `gpt-6-astra` — frontier tier; alias `astra`
 - `gpt-5.6-sol` (default) — flagship tier; `5.6`, `sol`, and `codex` normalize to it
 - `gpt-5.6` — official umbrella model; preserved for API-key or unknown authentication,
   but mapped to `gpt-5.6-sol` when `codex login status` reports ChatGPT authentication
