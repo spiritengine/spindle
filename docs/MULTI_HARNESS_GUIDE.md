@@ -78,7 +78,7 @@ spin(prompt="Add error handling to process_data()", harness="codex", working_dir
 ### Gemini CLI
 
 **CLI:** `gemini` (Google's Gemini CLI)
-**Models:** Gemini 2.5 Pro, 2.5 Flash, 3.1 Pro, 3.1 Flash Lite (Auto routing by default)
+**Models:** Gemini 3.8 Flash, 3.1 Pro Preview (default), 3.5 Flash-Lite, and explicit older aliases
 **Startup time:** ~5-10 seconds to first response
 **Strengths:** Fast startup, generous free tier, good for quick tasks
 
@@ -90,14 +90,19 @@ spin(prompt="Summarize this codebase", harness="gemini", working_dir="/path/to/p
 ```
 
 **Model aliases:**
-- `"flash"` → `gemini-2.5-flash`
-- `"pro"` → `gemini-2.5-pro`
+- `"flash"` / `"video"` / `"3.8-flash"` → `gemini-3.8-flash`
+- `"pro"` / `"3-pro"` → `gemini-3.1-pro-preview` (3 Pro Preview has shut down)
 - `"3.1-pro"` → `gemini-3.1-pro-preview`
-- `"flash-lite"` → `gemini-2.5-flash-lite`
-- No model specified → CLI's Auto routing (picks based on task complexity)
+- `"flash-lite"` / `"3.5-flash-lite"` → `gemini-3.5-flash-lite`
+- `"2.5-pro"`, `"2.5-flash"`, `"2.5-flash-lite"` → the corresponding 2.5 models
+- No model specified → `gemini-3.1-pro-preview`; Spindle selects it explicitly
 - Any other string passes through to the CLI as-is
 
 **Important:** Gemini requires `working_dir` to be specified. Auth via `gemini` interactive login or `GEMINI_API_KEY` env var.
+
+For native video, use `spin("Describe @clip.mp4", harness="gemini", model="video", working_dir="/path/to/clips")`.
+Gemini CLI 0.39.1 attaches the video bytes; Spindle does not extract frames.
+See [video setup, trust, and limits](GEMINI_VIDEO.md).
 
 ### Kimi CLI
 

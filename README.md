@@ -327,7 +327,8 @@ Spindle supports multiple AI agent harnesses, allowing you to choose the best to
 - Fast startup (~5-10 seconds to first response)
 - Full agent with tool use, file access, multi-step reasoning
 - Generous free tier (1000 req/day with Google account)
-- Models: `"flash"`, `"pro"`, or any full model name
+- Models: `"flash"`/`"video"` (3.8 Flash), `"pro"` (3.1 Pro Preview, default), `"flash-lite"` (3.5 Flash-Lite), or any full model name
+- Native video: put `@clip.mp4` in the prompt and set `working_dir` to its directory. Verified with Gemini CLI 0.39.1; local files are limited to 20 MiB. See [video setup and limits](docs/GEMINI_VIDEO.md).
 - Use `harness="gemini"`
 
 **Kimi CLI** - Moonshot AI's Kimi models via `kimi-cli`
@@ -500,7 +501,7 @@ abandonment.
 - `harness` (optional): "claude-code" (default), "codex", "gemini", or "kimi"
 - `working_dir` (optional for Claude, required for Codex/Gemini/Kimi): Project directory
 - `permission` (optional): "readonly" (alias "manual"), "careful" (default, = auto), "full", "shard", "careful+shard", "research", "research+shard", "auto", "auto+shard" (readonly/manual cannot be combined with shard intent; `auto` variants are Claude-only; other names map to harness-specific enforcement, and Kimi accepts them for compatibility but has no "careful" approval mode)
-- `model` (optional): Model to use ("sonnet", "opus", "opus-5", "haiku" for Claude; "astra", "sol", "terra", "luna" for Codex; "flash", "pro" for Gemini; "k3", "latest", "thinking", "k2.7-code", "k2.6", "k2.5" for Kimi)
+- `model` (optional): Model to use ("sonnet", "opus", "opus-5", "haiku" for Claude; "astra", "sol", "terra", "luna" for Codex; "flash", "pro", "video" for Gemini; "k3", "latest", "thinking", "k2.7-code", "k2.6", "k2.5" for Kimi)
 - `timeout` (optional): Auto-kill after N seconds
 - `tags` (optional): Comma-separated tags for organization
 - `shard` (optional): Create isolated git worktree (can also use `permission="shard"`)

@@ -4013,13 +4013,28 @@ class TestGeminiHarness:
 
     def test_gemini_model_aliases(self):
         """Model aliases should resolve to full model names."""
-        assert GEMINI_MODEL_ALIASES["flash"] == "gemini-2.5-flash"
-        assert GEMINI_MODEL_ALIASES["pro"] == "gemini-2.5-pro"
+        assert GEMINI_MODEL_ALIASES["flash"] == "gemini-3.8-flash"
+        assert GEMINI_MODEL_ALIASES["video"] == "gemini-3.8-flash"
+        assert GEMINI_MODEL_ALIASES["pro"] == "gemini-3.1-pro-preview"
+        assert GEMINI_MODEL_ALIASES["3-pro"] == "gemini-3.1-pro-preview"
         assert GEMINI_MODEL_ALIASES["3.1-pro"] == "gemini-3.1-pro-preview"
-        assert GEMINI_MODEL_ALIASES["flash-lite"] == "gemini-2.5-flash-lite"
+        assert GEMINI_MODEL_ALIASES["flash-lite"] == "gemini-3.5-flash-lite"
+        assert GEMINI_MODEL_ALIASES["2.5-pro"] == "gemini-2.5-pro"
 
-    def test_gemini_spin_resolves_alias(self, tmp_path):
-        """Gemini spin should resolve model aliases in the CLI command."""
+    @pytest.mark.parametrize(
+        "model, expected",
+        [
+            (None, "gemini-3.1-pro-preview"),
+            ("pro", "gemini-3.1-pro-preview"),
+            ("3-pro", "gemini-3.1-pro-preview"),
+            ("video", "gemini-3.8-flash"),
+            ("flash", "gemini-3.8-flash"),
+            ("2.5-pro", "gemini-2.5-pro"),
+            ("gemini-future-model", "gemini-future-model"),
+        ],
+    )
+    def test_gemini_spin_resolves_alias(self, tmp_path, model, expected):
+        """The command and spool agree, while CLI attachment syntax passes intact."""
         captured_cmd = []
 
         def fake_spawn(spool_id, cmd, cwd, env=None):
@@ -4029,17 +4044,22 @@ class TestGeminiHarness:
         with patch("spindle.SPINDLE_DIR", tmp_path):
             with patch("spindle._spawn_detached", side_effect=fake_spawn):
                 with patch("spindle._count_running", return_value=0):
-                    _gemini_spin_sync(
-                        prompt="Test",
+                    spool_id = _gemini_spin_sync(
+                        prompt="Describe @clip.mp4 in temporal order",
                         working_dir=str(tmp_path),
-                        model="pro",
+                        model=model,
                         system_prompt=None,
                         timeout=None,
                         tags=None,
                         env=None,
                     )
 
-        assert "gemini-2.5-pro" in captured_cmd
+        assert captured_cmd[captured_cmd.index("-m") + 1] == expected
+        assert captured_cmd[captured_cmd.index("-p") + 1] == "Describe @clip.mp4 in temporal order"
+        spool = json.loads((tmp_path / f"{spool_id}.json").read_text())
+        assert spool["model"] == expected
+        if model is None:
+            assert _get_harnesses()["gemini"]["default_model"] == expected
 
     def test_gemini_spin_requires_working_dir(self, tmp_path):
         """Gemini spin should require working_dir."""

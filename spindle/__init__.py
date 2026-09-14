@@ -5130,7 +5130,8 @@ async def spin(
         tags: Comma-separated tags for organizing spools (e.g. "batch-1,triage")
         model: Model to use - for Claude: "haiku", "sonnet", "opus", "fable" (claude-fable-5, access ends 2026-07-12), or versioned aliases like "opus-5";
                for Codex: "astra" (gpt-6-astra), "sol", "terra", "luna", or a full model name;
-               for Gemini: "flash", "pro", or full model names like "gemini-2.5-pro";
+               for Gemini: "flash", "pro", "video" (3.8 Flash), or full model names;
+               native video input uses @clip.mp4 in the prompt with the clip in working_dir;
                for Kimi: "k3"/"latest"/"thinking" (K3, always thinking), "k2.6", "k2.5", "k2.7-code"/"code" (coding-focused, thinking-only), "highspeed", or full model names.
                Use spin_harnesses() to see all available models.
         timeout: Kill spool after this many seconds (default: no timeout).
@@ -7180,8 +7181,9 @@ def _get_harnesses() -> dict:
         },
         "gemini": {
             "models": GEMINI_MODEL_ALIASES,
-            "default_model": "gemini-2.5-pro",
+            "default_model": GEMINI_DEFAULT_MODEL,
             "requires": "gemini CLI",
+            "note": "Native video: model='video', prompt='Describe @clip.mp4', working_dir containing the clip. Verified with Gemini CLI 0.39.1; its file reader limits files to 20 MiB. Trust the workspace in Gemini first.",
         },
         "kimi": {
             "models": KIMI_MODEL_ALIASES,
@@ -9186,21 +9188,29 @@ CODEX_MODEL_ALIASES = {
 # used by Claude Code and Codex harnesses.
 
 # Short aliases for common models. Anything not here passes through to the CLI.
-# Source of truth: Generative Language API — verify with:
-#   curl "https://generativelanguage.googleapis.com/v1beta/models?key=$GEMINI_API_KEY&pageSize=200"
-# All values verified 2026-06-20: every alias below resolves to a live generateContent model.
+# Catalog: https://ai.google.dev/gemini-api/docs/models (2026-09-13).
+# CLI/account availability can differ from the API catalog. See docs/GEMINI_VIDEO.md.
+GEMINI_DEFAULT_MODEL = "gemini-3.1-pro-preview"
 GEMINI_MODEL_ALIASES = {
-    # 2.5 family — current CLI default
-    "flash": "gemini-2.5-flash",
-    "pro": "gemini-2.5-pro",
-    "flash-lite": "gemini-2.5-flash-lite",
-    # 3.x family — pro variants preview-only; flash-lite and 3.5-flash GA; all live as of 2026-06-20
-    "3-pro": "gemini-3-pro-preview",
+    "flash": "gemini-3.8-flash",
+    "pro": GEMINI_DEFAULT_MODEL,
+    "video": "gemini-3.8-flash",
+    "flash-lite": "gemini-3.5-flash-lite",
+    # Explicit older models remain available without pinning the generic aliases.
+    "2.5-flash": "gemini-2.5-flash",
+    "2.5-pro": "gemini-2.5-pro",
+    "2.5-flash-lite": "gemini-2.5-flash-lite",
+    # 3 Pro Preview is shut down; keep its shortcut useful by selecting 3.1 Pro.
+    "3-pro": GEMINI_DEFAULT_MODEL,
     "3-flash": "gemini-3-flash-preview",
     "3.1-pro": "gemini-3.1-pro-preview",
     "3.1-flash-lite": "gemini-3.1-flash-lite",
     "3.1-customtools": "gemini-3.1-pro-preview-customtools",
     "3.5-flash": "gemini-3.5-flash",
+    "3.5-flash-lite": "gemini-3.5-flash-lite",
+    "3.6-flash": "gemini-3.6-flash",
+    "3.7-flash": "gemini-3.7-flash",
+    "3.8-flash": "gemini-3.8-flash",
     # Gemma 4 open-weight variants
     "gemma-4": "gemma-4-31b-it",
     "gemma-4-mini": "gemma-4-26b-a4b-it",
@@ -9573,7 +9583,7 @@ def _gemini_spin_sync(
             return f"Error: {error}"
 
     # Resolve model aliases (default to pro if no model specified)
-    resolved_model = GEMINI_MODEL_ALIASES.get(model, model) if model else "gemini-2.5-pro"
+    resolved_model = GEMINI_MODEL_ALIASES.get(model, model) if model else GEMINI_DEFAULT_MODEL
 
     effective_prompt = prompt
     if research_target_info:
@@ -12212,7 +12222,7 @@ def main():
     spin_parser.add_argument(
         "--model",
         "-m",
-        help="Model to use (e.g. haiku/sonnet/opus/opus-5/fable for Claude, flash/pro for Gemini, k3/latest/thinking/k2.6/k2.7-code for Kimi)",
+        help="Model to use (e.g. haiku/sonnet/opus/opus-5/fable for Claude, astra/sol/terra/luna for Codex, flash/pro/video for Gemini, k3/latest/thinking/k2.6/k2.7-code for Kimi)",
     )
     spin_parser.add_argument("--harness", help="Harness to use: claude-code (default), codex, gemini, or kimi")
     spin_parser.add_argument("--timeout", "-t", type=int, help="Kill spool after N seconds")
