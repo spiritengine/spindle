@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased
+
+Model catalog sweep (2026-09-25). Every alias below was checked against the
+provider's live model list and, for new ids, exercised with a one-line request.
+
+### Fixed
+
+- `model="fable"` no longer pins the legacy `claude-fable-5`. The alias now
+  passes through to the claude CLI's own rolling `fable` alias, which resolves
+  to Claude Fable 5.1. The old pin silently held every fable spin on the legacy
+  model after 5.1 shipped. The Fable safety-gate attribution follows the same
+  rule and recognizes any `claude-fable-*` id.
+- Kimi's `k2.5` alias is gone: Moonshot no longer serves `kimi-k2.6`'s
+  predecessor, so the alias could only fail the pre-spin model check.
+
+### Added
+
+- Claude pinned aliases `fable-5.1` (`claude-fable-5-1`), `opus-5.5`
+  (`claude-opus-5-5`), and `sonnet-5` (`claude-sonnet-5`); `fable-5` and
+  `opus-5` remain as legacy pins.
+- Codex aliases `reserve` (`gpt-reserve`, a hidden fast/affordable coding tier
+  that the ChatGPT-account route serves), `6` / `6-astra` (`gpt-6-astra`), and
+  `6-sol` / `6-luna` for the API-only GPT-6 tiers. The default stays on
+  `gpt-5.6-sol`. `gpt-5.5` retires 2026-10-14.
+
 ## 1.2.0
 
 Release-readiness pass: an installed spindle can now be identified, diagnosed,

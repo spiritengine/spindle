@@ -36,7 +36,7 @@ Spindle abstracts the underlying AI agent implementation through a "harness" lay
 ### Claude Code (Default)
 
 **CLI:** `claude` (Anthropic's Claude Code CLI)
-**Models:** Claude Sonnet, Opus, Haiku
+**Models:** Claude Fable, Opus, Sonnet, Haiku (Fable 5.1, Opus 5.5, Sonnet 5, Haiku 4.5 as of 2026-09-25)
 **Startup time:** ~3-4 minutes to first response
 **Strengths:** Complex reasoning, architecture design, code review
 
@@ -58,7 +58,7 @@ spin("Refactor auth to use dependency injection")
 ### Codex CLI
 
 **CLI:** `codex` (OpenAI's Codex CLI)
-**Models:** GPT-6 Astra and GPT-5 Codex (`astra` selects `gpt-6-astra`)
+**Models:** GPT-6 Astra (`astra`), GPT-5.6 Sol/Terra/Luna (`sol` is the default), GPT-Reserve (`reserve`); see [CODEX_SETUP.md](CODEX_SETUP.md) for what the ChatGPT-account route serves
 **Startup time:** ~10 seconds to first response
 **Strengths:** Speed, quick edits, prototyping
 
@@ -74,6 +74,13 @@ spin(prompt="Add error handling to process_data()", harness="codex", working_dir
 ```
 
 **Important:** Codex requires `working_dir` to be specified. Claude Code can infer it from the current session.
+
+**Claude model aliases:**
+- `"haiku"` / `"sonnet"` / `"opus"` / `"fable"` → passed through as the CLI's rolling "latest of this tier" alias (`fable` is Fable 5.1, `opus` is Opus 5.5 as of 2026-09-25)
+- `"fable-5.1"` → `claude-fable-5-1`, `"opus-5.5"` → `claude-opus-5-5`, `"sonnet-5"` → `claude-sonnet-5`, `"haiku-4.5"` → `claude-haiku-4-5`
+- `"fable-5"`, `"opus-5"`, `"opus-4.8"`, `"opus-4.7"`, `"opus-4.6"`, `"sonnet-4.6"` → the corresponding legacy ids (still served)
+- No model specified → `sonnet`
+- Any other string passes through to the CLI as-is
 
 ### Gemini CLI
 
@@ -141,7 +148,7 @@ spin(prompt="Analyze this bug and suggest a fix", harness="kimi", working_dir="/
 - `"k3"` → `moonshot-ai/kimi-k3` with required thinking mode
 - `"thinking"` → `moonshot-ai/kimi-k3` with required thinking mode
 - `"k2.6"` → `moonshot-ai/kimi-k2.6`
-- `"k2.5"` → `moonshot-ai/kimi-k2.5`
+- `"k2.7-code"` / `"code"` → `moonshot-ai/kimi-k2.7-code` with required thinking mode; `"highspeed"` → the highspeed variant
 - `"latest"` → `moonshot-ai/kimi-k3` with required thinking mode (latest stable)
 - No model specified → `moonshot-ai/kimi-k3` with required thinking mode (default)
 - Any other string passes through to the CLI as-is

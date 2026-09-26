@@ -3127,15 +3127,17 @@ def _is_fable_gate(model, text) -> bool:
     ``stop_reason == "refusal"`` is the generic Anthropic safety-refusal signal —
     any model can emit it, so it alone must not be attributed to Fable. When a
     model was recorded, trust it: the gate is Fable's iff the model resolves to
-    claude-fable-5; any other model's refusal is not Fable's, even if the task
-    text happens to mention "Fable 5". Only when no model was recorded (respins
-    and continues, which don't carry one) do we fall back to the CLI's
-    Fable-specific gate text. The separate "issue with the selected model
-    (claude-fable-5)" unavailability error never reaches here — it carries
-    stop_reason "stop_sequence", not "refusal".
+    a Fable-family id (the CLI's rolling "fable" alias, claude-fable-5-1, the
+    legacy claude-fable-5, and any later claude-fable-* release); any other
+    model's refusal is not Fable's, even if the task text happens to mention
+    "Fable 5". Only when no model was recorded (respins and continues, which
+    don't carry one) do we fall back to the CLI's Fable-specific gate text,
+    which names the model generation ("Fable 5", "Fable 5.1"). The separate
+    "issue with the selected model (claude-fable-5)" unavailability error never
+    reaches here — it carries stop_reason "stop_sequence", not "refusal".
     """
     if isinstance(model, str) and model.strip():
-        return CLAUDE_MODEL_ALIASES.get(model, model) == "claude-fable-5"
+        return _is_fable_model(model)
     return isinstance(text, str) and "Fable 5" in text
 
 
@@ -5128,11 +5130,12 @@ async def spin(
         working_dir: Directory for the agent to work in (defaults to current)
         allowed_tools: Override permission profile with explicit tool list
         tags: Comma-separated tags for organizing spools (e.g. "batch-1,triage")
-        model: Model to use - for Claude: "haiku", "sonnet", "opus", "fable" (claude-fable-5, access ends 2026-07-12), or versioned aliases like "opus-5";
-               for Codex: "astra" (gpt-6-astra), "sol", "terra", "luna", or a full model name;
+        model: Model to use - for Claude: "haiku", "sonnet", "opus", "fable" (the CLI's rolling latest of each tier;
+               "fable" is Fable 5.1 as of 2026-09-25) or pinned aliases like "fable-5.1", "opus-5.5", "sonnet-5", "opus-5";
+               for Codex: "astra" (gpt-6-astra), "sol" (default), "terra", "luna", "reserve" (gpt-reserve), or a full model name;
                for Gemini: "flash", "pro", "video" (3.8 Flash), or full model names;
                native video input uses @clip.mp4 in the prompt with the clip in working_dir;
-               for Kimi: "k3"/"latest"/"thinking" (K3, always thinking), "k2.6", "k2.5", "k2.7-code"/"code" (coding-focused, thinking-only), "highspeed", or full model names.
+               for Kimi: "k3"/"latest"/"thinking" (K3, always thinking), "k2.6", "k2.7-code"/"code" (coding-focused, thinking-only), "highspeed", or full model names.
                Use spin_harnesses() to see all available models.
         timeout: Kill spool after this many seconds (default: no timeout).
                  Exception: spools tagged with a review marker ("review", "fell-r1"
@@ -7170,11 +7173,11 @@ def _get_harnesses() -> dict:
         },
         "codex": {
             "models": CODEX_MODEL_ALIASES,
-            # gpt-5.6-sol is the default: it works on codex 0.144.4 (verified
-            # 2026-07-17). gpt-5.3-codex still 400s on ChatGPT-account auth
-            # (see the CODEX_MODEL_ALIASES access note). Keep the spindle
-            # service's PATH on a node whose global codex is current — an old
-            # node's stale codex (e.g. 0.125.0) 400s on 5.6.
+            # gpt-5.6-sol is the default (verified live 2026-09-25 on codex
+            # 0.154.0). The account catalog now ranks gpt-6-astra first and
+            # labels 5.6 "Older"; moving the default is Patrick's call. See the
+            # CODEX_MODEL_ALIASES access note for what 400s on ChatGPT auth and
+            # why the service PATH must lead with a current-codex node.
             "default_model": "gpt-5.6-sol",
             "requires": "codex CLI",
             "note": "Aliases are shortcuts; any model string accepted by codex CLI also works",
@@ -9103,50 +9106,91 @@ def _codex_respin_sync(session_id: str, prompt: str) -> str:
 
 
 # Short aliases for common Claude models. Anything not here passes through.
-# The plain "haiku"/"sonnet"/"opus" aliases are also accepted by the claude CLI
-# directly; they're listed here so spin_harnesses() can advertise them.
+# The plain "haiku"/"sonnet"/"opus"/"fable" aliases are the claude CLI's own
+# rolling "latest of this tier" names and are passed through untouched so they
+# keep tracking whatever the CLI considers current; they're listed here so
+# spin_harnesses() can advertise them. Versioned aliases pin a generation.
 # Source of truth: https://platform.claude.com/docs/en/about-claude/models/overview
+#
+# Catalog as of 2026-09-25 (claude CLI 2.1.282, each id verified live):
+#   current: claude-fable-5-1, claude-opus-5-5, claude-sonnet-5, claude-haiku-4-5
+#   legacy (still served): claude-fable-5, claude-opus-5, claude-opus-4-8/4-7/4-6,
+#            claude-sonnet-4-6
+# The CLI's bare "fable" resolves to claude-fable-5-1 and bare "opus" to
+# claude-opus-5-5. Do NOT pin "fable" to a dated id here: an earlier table did
+# ("fable" -> claude-fable-5) and silently held every fable spin on the legacy
+# model after Fable 5.1 shipped.
 CLAUDE_MODEL_ALIASES = {
     "haiku": "haiku",
     "sonnet": "sonnet",
     "opus": "opus",
+    "fable": "fable",
+    # Current generation, pinned
+    "fable-5.1": "claude-fable-5-1",
+    "opus-5.5": "claude-opus-5-5",
+    "sonnet-5": "claude-sonnet-5",
     "haiku-4.5": "claude-haiku-4-5",
-    "sonnet-4.6": "claude-sonnet-4-6",
-    "opus-4.6": "claude-opus-4-6",
-    "opus-4.7": "claude-opus-4-7",
-    "opus-4.8": "claude-opus-4-8",
-    "opus-5": "claude-opus-5",
-    # Fable access sunsets 2026-07-12; after that the claude CLI will reject
-    # the model (the alias itself stays harmless — unknowns pass through).
-    "fable": "claude-fable-5",
+    # Legacy generations, pinned (still served as of 2026-09-25)
     "fable-5": "claude-fable-5",
-    # Opus 4.7 already has 1M context at standard pricing; the [1m] suffix
-    # is preserved for explicit-context callers and back-compat.
+    "opus-5": "claude-opus-5",
+    "opus-4.8": "claude-opus-4-8",
+    "opus-4.7": "claude-opus-4-7",
+    "opus-4.6": "claude-opus-4-6",
+    "sonnet-4.6": "claude-sonnet-4-6",
+    # Every current model has 1M context natively; the [1m] suffix is kept
+    # only for explicit-context callers and back-compat with older scripts.
     "opus-4.7-1m": "claude-opus-4-7[1m]",
     "opus-1m": "claude-opus-4-7[1m]",
 }
 
+# Resolved Claude model ids that belong to the Fable family. The bare "fable"
+# alias is included because the CLI resolves it to the current Fable release.
+FABLE_MODEL_PREFIX = "claude-fable-"
+
+
+def _is_fable_model(model) -> bool:
+    """True when ``model`` (alias or full id) selects a Fable-family model."""
+    if not isinstance(model, str) or not model.strip():
+        return False
+    resolved = CLAUDE_MODEL_ALIASES.get(model, model)
+    return resolved == "fable" or resolved.startswith(FABLE_MODEL_PREFIX)
+
 
 # Short aliases for common Codex/OpenAI models. Anything not here passes through.
-# Source of truth: the codex CLI's own resolver, which reports the current latest
-# model (returns gpt-5.6-sol as of 2026-07-09):
-#   node ~/.codex/skills/.system/openai-docs/scripts/resolve-latest-model-info.js
+# Sources of truth, in order of authority for THIS account:
+#   1. The codex CLI's per-account catalog, refreshed on every run:
+#        python3 -c 'import json;[print(m["slug"],m["visibility"],m.get("upgrade"))
+#          for m in json.load(open("$HOME/.codex/models_cache.json"))["models"]]'
+#   2. The codex resolver for the newest public model (gpt-6-astra as of 2026-09-25):
+#        node ~/.codex/skills/.system/openai-docs/scripts/resolve-latest-model-info.cjs
+#   3. https://developers.openai.com/api/docs/models (API-key entitlements).
 #
-# ACCESS REALITY (ChatGPT-account auth on this box):
-#   * gpt-6-astra: LIVE (verified 2026-09-11 on codex 0.154.0).
-#   * gpt-5.6-sol/terra/luna: LIVE and the default (verified 2026-07-17 on codex
-#     0.144.4). Earlier (2026-07-09) codex 0.144.0 400'd with "requires a newer
-#     version of Codex", so 5.6 was staged; 0.144.4 speaks it. Gotcha: the 400
-#     is per codex-BINARY version, and the spindle service resolves `codex` off
-#     its systemd-unit PATH — if that PATH leads with an old node whose global
-#     codex is stale (e.g. 0.125.0), every spin 400s on 5.6 while an interactive
-#     shell on a newer node works. Keep the unit PATH on a current-codex node.
-#   * gpt-5.3-codex and the other API-only *-codex ids: 400 "not supported when
-#     using Codex with a ChatGPT account" — unusable on this auth.
-#   * gpt-5.5: works; prior default, kept as an alias.
+# ACCESS REALITY (ChatGPT-account auth on this box, codex 0.154.0, 2026-09-25):
+#   * gpt-6-astra: LIVE, catalog priority 1 (verified 2026-09-11).
+#   * gpt-reserve: LIVE (verified 2026-09-25). Hidden from the TUI picker
+#     (visibility "hide") but served; the catalog describes it as a "fast and
+#     affordable agentic coding model". Efforts low..max, no "ultra".
+#   * gpt-5.6-sol/terra/luna: LIVE and the default. The catalog now labels the
+#     5.6 tiers "Older"; Sol stays the default here until Patrick moves it.
+#     Gotcha: a stale codex BINARY 400s on 5.6 ("requires a newer version of
+#     Codex") — the spindle service resolves `codex` off its systemd-unit PATH,
+#     so keep that PATH on a node whose global codex is current.
+#   * gpt-5.5: LIVE but RETIRES 2026-10-14T19:00Z (catalog upgrade -> gpt-5.6-sol).
+#   * gpt-6-sol / gpt-6-luna: listed on the public API docs but 400 "not
+#     supported when using Codex with a ChatGPT account" (verified 2026-09-25).
+#     API-key installs may have them; aliases kept so they pass through cleanly.
+#   * gpt-5.3-codex and the other API-only *-codex ids: same 400 on this auth.
 CODEX_MODEL_ALIASES = {
-    # GPT-6 Astra — explicit frontier model; keep the stable default unchanged.
+    # GPT-6 family. Astra is the frontier tier and the only GPT-6 id served on
+    # ChatGPT-account auth; Sol/Luna are API-only (see access note). The stable
+    # default stays on 5.6 Sol.
     "astra": "gpt-6-astra",
+    "6": "gpt-6-astra",
+    "6-astra": "gpt-6-astra",
+    "6-sol": "gpt-6-sol",
+    "6-luna": "gpt-6-luna",
+    # GPT-Reserve — hidden, fast/affordable agentic coding tier (see access note)
+    "reserve": "gpt-reserve",
     # GPT-5.6 series (Sol/Terra/Luna) — LIVE on codex 0.144.4 (see access note
     # above). Sol/Terra/Luna are durable capability tiers (flagship /
     # balanced mini-like / fast nano-like); no separate "-codex" variant.
@@ -9157,7 +9201,8 @@ CODEX_MODEL_ALIASES = {
     "terra": "gpt-5.6-terra",
     "5.6-luna": "gpt-5.6-luna",
     "luna": "gpt-5.6-luna",
-    # GPT-5.5 series — prior default; "codex" now tracks the 5.6 flagship
+    # GPT-5.5 series — prior default, retires 2026-10-14 (migrate to 5.6 Sol);
+    # "codex" tracks the 5.6 flagship
     "5.5": "gpt-5.5",
     "5.5-pro": "gpt-5.5-pro",
     "codex": "gpt-5.6-sol",
@@ -9188,7 +9233,12 @@ CODEX_MODEL_ALIASES = {
 # used by Claude Code and Codex harnesses.
 
 # Short aliases for common models. Anything not here passes through to the CLI.
-# Catalog: https://ai.google.dev/gemini-api/docs/models (2026-09-13).
+# Catalog: https://ai.google.dev/gemini-api/docs/models; cross-checked against the
+# live list (GET /v1beta/models with GEMINI_API_KEY) on 2026-09-25 — every value
+# below is served. Newest text models in that list: gemini-3.8-flash and
+# gemini-3.1-pro-preview (no 3.5+ Pro yet). Not aliased on purpose: the rolling
+# gemini-flash-latest / gemini-pro-latest ids (pass through if wanted) and the
+# omni/tts/image/lyria families, which are not agent-CLI text models.
 # CLI/account availability can differ from the API catalog. See docs/GEMINI_VIDEO.md.
 GEMINI_DEFAULT_MODEL = "gemini-3.1-pro-preview"
 GEMINI_MODEL_ALIASES = {
@@ -9228,6 +9278,11 @@ GEMINI_MODEL_ALIASES = {
 # general model and runs it in thinking mode (see KIMI_THINKING_ALIASES). Upgrade
 # kimi-cli and use interactive `/model` if a newly released managed model is missing.
 #
+# Catalog check 2026-09-25 (GET https://api.moonshot.ai/v1/models, kimi-cli 0.27.0):
+# kimi-k3, kimi-k2.7-code, kimi-k2.7-code-highspeed, kimi-k2.6 — nothing newer
+# than K3. kimi-k2.5 is no longer served or registered locally, so its alias was
+# removed (it would have failed _kimi_validate_model before reserving a slot).
+#
 # K3 is the current general flagship and is always-thinking. kimi-k2.7-code
 # (released 2026-06-12) is a coding-focused upgrade on the k2.6 foundation and is
 # also thinking-only. These models MUST always run with --thinking regardless of
@@ -9240,7 +9295,6 @@ KIMI_MODEL_ALIASES = {
     "latest": "moonshot-ai/kimi-k3",
     "k3": "moonshot-ai/kimi-k3",
     "k2.6": "moonshot-ai/kimi-k2.6",
-    "k2.5": "moonshot-ai/kimi-k2.5",
     # k2.7-code — coding-specialized, thinking-only (see KIMI_THINKING_REQUIRED)
     "k2.7-code": "moonshot-ai/kimi-k2.7-code",
     "k2.7": "moonshot-ai/kimi-k2.7-code",
@@ -12222,7 +12276,7 @@ def main():
     spin_parser.add_argument(
         "--model",
         "-m",
-        help="Model to use (e.g. haiku/sonnet/opus/opus-5/fable for Claude, astra/sol/terra/luna for Codex, flash/pro/video for Gemini, k3/latest/thinking/k2.6/k2.7-code for Kimi)",
+        help="Model to use (e.g. haiku/sonnet/opus/fable or pinned fable-5.1/opus-5.5/sonnet-5 for Claude, astra/sol/terra/luna/reserve for Codex, flash/pro/video for Gemini, k3/latest/thinking/k2.6/k2.7-code for Kimi)",
     )
     spin_parser.add_argument("--harness", help="Harness to use: claude-code (default), codex, gemini, or kimi")
     spin_parser.add_argument("--timeout", "-t", type=int, help="Kill spool after N seconds")

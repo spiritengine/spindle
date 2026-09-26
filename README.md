@@ -226,8 +226,12 @@ spin("Summarize this file", model="haiku")
 # Complex work to opus
 spin("Design the new architecture", model="opus")
 
-# Pin Claude Opus 5
-spin("Implement the new architecture", model="opus-5")
+# Frontier reasoning: "fable" is the CLI's rolling alias (Fable 5.1 as of 2026-09)
+spin("Untangle the scheduler race", model="fable")
+
+# Pin a generation instead of riding the rolling alias
+spin("Implement the new architecture", model="opus-5.5")   # claude-opus-5-5
+spin("Reproduce last month's review", model="fable-5")      # legacy claude-fable-5
 
 # Auto-kill if it takes too long
 spin("Should be quick", timeout=60)
@@ -320,7 +324,7 @@ Spindle supports multiple AI agent harnesses, allowing you to choose the best to
 - Extremely fast startup (~10 seconds to first response)
 - Good for quick edits, simple tasks, prototyping
 - Requires ChatGPT Plus/Pro/Enterprise
-- Models include `"astra"` (`gpt-6-astra`), `"sol"`, `"terra"`, `"luna"`, or any full model name
+- Models include `"astra"` (`gpt-6-astra`), `"sol"` (default), `"terra"`, `"luna"`, `"reserve"` (`gpt-reserve`, fast/affordable coding tier), or any full model name
 - Use `harness="codex"`
 
 **Gemini CLI** - Google's Gemini models via `gemini` CLI
@@ -334,7 +338,7 @@ Spindle supports multiple AI agent harnesses, allowing you to choose the best to
 **Kimi CLI** - Moonshot AI's Kimi models via `kimi-cli`
 - Fast startup (~5-10 seconds to first response)
 - Thinking mode for complex reasoning
-- Models: `"k3"`/`"latest"`/`"thinking"` (K3, always thinking; default), `"k2.7-code"`, `"k2.6"`, `"k2.5"`, or any full model name
+- Models: `"k3"`/`"latest"`/`"thinking"` (K3, always thinking; default), `"k2.7-code"`, `"k2.6"`, or any full model name
 - Kimi headless mode auto-approves its tool calls; it has no classifier-vetted
   or genuinely "careful" mode. Spindle therefore wraps every Kimi process
   except `full` without shard intent in its own bwrap filesystem boundary. The
@@ -501,7 +505,7 @@ abandonment.
 - `harness` (optional): "claude-code" (default), "codex", "gemini", or "kimi"
 - `working_dir` (optional for Claude, required for Codex/Gemini/Kimi): Project directory
 - `permission` (optional): "readonly" (alias "manual"), "careful" (default, = auto), "full", "shard", "careful+shard", "research", "research+shard", "auto", "auto+shard" (readonly/manual cannot be combined with shard intent; `auto` variants are Claude-only; other names map to harness-specific enforcement, and Kimi accepts them for compatibility but has no "careful" approval mode)
-- `model` (optional): Model to use ("sonnet", "opus", "opus-5", "haiku" for Claude; "astra", "sol", "terra", "luna" for Codex; "flash", "pro", "video" for Gemini; "k3", "latest", "thinking", "k2.7-code", "k2.6", "k2.5" for Kimi)
+- `model` (optional): Model to use ("sonnet", "opus", "fable", "haiku" rolling aliases or pinned "fable-5.1", "opus-5.5", "sonnet-5", "opus-5" for Claude; "astra", "sol", "terra", "luna", "reserve" for Codex; "flash", "pro", "video" for Gemini; "k3", "latest", "thinking", "k2.7-code", "k2.6" for Kimi)
 - `timeout` (optional): Auto-kill after N seconds
 - `tags` (optional): Comma-separated tags for organization
 - `shard` (optional): Create isolated git worktree (can also use `permission="shard"`)

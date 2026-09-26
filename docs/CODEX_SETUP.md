@@ -122,14 +122,19 @@ spin(
 )
 ```
 
-Available models:
-- `gpt-6-astra` — frontier tier; alias `astra`
-- `gpt-5.6-sol` (default) — flagship tier; `5.6`, `sol`, and `codex` normalize to it
+Available models (account catalog checked 2026-09-25 on codex 0.154.0):
+- `gpt-6-astra` — frontier tier; aliases `astra`, `6`, `6-astra`
+- `gpt-reserve` — fast/affordable agentic coding tier; alias `reserve`. Hidden from the
+  TUI model picker but served on ChatGPT-account auth
+- `gpt-5.6-sol` (default) — flagship tier; `5.6`, `sol`, and `codex` normalize to it.
+  The catalog now labels the 5.6 tiers "Older"; the default stays here deliberately
 - `gpt-5.6` — official umbrella model; preserved for API-key or unknown authentication,
   but mapped to `gpt-5.6-sol` when `codex login status` reports ChatGPT authentication
   because that route rejects the umbrella ID on this installation
 - `gpt-5.6-terra` / `gpt-5.6-luna` — explicit faster tiers; aliases `terra` and `luna`
-- `gpt-5.5` — prior default and working compatibility choice
+- `gpt-5.5` — prior default; retires 2026-10-14 (the catalog points it at `gpt-5.6-sol`)
+- `gpt-6-sol` / `gpt-6-luna` — on the public API docs but API-only here; 400 on
+  ChatGPT-account auth. Aliases `6-sol` / `6-luna` pass them through for API-key installs
 - `gpt-5.3-codex` and other `-codex` ids — API-only; 400 on ChatGPT-account auth
 
 Spindle cannot infer every account's model entitlements. Unknown full model IDs pass through

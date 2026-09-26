@@ -4390,7 +4390,10 @@ class TestKimiHarness:
         assert KIMI_MODEL_ALIASES["thinking"] == "moonshot-ai/kimi-k3"
         assert KIMI_MODEL_ALIASES["k3"] == "moonshot-ai/kimi-k3"
         assert KIMI_MODEL_ALIASES["k2.6"] == "moonshot-ai/kimi-k2.6"
-        assert KIMI_MODEL_ALIASES["k2.5"] == "moonshot-ai/kimi-k2.5"
+        # kimi-k2.5 left the managed catalog (2026-09-25 sweep); the alias must not
+        # resolve to a model _kimi_validate_model would refuse.
+        assert "k2.5" not in KIMI_MODEL_ALIASES
+        assert "moonshot-ai/kimi-k2.5" not in KIMI_MODEL_ALIASES.values()
         assert KIMI_MODEL_ALIASES["latest"] == "moonshot-ai/kimi-k3"
         # The retired standalone thinking/turbo models must not reappear as alias targets.
         assert "moonshot-ai/kimi-k2-thinking" not in KIMI_MODEL_ALIASES.values()
@@ -4616,7 +4619,7 @@ class TestKimiHarness:
                     result = _kimi_spin_sync(
                         prompt="Test prompt",
                         working_dir=str(tmp_path),
-                        model="moonshot-ai/kimi-k2.5",
+                        model="moonshot-ai/kimi-k2.6",
                         system_prompt=None,
                         timeout=60,
                         tags="test",
@@ -4633,7 +4636,7 @@ class TestKimiHarness:
 
             assert spool["harness"] == "kimi"
             assert spool["prompt"] == "Test prompt"
-            assert spool["model"] == "moonshot-ai/kimi-k2.5"
+            assert spool["model"] == "moonshot-ai/kimi-k2.6"
             assert spool["timeout"] == 60
             assert "kimi" in spool["tags"]
             assert "test" in spool["tags"]
@@ -5975,13 +5978,55 @@ class TestSpinHarnesses:
         assert result["claude-code"]["models"] == CLAUDE_MODEL_ALIASES
 
     def test_claude_code_advertises_frontier_aliases(self):
-        """spin_harnesses should advertise the fable and current Opus aliases."""
+        """spin_harnesses should advertise the rolling fable alias and pinned generations."""
         result = _get_harnesses()
         models = result["claude-code"]["models"]
-        assert models["fable"] == "claude-fable-5"
+        # Bare "fable" must pass through to the CLI's rolling alias (Fable 5.1 as
+        # of 2026-09-25). Pinning it to claude-fable-5 held every fable spin on
+        # the legacy model after 5.1 shipped.
+        assert models["fable"] == "fable"
+        assert models["fable-5.1"] == "claude-fable-5-1"
         assert models["fable-5"] == "claude-fable-5"
+        assert models["opus-5.5"] == "claude-opus-5-5"
+        assert models["sonnet-5"] == "claude-sonnet-5"
         assert models["opus-4.8"] == "claude-opus-4-8"
         assert models["opus-5"] == "claude-opus-5"
+
+    def test_claude_rolling_aliases_pass_through_unpinned(self):
+        """The CLI's own tier aliases must never be rewritten to a dated id."""
+        for alias in ("haiku", "sonnet", "opus", "fable"):
+            assert CLAUDE_MODEL_ALIASES[alias] == alias
+
+    @pytest.mark.parametrize(
+        "model, expected",
+        [
+            ("fable", True),
+            ("fable-5.1", True),
+            ("fable-5", True),
+            ("claude-fable-5-1", True),
+            ("claude-fable-5", True),
+            ("claude-fable-6", True),  # any later Fable release is still Fable's gate
+            ("opus", False),
+            ("opus-5.5", False),
+            ("claude-opus-5-5", False),
+            ("sonnet-5", False),
+            ("", False),
+            (None, False),
+        ],
+    )
+    def test_is_fable_model_covers_the_family(self, model, expected):
+        assert spindle._is_fable_model(model) is expected
+
+    def test_fable_gate_attribution_follows_recorded_model(self):
+        """A recorded model decides attribution; gate text only matters when none was recorded."""
+        assert spindle._is_fable_gate("fable", "anything") is True
+        assert spindle._is_fable_gate("claude-fable-5-1", "anything") is True
+        # A non-Fable model's refusal is not Fable's even if the text mentions Fable.
+        assert spindle._is_fable_gate("opus-5.5", "Fable 5.1 declined this session") is False
+        # No recorded model: fall back to the CLI's gate text, which names the generation.
+        assert spindle._is_fable_gate(None, "Fable 5.1 declined this session") is True
+        assert spindle._is_fable_gate(None, "Fable 5 declined this session") is True
+        assert spindle._is_fable_gate(None, "The model declined") is False
 
     def test_claude_code_default_model_unchanged(self):
         """Adding frontier aliases must not change the claude-code default."""
@@ -5992,6 +6037,16 @@ class TestSpinHarnesses:
         result = _get_harnesses()["codex"]
         assert result["models"]["astra"] == "gpt-6-astra"
         assert result["default_model"] == "gpt-5.6-sol"
+
+    def test_codex_advertises_2026_09_catalog_additions(self):
+        """gpt-reserve and the GPT-6 tier spellings resolve to the catalog ids."""
+        models = _get_harnesses()["codex"]["models"]
+        assert models["reserve"] == "gpt-reserve"
+        assert models["6"] == "gpt-6-astra"
+        assert models["6-astra"] == "gpt-6-astra"
+        # API-only on ChatGPT-account auth (400), kept so they pass through cleanly.
+        assert models["6-sol"] == "gpt-6-sol"
+        assert models["6-luna"] == "gpt-6-luna"
 
     def test_unknown_harness_returns_error(self):
         """spin() should return error JSON for unknown harness names."""
