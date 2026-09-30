@@ -4,7 +4,7 @@
 
 ```bash
 # Clone the repo
-git clone https://github.com/smythp/spindle.git
+git clone https://github.com/spiritengine/spindle.git
 cd spindle
 
 # Install with dev dependencies
