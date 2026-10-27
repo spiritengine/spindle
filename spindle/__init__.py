@@ -270,12 +270,11 @@ _reload_pending = False
 # Concurrency limit (configurable via env var)
 MAX_CONCURRENT = int(os.environ.get("SPINDLE_MAX_CONCURRENT", "15"))
 
-# Result-size budgeting for unspool. Spool results are bimodal: most are small
-# (~6KB median) but a long tail runs 130KB-280KB and would flood the caller's
-# context. When a result exceeds UNSPOOL_MAX_CHARS, unspool() returns the head
-# and tail with a breadcrumb explaining how to pull the full text, page through
-# it, write it to a file, or search it. Full text always stays in the spool JSON;
-# this only affects the default read. full=True / offset / limit bypass it.
+# Result-size budgeting for MCP result delivery. Spool results are bimodal: most
+# are small (~6KB median) but a long tail runs 130KB-280KB and would flood the
+# caller's context. unspool() and spin_wait() therefore return bounded text with
+# breadcrumbs explaining how to pull the full result. Full text always stays in
+# the spool JSON; unspool(full=True) / offset / limit bypass the default budget.
 UNSPOOL_MAX_CHARS = int(os.environ.get("SPINDLE_UNSPOOL_MAX_CHARS", "50000"))
 UNSPOOL_HEAD_CHARS = int(os.environ.get("SPINDLE_UNSPOOL_HEAD_CHARS", "12000"))
 UNSPOOL_TAIL_CHARS = int(os.environ.get("SPINDLE_UNSPOOL_TAIL_CHARS", "12000"))
@@ -5318,6 +5317,72 @@ def _budget_result(text: str, spool_id: str) -> str:
     return truncated
 
 
+def _render_wait_results(results: Dict[str, object]) -> str:
+    """Render an MCP gather response within the normal result-read budget.
+
+    Budget each result as unspool() does, then enforce the same limit across the
+    aggregate response. When several individually reasonable results would still
+    overflow the caller, retain as many as fit and replace the rest with explicit
+    unspool breadcrumbs. The CLI wait path intentionally does not use this helper:
+    existing script callers consume its complete stdout outside an MCP context.
+    """
+    budgeted = {
+        spool_id: _budget_result(value, spool_id) if isinstance(value, str) else value
+        for spool_id, value in results.items()
+    }
+    rendered = json.dumps(budgeted, indent=2)
+    if len(rendered) <= UNSPOOL_MAX_CHARS:
+        return rendered
+
+    omitted = {
+        spool_id: (
+            f"[{len(value):,}-character result omitted from aggregate spin_wait response; "
+            f'retrieve with unspool("{spool_id}")]'
+            if isinstance(value, str)
+            else value
+        )
+        for spool_id, value in results.items()
+    }
+    bounded = dict(omitted)
+    for spool_id, value in budgeted.items():
+        bounded[spool_id] = value
+        if len(json.dumps(bounded, indent=2)) > UNSPOOL_MAX_CHARS:
+            bounded[spool_id] = omitted[spool_id]
+
+    rendered = json.dumps(bounded, indent=2)
+    if len(rendered) <= UNSPOOL_MAX_CHARS:
+        return rendered
+
+    # Defensive fallback for pathological configuration (for example, a limit
+    # smaller than the spool IDs and breadcrumbs themselves).
+    return json.dumps(
+        {
+            "error": "spin_wait aggregate metadata exceeds the configured result budget",
+            "spool_ids": list(results),
+        },
+        indent=2,
+    )
+
+
+def _render_wait_yield_result(spool_id: str, result: object, remaining_ids: list[str]) -> str:
+    """Render one MCP yield completion within the result-read budget."""
+    budgeted = _budget_result(result, spool_id) if isinstance(result, str) else result
+    payload = {
+        "spool_id": spool_id,
+        "result": budgeted,
+        "remaining": remaining_ids,
+    }
+    rendered = json.dumps(payload)
+    if len(rendered) <= UNSPOOL_MAX_CHARS:
+        return rendered
+
+    encoded_size = len(json.dumps(result))
+    payload["result"] = (
+        f'[{encoded_size:,}-character JSON result omitted from spin_wait response; retrieve with unspool("{spool_id}")]'
+    )
+    return json.dumps(payload)
+
+
 def _provider_lifecycle_detail(spool: dict) -> str:
     """Render bounded observational provider state without deriving public status."""
     lifecycle = spool.get("lifecycle")
@@ -5607,7 +5672,14 @@ def _spin_wait_sync(
                 _check_and_finalize_spool(spool_id)
                 spool = _read_spool(spool_id)
                 if not spool:
-                    return json.dumps({"spool_id": spool_id, "error": f"Unknown spool_id '{spool_id}'"})
+                    remaining = [s for s in ids if s != spool_id]
+                    return json.dumps(
+                        {
+                            "spool_id": spool_id,
+                            "error": f"Unknown spool_id '{spool_id}'",
+                            "remaining": remaining,
+                        }
+                    )
                 if spool.get("status") == "complete":
                     remaining = [s for s in ids if s != spool_id]
                     result = spool.get("result", "No result")
@@ -5683,7 +5755,11 @@ def _spin_wait_sync(
             if timeout:
                 elapsed = (datetime.now() - start_time).total_seconds()
                 if elapsed >= timeout:
-                    return f"Timeout after {timeout}s. Still pending: {', '.join(pending)}. Completed: {json.dumps(results)}"
+                    completed = ", ".join(results) or "none"
+                    return (
+                        f"Timeout after {timeout}s. Still pending: {', '.join(pending)}. "
+                        f"Completed IDs: {completed}. Read completed results with unspool(spool_id)."
+                    )
 
             time_module.sleep(poll_interval)
 
@@ -6069,6 +6145,12 @@ async def spin_wait(
         caller knows which spool completed and can pass remaining IDs to the
         next yield call.
 
+        Claude Code may move a long call to a background task. That call remains
+        active and will notify the session when it returns; do not start another
+        wait over the same IDs. Continue unrelated work, or end the turn if none
+        remains. MCP result bodies and aggregate gather responses are bounded;
+        use unspool() when a response supplies a retrieval breadcrumb.
+
     Examples:
         spin_wait("abc123,def456")  # Wait for spools
         spin_wait(time="90m")       # Sleep for 90 minutes
@@ -6134,17 +6216,18 @@ async def spin_wait(
                 await asyncio.to_thread(_check_and_finalize_spool, spool_id)
                 spool = await asyncio.to_thread(_read_spool, spool_id)
                 if not spool:
-                    return json.dumps({"spool_id": spool_id, "error": f"Unknown spool_id '{spool_id}'"})
-                if spool.get("status") == "complete":
                     remaining_ids = [s for s in ids if s != spool_id]
-                    result = spool.get("result", "No result")
                     return json.dumps(
                         {
                             "spool_id": spool_id,
-                            "result": result,
+                            "error": f"Unknown spool_id '{spool_id}'",
                             "remaining": remaining_ids,
                         }
                     )
+                if spool.get("status") == "complete":
+                    remaining_ids = [s for s in ids if s != spool_id]
+                    result = spool.get("result", "No result")
+                    return _render_wait_yield_result(spool_id, result, remaining_ids)
                 elif spool.get("status") == "error":
                     remaining_ids = [s for s in ids if s != spool_id]
                     return json.dumps(
@@ -6220,7 +6303,11 @@ async def spin_wait(
             if timeout:
                 elapsed = (datetime.now() - start_time).total_seconds()
                 if elapsed >= timeout:
-                    return f"Timeout after {timeout}s. Still pending: {', '.join(pending)}. Completed: {json.dumps(results)}"
+                    completed = ", ".join(results) or "none"
+                    return (
+                        f"Timeout after {timeout}s. Still pending: {', '.join(pending)}. "
+                        f"Completed IDs: {completed}. Read completed results with unspool(spool_id)."
+                    )
 
             # Periodic heartbeat to keep MCP connection alive
             now = datetime.now()
@@ -6236,7 +6323,7 @@ async def spin_wait(
 
             await asyncio.sleep(poll_interval)
 
-        return json.dumps(results, indent=2)
+        return _render_wait_results(results)
 
 
 @mcp.tool()

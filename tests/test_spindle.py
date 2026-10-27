@@ -977,7 +977,7 @@ class TestSpoolStorage:
 
 
 class TestResultBudgeting:
-    """Test head/tail truncation and paging of large unspool results."""
+    """Test bounded MCP delivery and paging of large spool results."""
 
     def test_small_result_unchanged(self):
         text = "x" * 100
@@ -1030,6 +1030,99 @@ class TestResultBudgeting:
             budgeted = asyncio.run(spindle.unspool.fn("sp1"))
             assert len(budgeted) < len(big)
             assert "full=True" in budgeted
+
+    def test_spin_wait_yield_uses_unspool_result_budget(self, tmp_path):
+        spool_id = "wait-yield-large"
+        big = "q" * (UNSPOOL_MAX_CHARS + 30000)
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool(spool_id, {"id": spool_id, "status": "complete", "result": big})
+            public_spin_wait = getattr(spindle.spin_wait, "fn", spindle.spin_wait)
+            rendered = asyncio.run(public_spin_wait(spool_id, mode="yield"))
+            result = json.loads(rendered)
+
+        assert len(rendered) <= UNSPOOL_MAX_CHARS
+        assert len(result["result"]) < len(big)
+        assert f'unspool("{spool_id}", full=True)' in result["result"]
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            '"' * (UNSPOOL_MAX_CHARS - 10),
+            {"payload": "x" * (UNSPOOL_MAX_CHARS + 10000)},
+        ],
+        ids=["json-escaping", "structured-result"],
+    )
+    def test_spin_wait_yield_budgets_serialized_response(self, tmp_path, value):
+        spool_id = "wait-yield-serialized"
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool(spool_id, {"id": spool_id, "status": "complete", "result": value})
+            public_spin_wait = getattr(spindle.spin_wait, "fn", spindle.spin_wait)
+            rendered = asyncio.run(public_spin_wait(spool_id, mode="yield"))
+
+        result = json.loads(rendered)
+        assert len(rendered) <= UNSPOOL_MAX_CHARS
+        assert "omitted from spin_wait response" in result["result"]
+        assert f'unspool("{spool_id}")' in result["result"]
+
+    def test_spin_wait_gather_budgets_aggregate_result(self, tmp_path):
+        spool_ids = ["wait-gather-a", "wait-gather-b", "wait-gather-c"]
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            for index, spool_id in enumerate(spool_ids):
+                _write_spool(
+                    spool_id,
+                    {
+                        "id": spool_id,
+                        "status": "complete",
+                        "result": chr(ord("a") + index) * 20000,
+                    },
+                )
+            public_spin_wait = getattr(spindle.spin_wait, "fn", spindle.spin_wait)
+            rendered = asyncio.run(public_spin_wait(",".join(spool_ids), mode="gather"))
+
+        result = json.loads(rendered)
+        assert len(rendered) <= UNSPOOL_MAX_CHARS
+        assert set(result) == set(spool_ids)
+        assert any("omitted from aggregate spin_wait response" in value for value in result.values())
+
+    @pytest.mark.parametrize("public", [False, True])
+    def test_spin_wait_yield_unknown_spool_includes_remaining(self, tmp_path, public):
+        missing_id = "wait-yield-missing"
+        complete_id = "wait-yield-complete"
+        with patch("spindle.SPINDLE_DIR", tmp_path):
+            _write_spool(complete_id, {"id": complete_id, "status": "complete", "result": "done"})
+            if public:
+                public_spin_wait = getattr(spindle.spin_wait, "fn", spindle.spin_wait)
+                output = asyncio.run(public_spin_wait(f"{missing_id},{complete_id}", mode="yield"))
+            else:
+                output = spindle._spin_wait_sync(f"{missing_id},{complete_id}", mode="yield")
+
+        result = json.loads(output)
+        assert result == {
+            "spool_id": missing_id,
+            "error": f"Unknown spool_id '{missing_id}'",
+            "remaining": [complete_id],
+        }
+
+    @pytest.mark.parametrize("public", [False, True])
+    def test_spin_wait_timeout_lists_completed_ids_without_result_bodies(self, tmp_path, public):
+        done_id = "wait-timeout-done"
+        running_id = "wait-timeout-running"
+        result_body = "completed body must not be copied into a timeout"
+        with (
+            patch("spindle.SPINDLE_DIR", tmp_path),
+            patch("spindle._check_and_finalize_spool"),
+        ):
+            _write_spool(done_id, {"id": done_id, "status": "complete", "result": result_body})
+            _write_spool(running_id, {"id": running_id, "status": "running"})
+            if public:
+                public_spin_wait = getattr(spindle.spin_wait, "fn", spindle.spin_wait)
+                output = asyncio.run(public_spin_wait(f"{done_id},{running_id}", timeout=-1))
+            else:
+                output = spindle._spin_wait_sync(f"{done_id},{running_id}", timeout=-1)
+
+        assert result_body not in output
+        assert f"Completed IDs: {done_id}" in output
+        assert "unspool(spool_id)" in output
 
     def test_unspool_paging_returns_slice_with_markers(self, tmp_path):
         big = "abcdefghij" * 10000  # 100k chars
