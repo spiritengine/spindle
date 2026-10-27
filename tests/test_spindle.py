@@ -1104,7 +1104,7 @@ class TestResultBudgeting:
         }
 
     @pytest.mark.parametrize("public", [False, True])
-    def test_spin_wait_timeout_lists_completed_ids_without_result_bodies(self, tmp_path, public):
+    def test_spin_wait_timeout_output_by_path(self, tmp_path, public):
         done_id = "wait-timeout-done"
         running_id = "wait-timeout-running"
         result_body = "completed body must not be copied into a timeout"
@@ -1120,9 +1120,13 @@ class TestResultBudgeting:
             else:
                 output = spindle._spin_wait_sync(f"{done_id},{running_id}", timeout=-1)
 
-        assert result_body not in output
-        assert f"Completed IDs: {done_id}" in output
-        assert "unspool(spool_id)" in output
+        if public:
+            assert result_body not in output
+            assert f"Completed IDs: {done_id}" in output
+            assert "unspool(spool_id)" in output
+        else:
+            # The CLI wait path keeps its full, unbudgeted timeout payload.
+            assert f"Completed: {json.dumps({done_id: result_body})}" in output
 
     def test_unspool_paging_returns_slice_with_markers(self, tmp_path):
         big = "abcdefghij" * 10000  # 100k chars
@@ -16212,3 +16216,10 @@ class TestResolverHasNoUnreachableFallback:
 
         # explicit arguments win over it
         assert spindle._resolve_service_settings(unit, 9001, "/srv/x", name="svc")[:2] == (9001, "/srv/x")
+
+
+def test_gather_budget_replaces_oversized_structured_result_with_breadcrumb(tmp_path):
+    big = {"items": ["x" * 1000] * (spindle.UNSPOOL_MAX_CHARS // 500)}
+    rendered = json.loads(spindle._render_wait_results({"small-id": "ok", "big-id": big}))
+    assert rendered["small-id"] == "ok"
+    assert isinstance(rendered["big-id"], str) and 'unspool("big-id")' in rendered["big-id"]

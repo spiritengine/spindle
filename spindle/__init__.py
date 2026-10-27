@@ -5339,7 +5339,7 @@ def _render_wait_results(results: Dict[str, object]) -> str:
             f"[{len(value):,}-character result omitted from aggregate spin_wait response; "
             f'retrieve with unspool("{spool_id}")]'
             if isinstance(value, str)
-            else value
+            else f'[structured result omitted from aggregate spin_wait response; retrieve with unspool("{spool_id}")]'
         )
         for spool_id, value in results.items()
     }
@@ -5377,10 +5377,10 @@ def _render_wait_yield_result(spool_id: str, result: object, remaining_ids: list
         return rendered
 
     encoded_size = len(json.dumps(result))
-    payload["result"] = (
+    omitted = (
         f'[{encoded_size:,}-character JSON result omitted from spin_wait response; retrieve with unspool("{spool_id}")]'
     )
-    return json.dumps(payload)
+    return json.dumps({**payload, "result": omitted})
 
 
 def _provider_lifecycle_detail(spool: dict) -> str:
@@ -5755,11 +5755,9 @@ def _spin_wait_sync(
             if timeout:
                 elapsed = (datetime.now() - start_time).total_seconds()
                 if elapsed >= timeout:
-                    completed = ", ".join(results) or "none"
-                    return (
-                        f"Timeout after {timeout}s. Still pending: {', '.join(pending)}. "
-                        f"Completed IDs: {completed}. Read completed results with unspool(spool_id)."
-                    )
+                    # CLI callers read complete stdout outside an MCP context;
+                    # keep their timeout payload unbudgeted, as before.
+                    return f"Timeout after {timeout}s. Still pending: {', '.join(pending)}. Completed: {json.dumps(results)}"
 
             time_module.sleep(poll_interval)
 
