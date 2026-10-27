@@ -690,6 +690,8 @@ implementation_id = respin(session, "Implement your recommendation using the pro
 ### Parallel Quick Edits
 
 ```python
+import json
+
 # Launch 10 quick fixes with Codex (fast startup)
 tasks = [
     "Add type hints to utils.py",
@@ -700,9 +702,12 @@ tasks = [
 
 spool_ids = [spin(task, harness="codex", working_dir="/app") for task in tasks]
 
-# Process results as they complete (yield mode)
-for result in spin_wait(",".join(spool_ids), mode="yield"):
-    print(f"Completed: {result}")
+# Process one completion at a time, always dropping IDs already returned
+remaining = spool_ids
+while remaining:
+    completion = json.loads(spin_wait(",".join(remaining), mode="yield"))
+    print(f"Completed: {completion.get('result', completion.get('error'))}")
+    remaining = completion.get("remaining", [])
 ```
 
 ### Fallback Strategy

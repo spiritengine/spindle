@@ -178,7 +178,14 @@ Shards create a git worktree + branch. If SKEIN is available, uses `skein shard 
 
 ### Wait for completion
 
+`spool_ids` is one comma-separated string, not a list. Use gather when work can
+wait for the whole batch. Use yield only when you will act on each completion;
+it returns one JSON object, and the next call must use that object's `remaining`
+IDs.
+
 ```
+import json
+
 # Spawn multiple agents
 id1 = spin("Find all TODO comments")
 id2 = spin("List unused imports")
@@ -187,15 +194,28 @@ id3 = spin("Check for type errors")
 # Gather: block until all complete, get all results
 results = spin_wait("id1,id2,id3", mode="gather")
 
-# Yield: return as each completes
-# Great when results are independent - process each as it lands
-result = spin_wait("id1,id2,id3", mode="yield")  # Returns first to finish
+# Yield: return one completion, then wait only on the returned remaining IDs
+completion = json.loads(spin_wait("id1,id2,id3", mode="yield"))
+completion = json.loads(spin_wait(",".join(completion["remaining"]), mode="yield"))
 
 # With timeout
 results = spin_wait("id1,id2", mode="gather", timeout=300)
 ```
 
-Yield mode keeps you responsive instead of blocking on the slowest agent.
+Claude Code may move a long MCP call to the background and promise a later task
+notification. That message means the existing `spin_wait` is still running and
+is now the subscription for those IDs. Do not start another wait over any of
+the same IDs: each extra call creates another subscription and later re-delivers
+the same results. Continue unrelated work. If none remains, ending the turn
+without another tool call is correct; the task notification will wake the
+session when the wait returns.
+
+MCP `spin_wait` responses use the same default 50,000-character result budget as
+`unspool`. Yield truncates an oversized result with retrieval instructions;
+gather also limits the aggregate response and replaces bodies that do not fit
+with explicit `unspool("spool-id")` breadcrumbs. Full results remain in
+`~/.spindle/spools`. The `spindle wait` CLI retains complete output for script
+compatibility.
 
 ### Time-based waiting
 

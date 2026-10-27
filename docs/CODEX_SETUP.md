@@ -206,13 +206,18 @@ This makes Codex **~20-30x faster** for quick tasks.
 For parallel batch work, Codex's speed provides higher throughput:
 
 ```python
+import json
+
 # Launch 10 tasks - all start within seconds
 tasks = ["Task 1", "Task 2", ..., "Task 10"]
 spool_ids = [spin(task, harness="codex", working_dir="/app") for task in tasks]
 
-# Process as they complete
-for result in spin_wait(",".join(spool_ids), mode="yield"):
-    print(f"Done: {result}")
+# Process one completion at a time, always dropping IDs already returned
+remaining = spool_ids
+while remaining:
+    completion = json.loads(spin_wait(",".join(remaining), mode="yield"))
+    print(f"Done: {completion.get('result', completion.get('error'))}")
+    remaining = completion.get("remaining", [])
 ```
 
 With Codex, all 10 tasks start immediately. With Claude, you'd wait 3-4 minutes per task startup.
