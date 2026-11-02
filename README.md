@@ -107,17 +107,48 @@ fallback to Claude Code.
 
 ## Usage
 
-### Basic: Spawn and collect
+### Basic: Launch and receive the result
 
+MCP `spin` and `respin` block by default and return an object with `spool_id`,
+`status`, and `result`. The CLI and synchronous Python launch helpers still return
+an ID immediately. The examples below show MCP tool arguments and result values.
+`working_dir` is required for every harness: the server's cwd is not your project.
+
+```python
+completion = spin("Research the Python GIL", working_dir="/project")
+# {"spool_id": "abc123", "status": "complete", "result": "..."}
+spool_id = completion["spool_id"]
+result = completion["result"]
 ```
-# Spawn an agent
-spool_id = spin("Research the Python GIL")
 
-# Do other work...
+Pass `wait=False` when you need an immediate ID, including every launch in a
+parallel batch. A detached launch does not notify you; call `spin_wait` to receive
+completion. `spool_retry` remains detached too.
 
-# Check result
-result = unspool(spool_id)
+```python
+spool_id = spin("Research the Python GIL", working_dir="/project", wait=False)
+spin_wait(spool_id)
 ```
+
+Blocking success and terminal failure return one JSON object in text content and
+in MCP `structuredContent`. Failures carry `status="error"`, `"timeout"`, or
+`"abandoned"` and a rendered failure message in `result`. Successful long results
+use `unspool`'s head/tail budget and full/page/export retrieval breadcrumbs.
+Pre-launch failures retain their existing error string and
+`structuredContent={"result": "Error: ..."}`. Detached success retains bare ID text
+and `structuredContent={"result": "abc123"}`.
+
+`timeout` is the agent's kill deadline. Optional `wait_timeout` only bounds the
+subscription: expiry returns the ID, current status, `wait_timed_out=true`, and
+instructions to call `spin_wait` again. Client deadlines can also end a wait.
+
+To find a spool while its blocking call is pending, supply a unique tag, then
+look in `spools()`, which includes tags, working directories, harnesses, prompts,
+and session IDs. Tags are not aliases or enforced unique names. Progress is
+shown in the client UI; it is not a model-visible handle. Cancelling a wait never
+cancels its spool. A reload or connection loss can end pending waits without
+returning a result; recover the ID with `spools()`, then `unspool(id)` or
+`spin_wait(id)` after reconnecting.
 
 ### Permission profiles
 
@@ -125,22 +156,22 @@ Control what tools the spawned agent can use:
 
 ```
 # Read-only / manual: the one tight, no-exec tier (allowlist-enforced)
-spin("Analyze the codebase", permission="readonly")   # "manual" is an alias
+spin("Analyze the codebase", permission="readonly", working_dir="/project")   # "manual" is an alias
 
 # Careful (default): classifier-vetted auto — CC vets each tool call server-side
-spin("Fix this bug", permission="careful")
+spin("Fix this bug", permission="careful", working_dir="/project")
 
 # Full access: for initial setup, dependency installs, environment provisioning
-spin("Set up a new Python project with dependencies", permission="full")
+spin("Set up a new Python project with dependencies", permission="full", working_dir="/project")
 
 # Shard: Full access + auto-isolated worktree (common for risky work)
-spin("Refactor the auth system", permission="shard")
+spin("Refactor the auth system", permission="shard", working_dir="/project")
 
 # Careful + shard: classifier-vetted, isolated in a bwrap-contained worktree
-spin("Update configs", permission="careful+shard")
+spin("Update configs", permission="careful+shard", working_dir="/project")
 
 # Research: web/file research routed to a SKEIN site, a single file, or a directory
-spin("Research deepseek vs kimi", permission="research", research_target="site:spindle-development")
+spin("Research deepseek vs kimi", permission="research", research_target="site:spindle-development", working_dir="/project")
 ```
 
 Profiles (claude-code harness):
@@ -162,12 +193,13 @@ Run agents in isolated git worktrees to prevent conflicts:
 
 ```
 # Agent works in its own worktree
-spool_id = spin("Refactor auth module", shard=True)
+spool_id = spin("Refactor auth module", shard=True, wait=False, working_dir="/project")
 
 # Check shard status
 shard_status(spool_id)
 
-# Merge changes back when done
+# Wait for the agent, then merge the reviewed changes
+spin_wait(spool_id)
 shard_merge(spool_id)
 
 # Or discard if not needed
@@ -187,24 +219,25 @@ IDs.
 import json
 
 # Spawn multiple agents
-id1 = spin("Find all TODO comments")
-id2 = spin("List unused imports")
-id3 = spin("Check for type errors")
+id1 = spin("Find all TODO comments", wait=False, working_dir="/project")
+id2 = spin("List unused imports", wait=False, working_dir="/project")
+id3 = spin("Check for type errors", wait=False, working_dir="/project")
 
 # Gather: block until all complete, get all results
-results = spin_wait("id1,id2,id3", mode="gather")
+results = spin_wait(f"{id1},{id2},{id3}", mode="gather")
 
 # Yield: return one completion, then wait only on the returned remaining IDs
-completion = json.loads(spin_wait("id1,id2,id3", mode="yield"))
+completion = json.loads(spin_wait(f"{id1},{id2},{id3}", mode="yield"))
 completion = json.loads(spin_wait(",".join(completion["remaining"]), mode="yield"))
 
 # With timeout
-results = spin_wait("id1,id2", mode="gather", timeout=300)
+results = spin_wait(f"{id1},{id2}", mode="gather", timeout=300)
 ```
 
 Claude Code may move a long MCP call to the background and promise a later task
-notification. That message means the existing `spin_wait` is still running and
-is now the subscription for those IDs. Do not start another wait over any of
+notification. Headless sessions wait in-band, so use `wait=False` for fan-out.
+A background notification promise means the existing `spin` or `spin_wait` is
+still running and is now the subscription for those IDs. Do not start another wait over any of
 the same IDs: each extra call creates another subscription and later re-delivers
 the same results. Continue unrelated work. If none remains, ending the turn
 without another tool call is correct; the task notification will wake the
@@ -241,30 +274,28 @@ Useful for periodic check-in loops (e.g., QM/dancing partner patterns).
 
 ```
 # Route quick tasks to haiku (fast, cheap)
-spin("Summarize this file", model="haiku")
+spin("Summarize this file", model="haiku", working_dir="/project")
 
 # Complex work to opus
-spin("Design the new architecture", model="opus")
+spin("Design the new architecture", model="opus", working_dir="/project")
 
 # Frontier reasoning: "fable" is the CLI's rolling alias (Fable 5.1 as of 2026-09)
-spin("Untangle the scheduler race", model="fable")
+spin("Untangle the scheduler race", model="fable", working_dir="/project")
 
 # Pin a generation instead of riding the rolling alias
-spin("Implement the new architecture", model="opus-5.5")   # claude-opus-5-5
-spin("Reproduce last month's review", model="fable-5")      # legacy claude-fable-5
+spin("Implement the new architecture", model="opus-5.5", working_dir="/project")   # claude-opus-5-5
+spin("Reproduce last month's review", model="fable-5", working_dir="/project")      # legacy claude-fable-5
 
 # Auto-kill if it takes too long
-spin("Should be quick", timeout=60)
+spin("Should be quick", timeout=60, working_dir="/project")
 ```
 
 ### Continue a session
 
 ```
-# Get session ID from completed spool
-result = unspool(spool_id)  # includes session_id
-
-# Continue that conversation
-new_id = respin(session_id, "Follow up question")
+# Continue using the completed spool's ID (a raw session ID also works)
+completion = respin(spool_id, "Follow up question")
+new_id = completion["spool_id"]
 ```
 
 If Claude reports that the provider session is unavailable or expired, the respin terminates with that provider error.
@@ -380,18 +411,19 @@ Spindle supports multiple AI agent harnesses, allowing you to choose the best to
 
 ```python
 # Claude Code (default) - best for complex work
-spool_id = spin("Refactor the auth module to use dependency injection")
+spool_id = spin("Refactor the auth module to use dependency injection", wait=False, working_dir="/project")
 
 # Codex CLI - fast for simple tasks
-spool_id = spin(prompt="Add error handling to this function", harness="codex", working_dir="/path/to/project")
+spool_id = spin(prompt="Add error handling to this function", harness="codex", working_dir="/path/to/project", wait=False)
 
 # Gemini CLI - fast with free tier
-spool_id = spin(prompt="Summarize this codebase", harness="gemini", working_dir="/path/to/project")
+spool_id = spin(prompt="Summarize this codebase", harness="gemini", working_dir="/path/to/project", wait=False)
 
 # Kimi CLI - fast reasoning with thinking mode
-spool_id = spin(prompt="Analyze this bug", harness="kimi", working_dir="/path/to/project")
+spool_id = spin(prompt="Analyze this bug", harness="kimi", working_dir="/path/to/project", wait=False)
 
 # All harnesses use the same API
+spin_wait(spool_id)
 result = unspool(spool_id)  # Auto-detects harness
 ```
 
@@ -458,9 +490,9 @@ Use a profile by passing its name as `harness`:
 
 ```python
 # Define ~/.spindle/profiles/my-endpoint/profile.json, then:
-spool_id = spin("Summarize this module", harness="my-endpoint", working_dir="/proj")
-spool_id = spin("Quick pass", harness="my-endpoint", model="fast")  # profile model_aliases
-result = unspool(spool_id)
+completion = spin("Summarize this module", harness="my-endpoint", working_dir="/proj")
+completion = spin("Quick pass", harness="my-endpoint", model="fast", working_dir="/project")  # profile model_aliases
+result = completion["result"]
 ```
 
 Built-in harness names (`claude-code`, `codex`, `gemini`, `kimi`) always win
@@ -504,9 +536,9 @@ for a worked example and the full schema reference.
 
 | Tool | Purpose |
 |------|---------|
-| `spin(prompt, permission?, shard?, system_prompt?, working_dir?, allowed_tools?, tags?, model?, timeout?, harness?)` | Spawn agent, return spool_id |
+| `spin(prompt, permission?, shard?, system_prompt?, working_dir?, allowed_tools?, tags?, model?, timeout?, harness?, wait?, wait_timeout?)` | Spawn agent and return {spool_id, status, result}; wait=False returns ID immediately |
 | `unspool(spool_id, full?, offset?, limit?)` | Get result (auto-detects harness, non-blocking; truncates huge results to head+tail by default) |
-| `respin(session_id, prompt)` | Continue session (auto-detects harness) |
+| `respin(session_id, prompt, wait?, wait_timeout?)` | Continue session and wait for result (auto-detects harness) |
 
 The MCP tool spindle_repair(spool_id, attest_dead) provides the same
 human-attested indeterminate settlement.
@@ -523,10 +555,12 @@ abandonment.
 **spin() parameters:**
 - `prompt` (required): The task for the agent
 - `harness` (optional): "claude-code" (default), "codex", "gemini", or "kimi"
-- `working_dir` (optional for Claude, required for Codex/Gemini/Kimi): Project directory
+- `working_dir` (required): Project directory for every harness
 - `permission` (optional): "readonly" (alias "manual"), "careful" (default, = auto), "full", "shard", "careful+shard", "research", "research+shard", "auto", "auto+shard" (readonly/manual cannot be combined with shard intent; `auto` variants are Claude-only; other names map to harness-specific enforcement, and Kimi accepts them for compatibility but has no "careful" approval mode)
 - `model` (optional): Model to use ("sonnet", "opus", "fable", "haiku" rolling aliases or pinned "fable-5.1", "opus-5.5", "sonnet-5", "opus-5" for Claude; "astra", "sol", "terra", "luna", "reserve" for Codex; "flash", "pro", "video" for Gemini; "k3", "latest", "thinking", "k2.7-code", "k2.6" for Kimi)
 - `timeout` (optional): Auto-kill after N seconds
+- `wait` (default True): Block for the result; False returns an ID immediately
+- `wait_timeout` (optional): Stop waiting after N seconds without killing the spool
 - `tags` (optional): Comma-separated tags for organization
 - `shard` (optional): Create isolated git worktree (can also use `permission="shard"`)
 - `system_prompt` (optional): Custom system prompt for Claude Code
@@ -703,7 +737,7 @@ filesystem semantics above.
 ## How It Works
 
 1. **spin()** spawns a detached CLI process (claude, codex, gemini, or kimi-cli) with the given prompt
-2. The process runs in background, writing output to temporary files
+2. The process runs in background, writing output to temporary files; the MCP call waits for its result unless `wait=False`
 3. A monitor thread polls for completion
 4. **unspool()** returns the result once complete (non-blocking check)
 5. Spool metadata persists to JSON files, surviving server restarts

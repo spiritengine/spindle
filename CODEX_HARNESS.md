@@ -7,7 +7,7 @@ This harness allows Spindle to delegate tasks to OpenAI's Codex CLI, providing a
 ## Features
 
 - **Transparent API**: Use regular `spin()`, `unspool()`, and `respin()` with `harness="codex"`
-- **Async execution**: `spin` returns immediately with a spool_id
+- **Blocking MCP results**: `spin` returns {spool_id, status, result}; `wait=False` returns the ID immediately
 - **Session continuity**: `respin` allows continuing conversations (auto-detects harness)
 - **Result retrieval**: `unspool` fetches results when complete (auto-detects harness)
 - **Unified spool management**: Codex spools integrate seamlessly with Claude Code spools
@@ -17,10 +17,12 @@ This harness allows Spindle to delegate tasks to OpenAI's Codex CLI, providing a
 
 ### spin (with harness="codex")
 
-Spawn a Codex CLI agent to handle a task. Returns immediately with spool_id.
+Spawn a Codex CLI agent and wait for its result. For parallel launches, pass
+`wait=False` to each, then call `spin_wait` for completion. The CLI and synchronous
+Python helpers remain detached. See the [MCP contract and recovery instructions](README.md#basic-launch-and-receive-the-result).
 
 ```python
-spool_id = spin(
+completion = spin(
     prompt="Write a function to parse CSV files",
     working_dir="/path/to/project",
     model="gpt-5.6",  # Optional; ChatGPT auth normalizes this to the default Sol tier
@@ -29,6 +31,7 @@ spool_id = spin(
     timeout=300,  # Optional, seconds
     tags="csv,utils",  # Optional, comma-separated tags
 )
+spool_id = completion["spool_id"]
 ```
 
 **Parameters:**
@@ -41,9 +44,11 @@ spool_id = spin(
   - `"full"` or `"shard"` → `"danger-full-access"`
   - Other → `"workspace-write"`
 - `timeout` (optional): Kill spool after this many seconds
+- `wait` (default True): Wait for the result; False returns an ID immediately
+- `wait_timeout` (optional): Bound the wait without stopping the spool
 - `tags` (optional): Comma-separated tags for organizing spools
 
-**Returns:** spool_id (string) with "codex-" prefix
+**Returns:** {spool_id, status, result}; spool_id has the "codex-" prefix. With `wait=False`, returns the bare ID string.
 
 ### unspool (auto-detects harness)
 
@@ -63,15 +68,15 @@ result = unspool(spool_id)
 Continue an existing session with a new message. Automatically detects whether the session uses Claude Code or Codex.
 
 ```python
-spool_id = respin(session_id="abc-123-def", prompt="Now add tests for that function")
-result = unspool(spool_id)
+completion = respin(session_id="abc-123-def", prompt="Now add tests for that function")
+result = completion["result"]
 ```
 
 **Parameters:**
 - `session_id` (required): The session ID to continue
 - `prompt` (required): The follow-up message/task
 
-**Returns:** spool_id (string) for the continuation
+**Returns:** {spool_id, status, result} for the continuation; `wait=False` returns the bare ID immediately.
 
 ## Implementation Details
 
@@ -128,24 +133,17 @@ Codex spools:
 
 ```python
 # Start a task
-spool_id = spin(
+completion = spin(
     prompt="Create a Python function to validate email addresses using regex",
     working_dir="/home/user/myproject",
     harness="codex",
 )
 
-# Check status (auto-detects harness)
-result = unspool(spool_id)
-# Returns: "Spool codex-abc123 still running..." or actual result
+result = completion["result"]
 
-# When complete, extract session_id from result if needed for continuation
-# (Session ID is in the JSON output from Codex CLI)
-
-# Continue the conversation (auto-detects harness)
-session_id = "extracted-from-previous-result"
-spool_id2 = respin(session_id=session_id, prompt="Add unit tests for that email validator")
-
-result2 = unspool(spool_id2)
+# Continue the completed spool (the provider session ID is resolved internally)
+next_completion = respin(completion["spool_id"], "Add unit tests for that email validator")
+result2 = next_completion["result"]
 ```
 
 ## Differences from Claude Code Harness

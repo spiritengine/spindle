@@ -1032,12 +1032,14 @@ async def test_stdio_launch_survives_stdio_parent_exit(supervisor_env):
         ["-m", "spindle", "serve"],
         env=env,
         cwd=str(REPO_ROOT),
+        keep_alive=False,
     )
     async with Client(transport) as client:
         result = await client.call_tool(
             "spin",
             {
                 "prompt": "stdio durable ownership",
+                "wait": False,  # Parent exits while the detached provider is still running.
                 "working_dir": str(workdir),
                 "skeinless": True,
             },
@@ -1045,6 +1047,60 @@ async def test_stdio_launch_survives_stdio_parent_exit(supervisor_env):
         spool_id = _mcp_result_text(result)
 
     assert _wait_spool(store, spool_id, "complete")["result"] == "durable result"
+
+
+@pytest.mark.asyncio
+async def test_cancel_blocking_spin_preserves_detached_provider(supervisor_env):
+    import asyncio
+
+    from fastmcp import Client
+    from fastmcp.client.transports import StdioTransport
+    from mcp import types
+    from mcp.shared.exceptions import McpError
+
+    env, store, workdir = supervisor_env
+    release = store / "provider.release"
+    pid_file = store / "provider.pid"
+    env.update(FAKE_HARNESS_MODE="wait-file", FAKE_HARNESS_RELEASE=str(release), FAKE_HARNESS_PID=str(pid_file))
+    transport = StdioTransport(
+        sys.executable, ["-m", "spindle", "serve"], env=env, cwd=str(REPO_ROOT), keep_alive=False
+    )
+    async with Client(transport) as client:
+        task = asyncio.create_task(
+            client.call_tool(
+                "spin",
+                {
+                    "prompt": "cancel only the subscription",
+                    "working_dir": str(workdir),
+                    "skeinless": True,
+                },
+            )
+        )
+        try:
+            await asyncio.to_thread(_wait_for, pid_file.exists, timeout=10, description="provider launched")
+            records = [_read_json(path) for path in store.glob("*.json")]
+            spool = next(record for record in records if record.get("prompt") == "cancel only the subscription")
+            sid = spool["id"]
+            provider_pid = int(pid_file.read_text())
+            assert _pid_alive(provider_pid)
+            assert not task.done()
+            request_id = list(client.session._response_streams)[-1]
+            await client.session.send_notification(
+                types.ClientNotification(
+                    types.CancelledNotification(
+                        method="notifications/cancelled", params=types.CancelledNotificationParams(requestId=request_id)
+                    )
+                )
+            )
+            with pytest.raises(McpError):
+                await asyncio.wait_for(task, 3)
+            assert _pid_alive(provider_pid)
+            assert _read_json(store / f"{sid}.json")["status"] == "running"
+        finally:
+            release.touch()
+        await asyncio.to_thread(_wait_spool, store, sid, "complete")
+        result = await client.call_tool("unspool", {"spool_id": sid})
+        assert _mcp_result_text(result) == "durable result"
 
 
 def _unused_local_port() -> int:
@@ -1098,7 +1154,9 @@ async def test_http_service_launch_reaps_idle_supervisor(supervisor_env):
                     "skeinless": True,
                 },
             )
-            spool_id = _mcp_result_text(result)
+            spool_id = result.structured_content["spool_id"]
+            assert result.structured_content["status"] == "complete"
+            assert result.structured_content["result"] == "durable result"
         assert _wait_spool(store, spool_id, "complete")["result"] == "durable result"
         owner_pid = _read_json(store / SUPERVISOR_RECORD)["pid"]
         _wait_for(

@@ -100,6 +100,13 @@ from spindle import (
 from spindle.namespace_owner_process import EVIDENCE_PRESERVATION_GRACE_SECONDS
 
 
+async def _detached_spin(*args, **kwargs):
+    """Launch-wiring tests need the legacy ID/error text, not a subscription."""
+    public_spin = getattr(spin, "fn", spin)
+    response = await public_spin(*args, **kwargs, wait=False)
+    return response.content[0].text
+
+
 def _claude_prompt_from_cmd(cmd):
     if "--prompt" in cmd:
         return cmd[cmd.index("--prompt") + 1]
@@ -230,7 +237,7 @@ class TestPermissionProfiles:
 
     def test_research_requires_target(self, tmp_path):
         """spin with research permission must reject missing research_target before spawning."""
-        _spin = spin.fn if hasattr(spin, "fn") else spin
+        _spin = _detached_spin
         result = asyncio.run(
             _spin("research a topic", permission="research", working_dir=str(tmp_path), skeinless=True)
         )
@@ -836,7 +843,7 @@ class TestClaudePermissionCommandShape:
         """spin() rejects the readonly/manual + shard pairing with a clear error and
         launches no spool — whether the shard arrived as a "+shard" string or the
         shard=True flag. Harness-agnostic: it fires before any harness routes."""
-        _spin = spin.fn if hasattr(spin, "fn") else spin
+        _spin = _detached_spin
         with patch("spindle.SPINDLE_DIR", tmp_path):
             # If routing were reached, these would blow up — assert they are not.
             with patch("spindle._spin_sync", side_effect=AssertionError("must not launch")):
@@ -4287,7 +4294,7 @@ class TestGeminiHarness:
 
     def test_gemini_research_requires_target(self, tmp_path):
         """Gemini research permission must reject missing research_target before spawn."""
-        _spin = spin.fn if hasattr(spin, "fn") else spin
+        _spin = _detached_spin
         result = asyncio.run(
             _spin(
                 "research a topic",
@@ -4330,7 +4337,7 @@ class TestGeminiHarness:
 
     def test_gemini_research_bad_prefix_errors(self, tmp_path):
         """Gemini research must reject malformed research_target prefixes."""
-        _spin = spin.fn if hasattr(spin, "fn") else spin
+        _spin = _detached_spin
         result = asyncio.run(
             _spin(
                 "research a topic",
@@ -5477,7 +5484,7 @@ class TestKimiHarness:
 
     def test_kimi_research_requires_target(self, tmp_path):
         """Kimi research permission must reject missing research_target before spawn."""
-        _spin = spin.fn if hasattr(spin, "fn") else spin
+        _spin = _detached_spin
         result = asyncio.run(
             _spin(
                 "research a topic",
@@ -6148,7 +6155,7 @@ class TestSpinHarnesses:
     def test_unknown_harness_returns_error(self):
         """spin() should return error JSON for unknown harness names."""
         # spin may be a FunctionTool (with .fn) or a plain function depending on fastmcp version
-        _spin = spin.fn if hasattr(spin, "fn") else spin
+        _spin = _detached_spin
         result = asyncio.run(_spin("test prompt", harness="bogus"))
         parsed = json.loads(result)
         assert "error" in parsed
@@ -6157,7 +6164,7 @@ class TestSpinHarnesses:
 
     def test_codex_research_site_permission_maps_to_read_only_sandbox(self, tmp_path):
         """Codex site research spins must use the read-only sandbox."""
-        _spin = spin.fn if hasattr(spin, "fn") else spin
+        _spin = _detached_spin
         captured = {}
 
         def fake_codex(prompt, working_dir, model, sandbox, timeout, tags, env, **kwargs):
@@ -6213,7 +6220,7 @@ class TestSpinHarnesses:
 
     def test_spin_codex_research_file_maps_to_workspace_write(self, tmp_path):
         """spin() must choose workspace-write for writable Codex research targets."""
-        _spin = spin.fn if hasattr(spin, "fn") else spin
+        _spin = _detached_spin
         captured = {}
 
         def fake_codex(prompt, working_dir, model, sandbox, timeout, tags, env, **kwargs):
@@ -6239,7 +6246,7 @@ class TestSpinHarnesses:
     def test_codex_manual_permission_maps_to_read_only_sandbox(self, tmp_path):
         """Finding A: spin(harness='codex', permission='manual') resolves to the
         read-only sandbox, exactly like readonly — not the workspace-write default."""
-        _spin = spin.fn if hasattr(spin, "fn") else spin
+        _spin = _detached_spin
         captured = {}
 
         def fake_codex(prompt, working_dir, model, sandbox, timeout, tags, env, **kwargs):
@@ -6311,7 +6318,7 @@ class TestSpinHarnesses:
 
     def test_auto_permission_on_codex_returns_error(self):
         """permission='auto' on codex must return an error, not silently degrade."""
-        _spin = spin.fn if hasattr(spin, "fn") else spin
+        _spin = _detached_spin
         result = asyncio.run(_spin("autonomous task", harness="codex", permission="auto"))
         parsed = json.loads(result)
         assert "error" in parsed
@@ -6320,7 +6327,7 @@ class TestSpinHarnesses:
 
     def test_auto_plus_shard_permission_on_codex_returns_error(self):
         """permission='auto+shard' on codex must return an error, not silently degrade."""
-        _spin = spin.fn if hasattr(spin, "fn") else spin
+        _spin = _detached_spin
         result = asyncio.run(_spin("autonomous task", harness="codex", permission="auto+shard"))
         parsed = json.loads(result)
         assert "error" in parsed
@@ -6329,7 +6336,7 @@ class TestSpinHarnesses:
 
     def test_auto_permission_on_gemini_returns_error(self):
         """permission='auto' on gemini must return an error, not silently degrade."""
-        _spin = spin.fn if hasattr(spin, "fn") else spin
+        _spin = _detached_spin
         result = asyncio.run(_spin("autonomous task", harness="gemini", permission="auto"))
         parsed = json.loads(result)
         assert "error" in parsed
@@ -6338,7 +6345,7 @@ class TestSpinHarnesses:
 
     def test_auto_permission_on_kimi_returns_error(self):
         """permission='auto' on kimi must return an error, not silently degrade."""
-        _spin = spin.fn if hasattr(spin, "fn") else spin
+        _spin = _detached_spin
         result = asyncio.run(_spin("autonomous task", harness="kimi", permission="auto"))
         parsed = json.loads(result)
         assert "error" in parsed
@@ -6347,7 +6354,7 @@ class TestSpinHarnesses:
 
     def test_auto_permission_does_not_spawn_on_non_cc_harness(self):
         """Verifies the error is returned before any spawn attempt on codex."""
-        _spin = spin.fn if hasattr(spin, "fn") else spin
+        _spin = _detached_spin
         with patch("spindle._codex_spin_sync") as mock_codex:
             result = asyncio.run(_spin("autonomous task", harness="codex", permission="auto"))
         parsed = json.loads(result)
@@ -11076,7 +11083,7 @@ class TestDetectDefaultBranch:
         spool_dir = tmp_path / "spools"
         spool_dir.mkdir()
 
-        _spin = spin.fn if hasattr(spin, "fn") else spin
+        _spin = _detached_spin
         with patch("spindle.SPINDLE_DIR", spool_dir):
             with patch("spindle._has_skein", return_value=False):
                 with patch("spindle._spawn_detached", return_value=12345):
@@ -12926,7 +12933,7 @@ class TestProfiles:
     # --- spin() wiring -----------------------------------------------------
 
     def _spin(self):
-        return spin.fn if hasattr(spin, "fn") else spin
+        return _detached_spin
 
     def test_spin_injects_env_to_spawn(self, profiles_root, tmp_path, monkeypatch):
         monkeypatch.setenv("ALT_KEY", "key-xyz")

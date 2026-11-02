@@ -3,7 +3,7 @@
 Spindle - MCP server for Claude Code to Claude Code delegation.
 
 Lets CC agents spawn other CC agents, all using Max subscription credits.
-Async by default - spin returns immediately, check results later.
+MCP spin waits for the result by default; wait=False opts into detached launches.
 
 Storage: ~/.spindle/spools/{spool_id}.json
 
@@ -67,7 +67,9 @@ def _showwarning_without_authlib_noise(message, category, filename, lineno, file
 
 warnings.showwarning = _showwarning_without_authlib_noise
 try:
+    from anyio import BrokenResourceError, ClosedResourceError  # noqa: E402
     from fastmcp import Context, FastMCP  # noqa: E402
+    from fastmcp.tools.tool import ToolResult  # noqa: E402
     from starlette.requests import Request  # noqa: E402
     from starlette.responses import JSONResponse  # noqa: E402
 finally:
@@ -5096,11 +5098,24 @@ async def spin(
     harness: Optional[str] = None,
     env: Optional[Dict[str, str]] = None,
     base_branch: Optional[str] = None,
-) -> str:
+    wait: bool = True,
+    wait_timeout: Optional[int] = None,
+    ctx: Context = None,
+) -> ToolResult:
     """
-    Spawn an agent to handle a task. Returns immediately with spool_id.
+    Spawn an agent; blocks until the spool finishes and returns its result.
+    With wait=False returns the ID immediately; call spin_wait to be notified.
 
-    The agent runs in background. Use unspool(spool_id) to get the result.
+    For fan-out, pass wait=False to each launch, then spin_wait(ids, mode="yield").
+    Headless clients wait in-band; interactive Claude Code may background this
+    call and notify you when it returns. Launching work is not read-only.
+
+    If you may need the ID before completion, pass a unique tag and find its
+    concrete spool ID with spools(). Progress messages are UI-only, not handles.
+    Tags are discovery metadata, not aliases; check working_dir/prompt if several
+    spools share a tag. Cancelling a wait never stops its spool. A reload or
+    lost connection can end pending waits without delivering a result: recover
+    the ID through spools(), then unspool(id) or spin_wait(id).
 
     Args:
         prompt: The task/question for the agent
@@ -5126,7 +5141,7 @@ async def spin(
                          Accepted forms: site:<id>, file:<absolute-path>, dir:<absolute-path>.
         shard: Run in isolated git worktree (SKEIN-aware with graceful fallback)
         system_prompt: Optional system prompt to configure behavior
-        working_dir: Directory for the agent to work in (defaults to current)
+        working_dir: Required directory for the agent (server cwd is not your project)
         allowed_tools: Override permission profile with explicit tool list
         tags: Comma-separated tags for organizing spools (e.g. "batch-1,triage")
         model: Model to use - for Claude: "haiku", "sonnet", "opus", "fable" (the CLI's rolling latest of each tier;
@@ -5149,22 +5164,27 @@ async def spin(
         env: Optional dict of environment variables to set in spawned agent
         base_branch: Branch to fork shard from (default: auto-detected from repo). Only used with shard or careful+shard permissions.
 
-    Returns:
-        spool_id to check result later
+        wait: Wait for completion (default True). False keeps the launch detached.
+        wait_timeout: Optional seconds to wait; expiry does NOT kill the spool.
+                      Distinct from timeout, which is the agent's kill deadline.
 
-    Example:
-        spool_id = spin("Research the Python GIL")
-        spool_id = spin("Fix the bug", permission="shard")  # full access + isolation
-        spool_id = spin("Careful work", permission="careful+shard")
-        spool_id = spin("Quick task", model="haiku", timeout=60)
-        spool_id = spin("Write a parser", harness="codex")  # Use Codex instead
-        spool_id = spin("Fix bug fast", harness="codex", permission="shard", model="codex")  # Codex + shard
-        spool_id = spin("Summarize this", harness="gemini", model="flash")  # Use Gemini
-        spool_id = spin("Analyze code", harness="kimi", model="thinking")  # Use Kimi
-        spool_id = spin("Do something", env={"CC_THINKING_BOOST": "1"})
-        spool_id = spin("Fork from branch", permission="shard", base_branch="feature-x")
-        spool_id = spin("Research deepseek vs kimi", permission="research", research_target="site:spindle-development")
-        result = unspool(spool_id)
+    Wire results (content text; structuredContent has the same object for waits):
+        Success: {"spool_id":"abc123", "status":"complete", "result":"READY"}
+        Failure: {"spool_id":"abc123", "status":"error", "result":"Spool abc123 failed: ..."}
+        Timeout: {"spool_id":"abc123", "status":"timeout", "result":"Spool abc123 failed: ..."}
+        Wait expiry: {"spool_id":"abc123", "status":"running", "result":"Wait timed out ...",
+                      "wait_timed_out":true}
+        Pre-launch error: unchanged string, e.g. "Error: working_dir required ...";
+                          structuredContent={"result":"Error: working_dir required ..."}.
+        wait=False: bare ID text abc123; structuredContent={"result":"abc123"}.
+        Wait results use unspool's head/tail budget with full/page/export breadcrumbs.
+
+    Examples:
+        completion = spin("Research the Python GIL", working_dir="/project")
+        spool_id = completion["spool_id"]
+        a = spin("Review parser", working_dir="/project", tags="parser-review-42", wait=False)
+        b = spin("Review scheduler", working_dir="/project", wait=False)
+        spin_wait(f"{a},{b}", mode="yield")
     """
     # Normalize harness parameter (case-insensitive)
     harness_lower = harness.lower() if harness else None
@@ -5176,7 +5196,7 @@ async def spin(
     # so the shard=True flag and retry/respin of a stored form cannot slip past.
     conflict = _readonly_shard_conflict_error(permission, shard or _permission_implies_shard(permission))
     if conflict:
-        return json.dumps({"error": conflict})
+        return _launch_tool_result(json.dumps({"error": conflict}))
 
     # The caller's explicit env is the only env safe to persist on the spool
     # record. Profile-resolved env (which carries ANTHROPIC_API_KEY and any
@@ -5188,14 +5208,16 @@ async def spin(
             harness, model, caller_env
         )
     except ValueError as exc:
-        return json.dumps({"error": str(exc)})
+        return _launch_tool_result(json.dumps({"error": str(exc)}))
 
     # auto/auto+shard is CC-specific; non-CC harnesses have no classifier-vetted mode
     if permission and permission.startswith("auto") and harness_lower and harness_lower != "claude-code":
-        return json.dumps(
-            {
-                "error": f"permission={permission!r} requires harness='claude-code'; {harness_lower!r} has no classifier-vetted mode.",
-            }
+        return _launch_tool_result(
+            json.dumps(
+                {
+                    "error": f"permission={permission!r} requires harness='claude-code'; {harness_lower!r} has no classifier-vetted mode.",
+                }
+            )
         )
 
     # Route to appropriate harness
@@ -5258,7 +5280,7 @@ async def spin(
         )
     else:
         # Default to Claude Code harness
-        return await asyncio.to_thread(
+        result = await asyncio.to_thread(
             _spin_sync,
             prompt,
             permission,
@@ -5278,7 +5300,7 @@ async def spin(
             spawn_env=spawn_env,
         )
 
-    return result
+    return await _finish_mcp_launch(result, wait, wait_timeout, ctx)
 
 
 def _budget_result(text: str, spool_id: str) -> str:
@@ -5553,6 +5575,9 @@ def _spools_sync() -> str:
                 "prompt": spool.get("prompt", "")[:100],
                 "created_at": spool.get("created_at"),
                 "session_id": spool.get("session_id"),
+                "tags": spool.get("tags", []),
+                "working_dir": spool.get("working_dir"),
+                "harness": spool.get("harness", "claude-code"),
             }
             for spool in all_spools
         },
@@ -5770,7 +5795,9 @@ async def spools() -> str:
     List all spools (running and completed).
 
     Returns:
-        JSON object with spool statuses
+        JSON object keyed by spool ID, with status, prompt, tags, working_dir,
+        harness, created_at and session_id. Find a pending blocking spin by its
+        caller-chosen unique tag; tags are not aliases or guaranteed unique.
     """
     import asyncio
 
@@ -6084,10 +6111,13 @@ async def respin(
     session_id: str,
     prompt: str,
     rebuild: bool = False,
-) -> str:
+    wait: bool = True,
+    wait_timeout: Optional[int] = None,
+    ctx: Context = None,
+) -> ToolResult:
     """
-    Continue an existing session with a new message.
-    Returns immediately with spool_id.
+    Continue a session; blocks until the new spool finishes and returns its result.
+    With wait=False returns the ID immediately; call spin_wait to be notified.
 
     Auto-detects the harness (claude-code, codex, gemini, kimi) from the
     original spool. An unavailable provider session produces a terminal respin
@@ -6098,9 +6128,14 @@ async def respin(
     instead a fresh session is rebuilt from the sanitized transcript with
     those tasks explicitly abandoned.
 
+    Uses spin's wire result shapes and unspool result budget. For fan-out use
+    wait=False. A cancelled wait never cancels the spool. Reload or connection
+    loss can end pending waits: find the new ID in spools() using its prompt,
+    working_dir and session_id, then call unspool(id) or spin_wait(id).
+
     Args:
         session_id: The handle of the session to continue. Accepts the
-            spool_id returned by spin() (preferred - consistent with every
+            spool_id from spin's result (preferred - consistent with every
             other spindle entrypoint) or a raw session_id (legacy). The
             spool's real session_id is resolved internally before resuming.
         prompt: The follow-up message/task
@@ -6112,10 +6147,135 @@ async def respin(
             judgment is the caller's. Resuming such a spool replays a stale
             stopped task-notification that reads as prompt injection.
 
+        wait: Wait for completion (default True); False returns the bare ID.
+        wait_timeout: Optional wait deadline in seconds; does not stop the spool.
+
     Returns:
-        spool_id to check result later
+        {spool_id, status, result}, or the unchanged bare ID/error string when detached
+        or launch fails. See spin for wire-level examples.
     """
-    return await asyncio.to_thread(_respin_sync, session_id, prompt, rebuild)
+    result = await asyncio.to_thread(_respin_sync, session_id, prompt, rebuild)
+    return await _finish_mcp_launch(result, wait, wait_timeout, ctx)
+
+
+# No executor thread is held while a subscription sleeps. The detached owner,
+# not an MCP request, owns the spool's process and deadlines.
+MCP_WAIT_POLL_INTERVAL = 3.0
+MCP_WAIT_HEARTBEAT_INTERVAL = 30.0
+
+
+@dataclass
+class _SpoolWaitOutcome:
+    records: dict[str, Optional[dict]]
+    pending: list[str]
+    timed_out: bool = False
+
+
+def _launch_tool_result(value: str | dict) -> ToolResult:
+    # Explicit ToolResult avoids FastMCP wrapping a blocking object (or a JSON
+    # string containing it) under "result". Detached/error wire output is exactly
+    # the former string tool's content plus {"result": string} envelope.
+    return ToolResult(content=value, structured_content={"result": value} if isinstance(value, str) else value)
+
+
+async def _wait_heartbeat(ctx: Optional[Context], elapsed: float, message: str) -> None:
+    """Retire a disconnected subscription through the SDK cancellation path."""
+    if ctx is None:
+        return
+    try:
+        await ctx.report_progress(elapsed, message=message)
+        # report_progress is a no-op without a token. A log send still detects a
+        # closed transport for those clients, without inspecting SDK internals.
+        await ctx.info(message)
+    except (ClosedResourceError, BrokenResourceError, ConnectionError):
+        # Returning a value makes the SDK send a response on the closed stream,
+        # crashing the stateless session. It explicitly suppresses that response
+        # for CancelledError. This cancels only this request, never the spool.
+        raise asyncio.CancelledError("MCP wait transport closed") from None
+
+
+def _poll_wait_spool(spool_id: str) -> Optional[dict]:
+    _check_and_finalize_spool(spool_id)
+    # Preserve the previous loops' missing/empty-record behavior.
+    return _read_spool(spool_id) or None
+
+
+async def _wait_for_spools(
+    ids: list[str],
+    mode: str,
+    timeout: Optional[int],
+    ctx: Optional[Context],
+) -> _SpoolWaitOutcome:
+    """Subscribe to terminal records without acquiring custody of their spools.
+
+    Cancellation propagates without spool cleanup. Stateless HTTP cancellation
+    notifications arrive on another session; a disconnected stream instead
+    closes notification sends, detected at most one heartbeat later.
+    """
+    outcome = _SpoolWaitOutcome(records={}, pending=list(dict.fromkeys(ids)))
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    next_heartbeat = started
+    while outcome.pending:
+        now = loop.time()
+        if now >= next_heartbeat:
+            message = f"Waiting {int(now - started)}s; pending: {', '.join(outcome.pending)}"
+            await _wait_heartbeat(ctx, now - started, message)
+            next_heartbeat = now + MCP_WAIT_HEARTBEAT_INTERVAL
+        for spool_id in list(outcome.pending):
+            spool = await asyncio.to_thread(_poll_wait_spool, spool_id)
+            if spool is None or spool.get("status") in {"complete", "error", "timeout", "abandoned"}:
+                outcome.records[spool_id] = spool
+                outcome.pending.remove(spool_id)
+                if spool is None or mode == "yield":
+                    return outcome
+        if not outcome.pending:
+            break
+        elapsed = loop.time() - started
+        if timeout and elapsed >= timeout:
+            outcome.timed_out = True
+            return outcome
+        delay = min(MCP_WAIT_POLL_INTERVAL, max(0, next_heartbeat - loop.time()))
+        if timeout:
+            delay = min(delay, max(0, timeout - elapsed))
+        await asyncio.sleep(delay)
+    return outcome
+
+
+async def _finish_mcp_launch(
+    launched: str,
+    wait: bool,
+    wait_timeout: Optional[int],
+    ctx: Optional[Context],
+) -> ToolResult:
+    # All launch helpers return either an ID or an error string. Check error
+    # prefixes before any pathname lookup (large JSON errors are not filenames).
+    if not wait or launched.startswith(("Error:", "{")):
+        return _launch_tool_result(launched)
+    outcome = await _wait_for_spools([launched], "gather", wait_timeout, ctx)
+    if outcome.timed_out:
+        spool = await asyncio.to_thread(_read_spool, launched)
+        return _launch_tool_result(
+            {
+                "spool_id": launched,
+                "status": spool.get("status", "unknown") if spool else "unknown",
+                "result": f'Wait timed out after {wait_timeout}s; nothing is waiting. Call spin_wait("{launched}") to be notified.',
+                "wait_timed_out": True,
+            }
+        )
+    spool = outcome.records.get(launched)
+    # Use precisely the normal unspool renderer for successful/failed provider
+    # results, including its provider-specific errors and structured-result coercion.
+    raw = await asyncio.to_thread(_unspool_sync, launched)
+    if not isinstance(raw, str):
+        raw = json.dumps(raw, indent=2)
+    return _launch_tool_result(
+        {
+            "spool_id": launched,
+            "status": spool.get("status", "unknown") if spool else "unknown",
+            "result": _budget_result(raw, launched),
+        }
+    )
 
 
 @mcp.tool()
@@ -6147,7 +6307,9 @@ async def spin_wait(
         active and will notify the session when it returns; do not start another
         wait over the same IDs. Continue unrelated work, or end the turn if none
         remains. MCP result bodies and aggregate gather responses are bounded;
-        use unspool() when a response supplies a retrieval breadcrumb.
+        use unspool() when a response supplies a retrieval breadcrumb. Reload or
+        connection loss ends pending waits: recover IDs with spools(), then use
+        unspool(id) or spin_wait(id). Cancelling a wait never cancels the spool.
 
     Examples:
         spin_wait("abc123,def456")  # Wait for spools
@@ -6167,7 +6329,6 @@ async def spin_wait(
 
         start_time = datetime.now()
         remaining = duration_seconds
-        total_chunks = max(1, (duration_seconds + HEARTBEAT_INTERVAL - 1) // HEARTBEAT_INTERVAL)
         chunks_done = 0
 
         while remaining > 0:
@@ -6178,14 +6339,7 @@ async def spin_wait(
 
             if ctx and remaining > 0:
                 elapsed = int((datetime.now() - start_time).total_seconds())
-                try:
-                    await ctx.report_progress(chunks_done, total_chunks)
-                except Exception:
-                    pass
-                try:
-                    await ctx.info(f"spin_wait: {elapsed}s/{duration_seconds}s elapsed")
-                except Exception:
-                    pass
+                await _wait_heartbeat(ctx, chunks_done, f"spin_wait: {elapsed}s/{duration_seconds}s elapsed")
 
         elapsed = int((datetime.now() - start_time).total_seconds())
         return json.dumps(
@@ -6204,124 +6358,45 @@ async def spin_wait(
         return "Error: Provide spool_ids to wait for spools, or time to wait for a duration"
 
     ids = [s.strip() for s in spool_ids.split(",")]
-    start_time = datetime.now()
-    poll_interval = 3  # seconds
-    last_heartbeat = datetime.now()
-
+    outcome = await _wait_for_spools(ids, mode, timeout, ctx)
+    if outcome.timed_out:
+        if mode == "yield":
+            return f"Timeout after {timeout}s. Spools still running: {', '.join(ids)}"
+        completed = ", ".join(outcome.records) or "none"
+        return (
+            f"Timeout after {timeout}s. Still pending: {', '.join(outcome.pending)}. "
+            f"Completed IDs: {completed}. Read completed results with unspool(spool_id)."
+        )
     if mode == "yield":
-        while True:
-            for spool_id in ids:
-                await asyncio.to_thread(_check_and_finalize_spool, spool_id)
-                spool = await asyncio.to_thread(_read_spool, spool_id)
-                if not spool:
-                    remaining_ids = [s for s in ids if s != spool_id]
-                    return json.dumps(
-                        {
-                            "spool_id": spool_id,
-                            "error": f"Unknown spool_id '{spool_id}'",
-                            "remaining": remaining_ids,
-                        }
-                    )
-                if spool.get("status") == "complete":
-                    remaining_ids = [s for s in ids if s != spool_id]
-                    result = spool.get("result", "No result")
-                    return _render_wait_yield_result(spool_id, result, remaining_ids)
-                elif spool.get("status") == "error":
-                    remaining_ids = [s for s in ids if s != spool_id]
-                    return json.dumps(
-                        {
-                            "spool_id": spool_id,
-                            "error": spool.get("error"),
-                            "remaining": remaining_ids,
-                        }
-                    )
-                elif spool.get("status") == "timeout":
-                    remaining_ids = [s for s in ids if s != spool_id]
-                    return json.dumps(
-                        {
-                            "spool_id": spool_id,
-                            "error": spool.get("error", "Spool timed out"),
-                            "remaining": remaining_ids,
-                        }
-                    )
-                elif spool.get("status") == "abandoned":
-                    remaining_ids = [s for s in ids if s != spool_id]
-                    return json.dumps(
-                        {
-                            "spool_id": spool_id,
-                            "error": spool.get("error"),
-                            "terminal_kind": "indeterminate",
-                            "remaining": remaining_ids,
-                        }
-                    )
-
-            if timeout:
-                elapsed = (datetime.now() - start_time).total_seconds()
-                if elapsed >= timeout:
-                    return f"Timeout after {timeout}s. Spools still running: {', '.join(ids)}"
-
-            # Periodic heartbeat to keep MCP connection alive
-            now = datetime.now()
-            if ctx and (now - last_heartbeat).total_seconds() >= HEARTBEAT_INTERVAL:
-                elapsed = int((now - start_time).total_seconds())
-                try:
-                    await ctx.info(f"spin_wait: waiting {elapsed}s, pending: {', '.join(ids)}")
-                except Exception:
-                    pass
-                last_heartbeat = now
-
-            await asyncio.sleep(poll_interval)
-    else:
-        # gather mode - wait for all
-        results = {}
-        pending = set(ids)
-
-        while pending:
-            for spool_id in list(pending):
-                await asyncio.to_thread(_check_and_finalize_spool, spool_id)
-                spool = await asyncio.to_thread(_read_spool, spool_id)
-                if not spool:
-                    return f"Error: Unknown spool_id '{spool_id}'"
-                if spool.get("status") == "complete":
-                    results[spool_id] = spool.get("result", "No result")
-                    pending.remove(spool_id)
-                elif spool.get("status") == "error":
-                    results[spool_id] = f"Error: {spool.get('error')}"
-                    pending.remove(spool_id)
-                elif spool.get("status") == "timeout":
-                    results[spool_id] = f"Error: {spool.get('error', 'Spool timed out')}"
-                    pending.remove(spool_id)
-                elif spool.get("status") == "abandoned":
-                    results[spool_id] = f"Indeterminate abandonment: {spool.get('error', 'custody abandoned')}"
-                    pending.remove(spool_id)
-
-            if not pending:
-                break
-
-            if timeout:
-                elapsed = (datetime.now() - start_time).total_seconds()
-                if elapsed >= timeout:
-                    completed = ", ".join(results) or "none"
-                    return (
-                        f"Timeout after {timeout}s. Still pending: {', '.join(pending)}. "
-                        f"Completed IDs: {completed}. Read completed results with unspool(spool_id)."
-                    )
-
-            # Periodic heartbeat to keep MCP connection alive
-            now = datetime.now()
-            if ctx and (now - last_heartbeat).total_seconds() >= HEARTBEAT_INTERVAL:
-                elapsed = int((now - start_time).total_seconds())
-                try:
-                    await ctx.info(
-                        f"spin_wait: waiting {elapsed}s, pending: {', '.join(pending)}, done: {len(results)}/{len(ids)}"
-                    )
-                except Exception:
-                    pass
-                last_heartbeat = now
-
-            await asyncio.sleep(poll_interval)
-
-        return _render_wait_results(results)
+        spool_id, spool = next(iter(outcome.records.items()))
+        remaining_ids = [s for s in ids if s != spool_id]
+        if spool is None:
+            return json.dumps(
+                {"spool_id": spool_id, "error": f"Unknown spool_id '{spool_id}'", "remaining": remaining_ids}
+            )
+        if spool.get("status") == "complete":
+            return _render_wait_yield_result(spool_id, spool.get("result", "No result"), remaining_ids)
+        result = {
+            "spool_id": spool_id,
+            "error": spool.get("error", "Spool timed out") if spool.get("status") == "timeout" else spool.get("error"),
+            "remaining": remaining_ids,
+        }
+        if spool.get("status") == "abandoned":
+            result["terminal_kind"] = "indeterminate"
+        return json.dumps(result)
+    results = {}
+    for spool_id, spool in outcome.records.items():
+        if spool is None:
+            return f"Error: Unknown spool_id '{spool_id}'"
+        status = spool.get("status")
+        if status == "complete":
+            results[spool_id] = spool.get("result", "No result")
+        elif status == "abandoned":
+            results[spool_id] = f"Indeterminate abandonment: {spool.get('error', 'custody abandoned')}"
+        else:
+            error = spool.get("error", "Spool timed out") if status == "timeout" else spool.get("error")
+            results[spool_id] = f"Error: {error}"
+    return _render_wait_results(results)
 
 
 @mcp.tool()
@@ -6772,7 +6847,8 @@ async def spool_peek(spool_id: str, lines: int = 50) -> str:
 @mcp.tool()
 async def spool_retry(spool_id: str) -> str:
     """
-    Re-run a spool with the same parameters.
+    Re-run a spool with the same parameters. Always detached: returns a new ID
+    immediately. Call spin_wait(new_id) to be notified when it finishes.
 
     Args:
         spool_id: The spool_id to retry
@@ -10391,6 +10467,10 @@ async def spindle_reload(force: bool = False) -> str:
     agents finish cleanly instead of being orphaned. New spins are still accepted
     while draining; the restart simply happens at the next moment the queue is
     empty (which is the point - let normal work proceed and reload when it can).
+
+    Reload ends pending MCP waits, even when draining has just completed the
+    spools. Results remain stored: find IDs with spools(), then unspool(id) or
+    spin_wait(id) after reconnecting. Delivery across a restart is not guaranteed.
 
     force=True restarts immediately without waiting, which may interrupt in-flight
     spools and leave them to orphan recovery on the next boot. This is the old

@@ -49,10 +49,10 @@ The Claude Code harness is Spindle's default and most capable option. It excels 
 **Usage:**
 ```python
 # Explicit
-spin("Refactor auth to use dependency injection", harness="claude-code")
+spin("Refactor auth to use dependency injection", harness="claude-code", working_dir="/project")
 
 # Implicit (default)
-spin("Refactor auth to use dependency injection")
+spin("Refactor auth to use dependency injection", working_dir="/project")
 ```
 
 ### Codex CLI
@@ -165,18 +165,30 @@ All harnesses use the same API surface, making them interchangeable:
 
 ### spin()
 
-Spawn an agent with any harness:
+MCP `spin` blocks by default and returns `{spool_id, status, result}`. `respin`
+uses the same default. Pass `wait=False` for an immediate ID, then `spin_wait`
+for completion; use this for every launch in a parallel batch. Headless clients
+wait in-band. The CLI and synchronous Python helpers remain detached.
+
+`working_dir` is required for all harnesses. `wait_timeout` limits only the wait;
+`timeout` kills the agent. See [result shapes and recovery](../README.md#basic-launch-and-receive-the-result)
+for budgeting, tags, cancellation, and reconnecting after reload.
+
+Launch detached agents with any harness:
 
 ```python
 # Claude Code (default)
-spool_id = spin("Complex refactoring task")
+spool_id = spin("Complex refactoring task", wait=False, working_dir="/project")
 
 # Codex
-spool_id = spin(prompt="Quick edit task", harness="codex", working_dir="/path/to/project")
+spool_id = spin(prompt="Quick edit task", harness="codex", working_dir="/path/to/project", wait=False)
 ```
 
 **Common parameters (work with all harnesses):**
 - `prompt` - The task description
+- `working_dir` - Required project directory for every harness
+- `wait` - True waits for the result; False returns the ID immediately
+- `wait_timeout` - Optional wait deadline, which does not stop the spool
 - `harness` - "claude-code", "codex", "gemini", or "kimi" (use `spin_harnesses()` to discover)
 - `model` - Model to use (harness-specific)
 - `timeout` - Auto-kill after N seconds
@@ -218,15 +230,11 @@ The harness is stored in the spool metadata and automatically loaded when you ca
 Continue a conversation with any harness:
 
 ```python
-# Initial task
-spool_id1 = spin("Write a CSV parser", harness="codex", working_dir="/project")
-result1 = unspool(spool_id1)
+# Initial task finishes before continuing
+completion = spin("Write a CSV parser", harness="codex", working_dir="/project")
 
-# Extract session_id from result metadata
-session_id = result1["session_id"]
-
-# Continue (auto-detects harness from session)
-spool_id2 = respin(session_id, "Add validation to the parser")
+# Continue using its spool ID (the harness and session are resolved internally)
+next_completion = respin(completion["spool_id"], "Add validation to the parser")
 ```
 
 Session continuity is harness-aware - Spindle remembers which harness was used and routes the respin call appropriately.
@@ -293,22 +301,22 @@ All harnesses support session continuity through `respin()`:
 
 ✅ **Complex refactoring**
 ```python
-spin("Refactor the auth module to use a plugin architecture")
+spin("Refactor the auth module to use a plugin architecture", working_dir="/project")
 ```
 
 ✅ **Architecture decisions**
 ```python
-spin("Design a caching layer for the API with Redis")
+spin("Design a caching layer for the API with Redis", working_dir="/project")
 ```
 
 ✅ **Code review and analysis**
 ```python
-spin("Review the payment processor for security issues")
+spin("Review the payment processor for security issues", working_dir="/project")
 ```
 
 ✅ **Multi-file changes**
 ```python
-spin("Add logging throughout the application", permission="shard")
+spin("Add logging throughout the application", permission="shard", working_dir="/project")
 ```
 
 ### Use Gemini for:
@@ -348,8 +356,8 @@ spin("Create a basic REST API for user CRUD", harness="codex", working_dir="/app
 ✅ **Parallel batch work** (faster = more throughput)
 ```python
 # Launch 10 quick edits in parallel
-for task in quick_tasks:
-    spin(task, harness="codex", working_dir="/app")
+ids = [spin(task, harness="codex", working_dir="/app", wait=False) for task in quick_tasks]
+spin_wait(",".join(ids))
 ```
 
 ### Use Kimi for:
@@ -387,10 +395,10 @@ Claude maps each tier to a `--permission-mode` (and, for the tight tier, an `--a
 
 Example:
 ```python
-spin("Analyze code", permission="readonly")
-spin("Fix bug", permission="careful")  # Default
-spin("Refactor module", permission="shard")  # Isolated worktree
-spin("Research deepseek pricing", permission="research", research_target="site:spindle-development")
+spin("Analyze code", permission="readonly", working_dir="/project")
+spin("Fix bug", permission="careful", working_dir="/project")  # Default
+spin("Refactor module", permission="shard", working_dir="/project")  # Isolated worktree
+spin("Research deepseek pricing", permission="research", research_target="site:spindle-development", working_dir="/project")
 ```
 
 ### Codex Sandbox Policies
@@ -508,10 +516,10 @@ This prevents resource exhaustion regardless of which harness you use:
 
 ```python
 # Mix of harnesses, max 15 total
-spin("Task 1", harness="claude-code")  # 1/15
-spin("Task 2", harness="codex", working_dir="/app")  # 2/15
-spin("Task 3", harness="gemini", working_dir="/app")  # 3/15
-spin("Task 4", harness="kimi", working_dir="/app")  # 4/15
+spin("Task 1", harness="claude-code", working_dir="/project", wait=False)  # 1/15
+spin("Task 2", harness="codex", working_dir="/app", wait=False)  # 2/15
+spin("Task 3", harness="gemini", working_dir="/app", wait=False)  # 3/15
+spin("Task 4", harness="kimi", working_dir="/app", wait=False)  # 4/15
 # ... up to 15 total
 ```
 
@@ -647,7 +655,7 @@ Planned improvements to the harness system:
 2. **Use Codex or Gemini for speed** - Much faster startup for simple tasks
 3. **Use Gemini for budget work** - Generous free tier with Google account
 4. **Use Kimi for fast reasoning** - Thinking mode at speed
-5. **Always specify working_dir for Codex/Gemini/Kimi** - Required parameter
+5. **Always specify working_dir** - Required for every harness
 5. **Use tags to organize** - Tag by harness, task type, or project
 6. **Monitor with spool_dashboard()** - Track mixed harness workloads
 7. **Test on your chosen harness** - Validate that tasks work as expected
@@ -658,10 +666,10 @@ Planned improvements to the harness system:
 
 ```python
 # Complex analysis with Claude
-analysis_id = spin("Analyze the caching strategy and recommend improvements", permission="readonly")
+analysis_id = spin("Analyze the caching strategy and recommend improvements", permission="readonly", wait=False, working_dir="/project")
 
 # Quick prototype with Codex
-prototype_id = spin("Create a basic LRU cache implementation", harness="codex", working_dir="/path/to/project")
+prototype_id = spin("Create a basic LRU cache implementation", harness="codex", working_dir="/path/to/project", wait=False)
 
 # Quick research with Gemini
 research_id = spin(
@@ -669,6 +677,7 @@ research_id = spin(
     harness="gemini",
     working_dir="/path/to/project",
     model="flash",
+    wait=False,
 )
 
 # Deep reasoning with Kimi
@@ -677,14 +686,14 @@ review_id = spin(
     harness="kimi",
     working_dir="/path/to/project",
     model="thinking",
+    wait=False,
 )
 
 # Wait for all
 results = spin_wait(f"{analysis_id},{prototype_id},{research_id},{review_id}", mode="gather")
 
 # Continue with Claude based on analysis
-session = _read_spool(analysis_id)["session_id"]
-implementation_id = respin(session, "Implement your recommendation using the prototype as a starting point")
+implementation = respin(analysis_id, "Implement your recommendation using the prototype as a starting point")
 ```
 
 ### Parallel Quick Edits
@@ -700,7 +709,7 @@ tasks = [
     # ... more quick tasks
 ]
 
-spool_ids = [spin(task, harness="codex", working_dir="/app") for task in tasks]
+spool_ids = [spin(task, harness="codex", working_dir="/app", wait=False) for task in tasks]
 
 # Process one completion at a time, always dropping IDs already returned
 remaining = spool_ids
@@ -713,16 +722,15 @@ while remaining:
 ### Fallback Strategy
 
 ```python
-# Try fast harness first
-spool_id = spin("Implement user authentication", harness="codex", working_dir="/app", timeout=60)
-
-result = unspool(spool_id)
+# Try fast harness first and inspect its terminal status
+completion = spin("Implement user authentication", harness="codex", working_dir="/app", timeout=60)
 
 # If it fails or times out, use Claude
-if result.get("status") == "error" or result.get("status") == "timeout":
-    spool_id = spin(
+if completion["status"] in {"error", "timeout"}:
+    completion = spin(
         "Implement user authentication with proper error handling and tests",
-        permission="shard",  # Isolated worktree for safety
+        working_dir="/app",
+        permission="shard",
     )
 ```
 
