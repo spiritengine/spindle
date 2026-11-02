@@ -33,6 +33,7 @@ import warnings
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from functools import wraps
 from pathlib import Path
 from typing import BinaryIO, Callable, Dict, Generator, Optional, Tuple
 
@@ -122,7 +123,38 @@ from .namespace_owner import (  # noqa: E402
     update_control_receipt as update_control_receipt,
 )
 
+
+def _guard_mcp_final_replies(server: FastMCP) -> None:
+    """Treat a closed reply stream as the end of that request, not a server crash.
+
+    MCP 1.22 sends the final response outside its handler's cancellation catch.
+    FastMCP middleware ends before that send and cannot cover this boundary.
+    Adapt only this server's request responder; tool exceptions and cancellation
+    still follow the SDK paths, and other server instances are unaffected.
+    """
+    handle_request = server._mcp_server._handle_request
+
+    @wraps(handle_request)
+    async def handle_with_reply_guard(message, *args, **kwargs):
+        respond = message.respond
+
+        async def respond_if_connected(response):
+            try:
+                await respond(response)
+            except (ClosedResourceError, BrokenResourceError, ConnectionError):
+                logger.debug("MCP request %s disconnected before its final reply", message.request_id)
+
+        message.respond = respond_if_connected
+        try:
+            return await handle_request(message, *args, **kwargs)
+        finally:
+            message.respond = respond
+
+    server._mcp_server._handle_request = handle_with_reply_guard
+
+
 mcp = FastMCP("spindle")
+_guard_mcp_final_replies(mcp)
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -5167,6 +5199,7 @@ async def spin(
         wait: Wait for completion (default True). False keeps the launch detached.
         wait_timeout: Optional seconds to wait; expiry does NOT kill the spool.
                       Distinct from timeout, which is the agent's kill deadline.
+                      Omitted or 0 means no deadline.
 
     Wire results (content text; structuredContent has the same object for waits):
         Success: {"spool_id":"abc123", "status":"complete", "result":"READY"}
@@ -6149,6 +6182,7 @@ async def respin(
 
         wait: Wait for completion (default True); False returns the bare ID.
         wait_timeout: Optional wait deadline in seconds; does not stop the spool.
+                      Omitted or 0 means no deadline.
 
     Returns:
         {spool_id, status, result}, or the unchanged bare ID/error string when detached
@@ -6248,22 +6282,26 @@ async def _finish_mcp_launch(
     wait_timeout: Optional[int],
     ctx: Optional[Context],
 ) -> ToolResult:
-    # All launch helpers return either an ID or an error string. Check error
-    # prefixes before any pathname lookup (large JSON errors are not filenames).
-    if not wait or launched.startswith(("Error:", "{")):
+    # Refusals are arbitrary text, including long sentences from _respin_sync.
+    # Bound the filename component (including .json) before any filesystem call,
+    # then require a published record rather than inferring success from prose.
+    if not wait or not re.fullmatch(r"[A-Za-z0-9_-]{1,250}", launched):
+        return _launch_tool_result(launched)
+    if not await asyncio.to_thread(_read_spool, launched):
         return _launch_tool_result(launched)
     outcome = await _wait_for_spools([launched], "gather", wait_timeout, ctx)
-    if outcome.timed_out:
-        spool = await asyncio.to_thread(_read_spool, launched)
-        return _launch_tool_result(
-            {
-                "spool_id": launched,
-                "status": spool.get("status", "unknown") if spool else "unknown",
-                "result": f'Wait timed out after {wait_timeout}s; nothing is waiting. Call spin_wait("{launched}") to be notified.',
-                "wait_timed_out": True,
-            }
-        )
     spool = outcome.records.get(launched)
+    if outcome.timed_out:
+        spool = await asyncio.to_thread(_poll_wait_spool, launched)
+        if spool and spool.get("status") not in {"complete", "error", "timeout", "abandoned"}:
+            return _launch_tool_result(
+                {
+                    "spool_id": launched,
+                    "status": spool.get("status", "unknown"),
+                    "result": f'Wait timed out after {wait_timeout}s; this call stopped waiting. Call spin_wait("{launched}") for the result.',
+                    "wait_timed_out": True,
+                }
+            )
     # Use precisely the normal unspool renderer for successful/failed provider
     # results, including its provider-specific errors and structured-result coercion.
     raw = await asyncio.to_thread(_unspool_sync, launched)

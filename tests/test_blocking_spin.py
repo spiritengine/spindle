@@ -283,7 +283,7 @@ async def test_wait_deadline_returns_handle_without_stopping_spool(launch_store,
     assert result["spool_id"] == launch_store[0]
     assert result["status"] == "running"
     assert result["wait_timed_out"] is True
-    assert "nothing is waiting" in result["result"]
+    assert "this call stopped waiting" in result["result"]
     assert f'spin_wait("{launch_store[0]}")' in result["result"]
     assert spindle._read_spool(launch_store[0])["status"] == "running"
 
@@ -396,3 +396,172 @@ async def test_empty_saved_record_is_unknown_instead_of_waiting(launch_store, mo
             "error": f"Unknown spool_id '{sid}'",
             "remaining": [],
         }
+
+
+@pytest.mark.parametrize("wait_args", [{}, {"wait": False}], ids=["default", "detached"])
+@pytest.mark.parametrize("state", ["pending", "running", "complete", "error", "timeout", "parked"])
+async def test_respin_refusals_preserve_text_and_envelope(monkeypatch, wait_args, state):
+    # Keep the actual resolver and parked-state detector, including long refusals.
+    monkeypatch.setattr(spindle, "_run_store_maintenance", lambda: None)
+    sid = "refused-spool"
+    record = {"id": sid, "status": state, "harness": "claude-code"}
+    if state in {"pending", "running"}:
+        record["session_id"] = "already-running-session"
+        expected = f"Spool '{sid}' is not in a resumable state (status={state}); wait for it to complete before respin"
+    elif state == "parked":
+        task_ids = [f"background-task-{i}" for i in range(5)]
+        record.update(
+            status="error",
+            error_kind="headless_background_wait",
+            pending_background_tasks=[{"id": task_id} for task_id in task_ids],
+        )
+        expected = (
+            f"Spool '{sid}' parked waiting on background task(s) [{', '.join(task_ids)}] and has no "
+            "saved transcript to rebuild from. Resuming it would replay a stale task "
+            "notification and park again — start a fresh spin() with the task context instead."
+        )
+        assert len(expected.encode()) > 255
+    else:
+        expected = f"Spool '{sid}' completed without a resumable session (status={state})"
+    spindle._write_spool(sid, record)
+    before = spindle._get_spool_path(sid).read_bytes()
+    async with Client(spindle.mcp) as client:
+        response = await client.call_tool("respin", {"session_id": sid, "prompt": "next", **wait_args})
+    assert response.content[0].text == expected
+    assert response.structured_content == {"result": expected}
+    assert spindle._get_spool_path(sid).read_bytes() == before
+    assert list(spindle.SPINDLE_DIR.glob("*.json")) == [spindle._get_spool_path(sid)]
+
+
+@pytest.mark.parametrize(
+    "tool,harness", [("spin", None), ("spin", "codex"), ("spin", "gemini"), ("spin", "kimi"), ("respin", None)]
+)
+@pytest.mark.parametrize("launch_result", ["missing-record", "x" * 300, "Error: refused", '{"error": "refused"}'])
+async def test_unpublished_launch_returns_unchanged(monkeypatch, tool, harness, launch_result):
+    launcher = "_respin_sync" if tool == "respin" else f"_{harness}_spin_sync" if harness else "_spin_sync"
+    monkeypatch.setattr(spindle, launcher, lambda *a, **kw: launch_result)
+    args = (
+        {"session_id": "old", "prompt": "next"} if tool == "respin" else {"working_dir": "/project", "prompt": "work"}
+    )
+    if harness:
+        args["harness"] = harness
+    async with Client(spindle.mcp) as client:
+        response = await client.call_tool(tool, args)
+    assert response.content[0].text == launch_result
+    assert response.structured_content == {"result": launch_result}
+
+
+@pytest.mark.parametrize("tool", ["spin", "respin"])
+@pytest.mark.parametrize("status", ["complete", "error", "timeout", "abandoned"])
+async def test_completion_during_wait_expiry_returns_terminal_result(launch_store, monkeypatch, tool, status):
+    original_wait = spindle._wait_for_spools
+
+    async def finish_at_deadline(ids, *args):
+        outcome = await original_wait(ids, *args)
+        assert outcome.timed_out
+        finish(ids[0], status=status, error="provider failed")
+        return outcome
+
+    monkeypatch.setattr(spindle, "_wait_for_spools", finish_at_deadline)
+    args = {"prompt": "work", "wait_timeout": -1}
+    args.update(working_dir="/project") if tool == "spin" else args.update(session_id="old")
+    async with Client(spindle.mcp) as client:
+        response = await client.call_tool(tool, args)
+        unspooled = await client.call_tool("unspool", {"spool_id": launch_store[0]})
+    assert response.structured_content == {
+        "spool_id": launch_store[0],
+        "status": status,
+        "result": unspooled.content[0].text,
+    }
+
+
+@pytest.mark.parametrize("tool", ["spin", "respin"])
+async def test_zero_wait_timeout_has_no_deadline(launch_store, tool):
+    args = {"prompt": "work", "wait_timeout": 0}
+    args.update(working_dir="/project") if tool == "spin" else args.update(session_id="old")
+    async with Client(spindle.mcp) as client:
+        task = asyncio.create_task(client.call_tool(tool, args))
+        await until(lambda: launch_store)
+        await asyncio.sleep(0.04)
+        assert not task.done()
+        finish(launch_store[0])
+        response = await asyncio.wait_for(task, 3)
+        description = next(t.description for t in await client.list_tools() if t.name == tool)
+    assert response.structured_content["result"] == "READY"
+    assert "0 means no deadline" in description
+
+
+@pytest.mark.parametrize("token", [False, True])
+@pytest.mark.parametrize("mode", ["spin", "respin", "gather", "yield"])
+@pytest.mark.parametrize("exit_kind", ["complete", "deadline", "reply_handoff"])
+async def test_disconnect_before_final_reply_is_quiet(launch_store, monkeypatch, caplog, token, mode, exit_kind):
+    from mcp.shared.session import RequestResponder
+
+    # No second heartbeat can retire the call before its final response.
+    monkeypatch.setattr(spindle, "MCP_WAIT_HEARTBEAT_INTERVAL", 30)
+    entered_reply = asyncio.Event()
+    release_reply = asyncio.Event()
+    reply_done = asyncio.Event()
+    original_respond = RequestResponder.respond
+
+    async def respond(self, response):
+        entered_reply.set()
+        if exit_kind == "reply_handoff":
+            await release_reply.wait()
+        try:
+            return await original_respond(self, response)
+        finally:
+            reply_done.set()
+
+    monkeypatch.setattr(RequestResponder, "respond", respond)
+    if mode in {"spin", "respin"}:
+        args = {"prompt": "work"}
+        args.update(working_dir="/project") if mode == "spin" else args.update(session_id="old")
+        if exit_kind == "deadline":
+            args["wait_timeout"] = 1
+        params = {"name": mode, "arguments": args}
+    else:
+        sid = spindle._spin_sync()
+        args = {"spool_ids": sid, "mode": mode}
+        if exit_kind == "deadline":
+            args["timeout"] = 1
+        params = {"name": "spin_wait", "arguments": args}
+    if token:
+        params["_meta"] = {"progressToken": "watch"}
+    app = spindle.mcp.http_app(path="/mcp", stateless_http=True)
+    async with app.router.lifespan_context(app):
+        task, queue, events = http_request(app, {"jsonrpc": "2.0", "id": 102, "method": "tools/call", "params": params})
+        try:
+            await until(lambda: any(b"notifications/message" in event.get("body", b"") for event in events))
+            sid = launch_store[0]
+            if exit_kind == "reply_handoff":
+                finish(sid)
+                await asyncio.wait_for(entered_reply.wait(), 2)
+            await queue.put({"type": "http.disconnect"})
+            await asyncio.wait_for(task, 2)
+            if exit_kind == "complete":
+                finish(sid)
+            before = spindle._get_spool_path(sid).read_bytes()
+            release_reply.set()
+            await asyncio.wait_for(reply_done.wait(), 2)
+        finally:
+            release_reply.set()
+            for sid in launch_store:
+                if spindle._read_spool(sid)["status"] == "running" and exit_kind != "deadline":
+                    finish(sid)
+    assert spindle._get_spool_path(sid).read_bytes() == before
+    assert not [r for r in caplog.records if r.levelno >= 40], "final reply on a disconnected stream logged an error"
+
+
+@pytest.mark.parametrize(
+    "exception", [spindle.ClosedResourceError, spindle.BrokenResourceError, ConnectionError, ValueError]
+)
+async def test_reply_guard_does_not_swallow_tool_failures(monkeypatch, exception):
+    def fail(*args):
+        raise exception("launch failed")
+
+    monkeypatch.setattr(spindle, "_respin_sync", fail)
+    async with Client(spindle.mcp) as client:
+        response = await client.call_tool("respin", {"session_id": "old", "prompt": "work"}, raise_on_error=False)
+    assert response.is_error
+    assert "launch failed" in response.content[0].text

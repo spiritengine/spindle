@@ -140,7 +140,10 @@ and `structuredContent={"result": "abc123"}`.
 
 `timeout` is the agent's kill deadline. Optional `wait_timeout` only bounds the
 subscription: expiry returns the ID, current status, `wait_timed_out=true`, and
-instructions to call `spin_wait` again. Client deadlines can also end a wait.
+instructions to call `spin_wait` again. If the spool has finished when the
+deadline is checked, its terminal result is returned instead. Omitting
+`wait_timeout` or setting it to `0` means no deadline. Client deadlines can also
+end a wait.
 
 To find a spool while its blocking call is pending, supply a unique tag, then
 look in `spools()`, which includes tags, working directories, harnesses, prompts,
@@ -560,7 +563,7 @@ abandonment.
 - `model` (optional): Model to use ("sonnet", "opus", "fable", "haiku" rolling aliases or pinned "fable-5.1", "opus-5.5", "sonnet-5", "opus-5" for Claude; "astra", "sol", "terra", "luna", "reserve" for Codex; "flash", "pro", "video" for Gemini; "k3", "latest", "thinking", "k2.7-code", "k2.6" for Kimi)
 - `timeout` (optional): Auto-kill after N seconds
 - `wait` (default True): Block for the result; False returns an ID immediately
-- `wait_timeout` (optional): Stop waiting after N seconds without killing the spool
+- `wait_timeout` (optional): Stop waiting after N seconds without killing the spool; omitted or `0` means no deadline
 - `tags` (optional): Comma-separated tags for organization
 - `shard` (optional): Create isolated git worktree (can also use `permission="shard"`)
 - `system_prompt` (optional): Custom system prompt for Claude Code
