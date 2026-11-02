@@ -149,13 +149,14 @@ See `spin_harnesses()` for the full alias list.
 
 ```python
 # Minimal example
-spool_id = spin(prompt="Add error handling to process_data()", harness="codex", working_dir="/path/to/project")
-
-# Check result
-result = unspool(spool_id)
+completion = spin(prompt="Add error handling to process_data()", harness="codex", working_dir="/path/to/project")
+spool_id = completion["spool_id"]
+result = completion["result"]
 ```
 
-**Important:** `working_dir` is REQUIRED for Codex (optional for Claude Code).
+`working_dir` is required for every harness. MCP `spin`/`respin` block by default;
+use `wait=False` to get an ID immediately and `spin_wait` to receive completion.
+The CLI remains detached. See the [MCP contract and recovery instructions](../README.md#basic-launch-and-receive-the-result).
 
 ### With Permissions
 
@@ -175,14 +176,11 @@ spin(prompt="Refactor the authentication module", harness="codex", working_dir="
 ### Session Continuity
 
 ```python
-# Initial task
-spool_id = spin(prompt="Create a user model", harness="codex", working_dir="/path/to/project")
+# Initial task completes before continuing
+completion = spin(prompt="Create a user model", harness="codex", working_dir="/path/to/project")
 
-result = unspool(spool_id)
-session_id = result["session_id"]
-
-# Continue the conversation
-spool_id2 = respin(session_id, "Add validation methods to the user model")
+# Continue using the completed spool ID
+next_completion = respin(completion["spool_id"], "Add validation methods to the user model")
 ```
 
 ### With Timeout
@@ -210,7 +208,7 @@ import json
 
 # Launch 10 tasks - all start within seconds
 tasks = ["Task 1", "Task 2", ..., "Task 10"]
-spool_ids = [spin(task, harness="codex", working_dir="/app") for task in tasks]
+spool_ids = [spin(task, harness="codex", working_dir="/app", wait=False) for task in tasks]
 
 # Process one completion at a time, always dropping IDs already returned
 remaining = spool_ids
@@ -463,8 +461,8 @@ spin("simple task", harness="codex", working_dir="/app", timeout=60)
 ```python
 # Rapid iteration loop
 for attempt in range(3):
-    spool_id = spin(f"Attempt {attempt}: optimize function", harness="codex", working_dir="/app", timeout=30)
-    result = unspool(spool_id)
+    completion = spin(f"Attempt {attempt}: optimize function", harness="codex", working_dir="/app", timeout=30)
+    result = completion["result"]
     if "success" in result:
         break
 ```
@@ -517,8 +515,8 @@ A: You can't switch mid-session. Finish with Claude, then start a new spool with
 **Q: Can I mix Claude and Codex in parallel?**
 A: Yes! They share the 15-spool limit but run independently:
 ```python
-claude_id = spin("Complex analysis")
-codex_id = spin("Quick fix", harness="codex", working_dir="/app")
+claude_id = spin("Complex analysis", working_dir="/app", wait=False)
+codex_id = spin("Quick fix", harness="codex", working_dir="/app", wait=False)
 spin_wait(f"{claude_id},{codex_id}")
 ```
 

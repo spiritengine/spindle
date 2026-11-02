@@ -77,9 +77,12 @@ export EXAMPLE_API_KEY="sk-..."        # your provider key
 Then spin with the profile name as the harness:
 
 ```python
-spool_id = spin("Summarize this module", harness="anthropic-compatible", working_dir="/path/to/project")
-spool_id = spin("Quick pass", harness="anthropic-compatible", model="fast")  # uses model_aliases
+completion = spin("Summarize this module", harness="anthropic-compatible", working_dir="/path/to/project")
+spool_id = completion["spool_id"]
+completion = spin("Quick pass", harness="anthropic-compatible", model="fast", working_dir="/path/to/project")  # uses model_aliases
 ```
 
-`unspool(spool_id)` and `respin(...)` work unchanged — the profile only shapes
-how the child process is launched.
+MCP `spin` and `respin` wait for the result by default. For parallel work use
+`wait=False` to receive IDs immediately, then `spin_wait` for completion.
+`unspool(spool_id)` retrieves the saved result; the profile only shapes how the
+child process is launched.
