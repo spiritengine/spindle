@@ -5597,25 +5597,29 @@ async def unspool(
     return _budget_result(raw, spool_id)
 
 
-def _spools_sync() -> str:
-    """Synchronous implementation of spools."""
+def _spools_sync(include_discovery: bool = False) -> str:
+    """Synchronous implementation of spools.
+
+    include_discovery adds tags, working_dir and harness for the MCP tool, where
+    an agent waiting on a blocking spin finds its spool by tag. The CLI keeps
+    its original fields so script callers see unchanged output.
+    """
     _run_store_maintenance()
     all_spools = _list_spools()
-    return json.dumps(
-        {
-            spool["id"]: {
-                "status": spool.get("status"),
-                "prompt": spool.get("prompt", "")[:100],
-                "created_at": spool.get("created_at"),
-                "session_id": spool.get("session_id"),
-                "tags": spool.get("tags", []),
-                "working_dir": spool.get("working_dir"),
-                "harness": spool.get("harness", "claude-code"),
-            }
-            for spool in all_spools
-        },
-        indent=2,
-    )
+    listing = {}
+    for spool in all_spools:
+        entry = {
+            "status": spool.get("status"),
+            "prompt": spool.get("prompt", "")[:100],
+            "created_at": spool.get("created_at"),
+            "session_id": spool.get("session_id"),
+        }
+        if include_discovery:
+            entry["tags"] = spool.get("tags", [])
+            entry["working_dir"] = spool.get("working_dir")
+            entry["harness"] = spool.get("harness", "claude-code")
+        listing[spool["id"]] = entry
+    return json.dumps(listing, indent=2)
 
 
 def _spin_drop_sync(spool_id: str) -> str:
@@ -5834,7 +5838,7 @@ async def spools() -> str:
     """
     import asyncio
 
-    return await asyncio.to_thread(_spools_sync)
+    return await asyncio.to_thread(_spools_sync, True)
 
 
 def _respin_parked_state(original_spool: dict, force_rebuild: bool = False) -> Tuple[list, Optional[str]]:

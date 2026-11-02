@@ -134,6 +134,12 @@ async def test_spools_exposes_discovery_fields(launch_store):
     assert record["harness"] == "claude-code"
 
 
+def test_cli_spools_keeps_original_fields(launch_store):
+    spindle._spin_sync()
+    record = json.loads(spindle._spools_sync())[launch_store[0]]
+    assert set(record) == {"status", "prompt", "created_at", "session_id"}
+
+
 async def test_concurrent_blocking_calls(launch_store):
     async with Client(spindle.mcp) as client:
         tasks = [
