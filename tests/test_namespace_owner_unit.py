@@ -2856,6 +2856,66 @@ def test_terminal_output_state_existing_timestamps_remain_a_pure_read(tmp_path):
         owner.lock.close()
 
 
+def test_terminal_output_state_rescans_captures_only_after_they_change(tmp_path, monkeypatch):
+    """The owner asks every interval; an unchanged capture is not re-read.
+
+    Reading and parsing the whole capture on every ask made an idle owner's
+    cost grow with the capture (issue-20260830-i7q8).  Any append must still
+    reach the real scan, including the one that publishes the sentinel.
+    """
+    import spindle
+
+    owner = _spawning_owner(tmp_path, "terminal-output-rescan")
+    owner.spool_path.write_text(
+        json.dumps(
+            {
+                "id": owner.spool_id,
+                "status": "running",
+                "harness": "claude-code",
+                "claude_protocol": spindle.CLAUDE_PROTOCOL_STREAM_V1,
+            },
+            sort_keys=True,
+        )
+    )
+    owner.stdout_path.write_text(json.dumps({"type": "assistant", "message": {"content": []}}) + "\n")
+    scans = []
+    real_scan = spindle._spool_complete_output_path
+
+    def counted_scan(*args):
+        scans.append(args)
+        return real_scan(*args)
+
+    monkeypatch.setattr(spindle, "_spool_complete_output_path", counted_scan)
+    try:
+        assert owner._terminal_output_state() == (False, False, None)
+        assert owner._terminal_output_state() == (False, False, None)
+        assert len(scans) == 1
+        with owner.stdout_path.open("a") as stream:
+            stream.write(json.dumps({"type": "result", "subtype": "success", "result": "done"}) + "\n")
+        assert owner._terminal_output_state() == (False, False, None)
+        assert len(scans) == 2
+        with owner.stdout_path.open("a") as stream:
+            stream.write(
+                json.dumps(
+                    {
+                        "type": "spindle_driver_terminal",
+                        "subtype": "complete",
+                        "protocol": spindle.CLAUDE_PROTOCOL_STREAM_V1,
+                        "unresolved_tasks": [],
+                    }
+                )
+                + "\n"
+            )
+        terminal, _shutdown_due, written_at = owner._terminal_output_state()
+        assert terminal is True and written_at is not None
+        assert len(scans) == 3
+        terminal, _shutdown_due, _written_at = owner._terminal_output_state()
+        assert terminal is True
+        assert len(scans) == 3
+    finally:
+        owner.lock.close()
+
+
 def test_bounded_custody_pass_uses_only_live_kernel_children(tmp_path, monkeypatch):
     """Containment after the latch signals current custody, never persisted ids.
 
