@@ -417,7 +417,9 @@ Spindle supports multiple AI agent harnesses, allowing you to choose the best to
 spool_id = spin("Refactor the auth module to use dependency injection", wait=False, working_dir="/project")
 
 # Codex CLI - fast for simple tasks
-spool_id = spin(prompt="Add error handling to this function", harness="codex", working_dir="/path/to/project", wait=False)
+spool_id = spin(
+    prompt="Add error handling to this function", harness="codex", working_dir="/path/to/project", wait=False
+)
 
 # Gemini CLI - fast with free tier
 spool_id = spin(prompt="Summarize this codebase", harness="gemini", working_dir="/path/to/project", wait=False)
