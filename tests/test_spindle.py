@@ -3046,6 +3046,11 @@ class TestWaitUntilIdle:
 class TestOrphanedLockSweep:
     """_cleanup_old_spools sweeps orphaned per-spool locks but spares the rest."""
 
+    @pytest.fixture(autouse=True)
+    def _retention_limit(self, monkeypatch):
+        # Retention is opt-in; these exercise the age sweep with a 24-hour limit.
+        monkeypatch.setattr(spindle, "SPOOL_RETENTION_HOURS", 24)
+
     def test_sweeps_only_old_orphaned_per_spool_locks(self, tmp_path):
         import time as _time
 
@@ -3082,7 +3087,7 @@ class TestOrphanedLockSweep:
             assert live.exists()  # spool json still present
 
     def test_preserved_shard_spool_handle_does_not_expire(self, tmp_path):
-        old_created = (datetime.now() - timedelta(hours=spindle.SPOOL_RETENTION_HOURS + 1)).isoformat()
+        old_created = (datetime.now() - timedelta(hours=25)).isoformat()
         with patch("spindle.SPINDLE_DIR", tmp_path):
             _write_spool(
                 "preserved",
@@ -3109,7 +3114,7 @@ class TestOrphanedLockSweep:
 
     def test_old_pending_reservation_survives_sweep_for_recovery(self, tmp_path):
         spool_id = "old-pending-shard"
-        old_created = (datetime.now() - timedelta(hours=spindle.SPOOL_RETENTION_HOURS + 1)).isoformat()
+        old_created = (datetime.now() - timedelta(hours=25)).isoformat()
         worktree = tmp_path / "worktree"
         with patch("spindle.SPINDLE_DIR", tmp_path):
             _write_spool(
@@ -3139,7 +3144,7 @@ class TestOrphanedLockSweep:
             assert _get_output_path(spool_id).read_text() == "startup diagnostics"
 
     def test_live_warned_process_keeps_old_spool_record_and_captures(self, tmp_path):
-        old_created = (datetime.now() - timedelta(hours=spindle.SPOOL_RETENTION_HOURS + 1)).isoformat()
+        old_created = (datetime.now() - timedelta(hours=25)).isoformat()
         spool_id = "warned-live-group"
         with patch("spindle.SPINDLE_DIR", tmp_path):
             _write_spool(
@@ -3170,7 +3175,7 @@ class TestOrphanedLockSweep:
 
     def test_old_spool_sweep_rechecks_preservation_after_lock(self, tmp_path):
         spool_id = "cleanup-lock-race"
-        old_created = (datetime.now() - timedelta(hours=spindle.SPOOL_RETENTION_HOURS + 1)).isoformat()
+        old_created = (datetime.now() - timedelta(hours=25)).isoformat()
 
         @contextmanager
         def publish_warning_before_lock_yields(*args, **kwargs):
@@ -7970,7 +7975,9 @@ class TestShardMergeCleanupFailure:
         assert "merge_in_progress" not in saved["shard"]
         assert "shard_cleanup_pending" not in saved
 
-    def test_failed_merge_keeps_durable_recovery_marker(self, tmp_path):
+    def test_failed_merge_keeps_durable_recovery_marker(self, tmp_path, monkeypatch):
+        # Retention is opt-in; the marker must hold against a 24-hour limit.
+        monkeypatch.setattr(spindle, "SPOOL_RETENTION_HOURS", 24)
         spool_id = "merge-conflict-preserved"
         state_dir = tmp_path / "spools"
         worktree = tmp_path / "worktrees" / "merge-conflict-preserved"
@@ -7980,7 +7987,7 @@ class TestShardMergeCleanupFailure:
             "status": "complete",
             "prompt": "merge me",
             "base_branch": "main",
-            "created_at": (datetime.now() - timedelta(hours=spindle.SPOOL_RETENTION_HOURS + 1)).isoformat(),
+            "created_at": (datetime.now() - timedelta(hours=25)).isoformat(),
             "shard": {
                 "worktree_path": str(worktree),
                 "branch_name": "shard-merge-conflict-preserved",
@@ -8024,7 +8031,9 @@ class TestShardMergeCleanupFailure:
         cleanup.assert_not_called()
         abandon_cleanup.assert_not_called()
 
-    def test_successful_merge_preserves_handle_when_worktree_cleanup_fails(self, tmp_path):
+    def test_successful_merge_preserves_handle_when_worktree_cleanup_fails(self, tmp_path, monkeypatch):
+        # Retention is opt-in; the marker must hold against a 24-hour limit.
+        monkeypatch.setattr(spindle, "SPOOL_RETENTION_HOURS", 24)
         spool_id = "merge-cleanup-failure"
         state_dir = tmp_path / "spools"
         worktree = tmp_path / "worktrees" / "merge-cleanup-failure"
@@ -8034,7 +8043,7 @@ class TestShardMergeCleanupFailure:
             "status": "complete",
             "prompt": "merge me",
             "base_branch": "main",
-            "created_at": (datetime.now() - timedelta(hours=spindle.SPOOL_RETENTION_HOURS + 1)).isoformat(),
+            "created_at": (datetime.now() - timedelta(hours=25)).isoformat(),
             "shard": {
                 "worktree_path": str(worktree),
                 "branch_name": "shard-merge-cleanup-failure",

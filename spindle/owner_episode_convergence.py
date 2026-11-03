@@ -911,16 +911,28 @@ def _may_materialize_before_cleanup_release(
     return False
 
 
+def duties_depend_only_on_record(record: dict | None) -> bool:
+    """Whether discoverable_duties_outstanding reads nothing but *record*.
+
+    A status-only terminal (an episode record with a terminal status but no
+    terminal_origin) also enumerates its control mailbox, which can gain a
+    request without the record changing. A caller that remembers the answer
+    across record versions may do so only when this is True.
+    """
+    record = record or {}
+    return not (
+        isinstance(record.get(EPISODE_KEY), dict)
+        and has_published_terminal(record)
+        and not record.get("terminal_origin")
+    )
+
+
 def discoverable_duties_outstanding(spool_id: str, record: dict | None) -> bool:
     """Whether retention/recovery must preserve or materialize terminal work."""
     record = record or {}
     if obligations_outstanding(record):
         return True
-    if not (
-        isinstance(record.get(EPISODE_KEY), dict)
-        and has_published_terminal(record)
-        and not record.get("terminal_origin")
-    ):
+    if duties_depend_only_on_record(record):
         return False
     discovery = _status_only_has_explicit_duties(spool_id, record)
     return True if isinstance(discovery, MailboxUnavailable) else discovery

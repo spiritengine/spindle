@@ -3208,6 +3208,7 @@ def test_s2_u_rec_02_every_pid_sensitive_caller_uses_reconciliation(
     tmp_path,
     reconciliation_spy,
     caller,
+    monkeypatch,
 ):
     spool_id = f"rec-{caller}"
     worktree = tmp_path / "worktree"
@@ -3258,6 +3259,8 @@ def test_s2_u_rec_02_every_pid_sensitive_caller_uses_reconciliation(
     elif caller == "pending_recovery":
         assert spindle._reconcile_pending_spool(spool_id) is True
     elif caller == "retention":
+        # The age sweep reads PID facts only when a retention limit is set.
+        monkeypatch.setattr(spindle, "SPOOL_RETENTION_HOURS", 24)
         spindle._cleanup_old_spools()
     elif caller == "drop":
         assert "ownership unverifiable" in spindle._spin_drop_locked(spool_id)

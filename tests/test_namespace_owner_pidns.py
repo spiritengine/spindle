@@ -311,7 +311,11 @@ print(json.dumps({"finalized": finalized, "message": message, "count": count, "u
 def test_foreign_cleanup_cannot_retire_episode_when_compatibility_mirror_is_missing(
     namespace_owner_env,
     foreign_pid_namespace,
+    monkeypatch,
 ):
+    # Retention is opt-in; exercise the age sweep with a 24-hour limit here and
+    # in the foreign observer.
+    monkeypatch.setattr(spindle, "SPOOL_RETENTION_HOURS", 24)
     store = namespace_owner_env["store"]
     spool_id = "foreign-missing-owner-mirror"
     owner_lock = store / f"{spool_id}.process-owner"
@@ -343,7 +347,7 @@ def test_foreign_cleanup_cannot_retire_episode_when_compatibility_mirror_is_miss
             {
                 "id": spool_id,
                 "status": "complete",
-                "created_at": (datetime.now() - timedelta(hours=spindle.SPOOL_RETENTION_HOURS + 1)).isoformat(),
+                "created_at": (datetime.now() - timedelta(hours=25)).isoformat(),
                 "lifecycle": {"ownership_state": "released"},
                 "owner_episode": episode,
             }
@@ -362,6 +366,7 @@ def test_foreign_cleanup_cannot_retire_episode_when_compatibility_mirror_is_miss
     source = (
         OBSERVER_PROLOGUE
         + r"""
+spindle.SPOOL_RETENTION_HOURS = 24
 spindle._cleanup_old_spools()
 spool_id = sys.argv[2]
 print(json.dumps({

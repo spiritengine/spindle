@@ -313,17 +313,18 @@ UNSPOOL_MAX_CHARS = int(os.environ.get("SPINDLE_UNSPOOL_MAX_CHARS", "50000"))
 UNSPOOL_HEAD_CHARS = int(os.environ.get("SPINDLE_UNSPOOL_HEAD_CHARS", "12000"))
 UNSPOOL_TAIL_CHARS = int(os.environ.get("SPINDLE_UNSPOOL_TAIL_CHARS", "12000"))
 
-# Retention for finished spools. The module-load sweep deletes a terminal
-# record and its captures once created_at is older than this, unless a
-# preservation rule keeps it (a live reservation, a preserved shard, an
-# unverified process group, or owed owner duties). Fourteen days because a fell
-# can stay open for days waiting on a decision and its next round continues the
-# same fixer with respin(spool_id); at 24 hours that record was already gone.
-DEFAULT_SPOOL_RETENTION_HOURS = 14 * 24
+# Optional retention for finished spools. By default nothing is pruned by age:
+# records are small and they are what unspool, respin and a fell's history
+# read back, sometimes weeks later. When SPINDLE_SPOOL_RETENTION_HOURS is set,
+# the module-load sweep deletes a terminal record and its captures once
+# created_at is older than that, unless a preservation rule keeps it (a live
+# reservation, a preserved shard, an unverified process group, or owed owner
+# duties). None means no limit.
+SPOOL_RETENTION_HOURS_DEFAULT: Optional[float] = None
 
 
-def _spool_retention_hours() -> float:
-    """Retention window from SPINDLE_SPOOL_RETENTION_HOURS, default on a bad value."""
+def _spool_retention_hours() -> Optional[float]:
+    """Opt-in retention limit from SPINDLE_SPOOL_RETENTION_HOURS; None keeps records."""
     raw = os.environ.get("SPINDLE_SPOOL_RETENTION_HOURS", "").strip()
     if raw:
         try:
@@ -333,18 +334,18 @@ def _spool_retention_hours() -> float:
         if math.isfinite(hours) and hours > 0:
             return hours
         logger.warning(
-            "spindle: ignoring SPINDLE_SPOOL_RETENTION_HOURS=%r (need a positive number of hours), using %d",
+            "spindle: ignoring SPINDLE_SPOOL_RETENTION_HOURS=%r (need a positive number of hours); "
+            "keeping every finished spool record",
             raw,
-            DEFAULT_SPOOL_RETENTION_HOURS,
         )
-    return DEFAULT_SPOOL_RETENTION_HOURS
+    return SPOOL_RETENTION_HOURS_DEFAULT
 
 
 SPOOL_RETENTION_HOURS = _spool_retention_hours()
 
 
 def _spool_retention_window() -> str:
-    """The retention window as people say it: '14 days', '36 hours'."""
+    """A set retention limit as people say it: '14 days', '36 hours'."""
     hours = SPOOL_RETENTION_HOURS
     if hours >= 24 and hours % 24 == 0:
         days = int(hours // 24)
@@ -357,6 +358,11 @@ def _missing_record_note() -> str:
     # Script callers key on the "Error: " prefix this follows, and speakbot reads
     # any failed output that says "running" as a spool still running; this text
     # must keep the prefix intact and never use that word.
+    if SPOOL_RETENTION_HOURS is None:
+        return (
+            "finished records are kept because SPINDLE_SPOOL_RETENTION_HOURS is not set, so check the ID "
+            "(older Spindle versions deleted records 24 hours after creation)"
+        )
     return (
         f"finished spool records are pruned {_spool_retention_window()} after creation "
         "(SPINDLE_SPOOL_RETENTION_HOURS), so it may have been pruned"
@@ -2494,13 +2500,14 @@ def _count_running() -> int:
     Pending reservations, running work, and structured stopping work all hold
     capacity until a terminal state is durably committed.
     """
-    count = 0
-    for spool in _list_spools():
-        lock, liveness = _owner_episode_observation(spool)
-        classification = classify_owner_episode(spool, lock, liveness)
-        if classification.state != "retireable" or _foreign_episode_retirement(spool, classification, liveness):
-            count += 1
-    return count
+    return sum(1 for spool in _list_spools() if _spool_holds_capacity(spool))
+
+
+def _spool_holds_capacity(spool: dict) -> bool:
+    """Whether one record counts toward capacity (see _count_running)."""
+    lock, liveness = _owner_episode_observation(spool)
+    classification = classify_owner_episode(spool, lock, liveness)
+    return classification.state != "retireable" or _foreign_episode_retirement(spool, classification, liveness)
 
 
 def _next_owner_generation(spool_id: str) -> int:
@@ -4025,21 +4032,26 @@ def _parse_duration(time_str: str) -> Optional[int]:
 
 
 def _cleanup_old_spools() -> None:
-    """Remove finished spool files older than the retention window."""
+    """Remove finished spool files older than an opt-in retention limit."""
     if not SPINDLE_DIR.exists():
         return
 
     now = datetime.now()
-    try:
-        cutoff = now - timedelta(hours=SPOOL_RETENTION_HOURS)
-    except OverflowError:
-        # A window wider than datetime can represent keeps every record.
-        cutoff = datetime.min
+    # With no limit set nothing can be pruned by age, and the record loop
+    # below decides nothing else (its reconciliation reads are discarded), so
+    # every CLI command skips reading the whole store here.
+    cutoff = None
+    if SPOOL_RETENTION_HOURS is not None:
+        try:
+            cutoff = now - timedelta(hours=SPOOL_RETENTION_HOURS)
+        except OverflowError:
+            # A window wider than datetime can represent keeps every record.
+            cutoff = datetime.min
     # Orphaned locks have no record to retain; their age check only guards a
     # spool whose JSON is not written yet, so they keep the 24-hour horizon.
     orphan_lock_cutoff = now - timedelta(hours=24)
 
-    for path in SPINDLE_DIR.glob("*.json"):
+    for path in SPINDLE_DIR.glob("*.json") if cutoff is not None else ():
         if path.name.startswith("."):
             continue
         spool_id = path.stem
@@ -4689,6 +4701,149 @@ def _start_spool_monitor(spool_id: str) -> None:
         logger.error("spindle: %s could not ensure durable supervisor: %s", spool_id, error)
 
 
+# The supervisor remembers finished records that owe nothing, so a pass costs
+# one stat per finished record instead of a parse, a duty check and an
+# ownership probe. Spool records are kept indefinitely by default, so without
+# this every pass would grow with the store's history.
+#
+# A remembered entry says: at exactly this file version (device, inode, size,
+# mtime, ctime), the record was not pending or running, owed no discoverable
+# duties, its duties depended on nothing but the record, and it did not hold
+# capacity. Such a record is skipped until its stamp changes. That is sound
+# because:
+# - Every production writer (_write_spool, the owner's and watchdog's episode
+#   transitions, the lifecycle store) publishes a new inode by rename or link,
+#   so any rewrite changes the stamp. That includes everything that gives a
+#   finished spool duty work or makes it live again: a new obligation block,
+#   status-only materialization, a shard merge or abandon marker, or a new
+#   reservation reusing the ID.
+# - A stamp is remembered only once its mtime and ctime are
+#   SUPERVISOR_SETTLE_MARGIN_NS old. A later write's ctime is at least the time
+#   of that write, so it cannot reproduce a remembered stamp even if it reuses
+#   the inode number; only a clock stepped back past the margin, landing on the
+#   same size and both timestamps to the nanosecond, could.
+# - A status-only terminal's duties also come from its control mailbox, which
+#   can gain a request without a record write, so it is never remembered
+#   (owner_episode_convergence.duties_depend_only_on_record).
+# - Pending and running records, records with duties, records that hold
+#   capacity and records that raise are never remembered.
+# - A file that is not a spool record (unparseable, or JSON that is not an
+#   object) was always skipped; it is remembered by the same stamp rule, so it
+#   is read again only after it changes.
+# The idle count can miss a remembered record whose ownership evidence later
+# changes without a record write (its lock file deleted or replaced). That
+# cannot create supervisor work, because a finished record without duties is
+# never reconciled, and retirement still asks _store_supervision_required,
+# which reads every record without this memory.
+SUPERVISOR_SETTLE_MARGIN_NS = 2_000_000_000
+
+
+def _record_stamp(stat: os.stat_result) -> tuple:
+    return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+
+
+def _unsettled_spool_records(settled: dict, seen: Optional[set] = None):
+    """Yield (name, stamp, record) for each readable record not remembered at its stamp.
+
+    Reads like _list_spools: dotfiles skipped, unreadable or unparseable files
+    skipped. The stamp comes from the open descriptor before the read, so a
+    write racing the read leaves a stamp that no longer matches the path.
+    scandir with a suffix test, not Path.glob: the store holds several sidecar
+    files per spool, and building a Path for each entry cost more than the stat
+    calls this pass exists to limit itself to.
+    """
+    try:
+        entries = list(os.scandir(SPINDLE_DIR))
+    except OSError:
+        return
+    for entry in entries:
+        name = entry.name
+        if not name.endswith(".json") or name.startswith("."):
+            continue
+        if seen is not None:
+            seen.add(name)
+        try:
+            if name in settled and settled[name] == _record_stamp(entry.stat()):
+                continue
+            settled.pop(name, None)
+            with open(entry.path) as f:
+                stamp = _record_stamp(os.fstat(f.fileno()))
+                try:
+                    record = json.load(f)
+                except ValueError:
+                    record = None
+        except Exception:
+            settled.pop(name, None)
+            continue
+        if not isinstance(record, dict):
+            # Not a spool record: corrupt, or another tool's JSON such as the
+            # list a default spool_export writes into the store. Skipped like
+            # _list_spools skips unparseable files, and remembered by stamp so
+            # a large one is not parsed again every pass.
+            if _stamp_old_enough(stamp):
+                settled[name] = stamp
+            continue
+        yield name, stamp, record
+
+
+def _stamp_old_enough(stamp: tuple) -> bool:
+    return max(stamp[3], stamp[4]) <= time.time_ns() - SUPERVISOR_SETTLE_MARGIN_NS
+
+
+def _may_remember_settled(spool: dict, stamp: tuple) -> bool:
+    """Whether a finished, duty-free record may be skipped until it changes."""
+    from .owner_episode_convergence import duties_depend_only_on_record
+
+    if not _stamp_old_enough(stamp):
+        return False
+    return duties_depend_only_on_record(spool) and not _spool_holds_capacity(spool)
+
+
+def _supervisor_pass(settled: dict) -> bool:
+    """One reconciliation pass over the store; True while it still needs an owner.
+
+    ``settled`` is the supervisor's memory of finished records that owe
+    nothing (see SUPERVISOR_SETTLE_MARGIN_NS); this pass updates it.
+    """
+    from .owner_episode_convergence import discoverable_duties_outstanding
+
+    any_active = False
+    seen: set = set()
+    for name, stamp, spool in _unsettled_spool_records(settled, seen):
+        try:
+            spool_id = spool["id"]
+            duty_work = discoverable_duties_outstanding(spool_id, spool)
+            if spool.get("status") not in {"pending", "running"} and not duty_work:
+                if _may_remember_settled(spool, stamp):
+                    settled[name] = stamp
+                continue
+            if _reconcile_spool_step(spool_id):
+                any_active = True
+            elif discoverable_duties_outstanding(spool_id, _read_spool(spool_id)):
+                # A transient durable-effect failure remains supervisor
+                # work even though the public record is already terminal.
+                any_active = True
+        except Exception:
+            # One malformed legacy record must not kill ownership for
+            # every healthy sibling and poison every later reclaim.
+            any_active = True
+            logger.exception("spindle: reconciliation failed for spool %r", name.removesuffix(".json"))
+    for name in set(settled) - seen:
+        del settled[name]
+    if any_active:
+        return True
+    # _count_running() over everything not remembered: a remembered record was
+    # verified not to hold capacity at its current stamp.
+    for _name, _stamp, spool in _unsettled_spool_records(settled):
+        try:
+            if _spool_holds_capacity(spool):
+                return True
+        except Exception:
+            logger.exception("spindle: capacity check failed for spool %r", _name.removesuffix(".json"))
+            return True
+    return False
+
+
 def _run_store_supervisor(store: str, lock_fd: int) -> None:
     """Own and reconcile one explicit spool store until its idle grace expires."""
     global SPINDLE_DIR, _STORE_LAYOUT
@@ -4704,30 +4859,11 @@ def _run_store_supervisor(store: str, lock_fd: int) -> None:
     _write_supervisor_record(_supervisor_identity(os.getpid(), started_at=started_at))
     idle_since: Optional[float] = None
     owned_fd = lock_fd
-    from .owner_episode_convergence import discoverable_duties_outstanding
+    settled: dict = {}
 
     try:
         while True:
-            any_active = False
-            for spool in _list_spools():
-                spool_id = spool["id"]
-                try:
-                    duty_work = discoverable_duties_outstanding(spool_id, spool)
-                    if spool.get("status") not in {"pending", "running"} and not duty_work:
-                        continue
-                    if _reconcile_spool_step(spool_id):
-                        any_active = True
-                    elif discoverable_duties_outstanding(spool_id, _read_spool(spool_id)):
-                        # A transient durable-effect failure remains supervisor
-                        # work even though the public record is already terminal.
-                        any_active = True
-                except Exception:
-                    # One malformed legacy record must not kill ownership for
-                    # every healthy sibling and poison every later reclaim.
-                    any_active = True
-                    logger.exception("spindle: reconciliation failed for spool %r", spool.get("id"))
-
-            if any_active or _count_running():
+            if _supervisor_pass(settled):
                 idle_since = None
             elif idle_since is None:
                 idle_since = time.monotonic()
