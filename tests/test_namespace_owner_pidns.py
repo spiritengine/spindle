@@ -343,7 +343,7 @@ def test_foreign_cleanup_cannot_retire_episode_when_compatibility_mirror_is_miss
             {
                 "id": spool_id,
                 "status": "complete",
-                "created_at": (datetime.now() - timedelta(hours=25)).isoformat(),
+                "created_at": (datetime.now() - timedelta(hours=spindle.SPOOL_RETENTION_HOURS + 1)).isoformat(),
                 "lifecycle": {"ownership_state": "released"},
                 "owner_episode": episode,
             }

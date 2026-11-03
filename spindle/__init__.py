@@ -313,6 +313,81 @@ UNSPOOL_MAX_CHARS = int(os.environ.get("SPINDLE_UNSPOOL_MAX_CHARS", "50000"))
 UNSPOOL_HEAD_CHARS = int(os.environ.get("SPINDLE_UNSPOOL_HEAD_CHARS", "12000"))
 UNSPOOL_TAIL_CHARS = int(os.environ.get("SPINDLE_UNSPOOL_TAIL_CHARS", "12000"))
 
+# Retention for finished spools. The module-load sweep deletes a terminal
+# record and its captures once created_at is older than this, unless a
+# preservation rule keeps it (a live reservation, a preserved shard, an
+# unverified process group, or owed owner duties). Fourteen days because a fell
+# can stay open for days waiting on a decision and its next round continues the
+# same fixer with respin(spool_id); at 24 hours that record was already gone.
+DEFAULT_SPOOL_RETENTION_HOURS = 14 * 24
+
+
+def _spool_retention_hours() -> float:
+    """Retention window from SPINDLE_SPOOL_RETENTION_HOURS, default on a bad value."""
+    raw = os.environ.get("SPINDLE_SPOOL_RETENTION_HOURS", "").strip()
+    if raw:
+        try:
+            hours = float(raw)
+        except ValueError:
+            hours = math.nan
+        if math.isfinite(hours) and hours > 0:
+            return hours
+        logger.warning(
+            "spindle: ignoring SPINDLE_SPOOL_RETENTION_HOURS=%r (need a positive number of hours), using %d",
+            raw,
+            DEFAULT_SPOOL_RETENTION_HOURS,
+        )
+    return DEFAULT_SPOOL_RETENTION_HOURS
+
+
+SPOOL_RETENTION_HOURS = _spool_retention_hours()
+
+
+def _spool_retention_window() -> str:
+    """The retention window as people say it: '14 days', '36 hours'."""
+    hours = SPOOL_RETENTION_HOURS
+    if hours >= 24 and hours % 24 == 0:
+        days = int(hours // 24)
+        return f"{days} day" if days == 1 else f"{days} days"
+    text = f"{hours:g}"
+    return f"{text} hour" if text == "1" else f"{text} hours"
+
+
+def _missing_record_note() -> str:
+    # Script callers key on the "Error: " prefix this follows, and speakbot reads
+    # any failed output that says "running" as a spool still running; this text
+    # must keep the prefix intact and never use that word.
+    return (
+        f"finished spool records are pruned {_spool_retention_window()} after creation "
+        "(SPINDLE_SPOOL_RETENTION_HOURS), so it may have been pruned"
+    )
+
+
+def _spool_record_absent(spool_id: str) -> bool:
+    """True when no record file exists for this ID (an unreadable one does)."""
+    try:
+        return not _get_spool_path(spool_id).exists()
+    except (OSError, ValueError):
+        # Too long or otherwise unusable as a file name: no record can exist.
+        return True
+
+
+def _unknown_spool_text(spool_id: str) -> str:
+    """The unknown-ID error without its "Error: " prefix.
+
+    A present but unreadable record keeps the bare text: saying "no record
+    exists" there would be false.
+    """
+    text = f"Unknown spool_id '{spool_id}'"
+    if _spool_record_absent(spool_id):
+        text += f": no record exists; {_missing_record_note()}"
+    return text
+
+
+def _unknown_spool_error(spool_id: str) -> str:
+    return f"Error: {_unknown_spool_text(spool_id)}"
+
+
 # Timeout for pending spools that never got a PID (seconds). Environment
 # overrides keep the real-subprocess crash contracts fast without adding a
 # production switch that can disable durable ownership.
@@ -3950,11 +4025,19 @@ def _parse_duration(time_str: str) -> Optional[int]:
 
 
 def _cleanup_old_spools() -> None:
-    """Remove spool files older than 24 hours."""
+    """Remove finished spool files older than the retention window."""
     if not SPINDLE_DIR.exists():
         return
 
-    cutoff = datetime.now() - timedelta(hours=24)
+    now = datetime.now()
+    try:
+        cutoff = now - timedelta(hours=SPOOL_RETENTION_HOURS)
+    except OverflowError:
+        # A window wider than datetime can represent keeps every record.
+        cutoff = datetime.min
+    # Orphaned locks have no record to retain; their age check only guards a
+    # spool whose JSON is not written yet, so they keep the 24-hour horizon.
+    orphan_lock_cutoff = now - timedelta(hours=24)
 
     for path in SPINDLE_DIR.glob("*.json"):
         if path.name.startswith("."):
@@ -4045,7 +4128,7 @@ def _cleanup_old_spools() -> None:
         if (SPINDLE_DIR / f"{lock_path.stem}.json").exists():
             continue  # still has a spool record
         try:
-            if datetime.fromtimestamp(lock_path.stat().st_mtime) < cutoff:
+            if datetime.fromtimestamp(lock_path.stat().st_mtime) < orphan_lock_cutoff:
                 lock_path.unlink()
         except (OSError, ValueError):
             pass
@@ -5487,7 +5570,7 @@ def _unspool_sync(spool_id: str) -> str:
     # Auto-detect harness from spool metadata
     spool = _read_spool(spool_id)
     if not spool:
-        return f"Error: Unknown spool_id '{spool_id}'"
+        return _unknown_spool_error(spool_id)
 
     harness = spool.get("harness", "claude-code")
     harness_lower = harness.lower() if harness else "claude-code"
@@ -5504,7 +5587,7 @@ def _unspool_sync(spool_id: str) -> str:
         _check_and_finalize_spool(spool_id)
         spool = _read_spool(spool_id)
         if not spool:
-            return f"Error: Unknown spool_id '{spool_id}'"
+            return _unknown_spool_error(spool_id)
         status = spool.get("status")
         if status == "pending":
             return f"Spool {spool_id} pending (not yet started)"
@@ -5640,7 +5723,7 @@ def _spin_drop_locked(spool_id: str) -> str:
     spool = _read_spool(spool_id)
 
     if not spool:
-        return f"Error: Unknown spool_id '{spool_id}'"
+        return _unknown_spool_error(spool_id)
 
     if spool.get("status") != "running":
         return f"Spool {spool_id} is not running (status: {spool.get('status')})"
@@ -5658,7 +5741,7 @@ def _spool_peek_sync(spool_id: str, lines: int = 50) -> str:
     """Synchronous implementation of spool_peek."""
     spool = _read_spool(spool_id)
     if not spool:
-        return f"Error: Unknown spool_id '{spool_id}'"
+        return _unknown_spool_error(spool_id)
 
     stdout_path = _get_output_path(spool_id)
     if not stdout_path.exists():
@@ -5738,7 +5821,7 @@ def _spin_wait_sync(
                     return json.dumps(
                         {
                             "spool_id": spool_id,
-                            "error": f"Unknown spool_id '{spool_id}'",
+                            "error": _unknown_spool_text(spool_id),
                             "remaining": remaining,
                         }
                     )
@@ -5797,7 +5880,7 @@ def _spin_wait_sync(
                 _check_and_finalize_spool(spool_id)
                 spool = _read_spool(spool_id)
                 if not spool:
-                    return f"Error: Unknown spool_id '{spool_id}'"
+                    return _unknown_spool_error(spool_id)
                 if spool.get("status") == "complete":
                     results[spool_id] = spool.get("result", "No result")
                     pending.remove(spool_id)
@@ -5908,7 +5991,10 @@ def _respin_sync(handle: str, prompt: str, rebuild: bool = False) -> str:
     # Resolve the original spool to detect harness (accepts spool_id or session_id)
     original_spool = _resolve_spool_for_respin(handle)
     if not original_spool:
-        return f"Error: No spool found for handle '{handle}'"
+        message = f"Error: No spool found for handle '{handle}'"
+        if _spool_record_absent(handle):
+            message += f": no record has that spool_id or session_id; {_missing_record_note()}"
+        return message
 
     # respin proceeds only when the spool reached a terminal state with a
     # usable session_id. A still-running spool may already have its
@@ -6414,7 +6500,7 @@ async def spin_wait(
         remaining_ids = [s for s in ids if s != spool_id]
         if spool is None:
             return json.dumps(
-                {"spool_id": spool_id, "error": f"Unknown spool_id '{spool_id}'", "remaining": remaining_ids}
+                {"spool_id": spool_id, "error": _unknown_spool_text(spool_id), "remaining": remaining_ids}
             )
         if spool.get("status") == "complete":
             return _render_wait_yield_result(spool_id, spool.get("result", "No result"), remaining_ids)
@@ -6429,7 +6515,7 @@ async def spin_wait(
     results = {}
     for spool_id, spool in outcome.records.items():
         if spool is None:
-            return f"Error: Unknown spool_id '{spool_id}'"
+            return _unknown_spool_error(spool_id)
         status = spool.get("status")
         if status == "complete":
             results[spool_id] = spool.get("result", "No result")
@@ -6746,7 +6832,7 @@ async def spool_grep(pattern: str, spool_id: Optional[str] = None, context: int 
         _check_and_finalize_spool(spool_id)
         spool = _read_spool(spool_id)
         if not spool:
-            return f"Error: Unknown spool_id '{spool_id}'"
+            return _unknown_spool_error(spool_id)
         result = spool.get("result", "") or ""
         if isinstance(result, (dict, list)):
             result = json.dumps(result, indent=2)
@@ -6826,7 +6912,7 @@ async def spool_peek(spool_id: str, lines: int = 50) -> str:
     """
     spool = _read_spool(spool_id)
     if not spool:
-        return f"Error: Unknown spool_id '{spool_id}'"
+        return _unknown_spool_error(spool_id)
 
     stdout_path = _get_output_path(spool_id)
 
@@ -6904,7 +6990,7 @@ async def spool_retry(spool_id: str) -> str:
     spool = _read_spool(spool_id)
 
     if not spool:
-        return f"Error: Unknown spool_id '{spool_id}'"
+        return _unknown_spool_error(spool_id)
 
     # Re-spin with same parameters - route to appropriate harness
     tags = spool.get("tags")
@@ -7456,7 +7542,7 @@ async def spool_export(
             if spool:
                 spools_to_export.append(spool)
             else:
-                return f"Error: Unknown spool_id '{sid}'"
+                return _unknown_spool_error(sid)
 
     if not spools_to_export:
         return "No spools to export"
@@ -7506,7 +7592,7 @@ def _shard_status_sync(spool_id: str) -> str:
     spool = _read_spool(spool_id)
 
     if not spool:
-        return f"Error: Unknown spool_id '{spool_id}'"
+        return _unknown_spool_error(spool_id)
 
     shard_info = spool.get("shard")
     if not shard_info:
@@ -7619,7 +7705,7 @@ def _shard_merge_locked(spool_id: str, keep_branch: bool, caller_cwd: str | None
     spool = _read_spool(spool_id)
 
     if not spool:
-        return f"Error: Unknown spool_id '{spool_id}'"
+        return _unknown_spool_error(spool_id)
 
     if spool.get("status") in {"pending", "running"}:
         _reconcile_spool_ownership(spool)
@@ -7804,7 +7890,7 @@ def _shard_abandon_locked(spool_id: str, keep_branch: bool, caller_cwd: str | No
     spool = _read_spool(spool_id)
 
     if not spool:
-        return f"Error: Unknown spool_id '{spool_id}'"
+        return _unknown_spool_error(spool_id)
 
     if spool.get("status") == "pending":
         return f"Error: Spool {spool_id} is still starting. Wait for PID publication or cancel it first."
@@ -8014,7 +8100,7 @@ async def spool_info(spool_id: str) -> str:
     """
     spool = _read_spool(spool_id)
     if not spool:
-        return f"Error: Unknown spool_id '{spool_id}'"
+        return _unknown_spool_error(spool_id)
 
     # Add transcript availability info
     if spool.get("session_id"):
@@ -9136,7 +9222,7 @@ def _codex_unspool_sync(spool_id: str) -> str:
     _check_and_finalize_spool(spool_id)
     spool = _read_spool(spool_id)
     if not spool:
-        return f"Error: Unknown spool_id '{spool_id}'"
+        return _unknown_spool_error(spool_id)
 
     status = spool.get("status")
     if status == "pending":
@@ -10015,7 +10101,7 @@ def _gemini_unspool_sync(spool_id: str) -> str:
     _check_and_finalize_spool(spool_id)
     spool = _read_spool(spool_id)
     if not spool:
-        return f"Error: Unknown spool_id '{spool_id}'"
+        return _unknown_spool_error(spool_id)
 
     status = spool.get("status")
     if status == "pending":
@@ -10484,7 +10570,7 @@ def _kimi_unspool_sync(spool_id: str) -> str:
     _check_and_finalize_spool(spool_id)
     spool = _read_spool(spool_id)
     if not spool:
-        return f"Error: Unknown spool_id '{spool_id}'"
+        return _unknown_spool_error(spool_id)
 
     status = spool.get("status")
     if status == "pending":
