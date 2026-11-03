@@ -49,19 +49,23 @@ except ImportError:  # checkout where the repo root is not on sys.path
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     import spindle_claude_driver as _claude_driver
 
-# fastmcp imports authlib, which announces a deprecation of its own internals as
-# it loads — three lines of stderr in front of the output of every single CLI
-# command, about something no spindle user can act on. A warnings filter can't
-# stop it: authlib itself calls warnings.simplefilter("always", ...) at import,
-# which takes precedence over anything registered earlier. So drop that one
-# message for the duration of the import and hand the machinery straight back.
+# fastmcp imports authlib, which announces deprecations of its own internals as
+# it loads — lines of stderr in front of the output of every single CLI command,
+# about something no spindle user can act on. A warnings filter can't stop it:
+# authlib itself calls warnings.simplefilter("always", ...) at import, which
+# takes precedence over anything registered earlier. So drop authlib's own
+# warning category for the duration of the import and hand the machinery
+# straight back. It is the category, not any one message: authlib 1.7 added a
+# second import-time warning that a message match let through. The category is
+# matched by class name, subclasses included as a warnings filter would, because
+# spindle depends on fastmcp rather than on authlib and does not import it.
 # (The E402s below are the cost of having to sit in front of the import.)
-_AUTHLIB_IMPORT_NOISE = "authlib.jose module is deprecated"
+_AUTHLIB_DEPRECATION_CATEGORY = "AuthlibDeprecationWarning"
 _real_showwarning = warnings.showwarning
 
 
 def _showwarning_without_authlib_noise(message, category, filename, lineno, file=None, line=None):
-    if _AUTHLIB_IMPORT_NOISE in str(message):
+    if any(cls.__name__ == _AUTHLIB_DEPRECATION_CATEGORY for cls in getattr(category, "__mro__", ())):
         return
     _real_showwarning(message, category, filename, lineno, file, line)
 
