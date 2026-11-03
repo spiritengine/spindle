@@ -97,6 +97,7 @@ from .namespace_owner import (  # noqa: E402
     _birth_token,
     _DurablePublicationCleanupError,
     _fsync_directory_after_publication,
+    _json_loads_with_nesting_cap,
     _lock_fact_from_dict,
     _owner_exit_from_dict,
     _pid_json_integer,
@@ -2448,7 +2449,7 @@ def _next_owner_generation(spool_id: str) -> int:
         encoded_identity = None
     if encoded_identity is not None:
         try:
-            identity = ProcessIdentity.from_dict(json.loads(encoded_identity))
+            identity = ProcessIdentity.from_dict(_json_loads_with_nesting_cap(encoded_identity))
         except (RecursionError, TypeError, ValueError) as exc:
             raise ValueError(f"malformed owner identity prevents generation allocation for {spool_id}") from exc
         generations.append(identity.owner_generation)
@@ -3373,7 +3374,7 @@ def _process_start_time(pid: int) -> Optional[str]:
 
 def _read_current_owner_identity(spool_id: str) -> Optional[ProcessIdentity]:
     try:
-        return ProcessIdentity.from_dict(json.loads(_get_owner_identity_path(spool_id).read_text()))
+        return ProcessIdentity.from_dict(_json_loads_with_nesting_cap(_get_owner_identity_path(spool_id).read_text()))
     except (FileNotFoundError, OSError, RecursionError, KeyError, TypeError, ValueError):
         return None
 
@@ -3381,7 +3382,7 @@ def _read_current_owner_identity(spool_id: str) -> Optional[ProcessIdentity]:
 def _owner_exit_evidence(spool_id: str, owner_generation: int) -> tuple[bool, bool]:
     """Return generation-matched exit and cleanup evidence for one owner."""
     try:
-        evidence = _owner_exit_from_dict(json.loads(_get_owner_exit_path(spool_id).read_text()))
+        evidence = _owner_exit_from_dict(_json_loads_with_nesting_cap(_get_owner_exit_path(spool_id).read_text()))
     except (FileNotFoundError, OSError, RecursionError, TypeError, ValueError):
         return False, False
     try:

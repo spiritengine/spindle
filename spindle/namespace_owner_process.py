@@ -26,6 +26,7 @@ from .namespace_owner import (
     ProcessIdentity,
     _atomic_json_write,
     _cleanup_locked_fd,
+    _json_loads_with_nesting_cap,
     _pgid_json_integer,
     _positive_json_integer,
     _utc_now,
@@ -586,7 +587,7 @@ class LogicalOwner:
 
     def _read_spool(self) -> dict:
         try:
-            value = json.loads(self.spool_path.read_text())
+            value = _json_loads_with_nesting_cap(self.spool_path.read_text())
         except (FileNotFoundError, RecursionError, ValueError):
             value = None
         if isinstance(value, dict):
@@ -695,7 +696,7 @@ class LogicalOwner:
             previous = 0
         else:
             try:
-                previous = ProcessIdentity.from_dict(json.loads(encoded)).owner_generation
+                previous = ProcessIdentity.from_dict(_json_loads_with_nesting_cap(encoded)).owner_generation
             except (RecursionError, TypeError, ValueError) as exc:
                 raise ValueError("malformed owner identity prevents generation allocation") from exc
         self.generation = _positive_json_integer(self.generation, "logical owner generation")
