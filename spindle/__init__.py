@@ -5200,6 +5200,14 @@ async def spin(
                     narrow its powers inside the box; research adds an output
                     target, shard substitutes a worktree but leaves Git metadata
                     read-only, and "full" without shard intent opts out of bwrap.
+                    Codex maps each profile to a --sandbox tier and pins
+                    approval_policy=never on every tier but "full", so a denied
+                    command stays denied. Its read-only tier (readonly, site
+                    research) blocks all network, the local SKEIN service included,
+                    so such a spool cannot run skein commands; a site research
+                    spool's findings come back in its result. A careful codex
+                    spool cannot commit (.git stays read-only); a shard spool is
+                    refused if codex's sandbox cannot start inside the wrapper.
         research_target: Required for permission="research" or "research+shard".
                          Accepted forms: site:<id>, file:<absolute-path>, dir:<absolute-path>.
         shard: Run in isolated git worktree (SKEIN-aware with graceful fallback)
@@ -8214,7 +8222,7 @@ def _codex_sandbox_probe_key(codex_bin: str, process_env: Optional[Dict[str, str
     return (codex_bin, _codex_cli_version(codex_bin, process_env), mtime, codex_home, config_signature)
 
 
-def _codex_sandbox_probe_argvs(codex_bin: str, shell_cmd: str) -> list:
+def _codex_sandbox_probe_argvs(codex_bin: str, shell_cmd: str, config_args: Optional[list] = None) -> list:
     """Candidate no-model `codex sandbox` invocations, most-current CLI shape first.
 
     codex's no-model sandbox-exec has changed shape across versions: 0.144.x runs the command
@@ -8228,8 +8236,13 @@ def _codex_sandbox_probe_argvs(codex_bin: str, shell_cmd: str) -> list:
     config-proof way and "probe enforces" faithfully predicts "real spin enforces". The
     `codex sandbox` subcommand does not accept `--sandbox` (only `codex exec` does), so the tier
     is pinned via `-c` alone here — do not add `--sandbox`, it errors and the shape never runs.
+
+    `config_args` replaces that read-only pin with a launch's own `-c` pins; the shard start
+    probe passes _codex_sandbox_config_args so it starts the sandbox the launch will start.
     """
-    base = [codex_bin, "-c", "sandbox_mode=read-only", "sandbox"]
+    if config_args is None:
+        config_args = ["-c", "sandbox_mode=read-only"]
+    base = [codex_bin, *config_args, "sandbox"]
     return [
         base + ["--", "/bin/sh", "-c", shell_cmd],  # codex >= 0.144.x
         base + ["linux", "--", "/bin/sh", "-c", shell_cmd],  # codex ~0.125.x
@@ -8807,25 +8820,220 @@ def _persist_codex_sandbox_refusal(
         return f"Error: {message} ({_codex_refusal_persistence_diagnostic(exc)})"
 
 
+def _codex_shard_git_write_paths(worktree_root: str) -> list:
+    """The git metadata a shard commit writes, which the shard wrapper binds writable.
+
+    A linked worktree's `.git` is a file pointing at `<repo>/.git/worktrees/<name>`. A commit
+    writes that per-worktree gitdir plus three shared paths in the main repo's `.git`: the
+    object store, the branch refs and their reflogs. Nothing else in the main `.git` (config,
+    hooks, HEAD, packed-refs) is writable, so a shard agent cannot plant a hook or rewrite
+    config that would then run in the operator's own checkout.
+
+    Both containment layers read this one list. _codex_bwrap_wrap binds these paths, and
+    _codex_writable_grants hands the same paths to codex's own sandbox as writable roots.
+    """
+    git_file = Path(worktree_root) / ".git"
+    if not (git_file.exists() and git_file.is_file()):
+        return []
+    git_content = git_file.read_text().strip()
+    if not git_content.startswith("gitdir:"):
+        return []
+    git_worktree_dir = git_content.split("gitdir:")[1].strip()
+    if not Path(git_worktree_dir).exists():
+        return []
+    paths = [git_worktree_dir]
+    main_git = Path(git_worktree_dir).parent.parent
+    if main_git.exists() and main_git.name == ".git":
+        for parts in (("objects",), ("refs", "heads"), ("logs", "refs", "heads")):
+            shared = main_git.joinpath(*parts)
+            if shared.exists():
+                paths.append(str(shared))
+    return paths
+
+
+def _codex_writable_grants(shard_info: Optional[dict], research_target_info: Optional[Dict[str, str]]) -> list:
+    """The paths a codex launch passes as `--add-dir`, beyond its own cwd.
+
+    A file/dir research target gets exactly its output path. Otherwise a shard gets the git
+    paths its commits need plus the worktree root (so a respin from a subdirectory keeps
+    sibling files writable).
+
+    Inside a shard, every one of these paths must also be writable in the bwrap wrapper.
+    codex 0.154 masks `.git`, `.agents` and `.codex` under every writable root it is given;
+    where one is missing it mounts a read-only tmpfs there, so bwrap must first create the
+    mount point. Spindle used to grant the main repo's `.git` itself while the wrapper kept that
+    directory read-only, so codex's `mkdir <repo>/.git/.git` failed and no command could start
+    (issue-20261022-zebt). Granting the paths _codex_shard_git_write_paths binds keeps the two
+    layers identical, and codex's sandbox never sees the main `.git` as writable.
+    """
+    if research_target_info and research_target_info["type"] in {"file", "dir"}:
+        return [_research_writable_path(research_target_info)]
+    if not shard_info:
+        return []
+    git_paths = _codex_shard_git_write_paths(shard_info["worktree_path"])
+    if not git_paths:
+        return []
+    return [*git_paths, shard_info["worktree_path"]]
+
+
+def _toml_basic_string(value: str) -> str:
+    """Quote `value` as a TOML basic string (what `codex -c key=value` parses)."""
+    escaped = []
+    for char in value:
+        if char in {'"', "\\"}:
+            escaped.append("\\" + char)
+        elif ord(char) < 0x20 or ord(char) == 0x7F:
+            escaped.append(f"\\u{ord(char):04x}")
+        else:
+            escaped.append(char)
+    return '"' + "".join(escaped) + '"'
+
+
+def _codex_sandbox_config_args(sandbox: str, shard_info: Optional[dict], grants: list) -> list:
+    """The `-c` pins every codex launch at `sandbox` carries, shared with the shard start probe.
+
+    - `sandbox_mode` matches the `--sandbox` flag, so ~/.codex/config.toml cannot widen it.
+    - `approval_policy=never` on every restrictive tier, so a sandbox denial stays a denial.
+      Under `approval_policy = "on-request"` with `approvals_reviewer = "auto_review"` in
+      config.toml, `codex exec` gives up its headless "never" default and a reviewer model can
+      approve a command out of the sandbox (issue-20260903-zigp). Under "never", codex 0.154
+      rejects a `require_escalated` command and never retries a denied one unsandboxed.
+      danger-full-access has no sandbox to escape, so it keeps the operator's own policy.
+    - Inside a shard at workspace-write, `sandbox_workspace_write.writable_roots` is pinned to
+      `grants`. That replaces any writable_roots in config.toml, which the shard wrapper would
+      not have bound, so codex's writable roots are exactly what the wrapper made writable.
+    """
+    args = ["-c", f"sandbox_mode={sandbox}"]
+    if sandbox in _CODEX_RESTRICTIVE_SANDBOX_MODES:
+        args.extend(["-c", "approval_policy=never"])
+    if shard_info and sandbox == "workspace-write":
+        roots = "[" + ", ".join(_toml_basic_string(path) for path in grants) + "]"
+        args.extend(["-c", f"sandbox_workspace_write.writable_roots={roots}"])
+    return args
+
+
+_CODEX_PROBE_STDERR_NOISE = ("note: run with `RUST_BACKTRACE", "WARNING: proceeding")
+
+
+def _codex_probe_failure_line(stderr: str, returncode: int) -> str:
+    """The most telling single line of a failed probe's stderr, bounded and printable.
+
+    bwrap's own error wins. Otherwise the last line that is not codex's PATH-alias warning
+    or Rust's backtrace hint, which is where a panic's message sits.
+    """
+    lines = [line.strip() for line in (stderr or "").splitlines() if line.strip()]
+    meaningful = [line for line in lines if not line.startswith(_CODEX_PROBE_STDERR_NOISE)] or lines
+    chosen = next((line for line in lines if line.startswith("bwrap:")), meaningful[-1] if meaningful else "")
+    if not chosen:
+        return f"exit {returncode}, no output"
+    chosen = "".join(ch if ch.isprintable() else " " for ch in chosen)
+    return chosen if len(chosen) <= 300 else chosen[:297] + "..."
+
+
+def _codex_shard_sandbox_start_failure(
+    codex_bin: str,
+    sandbox: str,
+    shard_info: dict,
+    grants: list,
+    research_target_info: Optional[Dict[str, str]],
+    process_env: Optional[Dict[str, str]],
+) -> Optional[str]:
+    """Why codex's own sandbox cannot start inside this shard's wrapper, or None if it can.
+
+    Runs one no-model `codex sandbox` command through the launch's own bwrap wrapper, with the
+    launch's own `-c` pins and writable roots, from the worktree root (where `--cd` puts a real
+    launch). The command only echoes a marker: its appearance proves bwrap, seccomp and the
+    sandbox helper all came up. Anything else (no marker, an error, a timeout) is a failure,
+    so an inconclusive probe refuses rather than launches.
+    """
+    worktree_root = shard_info["worktree_path"]
+    shell_cmd = f"echo {_CODEX_SANDBOX_PROBE_MARKER}"
+    config_args = _codex_sandbox_config_args(sandbox, shard_info, grants)
+    failures = []
+    for inner in _codex_sandbox_probe_argvs(codex_bin, shell_cmd, config_args=config_args):
+        cmd = _codex_bwrap_wrap(
+            inner,
+            shard_info,
+            worktree_root,
+            research_target_info=research_target_info,
+            process_env=process_env,
+            quiet=True,
+        )
+        try:
+            proc = subprocess.run(
+                cmd,
+                cwd=worktree_root,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                env=process_env,
+            )
+        except subprocess.TimeoutExpired:
+            return "codex sandbox start timed out after 30s"
+        except OSError as exc:
+            failures.append(f"could not run codex sandbox: {exc}")
+            continue
+        if _CODEX_SANDBOX_PROBE_MARKER in (proc.stdout or ""):
+            return None
+        failures.append(_codex_probe_failure_line(proc.stderr, proc.returncode))
+    # The first shape is the current CLI's, so its failure is the one worth reporting.
+    return failures[0] if failures else "no codex sandbox probe ran"
+
+
+def _codex_shard_sandbox_refusal(
+    codex_bin: Optional[str],
+    sandbox: str,
+    permission: Optional[str],
+    shard_info: Optional[dict],
+    grants: list,
+    research_target_info: Optional[Dict[str, str]],
+    process_env: Optional[Dict[str, str]],
+) -> Optional[str]:
+    """Refusal message when a shard launch's codex sandbox cannot start, else None.
+
+    Only a restrictive tier inside a shard nests codex's sandbox in Spindle's wrapper.
+    danger-full-access starts no codex sandbox, and outside a shard there is no wrapper.
+    A launch whose sandbox cannot start would fail every command (approval is pinned to
+    "never"), and before that pin it ran every command through escalation instead, so it is
+    refused up front with the reason.
+    """
+    if not shard_info or sandbox not in _CODEX_RESTRICTIVE_SANDBOX_MODES:
+        return None
+    detail = _codex_shard_sandbox_start_failure(
+        codex_bin or "codex", sandbox, shard_info, grants, research_target_info, process_env
+    )
+    if detail is None:
+        return None
+    tier = permission or sandbox
+    return (
+        f"REFUSED: codex's sandbox cannot start inside shard {shard_info['worktree_path']} "
+        f"({detail}); refusing to run a {tier} spool (sandbox {sandbox}) whose every command "
+        f"would fail or need escalation out of the sandbox. See 'Codex in shards' in "
+        f"docs/CODEX_SETUP.md."
+    )
+
+
 def _codex_bwrap_wrap(
     codex_cmd: list,
     shard_info: dict,
     cwd: str,
     research_target_info: Optional[Dict[str, str]] = None,
     process_env: Optional[Dict[str, str]] = None,
+    quiet: bool = False,
 ) -> list:
     """Wrap codex_cmd in bwrap for shard isolation.
 
     Returns the (possibly bwrap-wrapped) command. If bwrap is not available,
-    logs a warning and returns codex_cmd unchanged.
+    logs a warning (unless `quiet`) and returns codex_cmd unchanged.
     """
     effective_env = process_env or os.environ
     bwrap_bin = shutil.which("bwrap", path=effective_env.get("PATH"))
     if not bwrap_bin:
-        print(
-            "[Spindle] WARNING: bwrap not available — codex shard isolation is "
-            "advisory only (prompt-enforced, not OS-enforced). Install bwrap for enforcement."
-        )
+        if not quiet:
+            print(
+                "[Spindle] WARNING: bwrap not available — codex shard isolation is "
+                "advisory only (prompt-enforced, not OS-enforced). Install bwrap for enforcement."
+            )
         return codex_cmd
 
     home = effective_env.get("HOME", str(Path.home()))
@@ -8855,24 +9063,8 @@ def _codex_bwrap_wrap(
         ]
     )
     # Make git writable for commits inside the worktree
-    git_file = Path(worktree_root) / ".git"
-    if git_file.exists() and git_file.is_file():
-        git_content = git_file.read_text().strip()
-        if git_content.startswith("gitdir:"):
-            git_worktree_dir = git_content.split("gitdir:")[1].strip()
-            if Path(git_worktree_dir).exists():
-                cmd.extend(["--bind", git_worktree_dir, git_worktree_dir])
-                main_git = Path(git_worktree_dir).parent.parent
-                if main_git.exists() and main_git.name == ".git":
-                    objects_dir = main_git / "objects"
-                    if objects_dir.exists():
-                        cmd.extend(["--bind", str(objects_dir), str(objects_dir)])
-                    refs_heads = main_git / "refs" / "heads"
-                    if refs_heads.exists():
-                        cmd.extend(["--bind", str(refs_heads), str(refs_heads)])
-                    logs_refs_heads = main_git / "logs" / "refs" / "heads"
-                    if logs_refs_heads.exists():
-                        cmd.extend(["--bind", str(logs_refs_heads), str(logs_refs_heads)])
+    for git_path in _codex_shard_git_write_paths(worktree_root):
+        cmd.extend(["--bind", git_path, git_path])
     config_paths = [
         Path(home) / config_item
         for config_item in [
@@ -9066,37 +9258,34 @@ Your task:
     # it silently WINS over --sandbox regardless of flag order: `codex exec --full-auto
     # --sandbox read-only` reports "sandbox: workspace-write [workdir, /tmp, $TMPDIR]" and
     # lets a spool write outside its workspace, while the command line still reads
-    # "--sandbox read-only". It is not needed for non-interactive use either — `codex exec`
-    # already reports "approval: never" on its own. Verified against codex 0.125.0,
-    # 2026-07-16. Re-adding it silently disables every tier below workspace-write.
-    codex_cmd = [codex_bin or "codex", "exec", "--json"]
+    # "--sandbox read-only". It is not needed for non-interactive use either. `codex exec`
+    # defaults to "approval: never" on its own, though only while config.toml names no
+    # automatic reviewer, which is why the restrictive tiers now pin it (see
+    # _codex_sandbox_config_args). Verified against codex 0.125.0, 2026-07-16. Re-adding it
+    # silently disables every tier below workspace-write.
+    #
+    # --skip-git-repo-check because a spool's working dir need not be a repo: a doctor smoke's
+    # temp dir, a scratch research dir. codex 0.154 exits outside a git repo without it ("Not
+    # inside a trusted directory and --skip-git-repo-check was not specified"), so the codex
+    # leg of `spindle doctor --smoke` failed on every machine (issue-20260903-58ex; PR 1). The
+    # check only gates startup and changes no sandbox policy (codex exec/src/lib.rs).
+    codex_cmd = [codex_bin or "codex", "exec", "--json", "--skip-git-repo-check"]
 
     if resolved_model:
         codex_cmd.extend(["--model", resolved_model])
 
-    codex_cmd.extend(["--sandbox", effective_sandbox, "-c", f"sandbox_mode={effective_sandbox}"])
+    # Grants: the research output, or a shard's git paths and worktree root (resolved via the
+    # worktree root, since cwd may be a subdirectory). See _codex_writable_grants.
+    grants = _codex_writable_grants(shard_info, research_target_info)
+
+    codex_cmd.extend(["--sandbox", effective_sandbox])
+    codex_cmd.extend(_codex_sandbox_config_args(effective_sandbox, shard_info, grants))
 
     if shard_info:
         codex_cmd.extend(["--cd", shard_info["worktree_path"]])
 
-    if research_target_info and research_target_info["type"] in {"file", "dir"}:
-        codex_cmd.extend(["--add-dir", _research_writable_path(research_target_info)])
-
-    # For shards, grant write access to main repo's .git for commits
-    if shard_info:
-        # Resolve .git via the worktree root, since cwd may be a subdirectory.
-        if not (research_target_info and research_target_info["type"] in {"file", "dir"}):
-            git_file = Path(shard_info["worktree_path"]) / ".git"
-            if git_file.exists() and git_file.is_file():
-                git_content = git_file.read_text().strip()
-                if git_content.startswith("gitdir:"):
-                    git_worktree_dir = git_content.split("gitdir:")[1].strip()
-                    main_git = Path(git_worktree_dir).parent.parent
-                    if main_git.exists() and main_git.name == ".git":
-                        codex_cmd.extend(["--add-dir", str(main_git)])
-                        # Also grant write access to the worktree root so a
-                        # subdirectory cwd doesn't lock the agent out of sibling files.
-                        codex_cmd.extend(["--add-dir", shard_info["worktree_path"]])
+    for grant in grants:
+        codex_cmd.extend(["--add-dir", grant])
 
     # Prompt goes last
     codex_cmd.append(effective_prompt)
@@ -9151,6 +9340,16 @@ Your task:
         "error": None,
         "harness": "codex",  # Mark as codex harness
     }
+
+    # Fail closed inside a shard: codex's own sandbox nests in the wrapper above, and when it
+    # cannot start there every command fails. Checked once the shard exists, since the probe
+    # needs its real paths. The refused spool keeps a newly created shard for inspection.
+    shard_refusal = _codex_shard_sandbox_refusal(
+        codex_bin, effective_sandbox, permission, shard_info, grants, research_target_info, process_env
+    )
+    if shard_refusal:
+        _record_pre_spawn_failure(spool_id, shard_refusal, spool)
+        return f"Error: {shard_refusal}"
 
     startup_error = _start_spool_process(spool, cmd, cwd, process_env)
     if startup_error:
@@ -9251,31 +9450,21 @@ def _codex_respin_sync(session_id: str, prompt: str) -> str:
 
     # Build codex exec resume command.
     # --sandbox, --cd and --add-dir are `codex exec` flags that `codex exec resume` does not
-    # accept, so they must all precede the `resume` subcommand. --sandbox is paired with a
-    # matching `-c sandbox_mode=<tier>` so config.toml can't widen the tier on a respin either
-    # (see the note in _codex_spin_sync).
-    codex_cmd = [codex_bin or "codex", "exec", "--sandbox", sandbox, "-c", f"sandbox_mode={sandbox}"]
+    # accept, so they must all precede the `resume` subcommand, and so do the `-c` pins
+    # (sandbox_mode matching --sandbox, the approval pin, a shard's writable roots) and
+    # --skip-git-repo-check, all for the same reasons as on a fresh spin (see
+    # _codex_spin_sync and _codex_sandbox_config_args).
+    #
+    # Grants are resolved via the worktree root (shard_info), not working_dir, since
+    # working_dir may be a subdirectory inside the worktree.
+    grants = _codex_writable_grants(shard_info, research_target_info)
+    codex_cmd = [codex_bin or "codex", "exec", "--skip-git-repo-check", "--sandbox", sandbox]
+    codex_cmd.extend(_codex_sandbox_config_args(sandbox, shard_info, grants))
     if shard_info:
         codex_cmd.extend(["--cd", shard_info["worktree_path"]])
 
-    if research_target_info and research_target_info["type"] in {"file", "dir"}:
-        codex_cmd.extend(["--add-dir", _research_writable_path(research_target_info)])
-
-    # For shards, grant write access to main repo's .git for commits. Resolve .git via the
-    # worktree root (shard_info), not working_dir, since working_dir may be a subdirectory
-    # inside the worktree.
-    if shard_info and not (research_target_info and research_target_info["type"] in {"file", "dir"}):
-        git_file = Path(shard_info["worktree_path"]) / ".git"
-        if git_file.exists() and git_file.is_file():
-            git_content = git_file.read_text().strip()
-            if git_content.startswith("gitdir:"):
-                git_worktree_dir = git_content.split("gitdir:")[1].strip()
-                main_git = Path(git_worktree_dir).parent.parent
-                if main_git.exists() and main_git.name == ".git":
-                    codex_cmd.extend(["--add-dir", str(main_git)])
-                    # Also grant write access to the worktree root so a
-                    # subdirectory cwd doesn't lock the agent out of sibling files.
-                    codex_cmd.extend(["--add-dir", shard_info["worktree_path"]])
+    for grant in grants:
+        codex_cmd.extend(["--add-dir", grant])
 
     codex_cmd.extend(["resume", session_id, "--json"])
 
@@ -9328,6 +9517,15 @@ def _codex_respin_sync(session_id: str, prompt: str) -> str:
         "error": None,
         "harness": "codex",
     }
+
+    # Fail closed inside a shard, as on a fresh spin: the worktree, its git metadata or codex
+    # itself may have changed since the session was spun.
+    shard_refusal = _codex_shard_sandbox_refusal(
+        codex_bin, sandbox, permission, shard_info, grants, research_target_info, process_env
+    )
+    if shard_refusal:
+        _record_pre_spawn_failure(spool_id, shard_refusal, spool)
+        return f"Error: {shard_refusal}"
 
     startup_error = _start_spool_process(spool, cmd, working_dir, process_env)
     if startup_error:

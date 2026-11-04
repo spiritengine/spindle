@@ -4449,6 +4449,15 @@ class TestGeminiHarness:
         assert (str(host_home / ".codex"), str(host_home / ".codex")) not in binds
 
 
+def _codex_shard_sandbox_starts():
+    """Stub the shard start probe, which would otherwise run `codex sandbox` for real.
+
+    These tests build shard launches against a fake codex binary; the probe itself is
+    covered in tests/test_codex_containment.py.
+    """
+    return patch("spindle._codex_shard_sandbox_start_failure", new=lambda *args: None)
+
+
 def test_kimi_bwrap_resolution_ignores_caller_path():
     with patch("spindle.shutil.which", return_value="/usr/bin/bwrap") as which:
         assert spindle._kimi_bwrap_binary({"PATH": "/project/bin"}) == "/usr/bin/bwrap"
@@ -6509,6 +6518,7 @@ class TestSpawnFailureRecovery:
         assert spool["shard"]["startup_failure_preserved"] is True
         assert worktree.exists()
 
+    @_codex_shard_sandbox_starts()
     def test_codex_spawn_failure_preserves_pristine_shard_for_inspection(self, tmp_path):
         repo = tmp_path / "repo"
         worktree = tmp_path / "worktree"
@@ -7307,6 +7317,7 @@ class TestShardSpawnPreamblesAndCodexCd:
         assert "skein ready --name" not in prompt
         assert "2. Then: skein ready" in prompt
 
+    @_codex_shard_sandbox_starts()
     def test_codex_spin_sync_adds_cd_and_omits_ready_name_flag(self, tmp_path):
         fake_shard_path = tmp_path / "worktrees" / "codex-20260503-001"
         fake_shard = self._make_fake_shard_info(fake_shard_path)
@@ -7343,6 +7354,7 @@ class TestShardSpawnPreamblesAndCodexCd:
         assert "skein ready --name" not in prompt
         assert "2. Then: skein ready" in prompt
 
+    @_codex_shard_sandbox_starts()
     def test_codex_spin_sync_wraps_in_bwrap_for_shard(self, tmp_path):
         """bwrap should wrap codex commands for shards when bwrap is available."""
         fake_shard_path = tmp_path / "worktrees" / "codex-20260503-bwrap"
@@ -7390,6 +7402,7 @@ class TestShardSpawnPreamblesAndCodexCd:
         assert "--chdir" in cmd, f"Expected --chdir in bwrap command: {cmd!r}"
         assert "/usr/bin/codex" in cmd, f"Expected resolved codex in bwrap-wrapped command: {cmd!r}"
 
+    @_codex_shard_sandbox_starts()
     def test_codex_spin_sync_warns_when_bwrap_unavailable_for_shard(self, tmp_path, capsys):
         """When bwrap is not available for a shard, log a warning and run without it."""
         fake_shard_path = tmp_path / "worktrees" / "codex-20260503-nobwrap"
@@ -8066,8 +8079,9 @@ class TestShardMergeCleanupFailure:
 class TestCodexRespinPreservesGitAccess:
     """Regression for round-3 fell finding B: _codex_respin_sync must derive
     .git from shard_info['worktree_path'], not working_dir, so a subdirectory
-    cwd doesn't lose --add-dir grants for the main repo and worktree root."""
+    cwd doesn't lose --add-dir grants for the shard's git metadata and worktree root."""
 
+    @_codex_shard_sandbox_starts()
     def test_codex_respin_subdirectory_cwd_preserves_git_access(self, tmp_path):
         # Build a real repo + worktree so the gitdir resolution exercises
         # actual filesystem state instead of mocks.
@@ -8131,10 +8145,19 @@ class TestCodexRespinPreservesGitAccess:
         add_dirs = [cmd[i + 1] for i, tok in enumerate(cmd) if tok == "--add-dir"]
         resolved = {str(Path(d).resolve()) for d in add_dirs}
 
+        # The grant is the git metadata a commit writes, the same paths the shard wrapper
+        # binds writable, and never the main .git itself: codex masks `.git` under every
+        # writable root, and the wrapper keeps the main .git read-only, so granting it stops
+        # codex's sandbox from starting (issue-20261022-zebt).
         main_git = (repo / ".git").resolve()
-        assert str(main_git) in resolved, (
-            f"codex respin must --add-dir the main repo's .git ({main_git}); got {add_dirs!r}"
-        )
+        assert str(main_git) not in resolved, f"the main repo's .git must not be a codex grant; got {add_dirs!r}"
+        for git_path in [
+            main_git / "worktrees" / "shard-codex-respin-001",
+            main_git / "objects",
+            main_git / "refs" / "heads",
+            main_git / "logs" / "refs" / "heads",
+        ]:
+            assert str(git_path) in resolved, f"codex respin must --add-dir {git_path}; got {add_dirs!r}"
         assert str(wt_path.resolve()) in resolved, (
             f"codex respin must --add-dir the worktree root ({wt_path}) so a "
             f"subdirectory cwd retains write access to sibling files; got {add_dirs!r}"
@@ -8247,6 +8270,7 @@ class TestCodexRespinPreservesGitAccess:
             "tags": ["codex"],
         }
 
+    @_codex_shard_sandbox_starts()
     def test_codex_respin_sync_wraps_in_bwrap_for_shard(self, tmp_path):
         """bwrap wraps codex respin commands for shards when bwrap is available."""
         worktree_path = tmp_path / "worktrees" / "codex-respin-bwrap"
@@ -8312,6 +8336,7 @@ class TestCodexRespinPreservesGitAccess:
         assert "WARNING" in out
         assert "bwrap" in out.lower()
 
+    @_codex_shard_sandbox_starts()
     def test_codex_respin_research_shard_binds_output_dir_writable(self, tmp_path):
         """A research+shard respin must bind its research OUTPUT dir writable in the
         outer bwrap, not the worktree root — mirroring _codex_spin_sync. Without

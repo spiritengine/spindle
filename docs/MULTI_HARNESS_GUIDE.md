@@ -412,7 +412,13 @@ Every codex spool is launched with an explicit `--sandbox` tier, mapped from Cla
 - `permission="full"` → `--sandbox danger-full-access`
 - `permission="shard"` → `--sandbox workspace-write` (the `spindle spin` CLI maps `shard` to `danger-full-access`)
 - `permission="research"` → site target: `--sandbox read-only`; file/dir target: `--sandbox workspace-write` + `--add-dir` for the target path (no bwrap — plain research uses Codex native sandbox only)
-- `permission="research+shard"` → same conditional sandbox as `research` + isolated worktree; bwrap adds OS-level isolation on top when available
+- `permission="research+shard"` → same conditional sandbox as `research` + isolated worktree; bwrap adds OS-level isolation on top when available (a `file:`/`dir:` target is refused on codex 0.154, see [CODEX_SETUP.md](CODEX_SETUP.md#codex-in-shards))
+
+Every tier except `danger-full-access` also gets `-c approval_policy=never`, so a command the
+sandbox denies cannot be approved again outside it by an approval setting in
+`~/.codex/config.toml`. In a shard, codex's own writable roots are exactly the git metadata
+Spindle's bwrap wrapper makes writable, and a shard spool whose codex sandbox cannot start
+inside the wrapper is refused (see [Codex Sandbox Enforcement](#codex-sandbox-enforcement)).
 
 The mapping happens automatically in `_codex_spin_sync()`, and the tier that was actually
 passed is stored on the spool record as `sandbox` (alongside the requested `permission`).
@@ -461,14 +467,24 @@ passed unconditionally and enforces on pre-5.13 kernels. Verified 2026-07-16 on 
 against codex-cli 0.125.0: a `read-only` spool cannot write even inside its own cwd, and a
 `workspace-write` spool can write inside cwd but not to `$HOME`.
 
-Two traps to know about, both of which silently disable enforcement while leaving the
+Three traps to know about, each of which silently disables enforcement while leaving the
 command line looking correct:
 
 **`--full-auto` overrides `--sandbox`.** It is an alias carrying its own tier and it wins
 regardless of flag order. `codex exec --full-auto --sandbox read-only` reports
 `sandbox: workspace-write [workdir, /tmp, $TMPDIR]` and happily writes outside the
 workspace. Spindle therefore never passes it; `codex exec` is already non-interactive
-(`approval: never`) without it.
+without it.
+
+**An approval setting can re-run a denied command outside the sandbox.** `codex exec`
+defaults to `approval: never`, but only while `~/.codex/config.toml` names no automatic
+reviewer. With `approval_policy = "on-request"` and `approvals_reviewer = "auto_review"`, a
+read-only spool asked to escalate commands the sandbox had blocked, and a reviewer model ran
+them unsandboxed. Spindle therefore pins `-c approval_policy=never` on every restrictive
+tier, spin and respin alike. Under `never`, codex 0.154 rejects an escalation request
+(`approval policy is Never; reject command`) and never retries a denied command
+unsandboxed. `danger-full-access` has no sandbox to escape, so it keeps the operator's
+approval settings.
 
 **Enforcement is not guaranteed and is not a property of the version string.** A
 `sandbox_mode` in `~/.codex/config.toml` can override `--sandbox`, and the vendored sandbox
@@ -487,6 +503,17 @@ spool with `status: "error"` and a `sandbox_error` field (visible via `unspool`/
 rather than silently running unsandboxed. `danger-full-access` (the `full` tier) asks for no
 sandbox, so it is never probed and never refused. Each spool still records the resolved
 `codex_bin` and `codex_version` for provenance, but they no longer gate anything.
+
+**Inside a shard, codex's sandbox must also be able to start.** On Linux it runs inside
+Spindle's bwrap wrapper, and codex 0.154 masks `.git`, `.agents` and `.codex` under every
+writable root it is given, mounting an empty read-only directory where one is missing. bwrap
+must create that mount point, so every codex writable root has to be writable in the
+wrapper too. Spindle grants codex exactly the git paths the wrapper binds
+(`<repo>/.git/worktrees/<name>`, `objects`, `refs/heads`, `logs/refs/heads`) and pins
+`sandbox_workspace_write.writable_roots` to them. Before each restrictive shard launch,
+spin or respin, it runs one no-model `codex sandbox` command through that same wrapper with
+the same settings, and refuses the spool if the command did not run, quoting the reason.
+That check fails closed: no marker, an error or a timeout all refuse.
 
 ## Spool Management
 
@@ -602,6 +629,20 @@ spindle unspool <spool_id>   # the record carries codex_bin, codex_version, and 
 Fix the codex install (or point PATH at a codex that enforces) and re-spin, or use
 `permission=full` to run intentionally without a sandbox. The probe fails closed, so an
 inconclusive probe (codex missing, `codex sandbox` erroring, a timeout) also refuses.
+
+**Error:** a shard codex spool was refused with `REFUSED: codex's sandbox cannot start inside
+shard <worktree> (<reason>)`.
+
+**Cause:** codex's sandbox could not start inside Spindle's bwrap wrapper, so every command
+the agent ran would have failed. The reason is the sandbox's own error, usually `bwrap: Can't
+mkdir <path>: Read-only file system`, naming a mount point codex needed under a path the
+wrapper keeps read-only. On codex 0.154 this is expected for `research+shard` with a `file:`
+or `dir:` target, whose worktree the wrapper keeps read-only. For other tiers it means codex
+needed to write somewhere the wrapper does not bind. One known case is a `$TMPDIR` outside
+`/tmp`: codex keeps its mount bookkeeping there (`failed to create synthetic bubblewrap
+mount registry …`), so unset `TMPDIR` or point it under `/tmp` for the Spindle service.
+Otherwise report it with the spool's `error`. A refused new shard is kept for inspection,
+like any failed spool's shard.
 
 ### Wrong Harness Used
 
