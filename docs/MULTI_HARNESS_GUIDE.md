@@ -398,7 +398,12 @@ Example:
 spin("Analyze code", permission="readonly", working_dir="/project")
 spin("Fix bug", permission="careful", working_dir="/project")  # Default
 spin("Refactor module", permission="shard", working_dir="/project")  # Isolated worktree
-spin("Research deepseek pricing", permission="research", research_target="site:spindle-development", working_dir="/project")
+spin(
+    "Research deepseek pricing",
+    permission="research",
+    research_target="site:spindle-development",
+    working_dir="/project",
+)
 ```
 
 ### Codex Sandbox Policies
@@ -666,10 +671,14 @@ Planned improvements to the harness system:
 
 ```python
 # Complex analysis with Claude
-analysis_id = spin("Analyze the caching strategy and recommend improvements", permission="readonly", wait=False, working_dir="/project")
+analysis_id = spin(
+    "Analyze the caching strategy and recommend improvements", permission="readonly", wait=False, working_dir="/project"
+)
 
 # Quick prototype with Codex
-prototype_id = spin("Create a basic LRU cache implementation", harness="codex", working_dir="/path/to/project", wait=False)
+prototype_id = spin(
+    "Create a basic LRU cache implementation", harness="codex", working_dir="/path/to/project", wait=False
+)
 
 # Quick research with Gemini
 research_id = spin(

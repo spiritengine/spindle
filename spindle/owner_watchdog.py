@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import fcntl
-import json
 import os
 import signal
 import time
@@ -13,6 +12,7 @@ from pathlib import Path
 from .namespace_owner import (
     _atomic_json_write,
     _cleanup_locked_fd,
+    _json_loads_with_nesting_cap,
     _owner_exit_from_dict,
     _positive_json_integer,
     _process_identity_sidecar_from_dict,
@@ -104,7 +104,7 @@ def _record_guard(store: Path, spool_id: str):
 
 def _load(path: Path) -> dict | None:
     try:
-        value = json.loads(path.read_text())
+        value = _json_loads_with_nesting_cap(path.read_text())
     except (FileNotFoundError, OSError, RecursionError, TypeError, ValueError):
         return None
     return value if isinstance(value, dict) else None

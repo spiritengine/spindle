@@ -15,7 +15,7 @@ from types import SimpleNamespace
 import pytest
 
 import spindle
-from spindle import owner_episode_convergence, owner_watchdog
+from spindle import namespace_owner, owner_episode_convergence, owner_watchdog
 from spindle.namespace_owner import (
     LivenessEvidence,
     NamespaceIdentity,
@@ -677,14 +677,30 @@ def test_identity_loaders_treat_non_object_json_as_malformed(tmp_path, loader):
         assert isinstance(record["created_at"], str) and record["created_at"]
 
 
-@pytest.mark.parametrize("loader", ["watchdog", "convergence", "owner"])
-def test_identity_loaders_contain_deep_json_recursion(tmp_path, loader):
-    path = tmp_path / "deep.json"
-    depth = max(100_000, sys.getrecursionlimit() * 2)
-    path.write_text("[" * depth + "0" + "]" * depth, encoding="utf-8")
+# The strict loaders' explicit nesting cap. Interpreter limits are not a boundary:
+# Python 3.14 bounds json.loads by the thread's stack size, so with a large stack
+# (CI runners) it parses a 100,000-deep document that 3.11 to 3.13 refuse.
+JSON_NESTING_CAP = 256
 
-    with pytest.raises(RecursionError):
-        json.loads(path.read_text(encoding="utf-8"))
+
+def _nested_json_object(depth: int, **fields) -> str:
+    """A JSON object whose innermost value sits `depth` containers deep, the object being the first."""
+    head = json.dumps(fields)[:-1] + (", " if fields else "")
+    return head + '"nested": ' + "[" * (depth - 1) + "0" + "]" * (depth - 1) + "}"
+
+
+@pytest.mark.parametrize(
+    "document",
+    [
+        pytest.param(_nested_json_object(JSON_NESTING_CAP + 1, owner_generation=7), id="object-one-past-cap"),
+        pytest.param(_nested_json_object(100_000, owner_generation=7), id="object-100000-deep"),
+        pytest.param("[" * 100_000 + "0" + "]" * 100_000, id="array-100000-deep"),
+    ],
+)
+@pytest.mark.parametrize("loader", ["watchdog", "convergence", "owner"])
+def test_identity_loaders_treat_json_nested_past_the_cap_as_malformed(tmp_path, loader, document):
+    path = tmp_path / "deep.json"
+    path.write_text(document, encoding="utf-8")
 
     if loader == "watchdog":
         assert owner_watchdog._load(path) is None
@@ -697,6 +713,68 @@ def test_identity_loaders_contain_deep_json_recursion(tmp_path, loader):
         record = owner._read_spool()
         assert record["id"] == "deep"
         assert record["status"] == "pending"
+        assert "nested" not in record
+
+
+@pytest.mark.parametrize("loader", ["watchdog", "convergence", "owner"])
+def test_identity_loaders_accept_json_nested_exactly_to_the_cap(tmp_path, loader):
+    path = tmp_path / "at-cap.json"
+    document = _nested_json_object(JSON_NESTING_CAP, id="at-cap", status="running")
+    path.write_text(document, encoding="utf-8")
+    expected = json.loads(document)
+
+    if loader == "watchdog":
+        assert owner_watchdog._load(path) == expected
+    elif loader == "convergence":
+        assert owner_episode_convergence._read_json(path) == expected
+    else:
+        owner = object.__new__(LogicalOwner)
+        owner.spool_path = path
+        owner.spool_id = "at-cap"
+        assert owner._read_spool() == expected
+
+
+def test_owner_exit_nested_past_the_cap_is_never_evidence(tmp_path, monkeypatch):
+    """Owner exits keep unknown fields, so depth is the only thing a deep extension can trip."""
+    spool_id = "deep-owner-exit"
+    monkeypatch.setattr(spindle, "SPINDLE_DIR", tmp_path)
+    spindle._get_owner_exit_path(spool_id).write_text(
+        _nested_json_object(JSON_NESTING_CAP + 1, **_owner_exit_payload(provider_exit_code=7)), encoding="utf-8"
+    )
+    episode = make_episode("cleanup_proven", generation=7)
+
+    assert spindle._owner_exit_evidence(spool_id, 7) == (False, False)
+    assert owner_episode_convergence._exit_evidence(spool_id, {"id": spool_id}, episode) == (
+        None,
+        None,
+        "owner_exit_malformed",
+    )
+
+
+def _alternating_nesting(depth: int) -> str:
+    document = "0"
+    for level in range(depth):
+        document = f'{{"k": {document}}}' if level % 2 else f"[{document}]"
+    return document
+
+
+@pytest.mark.parametrize(
+    "document,accepted",
+    [
+        pytest.param(_alternating_nesting(JSON_NESTING_CAP), True, id="objects-and-arrays-at-cap"),
+        pytest.param(_alternating_nesting(JSON_NESTING_CAP + 1), False, id="objects-and-arrays-past-cap"),
+        # Depth follows a path; a thousand shallow siblings are two levels deep, not a thousand.
+        pytest.param("[" + ", ".join(['{"k": [0]}'] * 1000) + "]", True, id="wide-and-shallow"),
+        pytest.param('{"s": "' + "[{" * 1000 + '"}', True, id="delimiters-inside-a-string"),
+        pytest.param("7", True, id="scalar"),
+    ],
+)
+def test_nesting_cap_counts_containers_along_a_path(document, accepted):
+    if accepted:
+        assert namespace_owner._json_loads_with_nesting_cap(document) == json.loads(document)
+    else:
+        with pytest.raises(ValueError, match="nesting exceeds 256"):
+            namespace_owner._json_loads_with_nesting_cap(document)
 
 
 @pytest.mark.parametrize("function", ["process", "group"])

@@ -49,19 +49,26 @@ except ImportError:  # checkout where the repo root is not on sys.path
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     import spindle_claude_driver as _claude_driver
 
-# fastmcp imports authlib, which announces a deprecation of its own internals as
-# it loads — three lines of stderr in front of the output of every single CLI
-# command, about something no spindle user can act on. A warnings filter can't
-# stop it: authlib itself calls warnings.simplefilter("always", ...) at import,
-# which takes precedence over anything registered earlier. So drop that one
-# message for the duration of the import and hand the machinery straight back.
+# fastmcp imports authlib, which announces deprecations of its own internals as
+# it loads — lines of stderr in front of the output of every single CLI command,
+# about something no spindle user can act on. A warnings filter can't stop it:
+# authlib itself calls warnings.simplefilter("always", ...) at import, which
+# takes precedence over anything registered earlier. So drop authlib's own
+# warning category for the duration of the import and hand the machinery
+# straight back. It is the category, not any one message: authlib 1.7 added a
+# second import-time warning that a message match let through. The category is
+# matched by class name and authlib's module, subclasses included as a warnings filter would, because
+# spindle depends on fastmcp rather than on authlib and does not import it.
 # (The E402s below are the cost of having to sit in front of the import.)
-_AUTHLIB_IMPORT_NOISE = "authlib.jose module is deprecated"
+_AUTHLIB_DEPRECATION_CATEGORY = "AuthlibDeprecationWarning"
 _real_showwarning = warnings.showwarning
 
 
 def _showwarning_without_authlib_noise(message, category, filename, lineno, file=None, line=None):
-    if _AUTHLIB_IMPORT_NOISE in str(message):
+    if any(
+        cls.__name__ == _AUTHLIB_DEPRECATION_CATEGORY and str(getattr(cls, "__module__", "")).split(".")[0] == "authlib"
+        for cls in getattr(category, "__mro__", ())
+    ):
         return
     _real_showwarning(message, category, filename, lineno, file, line)
 
@@ -93,6 +100,7 @@ from .namespace_owner import (  # noqa: E402
     _birth_token,
     _DurablePublicationCleanupError,
     _fsync_directory_after_publication,
+    _json_loads_with_nesting_cap,
     _lock_fact_from_dict,
     _owner_exit_from_dict,
     _pid_json_integer,
@@ -2444,7 +2452,7 @@ def _next_owner_generation(spool_id: str) -> int:
         encoded_identity = None
     if encoded_identity is not None:
         try:
-            identity = ProcessIdentity.from_dict(json.loads(encoded_identity))
+            identity = ProcessIdentity.from_dict(_json_loads_with_nesting_cap(encoded_identity))
         except (RecursionError, TypeError, ValueError) as exc:
             raise ValueError(f"malformed owner identity prevents generation allocation for {spool_id}") from exc
         generations.append(identity.owner_generation)
@@ -3369,7 +3377,7 @@ def _process_start_time(pid: int) -> Optional[str]:
 
 def _read_current_owner_identity(spool_id: str) -> Optional[ProcessIdentity]:
     try:
-        return ProcessIdentity.from_dict(json.loads(_get_owner_identity_path(spool_id).read_text()))
+        return ProcessIdentity.from_dict(_json_loads_with_nesting_cap(_get_owner_identity_path(spool_id).read_text()))
     except (FileNotFoundError, OSError, RecursionError, KeyError, TypeError, ValueError):
         return None
 
@@ -3377,7 +3385,7 @@ def _read_current_owner_identity(spool_id: str) -> Optional[ProcessIdentity]:
 def _owner_exit_evidence(spool_id: str, owner_generation: int) -> tuple[bool, bool]:
     """Return generation-matched exit and cleanup evidence for one owner."""
     try:
-        evidence = _owner_exit_from_dict(json.loads(_get_owner_exit_path(spool_id).read_text()))
+        evidence = _owner_exit_from_dict(_json_loads_with_nesting_cap(_get_owner_exit_path(spool_id).read_text()))
     except (FileNotFoundError, OSError, RecursionError, TypeError, ValueError):
         return False, False
     try:
