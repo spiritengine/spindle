@@ -107,10 +107,11 @@ only if you want the HTTP transport or a shared long-lived instance — see
 
 ## Command line
 
-The core spawn-and-collect loop is available as subcommands, so you can drive
-spindle from a shell or a script without an MCP client. (The querying tools —
-search, grep, stats, export, and the shard commands — are MCP-only for now.)
-Commands print JSON by default; `--human` prints text.
+The core spawn-and-collect loop and the addressable capture reader are
+available as subcommands, so you can drive spindle from a shell or a script
+without an MCP client. (Search, grep, stats, export, and the shard commands are
+MCP-only for now.) Commands print JSON by default; `--human` prints text where
+the command supports it.
 
 ```bash
 # Spawn an agent (returns a spool id immediately)
@@ -126,6 +127,11 @@ spindle spools --human
 spindle peek <spool_id> -n 100
 spindle wait <id1>,<id2> --mode yield
 spindle drop <spool_id>
+
+# Browse the saved capture, then retrieve an address or normalized collection
+spindle reap <spool_id>
+spindle reap <spool_id> run:<spool_id>/final
+spindle reap <spool_id> --filter agent --filter tool-calls
 
 # Settle custody only when doctor reports an abandoned owner episode
 spindle repair <spool_id> --attest-dead
@@ -389,6 +395,64 @@ spool_export(spool_id, format="md", output_path="/tmp/result.md")
 Tune the thresholds with `SPINDLE_UNSPOOL_MAX_CHARS` (default 50000),
 `SPINDLE_UNSPOOL_HEAD_CHARS` (12000), and `SPINDLE_UNSPOOL_TAIL_CHARS` (12000).
 
+### Addressable capture reading
+
+`spool_reap` and `spindle reap` inspect the spool record and its existing
+stdout/transcript capture without launching, resuming, or finalizing anything.
+A bare spool ID returns a compact outline. Every preview carries a fully
+qualified address that can be copied into a later request:
+
+```
+run:<spool-id>/prompt
+run:<spool-id>/final
+run:<spool-id>/messages
+run:<spool-id>/tool-calls
+run:<spool-id>/tool-results
+run:<spool-id>/raw
+run:<spool-id>/events/<source-position>
+run:<spool-id>/events/<source-position>/parts/<part-position>
+```
+
+Event and part positions come from the underlying saved capture; filtering does
+not renumber them, and appending later events leaves earlier addresses stable.
+An inclusive range joins two full entry addresses with `..`. CLI address
+arguments may be repeated; MCP accepts a comma-separated `addresses` string.
+Overlapping addresses, ranges, and filters are deduplicated in captured order.
+
+```python
+# Outline first
+spool_reap(spool_id)
+
+# Normalized conversational roles (Claude tool-result wrappers are excluded)
+spool_reap(spool_id, filters="user,agent")
+
+# Calls of one exact provider tool type
+spool_reap(spool_id, filters="tool-calls", tool_name="command_execution")
+
+# Batch a node and an inclusive stable-position range
+spool_reap(
+    spool_id,
+    addresses=(
+        f"run:{spool_id}/final,"
+        f"run:{spool_id}/events/4/parts/0..run:{spool_id}/events/12/parts/0"
+    ),
+)
+
+# Read a large selected entry in chunks, or in full
+spool_reap(spool_id, addresses=f"run:{spool_id}/final", offset=20000, limit=20000)
+spool_reap(spool_id, addresses=f"run:{spool_id}/final", full=True)
+```
+
+`session=True` explicitly gathers every readable saved record carrying the
+same `session_id`, ordered by creation time. The response states that scope; it
+does not claim provider history Spindle never captured. Unknown harnesses and
+formats retain explicit raw-event access and report `raw-only` support rather
+than presenting an empty conversation. Growing captures are read to one
+observed byte boundary, with incomplete trailing material and all truncation
+reported in the response. A collection response is bounded to 200 entries; if
+more matched, `entry_truncation.retrieve.after` gives a stable address to pass
+as `after` while repeating the same selection.
+
 ### Search and filter
 
 ```
@@ -587,6 +651,7 @@ for a worked example and the full schema reference.
 |------|---------|
 | `spin(prompt, permission?, research_target?, shard?, system_prompt?, working_dir, allowed_tools?, tags?, model?, timeout?, skeinless?, harness?, env?, base_branch?, wait?, wait_timeout?)` | Spawn agent and return {spool_id, status, result}; wait=False returns ID immediately |
 | `unspool(spool_id, full?, offset?, limit?)` | Read a spool's saved result (auto-detects harness, non-blocking; truncates huge results to head+tail by default) |
+| `spool_reap(handle, addresses?, filters?, tool_name?, session?, after?, offset?, limit?, full?)` | Browse or retrieve addressable nodes from existing saved captures; read-only |
 | `respin(session_id, prompt, rebuild?, wait?, wait_timeout?)` | Continue session and wait for result (auto-detects harness) |
 
 The MCP tool `spindle_repair(spool_id, attest_dead)` provides the same
@@ -639,6 +704,7 @@ for `spin`.
 | `spool_retry(spool_id)` | Re-run with same params; detached, returns the new ID |
 | `spool_peek(spool_id, lines?)` | See partial output while running |
 | `spool_info(spool_id)` | Full spool record for debugging |
+| `spool_reap(handle, addresses?, filters?, tool_name?, session?, after?, offset?, limit?, full?)` | Addressable outline and retrieval for saved record/stdout/transcript evidence |
 | `spool_dashboard()` | Overview of running/complete/needs-attention |
 | `spool_stats()` | Get summary statistics |
 | `spin_harnesses()` | List available harnesses, models, and defaults |
@@ -809,7 +875,8 @@ filesystem semantics above.
    after the store goes idle
 4. MCP `spin` and `respin` wait for that final record and return the result,
    unless `wait=False`. **unspool()** reads a spool's saved result at any time
-   and never waits
+   and never waits; **spool_reap()** builds an ephemeral addressable view from
+   the same record and capture files without a second transcript store or index
 5. Records persist as JSON files, so results stay readable across server
    restarts until cleanup removes them (see Limits)
 

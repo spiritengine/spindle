@@ -151,6 +151,7 @@ from .namespace_owner import (  # noqa: E402
 from .namespace_owner import (  # noqa: E402
     update_control_receipt as update_control_receipt,
 )
+from .reap import reap_store  # noqa: E402
 
 
 def _guard_mcp_final_replies(server: FastMCP) -> None:
@@ -5886,6 +5887,84 @@ async def unspool(
         return raw
 
     return _budget_result(raw, spool_id)
+
+
+def _spool_reap_sync(
+    handle: str,
+    addresses: Optional[str] = None,
+    filters: Optional[str] = None,
+    tool_name: Optional[str] = None,
+    session: bool = False,
+    after: Optional[str] = None,
+    offset: int = 0,
+    limit: Optional[int] = None,
+    full: bool = False,
+) -> str:
+    """Synchronous shared implementation for CLI ``reap`` and MCP ``spool_reap``."""
+    result = reap_store(
+        SPINDLE_DIR,
+        handle,
+        addresses=addresses,
+        filters=filters,
+        tool_name=tool_name,
+        session=session,
+        after=after,
+        offset=offset,
+        limit=limit,
+        full=full,
+    )
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def spool_reap(
+    handle: str,
+    addresses: Optional[str] = None,
+    filters: Optional[str] = None,
+    tool_name: Optional[str] = None,
+    session: bool = False,
+    after: Optional[str] = None,
+    offset: int = 0,
+    limit: Optional[int] = None,
+    full: bool = False,
+) -> str:
+    """Browse and retrieve addressable evidence from saved spool captures.
+
+    With no addresses or filters, returns a bounded outline. Copy fully
+    qualified addresses from that outline to retrieve entries, collections, or
+    inclusive ranges. Multiple addresses and filters are comma-separated;
+    overlapping selections are deduplicated in original source order.
+
+    Args:
+        handle: A spool ID. With session=True, may instead be a session ID.
+        addresses: Comma-separated full addresses or full-address ranges.
+        filters: Comma-separated user, agent, messages, tool-calls, or tool-results.
+        tool_name: Exact provider tool name; implies/needs the tool-calls filter.
+        session: Gather saved runs with the exact same session_id. This reports
+            only Spindle captures, never unseen provider history.
+        after: Continue a large selection after this fully qualified address.
+        offset: Character offset applied to every returned entry.
+        limit: Character count applied to every returned entry.
+        full: Return complete entry content; incompatible with offset/limit.
+
+    Examples:
+        spool_reap("codex-abcd1234")
+        spool_reap("codex-abcd1234", filters="user,agent")
+        spool_reap("codex-abcd1234", filters="tool-calls", tool_name="command_execution")
+        spool_reap("codex-abcd1234", addresses="run:codex-abcd1234/final")
+    """
+    return await asyncio.to_thread(
+        _spool_reap_sync,
+        handle,
+        addresses,
+        filters,
+        tool_name,
+        session,
+        after,
+        offset,
+        limit,
+        full,
+    )
 
 
 def _spools_sync(include_discovery: bool = False) -> str:
@@ -13344,6 +13423,32 @@ def main():
     unspool_parser.add_argument("spool_id", help="The spool ID to get output from")
     unspool_parser.add_argument("--human", action="store_true", help="Human-readable output instead of JSON")
 
+    # reap command - addressable inspection of existing captures
+    reap_parser = subparsers.add_parser("reap", help="Browse or retrieve addressable saved spool evidence")
+    reap_parser.add_argument("handle", help="Spool ID, or with --session a spool/session ID")
+    reap_parser.add_argument(
+        "addresses",
+        nargs="*",
+        help="Fully qualified addresses or inclusive <address>..<address> ranges copied from the outline",
+    )
+    reap_parser.add_argument(
+        "--filter",
+        dest="filters",
+        action="append",
+        choices=["user", "agent", "messages", "tool-calls", "tool-results"],
+        help="Add a normalized collection (repeatable)",
+    )
+    reap_parser.add_argument("--tool", dest="tool_name", help="Exact tool name; implies the tool-calls filter")
+    reap_parser.add_argument(
+        "--session",
+        action="store_true",
+        help="Gather matching saved runs with the same session_id (captured history only)",
+    )
+    reap_parser.add_argument("--after", help="Continue the same selection after this stable full address")
+    reap_parser.add_argument("--offset", type=int, default=0, help="Character offset within each selected entry")
+    reap_parser.add_argument("--limit", type=int, help="Maximum characters from each selected entry")
+    reap_parser.add_argument("--full", action="store_true", help="Return complete selected entries")
+
     # spools command - list all
     spools_parser = subparsers.add_parser("spools", help="List all spools (running and completed)")
     spools_parser.add_argument("--human", action="store_true", help="Human-readable output instead of JSON")
@@ -13646,6 +13751,25 @@ def main():
             else:
                 print(json.dumps({"spool_id": result}))
         sys.exit(0)
+
+    elif args.command == "reap":
+        result = _spool_reap_sync(
+            args.handle,
+            addresses=args.addresses,
+            filters=args.filters,
+            tool_name=args.tool_name,
+            session=args.session,
+            after=args.after,
+            offset=args.offset,
+            limit=args.limit,
+            full=args.full,
+        )
+        print(result)
+        try:
+            ok = bool(json.loads(result).get("ok"))
+        except (json.JSONDecodeError, AttributeError):
+            ok = False
+        sys.exit(0 if ok else 1)
 
     elif args.command == "unspool":
         result = _unspool_sync(args.spool_id)
