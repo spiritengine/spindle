@@ -589,7 +589,7 @@ abandonment.
 | `spin_harnesses()` | List available harnesses, models, and defaults |
 | `spool_export(spool_ids, format?, output_path?)` | Export to file |
 | `shard_status(spool_id)` | Check shard worktree status |
-| `shard_merge(spool_id, keep_branch?)` | Merge shard to master |
+| `shard_merge(spool_id, keep_branch?)` | Merge shard into the main checkout's branch (normally the shard's base, not necessarily master) |
 | `shard_abandon(spool_id, keep_branch?)` | Discard shard |
 
 ## Storage

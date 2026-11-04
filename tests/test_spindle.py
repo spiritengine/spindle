@@ -14053,6 +14053,203 @@ class TestDoctorCliIdentity:
         assert result["data"]["console_script"] is None
         assert result["data"]["version"] == spindle.__version__
 
+    @pytest.fixture(autouse=True)
+    def _no_install_record(self, monkeypatch):
+        # These cases are about PATH identity. The install-record comparison has
+        # its own cases below; without this, a stale record on the machine
+        # running the suite would turn every "ok" here into a warn.
+        monkeypatch.setattr(spindle, "_install_records_for_this_code", lambda path=None: [], raising=False)
+
+    @staticmethod
+    def _pyenv(tmp_path, resolves_to):
+        """A pyenv root whose `spindle` shim runs *resolves_to*, in pyenv 2.x's shim format."""
+        root = tmp_path / "pyenv"
+        (root / "shims").mkdir(parents=True)
+        (root / "libexec").mkdir()
+        pyenv = root / "libexec" / "pyenv"
+        # Answers only when called the way the shim calls it, so a resolver that
+        # guessed instead of asking pyenv would not get the right path.
+        pyenv.write_text(
+            "#!/bin/sh\n"
+            f'if [ "$1" = which ] && [ "$2" = spindle ] && [ "$PYENV_ROOT" = "{root}" ]; then\n'
+            + (f'  echo "{resolves_to}"; exit 0\n' if resolves_to else "  :\n")
+            + "fi\n"
+            'echo "pyenv: $2: command not found" >&2\n'
+            "exit 127\n"
+        )
+        pyenv.chmod(0o755)
+        shim = root / "shims" / "spindle"
+        shim.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -e\n"
+            '[ -n "$PYENV_DEBUG" ] && set -x\n'
+            "\n"
+            'program="${0##*/}"\n'
+            "\n"
+            f'export PYENV_ROOT="{root}"\n'
+            f'exec "{pyenv}" exec "$program" "$@"\n'
+        )
+        shim.chmod(0o755)
+        return shim
+
+    @staticmethod
+    def _console_script(tmp_path, version, interpreter):
+        script = tmp_path / "pyenv" / "versions" / version / "bin" / "spindle"
+        script.parent.mkdir(parents=True)
+        script.write_text(f"#!{interpreter}\n")
+        return script
+
+    def test_pyenv_shim_that_runs_the_invoked_script_is_ok(self, tmp_path, monkeypatch):
+        """`/…/versions/3.12.0/bin/spindle doctor` is what the systemd unit runs.
+
+        PATH has the pyenv shim, a bash script; what it executes is the same
+        console script, so typing `spindle` does reach this install.
+        """
+        ours = self._console_script(tmp_path, "3.12.0", sys.executable)
+        shim = self._pyenv(tmp_path, resolves_to=ours)
+        monkeypatch.setattr(spindle.shutil, "which", lambda cmd: str(shim))
+        result = spindle._doctor_cli_check(argv0=str(ours))
+        assert result["status"] == "ok", result["lines"]
+        assert result["data"]["console_script"] == str(shim)
+        assert result["data"]["console_script_target"] == str(ours)
+        assert any(str(ours) in line and "pyenv" in line for line in result["lines"])
+
+    def test_pyenv_shim_under_module_invocation_compares_the_target(self, tmp_path, monkeypatch):
+        """`python -m spindle doctor`: the shim's own shebang is bash, not an install."""
+        ours = self._console_script(tmp_path, "3.12.0", Path(sys.executable).parent / "python3")
+        shim = self._pyenv(tmp_path, resolves_to=ours)
+        monkeypatch.setattr(spindle.shutil, "which", lambda cmd: str(shim))
+        result = spindle._doctor_cli_check(argv0="/some/pkg/__main__.py")
+        assert result["status"] == "ok", result["lines"]
+
+    def test_pyenv_shim_that_runs_another_version_warns(self, tmp_path, monkeypatch):
+        ours = self._console_script(tmp_path, "3.12.0", sys.executable)
+        theirs = self._console_script(tmp_path, "3.11.9", "/opt/other/bin/python3")
+        shim = self._pyenv(tmp_path, resolves_to=theirs)
+        monkeypatch.setattr(spindle.shutil, "which", lambda cmd: str(shim))
+        result = spindle._doctor_cli_check(argv0=str(ours))
+        assert result["status"] == "warn"
+        assert any("DIFFERENT install" in line and str(theirs) in line for line in result["lines"])
+
+    def test_pyenv_shim_that_runs_nothing_warns_with_pyenvs_reason(self, tmp_path, monkeypatch):
+        ours = self._console_script(tmp_path, "3.12.0", sys.executable)
+        shim = self._pyenv(tmp_path, resolves_to=None)
+        monkeypatch.setattr(spindle.shutil, "which", lambda cmd: str(shim))
+        result = spindle._doctor_cli_check(argv0=str(ours))
+        assert result["status"] == "warn"
+        assert any("command not found" in line for line in result["lines"])
+        assert result["data"]["console_script_target"] is None
+
+
+class TestDoctorInstallRecord:
+    """The installed package record must describe the code that is running.
+
+    A stale editable install (metadata 1.1.0 while the tree says 1.2.0) maps
+    only the modules that existed when it was made, and nothing that compares
+    __version__ strings can see it.
+    """
+
+    SOURCE_ROOT = Path(spindle.__file__).resolve().parent.parent
+
+    @staticmethod
+    def _record(site, version, *, editable_of=None, files=(), record=True, egg_info=False):
+        if egg_info:
+            meta = site / "spindle_mcp.egg-info"
+            meta.mkdir(parents=True)
+            (meta / "PKG-INFO").write_text(f"Metadata-Version: 2.1\nName: spindle-mcp\nVersion: {version}\n")
+            (meta / "SOURCES.txt").write_text("".join(f"{name}\n" for name in files))
+            return meta
+        meta = site / f"spindle_mcp-{version}.dist-info"
+        meta.mkdir(parents=True)
+        (meta / "METADATA").write_text(f"Metadata-Version: 2.1\nName: spindle-mcp\nVersion: {version}\n")
+        if record:
+            (meta / "RECORD").write_text("".join(f"{name},,\n" for name in files))
+        if editable_of is not None:
+            (meta / "direct_url.json").write_text(
+                json.dumps({"dir_info": {"editable": True}, "url": Path(editable_of).as_uri()})
+            )
+        return meta
+
+    def _site_with_this_package(self, tmp_path):
+        """A site-packages whose spindle/ is this code, as a regular install would have it."""
+        site = tmp_path / "site"
+        site.mkdir()
+        (site / "spindle").symlink_to(self.SOURCE_ROOT / "spindle", target_is_directory=True)
+        return site
+
+    def test_stale_editable_record_of_this_tree_is_found(self, tmp_path):
+        site = tmp_path / "site"
+        self._record(site, "1.1.0", editable_of=self.SOURCE_ROOT)
+        records = spindle._install_records_for_this_code(path=[str(site)])
+        assert [r["version"] for r in records] == ["1.1.0"]
+        assert str(self.SOURCE_ROOT) in records[0]["where"]
+
+    def test_regular_install_owning_this_file_is_found(self, tmp_path):
+        site = self._site_with_this_package(tmp_path)
+        self._record(site, "1.1.0", files=("spindle/__init__.py",))
+        assert [r["version"] for r in spindle._install_records_for_this_code(path=[str(site)])] == ["1.1.0"]
+
+    def test_records_of_other_code_are_not_this_install(self, tmp_path):
+        site = tmp_path / "site"
+        self._record(site, "1.1.0", editable_of=tmp_path / "another-checkout")
+        assert spindle._install_records_for_this_code(path=[str(site)]) == []
+
+    def test_build_byproduct_egg_info_is_not_an_install_record(self, tmp_path):
+        """setuptools leaves spindle_mcp.egg-info in a source tree; pip's record is the dist-info."""
+        site = self._site_with_this_package(tmp_path)
+        self._record(site, "9.9.9", files=("spindle/__init__.py",), egg_info=True)
+        assert spindle._install_records_for_this_code(path=[str(site)]) == []
+
+    def _cli_check_against(self, tmp_path, monkeypatch, site):
+        script = tmp_path / "bin" / "spindle"
+        script.parent.mkdir()
+        script.write_text(f"#!{sys.executable}\n")
+        monkeypatch.setattr(spindle.shutil, "which", lambda cmd: str(script))
+        real = spindle._install_records_for_this_code
+        monkeypatch.setattr(spindle, "_install_records_for_this_code", lambda path=None: real(path=[str(site)]))
+        return spindle._doctor_cli_check(argv0=str(script))
+
+    def test_doctor_reports_a_stale_install_record(self, tmp_path, monkeypatch):
+        site = tmp_path / "site"
+        self._record(site, "1.1.0", editable_of=self.SOURCE_ROOT)
+        result = self._cli_check_against(tmp_path, monkeypatch, site)
+        assert result["status"] == "warn"
+        stale = [line for line in result["lines"] if "1.1.0" in line]
+        assert stale and spindle.__version__ in stale[0] and "pip install -e" in stale[0]
+        assert result["data"]["installed_versions"] == ["1.1.0"]
+
+    def test_doctor_is_quiet_about_a_current_install_record(self, tmp_path, monkeypatch):
+        site = tmp_path / "site"
+        self._record(site, spindle.__version__, editable_of=self.SOURCE_ROOT)
+        result = self._cli_check_against(tmp_path, monkeypatch, site)
+        assert result["status"] == "ok", result["lines"]
+        assert result["data"]["installed_versions"] == [spindle.__version__]
+
+
+class TestCliHelp:
+    """`spindle <command> --help` must describe what the code does."""
+
+    def _help(self, capsys, *argv):
+        with patch.object(spindle.sys, "argv", ["spindle", *argv, "--help"]):
+            with pytest.raises(SystemExit) as exc:
+                spindle.main()
+        assert exc.value.code == 0
+        return " ".join(capsys.readouterr().out.split())
+
+    def test_spin_harness_help_names_lodged_profiles(self, capsys):
+        text = self._help(capsys, "spin")
+        assert "lodged profile" in text
+        # Only the Claude Code launch path (which profiles also use) honors these.
+        assert "--allowed-tools ALLOWED_TOOLS Override permission profile with explicit tool list (Claude Code" in text
+        assert "ignored by codex" in text
+
+    def test_unspool_help_says_it_reads_a_saved_result(self, capsys):
+        assert "Read a spool's saved result" in self._help(capsys)
+
+    def test_install_service_home_help_matches_the_settings_precedence(self, capsys):
+        """Like --port, --home keeps what spindle installed the service with before reading the shell."""
+        assert "keep the existing service's store" in self._help(capsys, "install-service")
+
 
 def test_cli_import_emits_no_third_party_deprecation_noise():
     """Every CLI command used to print an authlib deprecation warning first.
