@@ -818,11 +818,19 @@ class LogicalOwner:
         the steady-state loop asks every interval, so an idle owner's cost grew
         with its capture: a 5 MB Claude stream took 40 ms a scan on this box,
         at fifty scans a second (issue-20260830-i7q8).  The answer depends only
-        on the harness, the Claude protocol and the bytes of the two captures,
-        which providers only append to, so an unchanged stat signature reuses
-        the previous answer.  Signatures are taken before the scan reads: a
-        write that lands during the scan changes the next signature, which
-        forces another scan rather than trusting a stale one.
+        on the harness, the Claude protocol and the bytes of the captures the
+        scan reads (stdout, plus stderr for Gemini alone), which providers only
+        append to, so an unchanged stat signature reuses the previous answer.
+        Signatures are taken before the scan reads: a write that lands during
+        the scan changes the next signature, which forces another scan rather
+        than trusting a stale one.  An answer from a failed read is never
+        cached, so a transient read error is retried on the next pass.
+
+        Blind spot, accepted because providers append: a rewrite that keeps a
+        capture's size and lands in the same timestamp tick as the previous
+        signature (mtime and ctime are only as fine as the kernel's coarse
+        clock, a jiffy on 5.4) leaves the signature unchanged, so its bytes
+        are not seen until the capture next changes.
         """
         import spindle
 
@@ -830,13 +838,13 @@ class LogicalOwner:
             spool.get("harness"),
             spool.get("claude_protocol"),
             _capture_signature(self.stdout_path),
-            _capture_signature(self.stderr_path),
+            _capture_signature(self.stderr_path) if spindle._spool_terminal_output_reads_stderr(spool) else None,
         )
         previous = getattr(self, "_output_scan", None)
         if previous is not None and previous[0] == key:
             return previous[1]
-        output_path = spindle._spool_complete_output_path(spool, self.stdout_path, self.stderr_path)
-        self._output_scan = (key, output_path)
+        output_path, read_failed = spindle._spool_terminal_output_scan(spool, self.stdout_path, self.stderr_path)
+        self._output_scan = None if read_failed else (key, output_path)
         return output_path
 
     def _terminal_output_precedes_timeout(self, request, written_at: Optional[datetime]) -> bool:
