@@ -630,7 +630,7 @@ for `spin`.
 | `spin_harnesses()` | List available harnesses, models, and defaults |
 | `spool_export(spool_ids, format?, output_path?)` | Export to file |
 | `shard_status(spool_id)` | Check shard worktree status |
-| `shard_merge(spool_id, keep_branch?, caller_cwd?)` | Merge shard into the branch it was forked from |
+| `shard_merge(spool_id, keep_branch?, caller_cwd?)` | Merge shard into the main checkout's branch (normally the shard's base, not necessarily master) |
 | `shard_abandon(spool_id, keep_branch?, caller_cwd?)` | Discard shard |
 | `triage(worktree_path)` | Spin an agent to assess an orphaned worktree and create a SKEIN tender; detached, returns its spool ID |
 | `spindle_repair(spool_id, attest_dead)` | Settle an abandoned-custody spool (see above) |

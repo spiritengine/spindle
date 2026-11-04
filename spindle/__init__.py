@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Spindle - MCP server for Claude Code to Claude Code delegation.
+Spindle - MCP server and CLI for delegating work to headless agents.
 
-Lets CC agents spawn other CC agents, all using Max subscription credits.
+Agents spawn Claude Code, Codex, Gemini, Kimi, or lodged-profile agents as spools.
 MCP spin waits for the result by default; wait=False opts into detached launches.
 
 Storage: ~/.spindle/spools/{spool_id}.json
@@ -49,6 +49,16 @@ except ImportError:  # checkout where the repo root is not on sys.path
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     import spindle_claude_driver as _claude_driver
 
+# Helper processes - the per-spool owner and its watchdog, the store supervisor -
+# set SUPERVISOR_IMPORT_GUARD before importing the package. It keeps import-time
+# store maintenance out of them (see _run_store_maintenance below) and it keeps
+# the MCP server out: they import the package only for its spool helpers, and
+# fastmcp was 6.1 s of the owner's 7.1 s import under load, long enough for owner
+# launches to miss their ready windows (friction-20261103-mbj2). They bind inert
+# stand-ins for the server names instead; the service and the CLI are unchanged.
+SUPERVISOR_IMPORT_GUARD = "_SPINDLE_STORE_SUPERVISOR"
+_HELPER_IMPORT = os.environ.get(SUPERVISOR_IMPORT_GUARD) == "1"
+
 # fastmcp imports authlib, which announces deprecations of its own internals as
 # it loads — lines of stderr in front of the output of every single CLI command,
 # about something no spindle user can act on. A warnings filter can't stop it:
@@ -73,19 +83,30 @@ def _showwarning_without_authlib_noise(message, category, filename, lineno, file
     _real_showwarning(message, category, filename, lineno, file, line)
 
 
-warnings.showwarning = _showwarning_without_authlib_noise
-try:
-    from anyio import BrokenResourceError, ClosedResourceError  # noqa: E402
-    from fastmcp import Context, FastMCP  # noqa: E402
-    from fastmcp.tools.tool import ToolResult  # noqa: E402
-    from starlette.requests import Request  # noqa: E402
-    from starlette.responses import JSONResponse  # noqa: E402
-finally:
-    # Restore only if ours is still the installed hook. Anything imported above
-    # may legitimately install its own (logging.captureWarnings does), and
-    # blindly reassigning would silently uninstall it.
-    if warnings.showwarning is _showwarning_without_authlib_noise:
-        warnings.showwarning = _real_showwarning
+if _HELPER_IMPORT:
+    from ._mcp_standins import (  # noqa: E402
+        BrokenResourceError,
+        ClosedResourceError,
+        Context,
+        FastMCP,
+        JSONResponse,
+        Request,
+        ToolResult,
+    )
+else:
+    warnings.showwarning = _showwarning_without_authlib_noise
+    try:
+        from anyio import BrokenResourceError, ClosedResourceError  # noqa: E402
+        from fastmcp import Context, FastMCP  # noqa: E402
+        from fastmcp.tools.tool import ToolResult  # noqa: E402
+        from starlette.requests import Request  # noqa: E402
+        from starlette.responses import JSONResponse  # noqa: E402
+    finally:
+        # Restore only if ours is still the installed hook. Anything imported above
+        # may legitimately install its own (logging.captureWarnings does), and
+        # blindly reassigning would silently uninstall it.
+        if warnings.showwarning is _showwarning_without_authlib_noise:
+            warnings.showwarning = _real_showwarning
 
 from ._version import __version__  # noqa: E402
 from .namespace_owner import (  # noqa: E402
@@ -161,8 +182,18 @@ def _guard_mcp_final_replies(server: FastMCP) -> None:
     server._mcp_server._handle_request = handle_with_reply_guard
 
 
-mcp = FastMCP("spindle")
-_guard_mcp_final_replies(mcp)
+# Server-level guidance an MCP client shows the agent beside the tool list. The
+# per-tool descriptions carry the details; this carries the two rules agents most
+# often get wrong.
+MCP_INSTRUCTIONS = (
+    "spin and respin block until the spool finishes and return its result; pass wait=False to get the ID at once. "
+    "To run spools in parallel, launch each with wait=False and collect them with one spin_wait call whose "
+    "spool_ids is a single comma-separated string."
+)
+
+mcp = FastMCP("spindle", instructions=MCP_INSTRUCTIONS)
+if not _HELPER_IMPORT:
+    _guard_mcp_final_replies(mcp)
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -431,7 +462,6 @@ SUPERVISOR_CAPABILITIES = (
     "owner-convergence-v1",
 )
 REQUIRED_SUPERVISOR_CAPABILITIES = frozenset(SUPERVISOR_CAPABILITIES)
-SUPERVISOR_IMPORT_GUARD = "_SPINDLE_STORE_SUPERVISOR"
 SUPERVISOR_POLL_INTERVAL = float(os.environ.get("SPINDLE_SUPERVISOR_POLL_INTERVAL", "0.5"))
 SUPERVISOR_IDLE_GRACE = float(os.environ.get("SPINDLE_SUPERVISOR_IDLE_GRACE", "5"))
 
@@ -5787,11 +5817,11 @@ async def unspool(
     limit: Optional[int] = None,
 ) -> str:
     """
-    Get the result of a background spin task.
+    Read a spool's saved result (any spool, waited on or not).
+    Results over ~50K chars return head and tail with a breadcrumb; full=True or offset/limit read the rest.
 
-    Very long results (over ~50K chars) are truncated by default to their head
-    and tail with a breadcrumb showing how to pull the rest. Most results are
-    small and return whole.
+    Most results are small and return whole. A spool that has not finished
+    returns its status instead of a result.
 
     Args:
         spool_id: The spool to read.
@@ -6582,10 +6612,11 @@ async def spin_wait(
     ctx: Context = None,
 ) -> str:
     """
-    Block until spools complete.
+    Wait for spools; spool_ids is ONE comma-separated string, not a list.
+    mode='gather' returns all results (budgeted); mode='yield' returns one completion plus 'remaining' — call again with the remaining ids joined by commas.
 
     Args:
-        spool_ids: Comma-separated spool IDs to wait for
+        spool_ids: Comma-separated spool IDs to wait for, as one string: "abc123,def456"
         mode: 'gather' (wait for all) or 'yield' (return first completed)
         timeout: Optional timeout in seconds
         time: Duration to wait (when no spool_ids provided).
@@ -7563,7 +7594,7 @@ async def spool_dashboard() -> str:
     Commit status values:
     - uncommitted: Has uncommitted changes in worktree
     - has_commit: Has commits ready for merge
-    - merged: Already merged to master
+    - merged: Already merged with shard_merge
     - conflict: Would have merge conflicts
     - no_worktree: Worktree no longer exists
     - None: Not a shard spool
@@ -7826,10 +7857,10 @@ async def shard_status(spool_id: str) -> str:
 @mcp.tool()
 async def shard_merge(spool_id: str, keep_branch: bool = False, caller_cwd: str | None = None) -> str:
     """
-    Merge a shard's changes back to master and clean up the worktree.
+    Merge a finished spool's shard branch into the main checkout and remove the worktree.
+    The merge lands on the branch checked out there, normally the shard's base branch (not necessarily master).
 
-    The spool must be complete (not running). Changes are merged to master
-    using a merge commit.
+    The spool must be complete (not running). The merge is a --no-ff merge commit.
 
     Args:
         spool_id: The spool_id with a shard to merge
@@ -8172,16 +8203,17 @@ def _shard_abandon_locked(spool_id: str, keep_branch: bool, caller_cwd: str | No
 @mcp.tool()
 async def triage(worktree_path: str) -> str:
     """
-    Assess orphan worktree and create tender with recommendation.
+    Spin an agent that assesses an orphan worktree and tenders a recommendation.
+    Detached: returns the triage spool's ID immediately; call spin_wait(id) for its result.
 
-    Spins an agent to review the worktree, assess the work, and create
-    a tender with status and confidence score.
+    The agent reviews the worktree's commits and uncommitted work, then creates
+    a SKEIN tender with a status and confidence score.
 
     Args:
         worktree_path: Path to the worktree to triage
 
     Returns:
-        spool_id for the triage agent
+        The triage spool's ID (not its result), or an error message
     """
     # Validate path exists and is a git worktree
     if not Path(worktree_path).exists():
@@ -10965,24 +10997,34 @@ def _doctor_cli_check(argv0: Optional[str] = None) -> dict:
     status = "ok"
 
     on_path = shutil.which("spindle")
+    shim_target = None
     if not on_path:
         status = "warn"
         lines.append("no 'spindle' console script on PATH (run it via `python -m spindle`, or fix PATH)")
     else:
         lines.append(f"console script on PATH: {on_path}")
+        # A pyenv shim is a bash script that runs some install's console script;
+        # compare what it runs, not the shim. Without this, running an install
+        # by its absolute path (as the systemd unit does) always looked foreign.
+        shim_target, shim_error = _pyenv_shim_target(on_path)
+        runs = shim_target or on_path
+        if shim_target:
+            lines.append(f"that is a pyenv shim; from here it runs {shim_target}")
         invoked = argv0 if argv0 is not None else (sys.argv[0] if sys.argv else "")
         invoked_path = Path(invoked) if invoked else None
         foreign = None
-        if invoked_path is not None and invoked_path.name == "spindle" and invoked_path.exists():
+        if shim_error:
+            foreign = f"it is a pyenv shim that pyenv cannot resolve from here: {shim_error}"
+        elif invoked_path is not None and invoked_path.name == "spindle" and invoked_path.exists():
             # Invoked as a console script: compare the actual files.
-            if invoked_path.resolve() != Path(on_path).resolve():
-                foreign = f"you ran {invoked_path.resolve()}"
+            if invoked_path.resolve() != Path(runs).resolve():
+                foreign = f"you ran {invoked_path.resolve()}; `spindle` runs {runs}"
         else:
             # Invoked some other way (python -m spindle, a test, an import).
             # Compare the interpreter directory the PATH script points at with
             # ours: comparing the interpreters themselves is useless, since a
             # venv python resolves to the base interpreter it was created from.
-            interp = _script_interpreter(on_path)
+            interp = _script_interpreter(runs)
             if interp and Path(interp).parent != Path(sys.executable).parent:
                 foreign = f"it runs {interp}; this process runs {sys.executable}"
         if foreign:
@@ -10991,6 +11033,25 @@ def _doctor_cli_check(argv0: Optional[str] = None) -> dict:
                 f"the `spindle` on PATH is a DIFFERENT install from the one running this check "
                 f"({foreign}) — typing `spindle ...` will not reach this install"
             )
+
+    # __version__ comes from the code; the installer's record can lag it. A stale
+    # editable record (1.1.0 while the tree said 1.2.0) maps only the modules that
+    # existed when it was made, and no __version__ comparison can see it.
+    records = _install_records_for_this_code()
+    if not records:
+        lines.append("no installed spindle-mcp record covers this code (running from a source tree?)")
+    for record in records:
+        if record["version"] == __version__:
+            continue
+        status = "warn"
+        if record["editable_of"]:
+            remedy = f"rerun `{sys.executable} -m pip install -e {record['editable_of']}`"
+        else:
+            remedy = f"reinstall spindle-mcp with {sys.executable}"
+        lines.append(
+            f"the installed package record says spindle-mcp {record['version']} ({record['where']}) "
+            f"but this code is {__version__}: the install is stale; {remedy}"
+        )
 
     return _doctor_result(
         "cli",
@@ -11001,7 +11062,89 @@ def _doctor_cli_check(argv0: Optional[str] = None) -> dict:
         package=module_path,
         python=sys.executable,
         console_script=on_path,
+        console_script_target=shim_target,
+        installed_versions=[record["version"] for record in records],
     )
+
+
+def _pyenv_shim_target(path: str) -> Tuple[Optional[str], Optional[str]]:
+    """What a pyenv shim runs, asked of the pyenv the shim itself would call.
+
+    pyenv's shims are bash scripts that `exec "<pyenv>" exec "$program"`; pyenv
+    then picks an install from PYENV_VERSION, .python-version files and the
+    global version. Asking that same pyenv, with the PYENV_ROOT the shim exports,
+    from this process's environment and working directory answers what typing
+    the command here would run.
+
+    Returns (target, None) for a shim pyenv resolves, (None, reason) for one it
+    cannot, and (None, None) for anything that is not a pyenv shim.
+    """
+    try:
+        with open(path, "r", errors="replace") as fh:
+            head = fh.read(4096)
+    except OSError:
+        return None, None
+    pyenv = re.search(r'^exec "([^"]+)" exec "\$program"', head, re.MULTILINE)
+    if not head.startswith("#!") or not pyenv:
+        return None, None
+    env = os.environ.copy()
+    root = re.search(r'^export PYENV_ROOT="([^"]+)"', head, re.MULTILINE)
+    if root:
+        env["PYENV_ROOT"] = root.group(1)
+    command = os.path.basename(path)
+    try:
+        proc = subprocess.run([pyenv.group(1), "which", command], capture_output=True, text=True, env=env, timeout=10)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return None, f"`pyenv which {command}` failed: {exc}"
+    target = proc.stdout.strip()
+    if proc.returncode != 0 or not target:
+        stderr = proc.stderr.strip()
+        return None, stderr.splitlines()[0] if stderr else f"`pyenv which {command}` exited {proc.returncode}"
+    return target, None
+
+
+def _install_records_for_this_code(path: Optional[list] = None) -> list:
+    """The installed spindle-mcp records that describe this code.
+
+    Only an installer's record counts: a dist-info with a RECORD file, which pip
+    and uv write. The spindle_mcp.egg-info setuptools leaves in a source tree is
+    a build byproduct, and whichever record sys.path finds first may belong to a
+    different install, so a record must cover this very file: an editable
+    install of this source tree (PEP 610 direct_url.json) or a regular install
+    whose spindle/__init__.py is this file.
+
+    Returns dicts with version, where (for display) and editable_of (the source
+    tree for an editable install, else None). ``path`` overrides the directories
+    searched (default: sys.path).
+    """
+    import importlib.metadata
+    from urllib.parse import unquote, urlparse
+
+    this_file = Path(__file__).resolve()
+    source_root = this_file.parent.parent
+    search = {"name": "spindle-mcp"} if path is None else {"name": "spindle-mcp", "path": path}
+    records = []
+    for dist in importlib.metadata.distributions(**search):
+        if dist.read_text("RECORD") is None:
+            continue
+        try:
+            direct = json.loads(dist.read_text("direct_url.json") or "null")
+        except json.JSONDecodeError:
+            direct = None
+        dir_info = direct.get("dir_info") if isinstance(direct, dict) else None
+        if isinstance(dir_info, dict) and dir_info.get("editable") is True:
+            url = urlparse(str(direct.get("url", "")))
+            if url.scheme != "file" or Path(unquote(url.path)).resolve() != source_root:
+                continue
+            record = {"where": f"editable install of {source_root}", "editable_of": str(source_root)}
+        else:
+            if Path(str(dist.locate_file("spindle/__init__.py"))).resolve() != this_file:
+                continue
+            record = {"where": f"installed in {Path(str(dist.locate_file(''))).resolve()}", "editable_of": None}
+        record["version"] = dist.version or "unknown"
+        if record not in records:  # sys.path may list one directory twice
+            records.append(record)
+    return records
 
 
 def _doctor_service_check(host: str, port: int, timeout: float = 2.0) -> dict:
@@ -12696,7 +12839,8 @@ def main():
     )
     install_service_parser.add_argument(
         "--home",
-        help="SPINDLE_HOME to bake into the unit (default: the current SPINDLE_HOME, if set)",
+        help="SPINDLE_HOME to bake into the unit (default: keep the existing service's store, else the current "
+        "SPINDLE_HOME if set; '' means the default store)",
     )
 
     # spin command - spawn an agent
@@ -12717,7 +12861,7 @@ def main():
             "auto",
             "auto+shard",
         ],
-        help="Permission profile (default: careful, which is classifier-vetted auto)",
+        help="Permission profile (default: careful, which on Claude Code is classifier-vetted auto)",
     )
     spin_parser.add_argument(
         "--research-target",
@@ -12729,16 +12873,22 @@ def main():
         ),
     )
     spin_parser.add_argument("--shard", "-s", action="store_true", help="Run in isolated git worktree")
-    spin_parser.add_argument("--system-prompt", help="Optional system prompt")
+    spin_parser.add_argument("--system-prompt", help="Optional system prompt (ignored by codex)")
     spin_parser.add_argument("--working-dir", "-d", help="Directory for the agent (default: current)")
-    spin_parser.add_argument("--allowed-tools", help="Override permission profile with explicit tool list")
+    spin_parser.add_argument(
+        "--allowed-tools",
+        help="Override permission profile with explicit tool list (Claude Code and lodged profiles only)",
+    )
     spin_parser.add_argument("--tags", help="Comma-separated tags for organizing spools")
     spin_parser.add_argument(
         "--model",
         "-m",
         help="Model to use (e.g. haiku/sonnet/opus/fable or pinned fable-5.1/opus-5.5/sonnet-5 for Claude, astra/sol/terra/luna/reserve for Codex, flash/pro/video for Gemini, k3/latest/thinking/k2.6/k2.7-code for Kimi)",
     )
-    spin_parser.add_argument("--harness", help="Harness to use: claude-code (default), codex, gemini, or kimi")
+    spin_parser.add_argument(
+        "--harness",
+        help="Harness to use: claude-code (default), codex, gemini, kimi, or a lodged profile name",
+    )
     spin_parser.add_argument("--timeout", "-t", type=int, help="Kill spool after N seconds")
     spin_parser.add_argument("--skeinless", action="store_true", help="Skip SKEIN context injection for shard agents")
     spin_parser.add_argument(
@@ -12747,7 +12897,7 @@ def main():
     spin_parser.add_argument("--human", action="store_true", help="Human-readable output instead of JSON")
 
     # unspool command - get result
-    unspool_parser = subparsers.add_parser("unspool", help="Get the result of a background spin task")
+    unspool_parser = subparsers.add_parser("unspool", help="Read a spool's saved result in full")
     unspool_parser.add_argument("spool_id", help="The spool ID to get output from")
     unspool_parser.add_argument("--human", action="store_true", help="Human-readable output instead of JSON")
 

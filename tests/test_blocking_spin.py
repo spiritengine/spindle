@@ -320,6 +320,62 @@ async def test_spin_schema_advertises_wait_and_is_not_readonly():
         assert "spin_wait" in first_lines[1]
 
 
+# Claude Code truncates long tool descriptions, so the first two lines are the
+# part of the contract an agent is sure to read. Pinned so a rewrite cannot push
+# the calling convention back down to the bottom of a docstring.
+TOOL_CONTRACT_LINES = {
+    "spin": (
+        "Spawn an agent; blocks until the spool finishes and returns its result.",
+        "With wait=False returns the ID immediately; call spin_wait to be notified.",
+    ),
+    "respin": (
+        "Continue a session; blocks until the new spool finishes and returns its result.",
+        "With wait=False returns the ID immediately; call spin_wait to be notified.",
+    ),
+    "spin_wait": (
+        "Wait for spools; spool_ids is ONE comma-separated string, not a list.",
+        "mode='gather' returns all results (budgeted); mode='yield' returns one completion plus 'remaining' "
+        "— call again with the remaining ids joined by commas.",
+    ),
+    "unspool": (
+        "Read a spool's saved result (any spool, waited on or not).",
+        "Results over ~50K chars return head and tail with a breadcrumb; full=True or offset/limit read the rest.",
+    ),
+    "triage": (
+        "Spin an agent that assesses an orphan worktree and tenders a recommendation.",
+        "Detached: returns the triage spool's ID immediately; call spin_wait(id) for its result.",
+    ),
+    "shard_merge": (
+        "Merge a finished spool's shard branch into the main checkout and remove the worktree.",
+        "The merge lands on the branch checked out there, normally the shard's base branch (not necessarily master).",
+    ),
+}
+
+
+async def test_tool_contracts_lead_their_descriptions():
+    async with Client(spindle.mcp) as client:
+        tools = {tool.name: tool for tool in await client.list_tools()}
+    for name, expected in TOOL_CONTRACT_LINES.items():
+        assert tuple(tools[name].description.strip().splitlines()[:2]) == expected, name
+    # shard_merge merges into the shard's base branch, which is often main.
+    for name, tool in tools.items():
+        assert "to master" not in tool.description, name
+
+
+async def test_server_instructions_carry_the_blocking_default_and_fan_out_rule():
+    async with Client(spindle.mcp) as client:
+        instructions = client.initialize_result.instructions
+    assert instructions and len(instructions) < 400
+    assert "wait=False" in instructions
+    assert "spin_wait" in instructions
+    assert "comma-separated" in instructions
+
+
+def test_module_docstring_describes_the_current_product():
+    assert "Max subscription" not in spindle.__doc__
+    assert "Claude Code to Claude Code" not in spindle.__doc__
+
+
 async def test_structured_saved_result_uses_unspool_coercion(launch_store):
     async with Client(spindle.mcp) as client:
         task = asyncio.create_task(client.call_tool("spin", {"prompt": "work", "working_dir": "/project"}))
