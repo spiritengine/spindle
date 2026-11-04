@@ -92,10 +92,30 @@ codex exec --json --skip-git-repo-check --sandbox <mode> -c sandbox_mode=<mode> 
   reviewer model approve the command again outside the sandbox. Under `never`, codex rejects
   an escalation request outright and never retries a denied command unsandboxed; the agent
   works within its tier or reports what blocked it. `danger-full-access` has no sandbox to
-  escape, so it keeps your own approval settings.
+  escape, so it keeps your own approval settings. One exception: see
+  [Saved allow rules](#saved-allow-rules).
 - `--skip-git-repo-check` lets a spool run in a working dir that is not a git repository
   (a `spindle doctor --smoke` temp dir, a scratch research dir). codex refuses to start
   there without it. The check only gates startup; it relaxes no sandbox setting.
+
+The research tiers run through a codex permissions profile instead of `--sandbox`:
+
+```bash
+codex exec --json --skip-git-repo-check \
+  -c 'default_permissions="spindle-research"' \
+  -c 'permissions.spindle-research.filesystem={":root" = "read", "<target dir>" = "write"}' \
+  -c 'permissions.spindle-research.network.enabled=true' \
+  -c approval_policy=never "your task"
+```
+
+The profile reads the whole filesystem, writes only the research target's directory (nothing,
+for a `site:` target), and has the network on, so `skein post` and `curl` work. codex's
+`read-only` sandbox cannot do this: it blocks all network, loopback included. A research
+launch passes no `--sandbox` and no `-c sandbox_mode`, because either one makes codex ignore
+the profile; a profile selected on the command line wins over a `sandbox_mode` in
+config.toml. Before the first research spool, Spindle checks by behavior that the resolved
+codex honors the profile (a write to the probe's directory is refused and a write to its
+one allowed path lands), and refuses research spools if it does not.
 
 `--full-auto` is never passed: it carries its own workspace-write tier that overrides
 `--sandbox` regardless of order, and `codex exec` is already non-interactive without it.
@@ -106,36 +126,45 @@ Spindle maps permission levels to Codex sandbox policies:
 
 | Spindle Permission | Codex Sandbox Policy | Description |
 |-------------------|---------------------|-------------|
-| `readonly` | `read-only` | Can only read files |
+| `readonly` | `read-only` | Can only read files; no network |
 | `careful` (default) | `workspace-write` | Can read/write in workspace |
 | `full` | `danger-full-access` | Full filesystem access |
 | `shard` | `workspace-write` via `spin()`; `danger-full-access` via the `spindle spin` CLI | Isolated worktree |
-| `research` (site target) | `read-only` | Web research against a site; no writes |
-| `research` (file/dir target) | `workspace-write` | Adds `--add-dir` for the writable target path |
-| `research+shard` (site target) | `read-only` | research + isolated worktree; no writes |
-| `research+shard` (file/dir target) | `workspace-write` | Adds `--add-dir` for the writable target path + isolated worktree; refused on codex 0.154 (see [Codex in shards](#codex-in-shards)) |
+| `research` (site target) | research profile | Reads everything, writes nothing, network on |
+| `research` (file/dir target) | research profile | Reads everything, writes only the target's directory, network on |
+| `research+shard` (site target) | research profile | research + isolated worktree; the worktree is read-only |
+| `research+shard` (file/dir target) | research profile | research + isolated worktree; writes only the target's directory |
 
 Note that codex's `workspace-write` treats `/tmp` and `$TMPDIR` as writable in addition to
-the workspace, so a `careful` spool can still write there. Only `read-only` prevents all
-writes.
+the workspace, so a `careful` spool can still write there. `read-only` and the research
+profile do not (the research profile writes only its target's directory).
 
 codex's `read-only` also blocks all network from commands, loopback included, so a
-`readonly` or `site:` research codex spool cannot reach a local service such as SKEIN:
-`skein` commands fail inside it, and a `site:` research spool's findings come back in its
-result rather than being posted. Network inside `workspace-write` follows
-`[sandbox_workspace_write] network_access` in your config.toml.
+`readonly` codex spool cannot reach a local service such as SKEIN: `skein` commands fail
+inside it. The research profile has the network on. Network inside `workspace-write`
+follows `[sandbox_workspace_write] network_access` in your config.toml.
 
 codex's `workspace-write` also keeps the workspace's own `.git` read-only, and with approval
-pinned to `never` nothing can lift that, so a `careful` codex spool cannot commit. Use
-`careful+shard` for work that should end in a commit; Spindle grants a shard the git
-metadata its commits need (see [Codex in shards](#codex-in-shards)).
+pinned to `never` the agent cannot escalate past that, so a `careful` codex spool cannot
+commit. Use `careful+shard` for work that should end in a commit; Spindle grants a shard
+the git metadata its commits need (see [Codex in shards](#codex-in-shards)).
+
+### Saved allow rules
+
+codex skips its own sandbox for a command that matches an `allow` rule in its execution-
+policy rules (`prefix_rule(pattern=[...], decision="allow")` in `$CODEX_HOME/rules/`), at
+every tier and even with approval pinned to `never`. Such a command can write wherever your
+user can, unless Spindle's bwrap wrapper is around it: inside a shard the wrapper still
+applies, outside a shard nothing does. Spindle does not yet neutralize saved rules, so keep
+allow rules narrow, or none, on a machine that runs restrictive codex spools.
 
 ### Codex in shards
 
 On Linux a shard spool runs inside two sandboxes. Spindle's bwrap wrapper makes the whole
 filesystem read-only except the worktree, `/tmp`, the git metadata a commit writes and a few
-home directories (listed in the FAQ below). codex's own sandbox runs inside that wrapper at
-the spool's tier, with the same git metadata as its only extra writable roots:
+home directories (listed in the FAQ below). At `workspace-write`, codex's own sandbox runs
+inside that wrapper with its working directory (the worktree root), `/tmp`, `$TMPDIR` and
+the same git metadata as its writable roots:
 
 - `<repo>/.git/worktrees/<name>`, the worktree's own git dir (index, HEAD, its reflog)
 - `<repo>/.git/objects`, `<repo>/.git/refs/heads` and `<repo>/.git/logs/refs/heads`
@@ -144,21 +173,22 @@ The rest of the main repository's `.git` (config, hooks, `HEAD`, `packed-refs`) 
 read-only in both layers, so a shard agent cannot plant a hook or change config that would
 then run in your own checkout. For that reason git may print `Unable to create
 '.../packed-refs.lock': Read-only file system` while committing (git 2.50 does on every
-commit); the commit itself succeeds. Spindle also pins codex's
-`sandbox_workspace_write.writable_roots` to that list in a shard, so a `writable_roots` in
-config.toml cannot add a root the wrapper never made writable.
+commit); the commit itself succeeds. `refs/heads` is writable as a whole directory, though,
+so a shard agent can move any branch, the base branch included, not only its own; review
+`git log` on the base branch before merging a codex shard. Spindle also pins codex's
+`sandbox_workspace_write.writable_roots` to the git metadata and the worktree root in a
+shard, so a `writable_roots` in config.toml cannot add a root the wrapper never made
+writable.
+
+A research shard runs the research profile inside the same wrapper. Nothing in the worktree
+is writable to it; a `file:` or `dir:` target's directory is the one writable path in both
+layers, and it gets no instructions to commit.
 
 Before launching, Spindle runs one no-model `codex sandbox` command through the same
 wrapper, with the same settings, and checks that it ran. If codex's sandbox cannot start
 there, the spool is refused (`REFUSED: codex's sandbox cannot start inside shard …`, with
-the reason) instead of starting an agent whose every command would fail. This costs about
-a second per shard launch.
-
-One combination is refused on codex 0.154: `research+shard` with a `file:` or `dir:`
-target. The wrapper keeps that worktree read-only so the agent writes only its target, but
-codex's sandbox must create mount points for its `.agents` and `.codex` masks in its working
-directory, which it cannot do there. `research+shard` with a `site:` target runs at
-`read-only` and is not affected.
+the reason) instead of starting an agent whose every command would fail. This costs under
+two seconds per shard launch.
 
 Before 2.0.0, Spindle granted codex the main repository's `.git` instead, which the wrapper
 kept read-only. codex's sandbox then failed before every command (`bwrap: Can't mkdir
@@ -472,8 +502,9 @@ If manual execution fails, the issue is with Codex CLI setup, not Spindle.
 ## Security Considerations
 
 Spindle never passes `--dangerously-bypass-approvals-and-sandbox`. Every spool runs at the
-`--sandbox` tier its permission maps to (see [Sandbox Policies](#sandbox-policies)); only
-`permission="full"`, or `shard` through the `spindle spin` CLI, gets `danger-full-access`.
+tier its permission maps to (see [Sandbox Policies](#sandbox-policies)), as a `--sandbox` tier
+or, for research, the research permissions profile; only `permission="full"`, or `shard`
+through the `spindle spin` CLI, gets `danger-full-access`.
 A restrictive spool whose codex does not enforce its tier is refused, not run unsandboxed;
 see [Codex Sandbox Enforcement](MULTI_HARNESS_GUIDE.md#codex-sandbox-enforcement).
 
@@ -483,9 +514,15 @@ reviewer) cannot re-run a denied command outside the sandbox. A shard spool is r
 codex's sandbox cannot start inside Spindle's wrapper. See
 [How Spindle invokes it](#how-spindle-invokes-it) and [Codex in shards](#codex-in-shards).
 
-Two things the tier does not cover: MCP servers configured in your codex config run outside
-codex's sandbox, and network access inside `workspace-write` follows
-`[sandbox_workspace_write] network_access` in your config.toml.
+What the tier does not cover:
+
+- A command matching a saved `allow` rule runs outside codex's sandbox, even with approval
+  pinned to `never` (see [Saved allow rules](#saved-allow-rules)).
+- MCP servers configured in your codex config run outside codex's sandbox.
+- Network access inside `workspace-write` follows `[sandbox_workspace_write] network_access`
+  in your config.toml.
+- Inside a shard, `refs/heads` is writable as a directory, so a shard agent can move any
+  branch, not only its own (see [Codex in shards](#codex-in-shards)).
 
 **Still exercise caution:**
 - Use `permission="careful"` for most tasks; use `readonly` only for pure inspection or

@@ -4449,6 +4449,18 @@ class TestGeminiHarness:
         assert (str(host_home / ".codex"), str(host_home / ".codex")) not in binds
 
 
+def _codex_research_filesystem(cmd):
+    """The filesystem table of Spindle's codex research permissions profile in an argv."""
+    import tomllib
+
+    key = f"permissions.{spindle._CODEX_RESEARCH_PROFILE}.filesystem="
+    values = [
+        cmd[i + 1].split("=", 1)[1] for i, tok in enumerate(cmd[:-1]) if tok == "-c" and cmd[i + 1].startswith(key)
+    ]
+    assert values, f"no research permissions profile in {cmd!r}"
+    return tomllib.loads(f"v = {values[-1]}")["v"]
+
+
 def _codex_shard_sandbox_starts():
     """Stub the shard start probe, which would otherwise run `codex sandbox` for real.
 
@@ -6196,8 +6208,9 @@ class TestSpinHarnesses:
         assert captured["sandbox"] == "read-only"
         assert captured["kwargs"]["require_research_target"] is True
 
-    def test_codex_research_file_permission_uses_workspace_write_with_add_dir(self, tmp_path):
-        """Codex file research uses workspace-write plus a target-parent add-dir grant."""
+    def test_codex_research_file_permission_writes_only_the_target_parent(self, tmp_path):
+        """Codex file research runs the research permissions profile: the filesystem is
+        read-only except the target's parent directory, with no --sandbox and no --add-dir."""
         target = tmp_path / "report.md"
         captured_cmd = []
 
@@ -6219,13 +6232,13 @@ class TestSpinHarnesses:
                             env=None,
                             research_target=f"file:{target}",
                             require_research_target=True,
+                            permission="research",
                         )
 
         assert result.startswith("codex-")
-        sandbox_idx = captured_cmd.index("--sandbox")
-        assert captured_cmd[sandbox_idx + 1] == "workspace-write"
-        add_dirs = [captured_cmd[i + 1] for i, tok in enumerate(captured_cmd) if tok == "--add-dir"]
-        assert str(tmp_path) in add_dirs
+        assert "--sandbox" not in captured_cmd
+        assert "--add-dir" not in captured_cmd
+        assert _codex_research_filesystem(captured_cmd) == {":root": "read", str(tmp_path): "write"}
 
     def test_spin_codex_research_file_maps_to_workspace_write(self, tmp_path):
         """spin() must choose workspace-write for writable Codex research targets."""
@@ -8390,9 +8403,9 @@ class TestCodexRespinPreservesGitAccess:
         # ...not the worktree root (which the non-research path binds instead).
         wt_bound = any(cmd[i] == "--bind" and cmd[i + 1] == wt and cmd[i + 2] == wt for i in range(len(cmd) - 2))
         assert not wt_bound, f"worktree root must not be the writable bind for a research respin: {cmd!r}"
-        # And codex still gets the --add-dir grant for that dir.
-        add_dirs = [cmd[i + 1] for i, tok in enumerate(cmd) if tok == "--add-dir"]
-        assert out in add_dirs, f"codex must --add-dir the research output dir {out}: {add_dirs!r}"
+        # And codex's research permissions profile makes that dir, and only it, writable.
+        assert _codex_research_filesystem(cmd) == {":root": "read", out: "write"}, cmd
+        assert "--sandbox" not in cmd, "a research respin runs the permissions profile, not --sandbox"
 
 
 class TestAtomicJsonCreate:
@@ -8770,13 +8783,16 @@ class TestCodexSandboxEnforcement:
         [
             ("readonly", "read-only"),
             ("careful", "workspace-write"),
-            ("research", "read-only"),
             ("full", "danger-full-access"),
             (None, "workspace-write"),
         ],
     )
     def test_sandbox_flag_passed_for_each_tier(self, tmp_path, permission, expected_sandbox):
-        """Every tier reaches codex as an explicit --sandbox value."""
+        """Every non-research tier reaches codex as an explicit --sandbox value.
+
+        Research tiers pass their tier as a permissions profile instead; see
+        tests/test_codex_containment.py TestResearchProfile.
+        """
         sandbox = _codex_sandbox_for_permission(permission, None)
         assert sandbox == expected_sandbox, f"permission {permission!r} should map to {expected_sandbox!r}"
 
@@ -10712,8 +10728,8 @@ class TestCodexSandboxEnforcement:
     def test_codex_retry_preserves_research_target_grant(self, tmp_path):
         """spool_retry re-launches a codex spool through _codex_spin_sync and must
         thread the stored research_target + permission — otherwise a retried research
-        spool loses its --add-dir output grant and runs plain workspace-write with no
-        way to write its output. (The sandbox tier already survives via stored sandbox.)"""
+        spool loses its output grant (the research permissions profile's writable path)
+        and has no way to write its output. (The sandbox tier survives via stored sandbox.)"""
         _retry = spool_retry.fn if hasattr(spool_retry, "fn") else spool_retry
         output_dir = tmp_path / "research-out"
         output_dir.mkdir()
@@ -10746,9 +10762,8 @@ class TestCodexSandboxEnforcement:
         assert not result.startswith("Error"), result
         assert len(captured_cmd) == 1
         cmd = captured_cmd[0]
-        add_dirs = [cmd[i + 1] for i, tok in enumerate(cmd) if tok == "--add-dir"]
-        assert str(output_dir) in add_dirs, (
-            f"retried codex research spool must keep its --add-dir {output_dir} grant; got {add_dirs!r}"
+        assert _codex_research_filesystem(cmd) == {":root": "read", str(output_dir): "write"}, (
+            f"retried codex research spool must keep its {output_dir} grant; got {cmd!r}"
         )
         # The new spool record carries the research target + permission forward.
         retry_spool = _read_spool(result)

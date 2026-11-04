@@ -89,6 +89,45 @@ def _toml_list(value):
     return tomllib.loads(f"v = {value}")["v"]
 
 
+RESEARCH_PROFILE = "spindle-research"
+
+
+def _research_filesystem(cmd):
+    """The research permissions profile's filesystem table in an argv."""
+    value = _config_value(cmd, f"permissions.{RESEARCH_PROFILE}.filesystem")
+    assert value is not None, f"no research permissions profile in {cmd!r}"
+    return tomllib.loads(f"v = {value}")["v"]
+
+
+def _research_args(cmd):
+    """The four `-c` pairs that select and define the research profile, as they appear in cmd."""
+    start = cmd.index(f'default_permissions="{RESEARCH_PROFILE}"') - 1
+    return cmd[start : start + 8]
+
+
+def _assert_research_profile(cmd, writable):
+    # Either a --sandbox flag or -c sandbox_mode would put codex on its legacy syntax and
+    # silently drop the profile (codex core/src/config/mod.rs resolve_permission_config_syntax).
+    assert "--sandbox" not in cmd, cmd
+    assert _config_value(cmd, "sandbox_mode") is None, cmd
+    assert _config_value(cmd, "default_permissions") == f'"{RESEARCH_PROFILE}"', cmd
+    assert _research_filesystem(cmd) == {":root": "read", **{path: "write" for path in writable}}
+    assert _config_value(cmd, f"permissions.{RESEARCH_PROFILE}.network.enabled") == "true", cmd
+    assert _config_value(cmd, "approval_policy") == "never", cmd
+    assert "--add-dir" not in cmd, cmd
+
+
+def _research_target(tmp_path, kind):
+    """(research_target, the directory the profile should make writable) for one kind."""
+    if kind == "site":
+        return "site:spindle-development", []
+    out = tmp_path / "research-out"
+    out.mkdir(exist_ok=True)
+    if kind == "file":
+        return f"file:{out / 'report.md'}", [str(out)]
+    return f"dir:{out}", [str(out)]
+
+
 def _add_dirs(cmd):
     return [cmd[index + 1] for index, token in enumerate(cmd) if token == "--add-dir"]
 
@@ -123,7 +162,7 @@ def _validate_without_skein(research_target, working_dir):
 
 
 @contextmanager
-def _codex_launch(tmp_path, *, shard_info=None, shard_start_failure=None):
+def _codex_launch(tmp_path, *, shard_info=None, shard_start_failure=None, has_skein=False):
     """Run a codex launch with a stable fake binary and capture the spawned argv.
 
     The read-only enforcement probe is stubbed to "enforcing", bwrap always resolves, and
@@ -141,7 +180,7 @@ def _codex_launch(tmp_path, *, shard_info=None, shard_start_failure=None):
         (tmp_path / "state").mkdir(exist_ok=True)
         with (
             patch("spindle._count_running", return_value=0),
-            patch("spindle._has_skein", return_value=False),
+            patch("spindle._has_skein", return_value=has_skein),
             patch("spindle._resolve_codex_binary", return_value=FAKE_CODEX),
             patch("spindle._codex_cli_version", return_value="0.154.0"),
             patch("spindle._codex_auth_mode", return_value="chatgpt"),
@@ -333,6 +372,263 @@ class TestApprovalPolicyPin:
 
 
 # --------------------------------------------------------------------------------------
+# Fell r1: research tiers keep their network (finding-20261104-69no, finding-20261104-cc6n)
+# --------------------------------------------------------------------------------------
+
+
+def _latest_record(state_dir):
+    records = [_read_spool(path.stem) for path in Path(state_dir).glob("codex-*.json")]
+    records = [record for record in records if record and record.get("created_at")]
+    return max(records, key=lambda record: record["created_at"]) if records else None
+
+
+class TestResearchProfile:
+    """Codex research tiers: files read-only except the target, network on, approval never.
+
+    A read-only `--sandbox` unshares the network, loopback included, so with approval pinned
+    to never a site research spool could not `skein post` to the site its preamble names.
+    The research tiers now run a codex permissions profile instead of `--sandbox`; `readonly`
+    keeps `--sandbox read-only`, with no network.
+    """
+
+    @pytest.mark.parametrize("kind", ["site", "file", "dir"])
+    def test_spin_runs_the_research_profile(self, tmp_path, kind):
+        research_target, writable = _research_target(tmp_path, kind)
+        with _codex_launch(tmp_path) as (captured, _):
+            _spin(tmp_path, "research", research_target=research_target)
+            record = _latest_record(tmp_path / "state")
+
+        _assert_research_profile(captured[0], writable)
+        assert record["codex_permissions_profile"] == RESEARCH_PROFILE
+        assert record["permission"] == "research"
+
+    @pytest.mark.parametrize("kind", ["site", "dir"])
+    def test_respin_runs_the_research_profile_before_resume(self, tmp_path, kind):
+        research_target, writable = _research_target(tmp_path, kind)
+        sandbox = "read-only" if kind == "site" else "workspace-write"
+        original = _original(tmp_path, sandbox=sandbox, permission="research", research_target=research_target)
+        with _codex_launch(tmp_path) as (captured, _):
+            _respin(tmp_path, original)
+
+        cmd = captured[0]
+        _assert_research_profile(cmd, writable)
+        resume = cmd.index("resume")
+        assert all(index < resume for index, token in enumerate(cmd) if token == "-c"), cmd
+
+    def test_research_shard_site_runs_the_research_profile(self, tmp_path):
+        repo, worktree, shard_info = _repo_with_worktree(tmp_path)
+        with _codex_launch(tmp_path, shard_info=shard_info) as (captured, probe):
+            _spin(tmp_path, "research+shard", research_target="site:spindle-development", shard=True, working_dir=repo)
+
+        cmd = captured[0]
+        assert cmd[0] == "/usr/bin/bwrap"
+        _assert_research_profile(cmd, [])
+        assert probe.call_args.args[2] == _research_args(cmd)
+
+    def test_readonly_keeps_the_networkless_sandbox(self, tmp_path):
+        with _codex_launch(tmp_path) as (captured, _):
+            _spin(tmp_path, "readonly")
+            record = _latest_record(tmp_path / "state")
+
+        cmd = captured[0]
+        assert cmd[cmd.index("--sandbox") + 1] == "read-only"
+        assert _config_value(cmd, "sandbox_mode") == "read-only"
+        assert _config_value(cmd, "default_permissions") is None
+        assert not any(token.startswith("permissions.") for token in cmd)
+        assert record["codex_permissions_profile"] is None
+
+    def test_research_refusal_probes_the_research_profile(self, tmp_path):
+        enforces = MagicMock(return_value=False)
+        with _codex_launch(tmp_path) as (captured, _), patch("spindle._codex_sandbox_enforces", enforces):
+            result = _spin(tmp_path, "research", research_target="site:spindle-development")
+
+        assert captured == []
+        assert result.startswith("Error: REFUSED"), result
+        assert "research permissions profile" in result, result
+        assert enforces.call_args.kwargs.get("research") is True
+
+    def test_readonly_refusal_probes_the_read_only_sandbox(self, tmp_path):
+        enforces = MagicMock(return_value=False)
+        with _codex_launch(tmp_path) as (captured, _), patch("spindle._codex_sandbox_enforces", enforces):
+            result = _spin(tmp_path, "readonly")
+
+        assert captured == []
+        assert "(sandbox read-only)" in result, result
+        assert not enforces.call_args.kwargs.get("research")
+
+    @pytest.mark.parametrize("kind", ["site", "dir"])
+    def test_preamble_says_what_the_sandbox_allows(self, tmp_path, kind):
+        research_target, writable = _research_target(tmp_path, kind)
+        with _codex_launch(tmp_path) as (captured, _):
+            _spin(tmp_path, "research", research_target=research_target)
+
+        prompt = captured[0][-1]
+        assert "You are a research agent." in prompt
+        assert "the network is open (skein and curl work)" in prompt
+        if writable:
+            assert f"Every file is read-only except under {writable[0]}" in prompt
+        else:
+            assert "Your sandbox: Every file is read-only, and" in prompt
+            assert "skein post" in prompt, "a site research spool still posts to its site"
+
+    def test_claude_research_preamble_is_unchanged(self):
+        preamble = spindle._research_target_preamble({"type": "site", "value": "x", "raw": "site:x"})
+
+        assert "Your sandbox" not in preamble
+        assert preamble.endswith("Do not write loose files.\n\nYour task:\n")
+
+    def test_research_shard_gets_no_commit_instructions(self, tmp_path):
+        """Nothing in the worktree is writable to a research profile, so it cannot commit."""
+        repo, worktree, shard_info = _repo_with_worktree(tmp_path)
+        with _codex_launch(tmp_path, shard_info=shard_info, has_skein=True) as (captured, _):
+            _spin(tmp_path, "research+shard", research_target="site:spindle-development", shard=True, working_dir=repo)
+
+        prompt = captured[0][-1]
+        assert "You are a research agent." in prompt
+        assert "git commit" not in prompt
+        assert "skein shard tender" not in prompt
+
+    def test_profile_value_is_valid_toml_for_awkward_paths(self):
+        paths = ['/w/with "quote"', "/w/back\\slash", "/w/tab\there", "/w/naïve"]
+        args = spindle._codex_research_profile_args(paths)
+
+        assert _research_filesystem(args) == {":root": "read", **{path: "write" for path in paths}}
+
+
+class TestResearchEnforcementProbe:
+    """`_codex_sandbox_probe(research=True)`: the profile must be honored, both halves."""
+
+    @staticmethod
+    def _probe(tmp_path, behave):
+        """Run the probe with a fake codex that does `behave(cwd)` and then prints the marker."""
+        runs = []
+
+        def fake_run(argv, **kwargs):
+            runs.append((list(argv), kwargs))
+            behave(Path(kwargs["cwd"]))
+            return subprocess.CompletedProcess(argv, 0, stdout=f"{spindle._CODEX_SANDBOX_PROBE_MARKER}\n", stderr="")
+
+        with patch("spindle.subprocess.run", side_effect=fake_run):
+            result = spindle._codex_sandbox_probe(FAKE_CODEX, {"PATH": "/usr/bin"}, research=True)
+        return result, runs
+
+    def test_honored_profile_passes(self, tmp_path):
+        def honored(cwd):
+            (cwd / "allowed" / "ok.txt").write_text("OK")
+
+        result, runs = self._probe(tmp_path, honored)
+
+        assert result is True
+        argv, kwargs = runs[0]
+        allowed = os.path.join(kwargs["cwd"], "allowed")
+        assert argv[: 1 + 8] == [FAKE_CODEX, *spindle._codex_research_profile_args([allowed])]
+        assert _config_value(argv, "sandbox_mode") is None
+
+    def test_profile_ignored_as_plain_read_only_fails_closed(self, tmp_path):
+        result, _ = self._probe(tmp_path, lambda cwd: None)
+
+        assert result is False
+
+    def test_profile_ignored_as_workspace_write_fails_closed(self, tmp_path):
+        def wide(cwd):
+            (cwd / "enforce_probe.txt").write_text("BROKEN")
+            (cwd / "allowed" / "ok.txt").write_text("OK")
+
+        result, _ = self._probe(tmp_path, wide)
+
+        assert result is False
+
+    def test_research_result_is_cached_apart_from_read_only(self):
+        spindle._CODEX_SANDBOX_ENFORCES_CACHE.clear()
+        calls = []
+
+        def probe(codex_bin, process_env=None, research=False):
+            calls.append(research)
+            return True
+
+        with (
+            patch("spindle._codex_sandbox_probe", side_effect=probe),
+            patch("spindle._codex_sandbox_probe_key", return_value=("/fake/codex", "0.154.0")),
+        ):
+            spindle._codex_sandbox_enforces("/fake/codex")
+            spindle._codex_sandbox_enforces("/fake/codex", research=True)
+            spindle._codex_sandbox_enforces("/fake/codex", research=True)
+        spindle._CODEX_SANDBOX_ENFORCES_CACHE.clear()
+
+        assert calls == [False, True]
+
+
+_SANDBOX_REPORT = r"""
+import socket, sys
+port, cwd_target, out_target = int(sys.argv[1]), sys.argv[2], sys.argv[3]
+try:
+    socket.create_connection(("127.0.0.1", port), 3).close()
+    print("NET_OK")
+except OSError:
+    print("NET_BLOCKED")
+for label, path in (("CWD", cwd_target), ("OUT", out_target)):
+    try:
+        with open(path, "w") as handle:
+            handle.write("x")
+        print(label + "_WROTE")
+    except OSError:
+        print(label + "_DENIED")
+"""
+
+
+@pytest.mark.ns_required
+@pytest.mark.skipif(not shutil.which("codex"), reason="codex CLI is not installed")
+def test_real_codex_research_profile_reaches_loopback_and_writes_only_its_target(tmp_path):
+    """The real binary, no model: the research profile has network and one writable dir.
+
+    The scratch config.toml is shaped like the operator config that motivated the pins
+    (sandbox_mode workspace-write, approval on-request with an automatic reviewer, network
+    on), to show that the command-line profile wins over it. A local listener stands in for
+    the SKEIN service. The legacy read-only sandbox is run as the control.
+    """
+    import socket
+
+    codex = shutil.which("codex")
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text(
+        'approval_policy = "on-request"\napprovals_reviewer = "auto_review"\nsandbox_mode = "workspace-write"\n'
+        "check_for_update_on_startup = false\n[sandbox_workspace_write]\nnetwork_access = true\n"
+    )
+    work = tmp_path / "work"
+    work.mkdir()
+    out = tmp_path / "research-out"
+    out.mkdir()
+    env = {key: value for key, value in os.environ.items() if key not in {"CODEX_API_KEY", "OPENAI_API_KEY", "TMPDIR"}}
+    env.update(
+        HOME=str(tmp_path),
+        CODEX_HOME=str(codex_home),
+        PATH=os.path.dirname(codex) + os.pathsep + env.get("PATH", ""),
+    )
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(4)
+    port = listener.getsockname()[1]
+
+    def run(config_args):
+        argv = [codex, *config_args, "sandbox", "--", sys.executable, "-I", "-c", _SANDBOX_REPORT]
+        argv += [str(port), str(work / "cwd.txt"), str(out / "report.md")]
+        proc = subprocess.run(argv, cwd=work, env=env, capture_output=True, text=True, timeout=60)
+        return proc.stdout.split(), proc.stderr
+
+    try:
+        research, research_err = run(spindle._codex_research_profile_args([str(out)]))
+        legacy, _ = run(["-c", "sandbox_mode=read-only", "-c", "approval_policy=never"])
+        probe_passes = spindle._codex_sandbox_probe(codex, env, research=True)
+    finally:
+        listener.close()
+
+    assert research == ["NET_OK", "CWD_DENIED", "OUT_WROTE"], research_err
+    assert legacy == ["NET_BLOCKED", "CWD_DENIED", "OUT_DENIED"]
+    assert probe_passes is True
+
+
+# --------------------------------------------------------------------------------------
 # issue-20261022-zebt: codex's sandbox must be able to start inside the shard wrapper
 # --------------------------------------------------------------------------------------
 
@@ -390,19 +686,22 @@ class TestShardWritableRoots:
         resume = cmd.index("resume")
         assert all(index < resume for index, token in enumerate(cmd) if token == "--add-dir"), cmd
 
-    def test_research_shard_grants_only_its_output(self, tmp_path):
+    def test_research_shard_writes_only_its_output(self, tmp_path):
         repo, worktree, shard_info = _repo_with_worktree(tmp_path)
         out = tmp_path / "out"
         out.mkdir()
-        with _codex_launch(tmp_path, shard_info=shard_info) as (captured, _):
+        with _codex_launch(tmp_path, shard_info=shard_info) as (captured, probe):
             _spin(tmp_path, "research+shard", research_target=f"dir:{out}", shard=True, working_dir=repo)
 
         cmd = captured[0]
-        assert _add_dirs(cmd) == [str(out)], cmd
-        assert _toml_list(_config_value(cmd, "sandbox_workspace_write.writable_roots")) == [str(out)]
+        assert _add_dirs(cmd) == [], "a research launch's one writable path is in its permissions profile"
+        assert _research_filesystem(cmd) == {":root": "read", str(out): "write"}
+        assert _config_value(cmd, "sandbox_workspace_write.writable_roots") is None
         outer = _outer_writable_binds(cmd, cmd.index(FAKE_CODEX))
         assert str(out) in outer
         assert str(worktree) not in outer, "research writes only its target, not the worktree"
+        probe.assert_called_once()
+        assert probe.call_args.args[2] == _research_args(cmd), "the start probe gets the research profile"
 
     def test_non_shard_launch_leaves_writable_roots_alone(self, tmp_path):
         """Outside a shard there is no wrapper to mirror; the pin is shard-only."""
@@ -528,10 +827,15 @@ else:
     codex = sys.argv[6]
     env["PATH"] = os.path.dirname(codex) + os.pathsep + env.get("PATH", "")
     old = [os.path.join(repo, ".git"), worktree]
+    out = os.path.join(base, "research-out")
+    research = {"type": "dir", "value": out, "raw": "dir:" + out}
+    _, research_args, _ = spindle._codex_launch_policy("workspace-write", "research+shard", shard_info, research)
     probe = spindle._codex_shard_sandbox_start_failure
+    config = spindle._codex_sandbox_config_args
     result = {
-        "fixed": probe(codex, "workspace-write", shard_info, grants, None, env),
-        "old_grant": probe(codex, "workspace-write", shard_info, old, None, env),
+        "fixed": probe(codex, shard_info, config("workspace-write", shard_info, grants), None, env),
+        "old_grant": probe(codex, shard_info, config("workspace-write", shard_info, old), None, env),
+        "research_dir": probe(codex, shard_info, research_args, research, env),
     }
     print(json.dumps(result))
 """
@@ -606,12 +910,15 @@ def test_real_codex_sandbox_starts_inside_shard_wrapper(tmp_path):
     """The real binary: the probe passes on Spindle's grants and catches the old grant.
 
     No model call; `codex sandbox` runs one shell command under the sandbox. HOME points at
-    an empty scratch dir, so no operator config or credentials are read.
+    an empty scratch dir, so no operator config or credentials are read. research+shard with
+    a dir: target starts too: under the research permissions profile the worktree is not a
+    writable root, so codex needs no mount points in it.
     """
     result = _run_remapped(tmp_path, "codex", shutil.which("codex"))
 
     assert result["fixed"] is None, result
     assert result["old_grant"] and ".git/.git" in result["old_grant"], result
+    assert result["research_dir"] is None, result
 
 
 # --------------------------------------------------------------------------------------
@@ -659,9 +966,12 @@ class TestShardSandboxFailsClosed:
             _spin(tmp_path, "careful+shard", shard=True, working_dir=repo)
 
         probe.assert_called_once()
-        codex_bin, sandbox, probed_shard, grants, research_info, _env = probe.call_args.args
-        assert (codex_bin, sandbox, probed_shard, research_info) == (FAKE_CODEX, "workspace-write", shard_info, None)
-        assert grants == _add_dirs(captured[0])
+        codex_bin, probed_shard, config_args, research_info, _env = probe.call_args.args
+        assert (codex_bin, probed_shard, research_info) == (FAKE_CODEX, shard_info, None)
+        cmd = captured[0]
+        start = cmd.index("--sandbox") + 2
+        assert cmd[start : start + len(config_args)] == config_args, "the probe pins exactly what the launch pins"
+        assert _toml_list(_config_value(config_args, "sandbox_workspace_write.writable_roots")) == _add_dirs(cmd)
 
     @pytest.mark.parametrize(
         "permission,shard",
@@ -697,13 +1007,12 @@ class TestShardSandboxStartProbe:
             return outcome
 
         env = {"HOME": str(tmp_path), "PATH": "/usr/bin"}
+        config_args = spindle._codex_sandbox_config_args(sandbox, shard_info, grants)
         with (
             patch("spindle.subprocess.run", side_effect=fake_run),
             patch("spindle.shutil.which", side_effect=_bwrap_only),
         ):
-            detail = spindle._codex_shard_sandbox_start_failure(
-                FAKE_CODEX, sandbox, shard_info, grants, research_info, env
-            )
+            detail = spindle._codex_shard_sandbox_start_failure(FAKE_CODEX, shard_info, config_args, research_info, env)
             expected_outer = _codex_bwrap_wrap(
                 [], shard_info, shard_info["worktree_path"], research_target_info=research_info, process_env=env
             )

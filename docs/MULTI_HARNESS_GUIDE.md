@@ -411,12 +411,13 @@ Every codex spool is launched with an explicit `--sandbox` tier, mapped from Cla
 - `permission="careful"` → `--sandbox workspace-write`
 - `permission="full"` → `--sandbox danger-full-access`
 - `permission="shard"` → `--sandbox workspace-write` (the `spindle spin` CLI maps `shard` to `danger-full-access`)
-- `permission="research"` → site target: `--sandbox read-only`; file/dir target: `--sandbox workspace-write` + `--add-dir` for the target path (no bwrap — plain research uses Codex native sandbox only)
-- `permission="research+shard"` → same conditional sandbox as `research` + isolated worktree; bwrap adds OS-level isolation on top when available (a `file:`/`dir:` target is refused on codex 0.154, see [CODEX_SETUP.md](CODEX_SETUP.md#codex-in-shards))
+- `permission="research"` → no `--sandbox`; the `spindle-research` permissions profile instead: the filesystem is read-only except a `file:`/`dir:` target's directory, and the network is on so `skein post` and `curl` work (no bwrap; codex's own sandbox only)
+- `permission="research+shard"` → the same profile + isolated worktree, inside the bwrap wrapper; nothing in the worktree is writable (see [CODEX_SETUP.md](CODEX_SETUP.md#codex-in-shards))
 
 Every tier except `danger-full-access` also gets `-c approval_policy=never`, so a command the
 sandbox denies cannot be approved again outside it by an approval setting in
-`~/.codex/config.toml`. In a shard, codex's own writable roots are exactly the git metadata
+`~/.codex/config.toml`. A command matching a saved codex `allow` rule still runs outside the
+sandbox (see [CODEX_SETUP.md](CODEX_SETUP.md#saved-allow-rules)). In a shard, codex's own writable roots are exactly the git metadata
 Spindle's bwrap wrapper makes writable, and a shard spool whose codex sandbox cannot start
 inside the wrapper is refused (see [Codex Sandbox Enforcement](#codex-sandbox-enforcement)).
 
@@ -484,7 +485,9 @@ them unsandboxed. Spindle therefore pins `-c approval_policy=never` on every res
 tier, spin and respin alike. Under `never`, codex 0.154 rejects an escalation request
 (`approval policy is Never; reject command`) and never retries a denied command
 unsandboxed. `danger-full-access` has no sandbox to escape, so it keeps the operator's
-approval settings.
+approval settings. The pin does not cover a command that matches a saved codex `allow` rule:
+codex runs that command outside its sandbox at any approval policy (see
+[CODEX_SETUP.md](CODEX_SETUP.md#saved-allow-rules)).
 
 **Enforcement is not guaranteed and is not a property of the version string.** A
 `sandbox_mode` in `~/.codex/config.toml` can override `--sandbox`, and the vendored sandbox
@@ -509,11 +512,21 @@ Spindle's bwrap wrapper, and codex 0.154 masks `.git`, `.agents` and `.codex` un
 writable root it is given, mounting an empty read-only directory where one is missing. bwrap
 must create that mount point, so every codex writable root has to be writable in the
 wrapper too. Spindle grants codex exactly the git paths the wrapper binds
-(`<repo>/.git/worktrees/<name>`, `objects`, `refs/heads`, `logs/refs/heads`) and pins
-`sandbox_workspace_write.writable_roots` to them. Before each restrictive shard launch,
+(`<repo>/.git/worktrees/<name>`, `objects`, `refs/heads`, `logs/refs/heads`) plus the
+worktree root, and pins `sandbox_workspace_write.writable_roots` to that list. Before each restrictive shard launch,
 spin or respin, it runs one no-model `codex sandbox` command through that same wrapper with
 the same settings, and refuses the spool if the command did not run, quoting the reason.
 That check fails closed: no marker, an error or a timeout all refuse.
+
+**The research tiers run a permissions profile, probed the same way.** codex's `read-only`
+sandbox blocks all network, loopback included, so a research spool on it could not
+`skein post` to its site. Research tiers therefore pass no `--sandbox`; they select the
+`spindle-research` profile on the command line (read the whole filesystem, write only a
+`file:`/`dir:` target's directory, network on, approval never). The enforcement probe has a
+research variant: under that profile, with a probe-only directory as its one writable path,
+the write to the probe's cwd must be refused and the write to that directory must land. A
+codex that ignores the profile falls back to some other policy, fails one half, and research
+spools are refused.
 
 ## Spool Management
 
@@ -621,8 +634,9 @@ does). Note codex refuses to create the helper when `CODEX_HOME` is under a temp
 enforcing …` error.
 
 **Cause:** the enforcement probe found that the resolved codex does not actually block writes
-under `--sandbox`, so spindle refused to launch rather than run the spool unsandboxed. Check
-what was resolved and why:
+under `--sandbox` (or, for a research spool, does not apply the research permissions
+profile; the message names it), so spindle refused to launch rather than run the spool
+unsandboxed. Check what was resolved and why:
 ```bash
 spindle unspool <spool_id>   # the record carries codex_bin, codex_version, and sandbox_error
 ```
@@ -636,9 +650,8 @@ shard <worktree> (<reason>)`.
 **Cause:** codex's sandbox could not start inside Spindle's bwrap wrapper, so every command
 the agent ran would have failed. The reason is the sandbox's own error, usually `bwrap: Can't
 mkdir <path>: Read-only file system`, naming a mount point codex needed under a path the
-wrapper keeps read-only. On codex 0.154 this is expected for `research+shard` with a `file:`
-or `dir:` target, whose worktree the wrapper keeps read-only. For other tiers it means codex
-needed to write somewhere the wrapper does not bind. One known case is a `$TMPDIR` outside
+wrapper keeps read-only, which means codex needed to write somewhere the wrapper does not
+bind. One known case is a `$TMPDIR` outside
 `/tmp`: codex keeps its mount bookkeeping there (`failed to create synthetic bubblewrap
 mount registry …`), so unset `TMPDIR` or point it under `/tmp` for the Spindle service.
 Otherwise report it with the spool's `error`. A refused new shard is kept for inspection,

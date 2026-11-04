@@ -657,7 +657,8 @@ def _validate_research_target(research_target: Optional[str], working_dir: Optio
     return target
 
 
-def _research_target_preamble(target: Dict[str, str]) -> str:
+def _research_target_preamble(target: Dict[str, str], sandbox_note: Optional[str] = None) -> str:
+    """The research preamble; `sandbox_note` tells a harness's agent what its sandbox allows."""
     target_type = target["type"]
     value = target["value"]
     if target_type == "site":
@@ -672,6 +673,7 @@ def _research_target_preamble(target: Dict[str, str]) -> str:
         target_description = f"dir:{value}"
         target_instruction = f"Write artifacts within {value}. Do not write outside it."
 
+    note = f"{sandbox_note}\n\n" if sandbox_note else ""
     return f"""You are a research agent.
 
 You can read from the world (files, web, repos) but you cannot run python,
@@ -681,7 +683,7 @@ Your output target is: {target_description}.
 
 {target_instruction}
 
-Your task:
+{note}Your task:
 """
 
 
@@ -5202,12 +5204,13 @@ async def spin(
                     read-only, and "full" without shard intent opts out of bwrap.
                     Codex maps each profile to a --sandbox tier and pins
                     approval_policy=never on every tier but "full", so a denied
-                    command stays denied. Its read-only tier (readonly, site
-                    research) blocks all network, the local SKEIN service included,
-                    so such a spool cannot run skein commands; a site research
-                    spool's findings come back in its result. A careful codex
-                    spool cannot commit (.git stays read-only); a shard spool is
-                    refused if codex's sandbox cannot start inside the wrapper.
+                    command stays denied (a saved codex allow rule is the exception).
+                    readonly blocks all network, the local SKEIN service included,
+                    so it cannot run skein. Research runs a permissions profile:
+                    files read-only except the target's directory, network on, so
+                    skein post works. A careful codex spool cannot commit (.git stays
+                    read-only); a shard spool is refused if codex's sandbox cannot
+                    start inside the wrapper.
         research_target: Required for permission="research" or "research+shard".
                          Accepted forms: site:<id>, file:<absolute-path>, dir:<absolute-path>.
         shard: Run in isolated git worktree (SKEIN-aware with graceful fallback)
@@ -8238,7 +8241,8 @@ def _codex_sandbox_probe_argvs(codex_bin: str, shell_cmd: str, config_args: Opti
     is pinned via `-c` alone here — do not add `--sandbox`, it errors and the shape never runs.
 
     `config_args` replaces that read-only pin with a launch's own `-c` pins; the shard start
-    probe passes _codex_sandbox_config_args so it starts the sandbox the launch will start.
+    probe passes the pins from _codex_launch_policy so it starts the sandbox the launch will start;
+    the research enforcement probe passes the research permissions profile.
     """
     if config_args is None:
         config_args = ["-c", "sandbox_mode=read-only"]
@@ -8249,25 +8253,45 @@ def _codex_sandbox_probe_argvs(codex_bin: str, shell_cmd: str, config_args: Opti
     ]
 
 
-def _codex_sandbox_probe(codex_bin: str, process_env: Optional[Dict[str, str]] = None) -> bool:
+def _codex_sandbox_probe(codex_bin: str, process_env: Optional[Dict[str, str]] = None, research: bool = False) -> bool:
     """One uncached run of the enforcement probe. See _codex_sandbox_enforces.
 
     True only on a definite "the sandbox blocked the write" reading. Any other outcome —
     the write succeeded (fail open), no known CLI shape executed the command, an error or
     timeout — returns False, so uncertainty fails closed.
+
+    With `research`, the probe runs under the research permissions profile instead of
+    `-c sandbox_mode=read-only`, with one probe-only directory as the profile's writable
+    path. Both halves must hold: the write to the probe's cwd is blocked, and the write to
+    that directory lands. A codex that does not honor the profile resolves some other policy
+    (config.toml's sandbox_mode, or plain read-only), which fails one half or the other.
     """
+    label = "research profile" if research else "read-only"
     probe_dir = None
     try:
         probe_dir = tempfile.mkdtemp(prefix="spindle-codex-probe-")
         target = os.path.join(probe_dir, "enforce_probe.txt")
+        config_args = None
+        allowed_file = None
         # The marker is emitted only after the relative write was attempted. Its presence
         # proves that attempt completed under the sandbox; any target existence then proves
         # the read-only boundary failed. This runs with no model turn.
         shell_cmd = (
             f"printf BROKEN > enforce_probe.txt; write_rc=$?; echo {_CODEX_SANDBOX_PROBE_MARKER}; exit $write_rc"
         )
-        for argv in _codex_sandbox_probe_argvs(codex_bin, shell_cmd):
+        if research:
+            allowed_dir = os.path.join(probe_dir, "allowed")
+            os.mkdir(allowed_dir)
+            allowed_file = os.path.join(allowed_dir, "ok.txt")
+            config_args = _codex_research_profile_args([allowed_dir])
+            shell_cmd = (
+                "printf BROKEN > enforce_probe.txt; write_rc=$?; printf OK > allowed/ok.txt; "
+                f"echo {_CODEX_SANDBOX_PROBE_MARKER}; exit $write_rc"
+            )
+        for argv in _codex_sandbox_probe_argvs(codex_bin, shell_cmd, config_args=config_args):
             Path(target).unlink(missing_ok=True)  # no stale file from a prior shape
+            if allowed_file:
+                Path(allowed_file).unlink(missing_ok=True)
             try:
                 proc = subprocess.run(
                     argv,
@@ -8278,7 +8302,7 @@ def _codex_sandbox_probe(codex_bin: str, process_env: Optional[Dict[str, str]] =
                     env=process_env,
                 )
             except Exception as exc:
-                logger.warning("spindle: codex sandbox probe (read-only) argv failed on %s: %s", codex_bin, exc)
+                logger.warning("spindle: codex sandbox probe (%s) argv failed on %s: %s", label, codex_bin, exc)
                 continue
             if _CODEX_SANDBOX_PROBE_MARKER not in (proc.stdout or ""):
                 continue  # wrong CLI shape for this version — the command never ran
@@ -8290,15 +8314,25 @@ def _codex_sandbox_probe(codex_bin: str, process_env: Optional[Dict[str, str]] =
                 # target was never created. Logged at debug — as a warning it read like
                 # a probe failure and greeted every clean install's first codex spin.
                 logger.debug(
-                    "spindle: codex sandbox probe (read-only) target absent on %s — write was blocked",
+                    "spindle: codex sandbox probe (%s) target absent on %s — write was blocked",
+                    label,
                     codex_bin,
                 )
                 wrote = False
             except OSError as exc:
                 logger.warning(
-                    "spindle: codex sandbox probe (read-only) could not stat target on %s: %s",
+                    "spindle: codex sandbox probe (%s) could not stat target on %s: %s",
+                    label,
                     codex_bin,
                     exc,
+                )
+                return False
+            if allowed_file and not wrote and not os.path.exists(allowed_file):
+                logger.warning(
+                    "spindle: codex sandbox probe (%s) on %s: the profile's writable path was refused, "
+                    "so this codex did not apply Spindle's permissions profile; failing closed",
+                    label,
+                    codex_bin,
                 )
                 return False
             # The command demonstrably ran: blocked write -> enforcing, landed write -> fail
@@ -8306,13 +8340,15 @@ def _codex_sandbox_probe(codex_bin: str, process_env: Optional[Dict[str, str]] =
             return not wrote
         # No known CLI shape executed the probe — inconclusive.
         logger.warning(
-            "spindle: codex sandbox probe (read-only) ran no known CLI shape on %s; failing closed",
+            "spindle: codex sandbox probe (%s) ran no known CLI shape on %s; failing closed",
+            label,
             codex_bin,
         )
         return False
     except Exception as exc:
         logger.warning(
-            "spindle: codex sandbox probe (read-only) errored on %s: %s; failing closed",
+            "spindle: codex sandbox probe (%s) errored on %s: %s; failing closed",
+            label,
             codex_bin,
             exc,
         )
@@ -8322,13 +8358,16 @@ def _codex_sandbox_probe(codex_bin: str, process_env: Optional[Dict[str, str]] =
             shutil.rmtree(probe_dir, ignore_errors=True)
 
 
-def _codex_sandbox_enforces(codex_bin: Optional[str], process_env: Optional[Dict[str, str]] = None) -> bool:
+def _codex_sandbox_enforces(
+    codex_bin: Optional[str], process_env: Optional[Dict[str, str]] = None, research: bool = False
+) -> bool:
     """Whether `codex_bin` actually enforces its sandbox right now.
 
     Behavioral, not version-based: runs codex's no-model `codex sandbox` subcommand under
     read-only, attempts a write inside a scratch cwd, and reports whether the write was
     BLOCKED. Cached per binary/config context for the process lifetime, so identical launch
-    contexts reuse the result. It is never a model call.
+    contexts reuse the result. It is never a model call. `research` probes the research
+    permissions profile instead (see _codex_sandbox_probe), cached separately.
 
     Fails closed: a missing binary, an inconclusive probe, or any error returns False.
     """
@@ -8336,11 +8375,16 @@ def _codex_sandbox_enforces(codex_bin: Optional[str], process_env: Optional[Dict
         return False
 
     key = _codex_sandbox_probe_key(codex_bin, process_env)
+    if research:
+        key = (key, _CODEX_RESEARCH_PROFILE)
     cached = _CODEX_SANDBOX_ENFORCES_CACHE.get(key)
     if cached is not None:
         return cached
 
-    result = _codex_sandbox_probe(codex_bin, process_env)
+    if research:
+        result = _codex_sandbox_probe(codex_bin, process_env, research=True)
+    else:
+        result = _codex_sandbox_probe(codex_bin, process_env)
     _CODEX_SANDBOX_ENFORCES_CACHE[key] = result
     return result
 
@@ -8361,15 +8405,20 @@ def _codex_sandbox_refusal(
     """
     if sandbox not in _CODEX_RESTRICTIVE_SANDBOX_MODES:
         return None
-    if _codex_sandbox_enforces(codex_bin, process_env):
-        return None
+    if _codex_uses_research_profile(permission, sandbox):
+        if _codex_sandbox_enforces(codex_bin, process_env, research=True):
+            return None
+        enforced = f"Spindle's research permissions profile ({_CODEX_RESEARCH_PROFILE})"
+    else:
+        if _codex_sandbox_enforces(codex_bin, process_env):
+            return None
+        enforced = f"sandbox {sandbox}"
 
     tier = permission or sandbox
     return (
         f"REFUSED: codex sandbox is not enforcing on {codex_bin or 'codex (not found on PATH)'} "
-        f"({codex_version or 'unknown version'}); refusing to run a {tier} spool (sandbox "
-        f"{sandbox}) unsandboxed. Fix the codex install or use permission=full to run without "
-        f"a sandbox."
+        f"({codex_version or 'unknown version'}); refusing to run a {tier} spool ({enforced}) "
+        f"unsandboxed. Fix the codex install or use permission=full to run without a sandbox."
     )
 
 
@@ -8912,6 +8961,86 @@ def _codex_sandbox_config_args(sandbox: str, shard_info: Optional[dict], grants:
     return args
 
 
+# Research tiers on codex run through a permissions profile, not `--sandbox`: the filesystem
+# is read-only except the output target, and the network is on. A read-only `--sandbox`
+# unshares the network, loopback included, so with approval pinned to never a site research
+# spool could not run the `skein post` its preamble asks for. See _codex_research_profile_args.
+_CODEX_RESEARCH_PERMISSIONS = frozenset({"research", "research+shard"})
+_CODEX_RESEARCH_PROFILE = "spindle-research"
+
+
+def _codex_uses_research_profile(permission: Optional[str], sandbox: Optional[str]) -> bool:
+    """Whether a launch at `permission` / `sandbox` runs through the research profile."""
+    return permission in _CODEX_RESEARCH_PERMISSIONS and sandbox in _CODEX_RESTRICTIVE_SANDBOX_MODES
+
+
+def _codex_research_profile_args(writable_paths: list) -> list:
+    """The `-c` pins that run codex under Spindle's research permissions profile.
+
+    The profile reads the whole filesystem, writes only `writable_paths` (a file/dir research
+    target's directory, or nothing for a site target), and has the network on, so `skein
+    post` and `curl` work. Approval stays pinned to never. codex 0.154 selects a profile from
+    `default_permissions` on the command line ahead of a `sandbox_mode` in config.toml, but a
+    `--sandbox` flag forces its legacy syntax and the profile is then ignored
+    (core/src/config/mod.rs resolve_permission_config_syntax), so a research launch passes
+    no `--sandbox` and no `-c sandbox_mode`. Whether the binary honors the profile is checked
+    by behavior before launch (_codex_sandbox_probe with research=True).
+    """
+    profile = _CODEX_RESEARCH_PROFILE
+    entries = [(":root", "read"), *((path, "write") for path in writable_paths)]
+    filesystem = (
+        "{" + ", ".join(f"{_toml_basic_string(key)} = {_toml_basic_string(mode)}" for key, mode in entries) + "}"
+    )
+    return [
+        "-c",
+        f"default_permissions={_toml_basic_string(profile)}",
+        "-c",
+        f"permissions.{profile}.filesystem={filesystem}",
+        "-c",
+        f"permissions.{profile}.network.enabled=true",
+        "-c",
+        "approval_policy=never",
+    ]
+
+
+def _codex_research_writable_paths(research_target_info: Optional[Dict[str, str]]) -> list:
+    if research_target_info and research_target_info["type"] in {"file", "dir"}:
+        return [_research_writable_path(research_target_info)]
+    return []
+
+
+def _codex_launch_policy(
+    sandbox: str,
+    permission: Optional[str],
+    shard_info: Optional[dict],
+    research_target_info: Optional[Dict[str, str]],
+) -> tuple:
+    """(`--sandbox` flags, `-c` pins, `--add-dir` grants) for one codex launch at `sandbox`.
+
+    Spin, respin and the shard start probe all take the pins from here, so the probe starts
+    exactly the sandbox the launch will. A research tier gets the research profile and no
+    `--sandbox` or `--add-dir` (its one writable path is in the profile); every other tier
+    gets `--sandbox` plus _codex_sandbox_config_args.
+    """
+    if _codex_uses_research_profile(permission, sandbox):
+        return [], _codex_research_profile_args(_codex_research_writable_paths(research_target_info)), []
+    grants = _codex_writable_grants(shard_info, research_target_info)
+    return ["--sandbox", sandbox], _codex_sandbox_config_args(sandbox, shard_info, grants), grants
+
+
+def _codex_research_sandbox_note(research_target_info: Optional[Dict[str, str]]) -> str:
+    """What a codex research agent's sandbox allows, for its preamble."""
+    writable = _codex_research_writable_paths(research_target_info)
+    if writable:
+        files = f"Every file is read-only except under {writable[0]}"
+    else:
+        files = "Every file is read-only"
+    return (
+        f"Your sandbox: {files}, and the network is open (skein and curl work). A command "
+        f"that needs to write anywhere else fails, and you cannot ask for more access."
+    )
+
+
 _CODEX_PROBE_STDERR_NOISE = ("note: run with `RUST_BACKTRACE", "WARNING: proceeding")
 
 
@@ -8932,23 +9061,22 @@ def _codex_probe_failure_line(stderr: str, returncode: int) -> str:
 
 def _codex_shard_sandbox_start_failure(
     codex_bin: str,
-    sandbox: str,
     shard_info: dict,
-    grants: list,
+    config_args: list,
     research_target_info: Optional[Dict[str, str]],
     process_env: Optional[Dict[str, str]],
 ) -> Optional[str]:
     """Why codex's own sandbox cannot start inside this shard's wrapper, or None if it can.
 
     Runs one no-model `codex sandbox` command through the launch's own bwrap wrapper, with the
-    launch's own `-c` pins and writable roots, from the worktree root (where `--cd` puts a real
-    launch). The command only echoes a marker: its appearance proves bwrap, seccomp and the
-    sandbox helper all came up. Anything else (no marker, an error, a timeout) is a failure,
-    so an inconclusive probe refuses rather than launches.
+    launch's own `-c` pins (from _codex_launch_policy, writable roots included), from the
+    worktree root (where `--cd` puts a real launch). The command only echoes a marker: its
+    appearance proves bwrap, seccomp and the sandbox helper all came up. Anything else (no
+    marker, an error, a timeout) is a failure, so an inconclusive probe refuses rather than
+    launches.
     """
     worktree_root = shard_info["worktree_path"]
     shell_cmd = f"echo {_CODEX_SANDBOX_PROBE_MARKER}"
-    config_args = _codex_sandbox_config_args(sandbox, shard_info, grants)
     failures = []
     for inner in _codex_sandbox_probe_argvs(codex_bin, shell_cmd, config_args=config_args):
         cmd = _codex_bwrap_wrap(
@@ -8985,7 +9113,7 @@ def _codex_shard_sandbox_refusal(
     sandbox: str,
     permission: Optional[str],
     shard_info: Optional[dict],
-    grants: list,
+    config_args: list,
     research_target_info: Optional[Dict[str, str]],
     process_env: Optional[Dict[str, str]],
 ) -> Optional[str]:
@@ -9000,7 +9128,7 @@ def _codex_shard_sandbox_refusal(
     if not shard_info or sandbox not in _CODEX_RESTRICTIVE_SANDBOX_MODES:
         return None
     detail = _codex_shard_sandbox_start_failure(
-        codex_bin or "codex", sandbox, shard_info, grants, research_target_info, process_env
+        codex_bin or "codex", shard_info, config_args, research_target_info, process_env
     )
     if detail is None:
         return None
@@ -9204,12 +9332,18 @@ def _codex_spin_sync(
             _record_pre_spawn_failure(spool_id, error)
             return f"Error: {error}"
 
+    # A research tier runs codex under the research permissions profile: files read-only
+    # except its output target, network on. Its preamble says so, and a research shard gets
+    # no commit instructions, since nothing in the worktree is writable to it.
+    research_profile = _codex_uses_research_profile(permission, effective_sandbox)
+
     # Inject shard instructions into prompt
     effective_prompt = prompt
     if research_target_info:
-        effective_prompt = _research_target_preamble(research_target_info) + prompt
+        sandbox_note = _codex_research_sandbox_note(research_target_info) if research_profile else None
+        effective_prompt = _research_target_preamble(research_target_info, sandbox_note=sandbox_note) + prompt
 
-    omit_shard_commit_preamble = _research_omits_shard_commit_preamble(research_target_info)
+    omit_shard_commit_preamble = research_profile or _research_omits_shard_commit_preamble(research_target_info)
 
     if shard_info and not omit_shard_commit_preamble:
         if _has_skein(working_dir) and not skeinless:
@@ -9274,12 +9408,15 @@ Your task:
     if resolved_model:
         codex_cmd.extend(["--model", resolved_model])
 
-    # Grants: the research output, or a shard's git paths and worktree root (resolved via the
-    # worktree root, since cwd may be a subdirectory). See _codex_writable_grants.
-    grants = _codex_writable_grants(shard_info, research_target_info)
-
-    codex_cmd.extend(["--sandbox", effective_sandbox])
-    codex_cmd.extend(_codex_sandbox_config_args(effective_sandbox, shard_info, grants))
+    # The tier: `--sandbox` plus its `-c` pins, or for a research tier the research
+    # permissions profile with no `--sandbox`. Grants: a shard's git paths and worktree root
+    # (resolved via the worktree root, since cwd may be a subdirectory), or a non-research
+    # launch's research output. See _codex_launch_policy.
+    sandbox_flags, config_args, grants = _codex_launch_policy(
+        effective_sandbox, permission, shard_info, research_target_info
+    )
+    codex_cmd.extend(sandbox_flags)
+    codex_cmd.extend(config_args)
 
     if shard_info:
         codex_cmd.extend(["--cd", shard_info["worktree_path"]])
@@ -9315,8 +9452,10 @@ Your task:
         "session_id": None,  # Will be extracted from output
         "working_dir": cwd,
         "model": resolved_model or "default",
-        # The tier actually passed to codex, not the one that was merely asked for.
+        # The tier actually passed to codex, not the one that was merely asked for. A
+        # research tier passes it as the permissions profile named below, not as --sandbox.
         "sandbox": effective_sandbox,
+        "codex_permissions_profile": _CODEX_RESEARCH_PROFILE if research_profile else None,
         # The requested tier, kept so a respin can re-derive the same sandbox.
         "permission": permission,
         # Which codex actually ran: enforcement varies by version, and PATH decides.
@@ -9345,7 +9484,7 @@ Your task:
     # cannot start there every command fails. Checked once the shard exists, since the probe
     # needs its real paths. The refused spool keeps a newly created shard for inspection.
     shard_refusal = _codex_shard_sandbox_refusal(
-        codex_bin, effective_sandbox, permission, shard_info, grants, research_target_info, process_env
+        codex_bin, effective_sandbox, permission, shard_info, config_args, research_target_info, process_env
     )
     if shard_refusal:
         _record_pre_spawn_failure(spool_id, shard_refusal, spool)
@@ -9451,15 +9590,15 @@ def _codex_respin_sync(session_id: str, prompt: str) -> str:
     # Build codex exec resume command.
     # --sandbox, --cd and --add-dir are `codex exec` flags that `codex exec resume` does not
     # accept, so they must all precede the `resume` subcommand, and so do the `-c` pins
-    # (sandbox_mode matching --sandbox, the approval pin, a shard's writable roots) and
-    # --skip-git-repo-check, all for the same reasons as on a fresh spin (see
-    # _codex_spin_sync and _codex_sandbox_config_args).
+    # (sandbox_mode matching --sandbox or the research permissions profile, the approval pin,
+    # a shard's writable roots) and --skip-git-repo-check, all for the same reasons as on a
+    # fresh spin (see _codex_spin_sync and _codex_launch_policy).
     #
     # Grants are resolved via the worktree root (shard_info), not working_dir, since
     # working_dir may be a subdirectory inside the worktree.
-    grants = _codex_writable_grants(shard_info, research_target_info)
-    codex_cmd = [codex_bin or "codex", "exec", "--skip-git-repo-check", "--sandbox", sandbox]
-    codex_cmd.extend(_codex_sandbox_config_args(sandbox, shard_info, grants))
+    research_profile = _codex_uses_research_profile(permission, sandbox)
+    sandbox_flags, config_args, grants = _codex_launch_policy(sandbox, permission, shard_info, research_target_info)
+    codex_cmd = [codex_bin or "codex", "exec", "--skip-git-repo-check", *sandbox_flags, *config_args]
     if shard_info:
         codex_cmd.extend(["--cd", shard_info["worktree_path"]])
 
@@ -9502,6 +9641,7 @@ def _codex_respin_sync(session_id: str, prompt: str) -> str:
         # resolve to this record instead of the original spin (both share the session_id,
         # and _list_spools globs in arbitrary order), so the tier has to survive here too.
         "sandbox": sandbox,
+        "codex_permissions_profile": _CODEX_RESEARCH_PROFILE if research_profile else None,
         "permission": permission,
         "research_target": research_target,
         "codex_bin": codex_bin,
@@ -9521,7 +9661,7 @@ def _codex_respin_sync(session_id: str, prompt: str) -> str:
     # Fail closed inside a shard, as on a fresh spin: the worktree, its git metadata or codex
     # itself may have changed since the session was spun.
     shard_refusal = _codex_shard_sandbox_refusal(
-        codex_bin, sandbox, permission, shard_info, grants, research_target_info, process_env
+        codex_bin, sandbox, permission, shard_info, config_args, research_target_info, process_env
     )
     if shard_refusal:
         _record_pre_spawn_failure(spool_id, shard_refusal, spool)
