@@ -468,8 +468,11 @@ whose codex does not enforce it; only `danger-full-access` (see above) runs with
 **Q: Does Codex support shards (isolated worktrees)?**
 A: Yes. `shard` and `careful+shard` create a worktree, run codex there at `workspace-write`
 (the `spindle spin` CLI maps `shard` to `danger-full-access`), and on Linux wrap it in
-bwrap: the worktree, `/tmp`, codex's state and the git metadata a commit needs are
-writable, and the rest of the filesystem is read-only.
+bwrap. Inside that wrapper the worktree, `/tmp`, the git metadata a commit needs, and
+these home directories when they exist are writable: `~/.codex` (or `$CODEX_HOME`),
+`~/.claude`, `~/.claude.json`, `~/.anthropic`, `~/.gemini`, `~/.spindle`, `~/.config` and
+`~/.cache`. Everything else is read-only. With `danger-full-access` this outer wrapper is
+the only boundary, so a full-access spool can write those home directories.
 
 **Q: How do I switch from Claude to Codex for an existing task?**
 A: You can't switch mid-session. Finish with Claude, then start a new spool with Codex if needed.
