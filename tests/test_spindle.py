@@ -4455,6 +4455,36 @@ class TestGeminiHarness:
         assert (str(host_home / ".codex"), str(host_home / ".codex")) not in binds
 
 
+def _codex_research_filesystem(cmd):
+    """The filesystem table of the codex research permissions profile in an argv.
+
+    Each launch names its own profile (spindle-research-<id>), so find the name first.
+    """
+    import tomllib
+
+    def last(prefix):
+        values = [
+            cmd[i + 1].split("=", 1)[1]
+            for i, tok in enumerate(cmd[:-1])
+            if tok == "-c" and cmd[i + 1].startswith(prefix)
+        ]
+        assert values, f"no {prefix} in {cmd!r}"
+        return tomllib.loads(f"v = {values[-1]}")["v"]
+
+    name = last("default_permissions=")
+    assert name.startswith("spindle-research-"), name
+    return last(f"permissions.{name}.filesystem=")
+
+
+def _codex_shard_sandbox_starts():
+    """Stub the shard start probe, which would otherwise run `codex sandbox` for real.
+
+    These tests build shard launches against a fake codex binary; the probe itself is
+    covered in tests/test_codex_containment.py.
+    """
+    return patch("spindle._codex_shard_sandbox_start_failure", new=lambda *args: None)
+
+
 def test_kimi_bwrap_resolution_ignores_caller_path():
     with patch("spindle.shutil.which", return_value="/usr/bin/bwrap") as which:
         assert spindle._kimi_bwrap_binary({"PATH": "/project/bin"}) == "/usr/bin/bwrap"
@@ -6193,8 +6223,9 @@ class TestSpinHarnesses:
         assert captured["sandbox"] == "read-only"
         assert captured["kwargs"]["require_research_target"] is True
 
-    def test_codex_research_file_permission_uses_workspace_write_with_add_dir(self, tmp_path):
-        """Codex file research uses workspace-write plus a target-parent add-dir grant."""
+    def test_codex_research_file_permission_writes_only_the_target_parent(self, tmp_path):
+        """Codex file research runs the research permissions profile: the filesystem is
+        read-only except the target's parent directory, with no --sandbox and no --add-dir."""
         target = tmp_path / "report.md"
         captured_cmd = []
 
@@ -6216,13 +6247,13 @@ class TestSpinHarnesses:
                             env=None,
                             research_target=f"file:{target}",
                             require_research_target=True,
+                            permission="research",
                         )
 
         assert result.startswith("codex-")
-        sandbox_idx = captured_cmd.index("--sandbox")
-        assert captured_cmd[sandbox_idx + 1] == "workspace-write"
-        add_dirs = [captured_cmd[i + 1] for i, tok in enumerate(captured_cmd) if tok == "--add-dir"]
-        assert str(tmp_path) in add_dirs
+        assert "--sandbox" not in captured_cmd
+        assert "--add-dir" not in captured_cmd
+        assert _codex_research_filesystem(captured_cmd) == {":root": "read", str(tmp_path): {".": "write"}}
 
     def test_spin_codex_research_file_maps_to_workspace_write(self, tmp_path):
         """spin() must choose workspace-write for writable Codex research targets."""
@@ -6515,6 +6546,7 @@ class TestSpawnFailureRecovery:
         assert spool["shard"]["startup_failure_preserved"] is True
         assert worktree.exists()
 
+    @_codex_shard_sandbox_starts()
     def test_codex_spawn_failure_preserves_pristine_shard_for_inspection(self, tmp_path):
         repo = tmp_path / "repo"
         worktree = tmp_path / "worktree"
@@ -7155,6 +7187,7 @@ class TestDetectExistingShard:
             f"main_repo derived via .parent.parent {main_repo!r} must match the actual repo root {repo!r}"
         )
 
+    @_codex_shard_sandbox_starts()
     def test_codex_spin_sync_reuses_existing_shard(self, tmp_path):
         """
         Mirror of test_spin_reuses_existing_shard_instead_of_spawning_new for
@@ -7313,6 +7346,7 @@ class TestShardSpawnPreamblesAndCodexCd:
         assert "skein ready --name" not in prompt
         assert "2. Then: skein ready" in prompt
 
+    @_codex_shard_sandbox_starts()
     def test_codex_spin_sync_adds_cd_and_omits_ready_name_flag(self, tmp_path):
         fake_shard_path = tmp_path / "worktrees" / "codex-20260503-001"
         fake_shard = self._make_fake_shard_info(fake_shard_path)
@@ -7349,6 +7383,7 @@ class TestShardSpawnPreamblesAndCodexCd:
         assert "skein ready --name" not in prompt
         assert "2. Then: skein ready" in prompt
 
+    @_codex_shard_sandbox_starts()
     def test_codex_spin_sync_wraps_in_bwrap_for_shard(self, tmp_path):
         """bwrap should wrap codex commands for shards when bwrap is available."""
         fake_shard_path = tmp_path / "worktrees" / "codex-20260503-bwrap"
@@ -7396,6 +7431,7 @@ class TestShardSpawnPreamblesAndCodexCd:
         assert "--chdir" in cmd, f"Expected --chdir in bwrap command: {cmd!r}"
         assert "/usr/bin/codex" in cmd, f"Expected resolved codex in bwrap-wrapped command: {cmd!r}"
 
+    @_codex_shard_sandbox_starts()
     def test_codex_spin_sync_warns_when_bwrap_unavailable_for_shard(self, tmp_path, capsys):
         """When bwrap is not available for a shard, log a warning and run without it."""
         fake_shard_path = tmp_path / "worktrees" / "codex-20260503-nobwrap"
@@ -8076,8 +8112,9 @@ class TestShardMergeCleanupFailure:
 class TestCodexRespinPreservesGitAccess:
     """Regression for round-3 fell finding B: _codex_respin_sync must derive
     .git from shard_info['worktree_path'], not working_dir, so a subdirectory
-    cwd doesn't lose --add-dir grants for the main repo and worktree root."""
+    cwd doesn't lose --add-dir grants for the shard's git metadata and worktree root."""
 
+    @_codex_shard_sandbox_starts()
     def test_codex_respin_subdirectory_cwd_preserves_git_access(self, tmp_path):
         # Build a real repo + worktree so the gitdir resolution exercises
         # actual filesystem state instead of mocks.
@@ -8141,10 +8178,19 @@ class TestCodexRespinPreservesGitAccess:
         add_dirs = [cmd[i + 1] for i, tok in enumerate(cmd) if tok == "--add-dir"]
         resolved = {str(Path(d).resolve()) for d in add_dirs}
 
+        # The grant is the git metadata a commit writes, the same paths the shard wrapper
+        # binds writable, and never the main .git itself: codex masks `.git` under every
+        # writable root, and the wrapper keeps the main .git read-only, so granting it stops
+        # codex's sandbox from starting (issue-20261022-zebt).
         main_git = (repo / ".git").resolve()
-        assert str(main_git) in resolved, (
-            f"codex respin must --add-dir the main repo's .git ({main_git}); got {add_dirs!r}"
-        )
+        assert str(main_git) not in resolved, f"the main repo's .git must not be a codex grant; got {add_dirs!r}"
+        for git_path in [
+            main_git / "worktrees" / "shard-codex-respin-001",
+            main_git / "objects",
+            main_git / "refs" / "heads",
+            main_git / "logs" / "refs" / "heads",
+        ]:
+            assert str(git_path) in resolved, f"codex respin must --add-dir {git_path}; got {add_dirs!r}"
         assert str(wt_path.resolve()) in resolved, (
             f"codex respin must --add-dir the worktree root ({wt_path}) so a "
             f"subdirectory cwd retains write access to sibling files; got {add_dirs!r}"
@@ -8164,6 +8210,7 @@ class TestCodexRespinPreservesGitAccess:
             f"--cd at index {cd_idx} must come before `resume` at index {resume_idx}; cmd={cmd!r}"
         )
 
+    @_codex_shard_sandbox_starts()
     def test_codex_respin_sets_cd_to_shard_worktree(self, tmp_path):
         session_id = "codex-session-cd"
         worktree_path = tmp_path / "worktrees" / "codex-respin-001"
@@ -8257,6 +8304,7 @@ class TestCodexRespinPreservesGitAccess:
             "tags": ["codex"],
         }
 
+    @_codex_shard_sandbox_starts()
     def test_codex_respin_sync_wraps_in_bwrap_for_shard(self, tmp_path):
         """bwrap wraps codex respin commands for shards when bwrap is available."""
         worktree_path = tmp_path / "worktrees" / "codex-respin-bwrap"
@@ -8293,6 +8341,7 @@ class TestCodexRespinPreservesGitAccess:
         assert "--chdir" in cmd
         assert "/usr/bin/codex" in cmd
 
+    @_codex_shard_sandbox_starts()
     def test_codex_respin_sync_warns_when_bwrap_unavailable_for_shard(self, tmp_path, capsys):
         """Warning is logged when bwrap is absent for a respin shard."""
         worktree_path = tmp_path / "worktrees" / "codex-respin-nobwrap"
@@ -8322,6 +8371,7 @@ class TestCodexRespinPreservesGitAccess:
         assert "WARNING" in out
         assert "bwrap" in out.lower()
 
+    @_codex_shard_sandbox_starts()
     def test_codex_respin_research_shard_binds_output_dir_writable(self, tmp_path):
         """A research+shard respin must bind its research OUTPUT dir writable in the
         outer bwrap, not the worktree root — mirroring _codex_spin_sync. Without
@@ -8375,9 +8425,9 @@ class TestCodexRespinPreservesGitAccess:
         # ...not the worktree root (which the non-research path binds instead).
         wt_bound = any(cmd[i] == "--bind" and cmd[i + 1] == wt and cmd[i + 2] == wt for i in range(len(cmd) - 2))
         assert not wt_bound, f"worktree root must not be the writable bind for a research respin: {cmd!r}"
-        # And codex still gets the --add-dir grant for that dir.
-        add_dirs = [cmd[i + 1] for i, tok in enumerate(cmd) if tok == "--add-dir"]
-        assert out in add_dirs, f"codex must --add-dir the research output dir {out}: {add_dirs!r}"
+        # And codex's research permissions profile makes that dir, and only it, writable.
+        assert _codex_research_filesystem(cmd) == {":root": "read", out: {".": "write"}}, cmd
+        assert "--sandbox" not in cmd, "a research respin runs the permissions profile, not --sandbox"
 
 
 class TestAtomicJsonCreate:
@@ -8755,13 +8805,16 @@ class TestCodexSandboxEnforcement:
         [
             ("readonly", "read-only"),
             ("careful", "workspace-write"),
-            ("research", "read-only"),
             ("full", "danger-full-access"),
             (None, "workspace-write"),
         ],
     )
     def test_sandbox_flag_passed_for_each_tier(self, tmp_path, permission, expected_sandbox):
-        """Every tier reaches codex as an explicit --sandbox value."""
+        """Every non-research tier reaches codex as an explicit --sandbox value.
+
+        Research tiers pass their tier as a permissions profile instead; see
+        tests/test_codex_containment.py TestResearchProfile.
+        """
         sandbox = _codex_sandbox_for_permission(permission, None)
         assert sandbox == expected_sandbox, f"permission {permission!r} should map to {expected_sandbox!r}"
 
@@ -10697,8 +10750,8 @@ class TestCodexSandboxEnforcement:
     def test_codex_retry_preserves_research_target_grant(self, tmp_path):
         """spool_retry re-launches a codex spool through _codex_spin_sync and must
         thread the stored research_target + permission — otherwise a retried research
-        spool loses its --add-dir output grant and runs plain workspace-write with no
-        way to write its output. (The sandbox tier already survives via stored sandbox.)"""
+        spool loses its output grant (the research permissions profile's writable path)
+        and has no way to write its output. (The sandbox tier survives via stored sandbox.)"""
         _retry = spool_retry.fn if hasattr(spool_retry, "fn") else spool_retry
         output_dir = tmp_path / "research-out"
         output_dir.mkdir()
@@ -10731,9 +10784,8 @@ class TestCodexSandboxEnforcement:
         assert not result.startswith("Error"), result
         assert len(captured_cmd) == 1
         cmd = captured_cmd[0]
-        add_dirs = [cmd[i + 1] for i, tok in enumerate(cmd) if tok == "--add-dir"]
-        assert str(output_dir) in add_dirs, (
-            f"retried codex research spool must keep its --add-dir {output_dir} grant; got {add_dirs!r}"
+        assert _codex_research_filesystem(cmd) == {":root": "read", str(output_dir): {".": "write"}}, (
+            f"retried codex research spool must keep its {output_dir} grant; got {cmd!r}"
         )
         # The new spool record carries the research target + permission forward.
         retry_spool = _read_spool(result)

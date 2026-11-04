@@ -225,6 +225,20 @@ Web-egress work (WebFetch, WebSearch, curl) belongs in `research` — the other 
 
 You can also pass explicit `allowed_tools` to override the profile.
 
+Codex harness: each profile maps to a codex `--sandbox` tier (`readonly` → `read-only`,
+`careful` → `workspace-write`, `full` → `danger-full-access`), and the research profiles to
+a codex permissions profile that reads everything, writes only the research target's
+directory and has the network on (the full table is in
+[docs/CODEX_SETUP.md](docs/CODEX_SETUP.md#sandbox-policies)). Every tier except
+`danger-full-access` also pins `approval_policy=never`, so an approval setting in
+`~/.codex/config.toml` cannot re-run a command the sandbox denied outside it; a command
+matching a saved codex `allow` rule is the exception
+([Saved allow rules](docs/CODEX_SETUP.md#saved-allow-rules)). A shard spool runs codex's
+sandbox inside Spindle's bwrap wrapper and is refused if that sandbox cannot start there. A
+`readonly` codex spool has no network, so it cannot run `skein`. A `careful` codex spool
+cannot commit (codex keeps `.git` read-only); use `careful+shard`. Network access inside
+`workspace-write` follows codex's own `[sandbox_workspace_write] network_access` setting.
+
 ### Isolated workspaces with shards
 
 Run agents in isolated git worktrees to prevent conflicts:
