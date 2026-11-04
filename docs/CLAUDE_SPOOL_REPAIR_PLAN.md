@@ -1,6 +1,13 @@
 # Claude spool ownership and observability repair plan
 
-Status: proposed; plan only, not yet implemented
+Status: partly implemented; kept as the design record. Items 1 to 3 landed: the
+store supervisor (4bc7eaf, 2026-07-30; it now reconciles the per-spool owners
+that `docs/HARNESS_LIFECYCLE_REMEDIATION_PLAN.md` introduced), the stream driver as
+the Claude default with `SPINDLE_CLAUDE_STREAM_DRIVER=0` as rollback (5c0ea3e,
+2026-08-19), and live Claude lifecycle telemetry (a2ab382, 2026-08-24). Items 4 to
+6 (cancellation source and reason fields with capture retention, the auto-mode
+model deny-list, and stored permission-denial summaries) were not implemented as
+written. Checked against master 138e07e on 2026-11-03.
 
 Primary evidence:
 
