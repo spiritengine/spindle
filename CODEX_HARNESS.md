@@ -38,11 +38,14 @@ spool_id = completion["spool_id"]
 - `prompt` (required): The task/question for the Codex agent
 - `working_dir` (required): Directory for the agent to work in
 - `harness` (required): Set to "codex" to use Codex CLI
-- `model` (optional): Model to use (e.g., "gpt-5.5")
+- `model` (optional): Model to use (e.g., "sol", "astra", or a full model name)
 - `permission` (optional): Mapped to Codex sandbox policy:
-  - `"readonly"` → `"read-only"`
-  - `"full"` or `"shard"` → `"danger-full-access"`
+  - `"readonly"` / `"manual"` → `"read-only"`
+  - `"full"` → `"danger-full-access"`
+  - `"shard"` → `"workspace-write"` through MCP `spin`; the `spindle spin` CLI maps it to `"danger-full-access"`
+  - `"research"` / `"research+shard"` → `"read-only"` for a `site:` target, `"workspace-write"` plus `--add-dir` for a `file:` or `dir:` target
   - Other → `"workspace-write"`
+- `shard` (optional): Run in an isolated git worktree (also via `permission="shard"` or `"careful+shard"`)
 - `timeout` (optional): Kill spool after this many seconds
 - `wait` (default True): Wait for the result; False returns an ID immediately
 - `wait_timeout` (optional): Bound the wait without stopping the spool
@@ -52,7 +55,7 @@ spool_id = completion["spool_id"]
 
 ### unspool (auto-detects harness)
 
-Get the result of a background spin task. Automatically detects whether the spool uses Claude Code or Codex.
+Read a spool's saved result (works for any spool, waited on or not). Automatically detects whether the spool uses Claude Code or Codex.
 
 ```python
 result = unspool(spool_id)
@@ -102,7 +105,7 @@ Codex spools include a `harness` field set to "codex" to distinguish them from C
   "status": "running",
   "prompt": "Write a CSV parser",
   "working_dir": "/path/to/project",
-  "model": "gpt-5.5",
+  "model": "gpt-5.6-sol",
   "sandbox": "workspace-write",
   "tags": ["codex", "csv"],
   "session_id": null,
@@ -113,7 +116,7 @@ Codex spools include a `harness` field set to "codex" to distinguish them from C
 
 ### Session Continuity
 
-The harness uses `codex resume <session_id>` to continue conversations. Session IDs are extracted from the Codex CLI JSON output and stored in the spool metadata.
+The harness uses `codex exec resume <session_id>` to continue conversations. Session IDs are extracted from the Codex CLI JSON output and stored in the spool metadata.
 
 ### Integration with Spindle
 
@@ -150,19 +153,16 @@ result2 = next_completion["result"]
 
 | Feature | Claude Code (`harness="claude-code"`) | Codex CLI (`harness="codex"`) |
 |---------|---------------------|-------------------------|
-| Command | `claude exec` | `codex exec` |
+| Command | `claude -p` | `codex exec` |
 | Spool prefix | 8-char UUID | `codex-` + 8-char UUID |
-| Shard support | Full (via `permission="shard"`) | Not yet implemented |
-| SKEIN integration | Full | Not yet implemented |
+| Shard support | `shard`, `careful+shard` (bwrap-contained on Linux) | `shard`, `careful+shard` (worktree at `workspace-write`, bwrap-wrapped on Linux) |
+| SKEIN integration | In a SKEIN project, shards spawn through `skein shard spawn` and shard agents get SKEIN orientation unless `skeinless=True` | Same |
 | Permission modes | careful, readonly, full, shard | Mapped to sandbox policies (read-only, workspace-write, danger-full-access) |
 | Model selection | sonnet, opus, haiku | gpt-5.6-sol default; ChatGPT auth maps gpt-5.6 to Sol |
-| Session resume | `--resume` flag | `codex resume` command |
+| Session resume | `--resume` flag | `codex exec resume` command |
 
 ## Future Enhancements
 
-- [ ] Add shard support for Codex (isolated git worktrees)
-- [ ] SKEIN integration for Codex agents
-- [ ] Extract session_id automatically from Codex JSON output
 - [ ] Support Codex-specific features (screenshots, web search, MCP tools)
 - [ ] Add reasoning effort control (`--reasoning-effort`)
 - [ ] Support for Codex agent skills
@@ -202,7 +202,7 @@ To test the Codex harness:
 
 **Spool stuck in "running" state**
 - Check if Codex process is still alive
-- Review logs in `~/.spindle/<spool_id>.stdout`
+- Review the captured output in `~/.spindle/spools/<spool_id>.stdout` (or `$SPINDLE_HOME/spools/`)
 - Kill stuck process and retry
 
 **"Max concurrent spools" error**

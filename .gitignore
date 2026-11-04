@@ -43,6 +43,9 @@ htmlcov/
 
 # Project-specific
 worktrees/
+# The project builds with setuptools and CI/CONTRIBUTING use pip; a local uv
+# lock is a personal artifact, not a pinned dev environment.
+uv.lock
 .skein/
 .claude/
 .hypothesis/

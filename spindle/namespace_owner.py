@@ -129,6 +129,38 @@ def _type_strict_json_equal(left, right) -> bool:
     return left == right
 
 
+# Strict readers of owner artifacts treat absurd nesting as malformed. They once
+# relied on json.loads raising RecursionError, but where that happens belongs to
+# the interpreter: Python 3.14 bounds the decoder by the thread's stack size, and
+# with a large stack it parses documents 100,000 levels deep that 3.11 to 3.13
+# refuse. Spindle's own records nest a handful of levels. 256 matches the
+# refusal-record reader in spindle/__init__.py and keeps what these readers
+# return within the recursion limits of the code that handles it next
+# (_type_strict_json_equal, deepcopy, json.dump) on every supported Python.
+_MAX_JSON_NESTING_DEPTH = 256
+
+
+def _json_loads_with_nesting_cap(text: str):
+    """json.loads that raises ValueError when containers nest past _MAX_JSON_NESTING_DEPTH.
+
+    The outermost container is level 1. Depth is checked on the decoded value,
+    iteratively: the logical owner rereads its spool record on every poll (20 ms
+    by default), and scanning the raw text first would cost more than the parse.
+    A document deep enough to exhaust the decoder still raises RecursionError,
+    which every caller already treats as malformed.
+    """
+    value = json.loads(text)
+    pending = [(value, 1)] if isinstance(value, (dict, list)) else []
+    while pending:
+        container, depth = pending.pop()
+        if depth > _MAX_JSON_NESTING_DEPTH:
+            raise ValueError(f"JSON nesting exceeds {_MAX_JSON_NESTING_DEPTH} levels")
+        for child in container.values() if isinstance(container, dict) else container:
+            if isinstance(child, (dict, list)):
+                pending.append((child, depth + 1))
+    return value
+
+
 def _positive_json_integer(value, field: str) -> int:
     """Return a plain positive JSON integer, rejecting Python coercions."""
     if type(value) is not int or value <= 0:

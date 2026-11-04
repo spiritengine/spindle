@@ -2,8 +2,8 @@
 
 Reference copies of what `spindle install-service` generates. Prefer the
 command — it fills in the real executable path, port, spool store, and `PATH`
-for your machine, and it will not overwrite a service file spindle did not
-write:
+for your machine, and it never replaces an existing service file without
+`--force`:
 
 ```bash
 spindle install-service                                  # name spindle, port 8002
@@ -26,6 +26,8 @@ spindle doctor
 
 ## macOS (launchd agent)
 
+The launchd path is not tested extensively; reports and fixes are welcome.
+
 ```bash
 cp examples/com.spindle.server.plist ~/Library/LaunchAgents/
 # Replace YOURUSERNAME, set the spindle path to `which spindle`, edit PATH
@@ -36,9 +38,13 @@ spindle doctor
 
 ## Two things to get right
 
-**Keep the `managed-by: spindle install-service` marker.** It is how
-`install-service` recognizes a file as its own. Strip it and the command will
-refuse to replace the file later, on the assumption that someone else wrote it.
+**The `managed-by: spindle install-service` marker is informational.**
+`install-service` refuses to replace any existing service file unless you pass
+`--force`, and with `--force` it always copies the old file aside first
+(`<file>.bak-<timestamp>`), marker or not. The marker only changes the message:
+a file without it is reported as one spindle did not write. Keep it if you want
+`--force` to describe the file as spindle's own; drop it once you have
+customized the file, so the next `--force` names it as yours.
 
 **`PATH` is the one that bites.** A systemd user unit starts with a minimal
 `PATH`, and a launchd agent does not inherit your shell's at all — so neither

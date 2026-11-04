@@ -20,6 +20,7 @@ from typing import Any
 from .namespace_owner import (
     MalformedControlReceipt,
     NamespaceIdentity,
+    _json_loads_with_nesting_cap,
     _owner_exit_from_dict,
     _process_fact_from_dict,
     _type_strict_json_equal,
@@ -167,7 +168,7 @@ def _normalise_exit(code: Any) -> int | None:
 
 def _read_json(path: Path) -> dict | None:
     try:
-        value = json.loads(path.read_text())
+        value = _json_loads_with_nesting_cap(path.read_text())
     except (FileNotFoundError, OSError, RecursionError, TypeError, ValueError):
         return None
     return value if isinstance(value, dict) else None
@@ -189,7 +190,7 @@ def _exit_evidence(spool_id: str, record: dict, episode: dict) -> tuple[int | No
 
     sidecar_path = spindle._get_owner_exit_path(spool_id)
     try:
-        raw_sidecar = json.loads(sidecar_path.read_text())
+        raw_sidecar = _json_loads_with_nesting_cap(sidecar_path.read_text())
     except FileNotFoundError:
         sidecar = None
     except (OSError, RecursionError, TypeError, ValueError):

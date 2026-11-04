@@ -14082,24 +14082,103 @@ def test_cli_import_emits_no_third_party_deprecation_noise():
     assert "authlib" not in proc.stderr
 
 
-class TestImportNoiseSuppression:
-    """authlib's import-time deprecation used to precede every command's output."""
+_FASTMCP_IMPORT_WARNINGS_SCRIPT = """
+import sys
+import warnings
 
-    def test_authlib_message_is_dropped(self, monkeypatch):
+
+class EmitWhileFastmcpLoads:
+    def find_spec(self, name, path=None, target=None):
+        if name == "fastmcp":
+            sys.meta_path.remove(self)
+            from authlib.deprecate import deprecate
+
+            deprecate("spindle-test: a deprecation no authlib release has used yet")
+            warnings.warn("spindle-test: unrelated import-time warning", UserWarning)
+        return None
+
+
+sys.meta_path.insert(0, EmitWhileFastmcpLoads())
+import spindle
+"""
+
+
+def test_cli_import_drops_every_authlib_deprecation_raised_while_fastmcp_loads():
+    """authlib 1.7 added a second import-time deprecation that a message match let through.
+
+    The installed authlib may predate any particular message, so raise one through
+    authlib's own deprecate() from inside the fastmcp import, with text no authlib
+    release has used, beside an unrelated warning that must still reach stderr.
+    """
+    pytest.importorskip("authlib.deprecate")
+    proc = subprocess.run(
+        [sys.executable, "-W", "default", "-c", _FASTMCP_IMPORT_WARNINGS_SCRIPT],
+        capture_output=True,
+        text=True,
+        cwd=str(Path(spindle.__file__).parent.parent),
+        timeout=120,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "no authlib release has used yet" not in proc.stderr
+    assert "AuthlibDeprecationWarning" not in proc.stderr
+    assert "spindle-test: unrelated import-time warning" in proc.stderr
+
+
+class TestImportNoiseSuppression:
+    """authlib's import-time deprecations used to precede every command's output."""
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "authlib.jose module is deprecated, please use joserfc instead.",
+            "The httpx module is deprecated; please use httpx2 instead.",
+            "a deprecation no authlib release has used yet",
+        ],
+    )
+    def test_authlib_deprecations_are_dropped_whatever_they_say(self, monkeypatch, message):
+        AuthlibDeprecationWarning = pytest.importorskip("authlib.deprecate").AuthlibDeprecationWarning
+
         seen = []
         monkeypatch.setattr(spindle, "_real_showwarning", lambda *args: seen.append(args))
         spindle._showwarning_without_authlib_noise(
-            "authlib.jose module is deprecated, please use joserfc instead.",
-            DeprecationWarning,
-            "authlib/jose.py",
-            10,
+            AuthlibDeprecationWarning(message), AuthlibDeprecationWarning, "authlib/deprecate.py", 15
         )
         assert seen == []
 
-    def test_other_warnings_still_surface(self, monkeypatch):
+    def test_subclasses_of_authlibs_category_are_dropped(self, monkeypatch):
+        """Same matching as a warnings filter on the category: subclasses included."""
+        AuthlibDeprecationWarning = pytest.importorskip("authlib.deprecate").AuthlibDeprecationWarning
+
+        class NarrowerAuthlibDeprecation(AuthlibDeprecationWarning):
+            pass
+
         seen = []
         monkeypatch.setattr(spindle, "_real_showwarning", lambda *args: seen.append(args))
-        spindle._showwarning_without_authlib_noise("something you should know", UserWarning, "x.py", 1)
+        spindle._showwarning_without_authlib_noise("narrower", NarrowerAuthlibDeprecation, "authlib/x.py", 1)
+        assert seen == []
+
+    @pytest.mark.parametrize(
+        "category,message",
+        [
+            (UserWarning, "something you should know"),
+            # The match is on authlib's category, not on what a message mentions.
+            (DeprecationWarning, "authlib.jose module is deprecated, please use joserfc instead."),
+        ],
+    )
+    def test_other_warnings_still_surface(self, monkeypatch, category, message):
+        seen = []
+        monkeypatch.setattr(spindle, "_real_showwarning", lambda *args: seen.append(args))
+        spindle._showwarning_without_authlib_noise(message, category, "x.py", 1)
+        assert len(seen) == 1
+
+    def test_same_named_category_outside_authlib_still_surfaces(self, monkeypatch):
+        """Only authlib's own class is dropped, not another package's class of that name."""
+        AuthlibDeprecationWarning = type(
+            "AuthlibDeprecationWarning", (DeprecationWarning,), {"__module__": "otherpkg.warn"}
+        )
+        seen = []
+        monkeypatch.setattr(spindle, "_real_showwarning", lambda *args: seen.append(args))
+        spindle._showwarning_without_authlib_noise("unrelated", AuthlibDeprecationWarning, "otherpkg/warn.py", 1)
         assert len(seen) == 1
 
     def test_warnings_machinery_is_handed_back(self):
