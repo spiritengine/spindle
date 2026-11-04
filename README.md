@@ -763,6 +763,7 @@ Environment variables:
 | `SPINDLE_UNSPOOL_MAX_CHARS` | `50000` | Results longer than this are truncated to head+tail by `unspool()` |
 | `SPINDLE_UNSPOOL_HEAD_CHARS` | `12000` | Chars kept from the start of a truncated result |
 | `SPINDLE_UNSPOOL_TAIL_CHARS` | `12000` | Chars kept from the end of a truncated result |
+| `SPINDLE_SPOOL_RETENTION_HOURS` | unset (keep everything) | Optional limit: hours after creation before a finished spool's record and captures are deleted. Spools still running, holding a preserved shard, or owing cleanup are kept regardless. Looking up a missing spool names the limit, or says none is set |
 
 Storage location: `~/.spindle/spools/`, or `$SPINDLE_HOME/spools/` when set.
 The spool store must be on a persistent local filesystem. Network and
@@ -806,8 +807,7 @@ For shards:
 ## Limits
 
 - Max 15 concurrent spools (configurable via `SPINDLE_MAX_CONCURRENT`)
-- Finished spools are deleted 24 hours after they were created; after that
-  `unspool` reports `Unknown spool_id` and `respin` reports `No spool found`
+- Finished spools are kept until removed; set `SPINDLE_SPOOL_RETENTION_HOURS` to delete them after that many hours
 - If a spool's owner and watchdog both die before publishing cleanup proof,
   Spindle does not guess an outcome: `spindle doctor` lists the spool, and
   `spindle repair <spool_id> --attest-dead` settles it as `abandoned`

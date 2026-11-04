@@ -875,6 +875,7 @@ def test_retirement_deletes_a_converged_record_here_and_refuses_it_from_outside(
     must leave its artifacts alone, and the comparison is only meaningful
     because the same sweep really does delete the local one.
     """
+    monkeypatch.setattr(spindle, "SPOOL_RETENTION_HOURS", 24)  # retention is opt-in
     foreign = build_scenario(episode_store, BY_EVIDENCE["natural"], spool_id="retire-foreign", with_handle=False)
     local = build_scenario(episode_store, BY_EVIDENCE["natural"], spool_id="retire-local", with_handle=False)
     converge_to_fixed_point(foreign.spool_id)
@@ -1360,8 +1361,9 @@ def test_store_health_refuses_new_launches_while_a_record_is_unhealthy(episode_s
     assert "unhealthy" in error
 
 
-def test_retention_retires_only_a_fully_converged_record(episode_store, tmp_path):
+def test_retention_retires_only_a_fully_converged_record(episode_store, tmp_path, monkeypatch):
     """Retention timing stays outside the primitive but consumes its result."""
+    monkeypatch.setattr(spindle, "SPOOL_RETENTION_HOURS", 24)  # retention is opt-in
     converged = build_scenario(episode_store, BY_EVIDENCE["natural"], spool_id="retain-done", with_handle=False)
     pending = build_scenario(
         episode_store,

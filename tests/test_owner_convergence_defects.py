@@ -420,6 +420,7 @@ def test_retention_never_retires_a_record_whose_obligations_are_pending(episode_
     recovery has: retiring it there does not merely postpone the duty, it
     destroys the only durable statement of it.
     """
+    monkeypatch.setattr(spindle, "SPOOL_RETENTION_HOURS", 24)  # retention is opt-in
     scenario = build_scenario(episode_store, BY_EVIDENCE["natural"], with_handle=False)
     with monkeypatch.context() as broken:
         _unwritable_transcript(broken)
@@ -1802,8 +1803,9 @@ def test_durable_supervisor_revisits_terminal_obligations_until_complete(episode
     assert obligations_of(episode_store.read(spool_id))["natural_transcript"]["progress"] == "complete"
 
 
-def test_completed_status_only_duties_do_not_prevent_retirement(episode_store, tmp_path):
+def test_completed_status_only_duties_do_not_prevent_retirement(episode_store, tmp_path, monkeypatch):
     """Mixed-version discovery ends when every materialized duty is complete."""
+    monkeypatch.setattr(spindle, "SPOOL_RETENTION_HOURS", 24)  # retention is opt-in
     spool_id = "status-only-complete-duty-retires"
     build_scenario(
         episode_store,

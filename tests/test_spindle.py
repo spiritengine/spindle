@@ -1104,9 +1104,10 @@ class TestResultBudgeting:
                 output = spindle._spin_wait_sync(f"{missing_id},{complete_id}", mode="yield")
 
         result = json.loads(output)
+        # A missing record also says it may have been pruned (tests/test_spool_retention.py).
         assert result == {
             "spool_id": missing_id,
-            "error": f"Unknown spool_id '{missing_id}'",
+            "error": f"Unknown spool_id '{missing_id}': no record exists; {spindle._missing_record_note()}",
             "remaining": [complete_id],
         }
 
@@ -3044,6 +3045,11 @@ class TestWaitUntilIdle:
 
 class TestOrphanedLockSweep:
     """_cleanup_old_spools sweeps orphaned per-spool locks but spares the rest."""
+
+    @pytest.fixture(autouse=True)
+    def _retention_limit(self, monkeypatch):
+        # Retention is opt-in; these exercise the age sweep with a 24-hour limit.
+        monkeypatch.setattr(spindle, "SPOOL_RETENTION_HOURS", 24)
 
     def test_sweeps_only_old_orphaned_per_spool_locks(self, tmp_path):
         import time as _time
@@ -7969,7 +7975,9 @@ class TestShardMergeCleanupFailure:
         assert "merge_in_progress" not in saved["shard"]
         assert "shard_cleanup_pending" not in saved
 
-    def test_failed_merge_keeps_durable_recovery_marker(self, tmp_path):
+    def test_failed_merge_keeps_durable_recovery_marker(self, tmp_path, monkeypatch):
+        # Retention is opt-in; the marker must hold against a 24-hour limit.
+        monkeypatch.setattr(spindle, "SPOOL_RETENTION_HOURS", 24)
         spool_id = "merge-conflict-preserved"
         state_dir = tmp_path / "spools"
         worktree = tmp_path / "worktrees" / "merge-conflict-preserved"
@@ -8023,7 +8031,9 @@ class TestShardMergeCleanupFailure:
         cleanup.assert_not_called()
         abandon_cleanup.assert_not_called()
 
-    def test_successful_merge_preserves_handle_when_worktree_cleanup_fails(self, tmp_path):
+    def test_successful_merge_preserves_handle_when_worktree_cleanup_fails(self, tmp_path, monkeypatch):
+        # Retention is opt-in; the marker must hold against a 24-hour limit.
+        monkeypatch.setattr(spindle, "SPOOL_RETENTION_HOURS", 24)
         spool_id = "merge-cleanup-failure"
         state_dir = tmp_path / "spools"
         worktree = tmp_path / "worktrees" / "merge-cleanup-failure"
