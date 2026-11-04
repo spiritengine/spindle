@@ -79,9 +79,8 @@ Then spin with the profile name as the harness:
 ```python
 completion = spin("Summarize this module", harness="anthropic-compatible", working_dir="/path/to/project")
 spool_id = completion["spool_id"]
-completion = spin(
-    "Quick pass", harness="anthropic-compatible", model="fast", working_dir="/path/to/project"
-)  # uses model_aliases
+# model="fast" resolves through model_aliases
+completion = spin("Quick pass", harness="anthropic-compatible", model="fast", working_dir="/path/to/project")
 ```
 
 MCP `spin` and `respin` wait for the result by default. For parallel work use

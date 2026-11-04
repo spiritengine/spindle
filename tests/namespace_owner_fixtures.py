@@ -18,6 +18,10 @@ from pathlib import Path
 
 import pytest
 
+# Fake-provider sizes shared with the steady-state owner tests.
+ORPHAN_BURST = 40
+LARGE_CAPTURE_BYTES = 8 * 1024 * 1024
+
 
 @pytest.fixture
 def namespace_owner_env(tmp_path):
@@ -75,6 +79,8 @@ def fake_provider_factory(namespace_owner_env):
             "import json, os, signal, socket, sys, time\n"
             "from pathlib import Path\n"
             f"MODE = {mode!r}\n"
+            f"ORPHAN_BURST = {ORPHAN_BURST!r}\n"
+            f"LARGE_CAPTURE_BYTES = {LARGE_CAPTURE_BYTES!r}\n"
             "STORE = Path(os.environ['SPINDLE_OWNER_STORE'])\n"
             "SPOOL_ID = os.environ['SPINDLE_OWNER_SPOOL_ID']\n"
             "CONTROL_FD = int(os.environ['SPINDLE_PROVIDER_CONTROL_FD'])\n"
@@ -167,6 +173,31 @@ def fake_provider_factory(namespace_owner_env):
             "            time.sleep(0.05)\n"
             "            raise SystemExit(0)\n"
             "    raise SystemExit(0)\n"
+            # A shell running `cmd &` and exiting, the way an agent's shell
+            # tool does: each grandchild outlives its parent, reparents to the
+            # owner subreaper and exits there while the provider keeps running.
+            # The distinctive exit status shows whose wait consumed the
+            # provider: Popen reads a stolen status as ECHILD, i.e. exit 0.
+            "if MODE == 'orphan-burst':\n"
+            "    for _ in range(ORPHAN_BURST):\n"
+            "        child = os.fork()\n"
+            "        if child == 0:\n"
+            "            if os.fork() == 0:\n"
+            "                os._exit(0)\n"
+            "            os._exit(0)\n"
+            "        os.waitpid(child, 0)\n"
+            "    (STORE / f'{SPOOL_ID}.burst-done').write_text(str(ORPHAN_BURST))\n"
+            "    message = control.recv(4096)\n"
+            "    if b'cancel' in message:\n"
+            "        control.sendall(b'ack\\n')\n"
+            "    raise SystemExit(23)\n"
+            # A long Claude stream capture that then sits unchanged while the
+            # agent waits on its API.
+            "if MODE == 'large-stream-capture':\n"
+            "    event = json.dumps({'type': 'assistant', 'message': {'content': [{'type': 'text', 'text': 'x' * 900}]}})\n"
+            "    sys.stdout.write((event + '\\n') * (LARGE_CAPTURE_BYTES // (len(event) + 1)))\n"
+            "    sys.stdout.flush()\n"
+            "    (STORE / f'{SPOOL_ID}.capture-done').write_text('done')\n"
             "if MODE == 'ignore-term':\n"
             "    signal.signal(signal.SIGTERM, lambda *_: None)\n"
             "    while True: time.sleep(0.05)\n"
