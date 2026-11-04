@@ -1,19 +1,19 @@
 # Spindle
 
-<!-- Uncomment when published:
-[![PyPI version](https://badge.fury.io/py/spindle.svg)](https://badge.fury.io/py/spindle)
+<!-- Uncomment once CI on master is green:
+[![PyPI version](https://badge.fury.io/py/spindle-mcp.svg)](https://pypi.org/project/spindle-mcp/)
 [![CI](https://github.com/spiritengine/spindle/actions/workflows/ci.yml/badge.svg)](https://github.com/spiritengine/spindle/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 -->
 
-MCP server for multi-harness AI agent delegation. Spawn background agents (Claude Code, Codex, Gemini, Kimi) that run asynchronously, with optional git worktree isolation for safe parallel work.
+MCP server for multi-harness AI agent delegation. Hand a task to an agent (Claude Code, Codex, Gemini, Kimi) and get its result back: MCP `spin` waits for the agent by default, and `wait=False` launches it in the background so you can fan out several and collect them with `spin_wait`. Optional git worktree isolation keeps parallel work from colliding.
 
 ## Features
 
-- **Async agent spawning** - Fire-and-forget pattern with spool IDs
-- **Optional blocking with gather/yield** - Wait for all results at once, or stream them as agents complete. Alternatively, agent can continue other work, spins are nonblocking by default
+- **Blocking by default** - `spin` returns the agent's result; pass `wait=False` for an ID and `spin_wait` for fan-out
+- **Gather or yield** - `spin_wait` returns a whole batch at once, or one spool at a time as each finishes
 - **Permission profiles** - Control what tools child agents can use (readonly, careful, full)
-- **Shard isolation** - Run agents in sandboxed git worktrees to prevent conflicts
+- **Shard isolation** - Run agents in their own git worktrees to prevent conflicts (bwrap-contained on Linux)
 - **Model selection** - Route tasks to different models per-agent
 - **Session continuity** - Resume conversations while the upstream provider session remains available; saved transcripts remain available for manual reconstruction when it does not
 - **Rich querying** - Search, filter, peek at running output, export results
@@ -21,7 +21,17 @@ MCP server for multi-harness AI agent delegation. Spawn background agents (Claud
 
 ## Requirements
 
-- Python 3.11+
+- Linux. macOS is supported but not tested extensively; reports and
+  contributions are welcome. Windows is not supported; use WSL2, which works
+  like native Linux.
+- Python 3.11+. On Linux, use a build whose `os` module has `pidfd_open`
+  (`python3 -c 'import os; print(hasattr(os, "pidfd_open"))'`); Spindle uses it
+  to confirm that a crashed spool process is gone. Without it, spools that
+  finish normally still settle, but a spool whose owner and watchdog both
+  crash, or whose launch dies before its owner starts, can never be settled,
+  not even with `spindle repair`. Some older standalone builds lack it,
+  including the uv-managed 3.11.11, 3.12.8 and 3.13.1 builds from late 2024;
+  current uv-managed builds have it.
 - At least one harness CLI, installed and already authenticated. Spindle shells
   out to the CLI you already use and inherits its login — it never asks for an
   API key of its own:
@@ -31,13 +41,25 @@ MCP server for multi-harness AI agent delegation. Spawn background agents (Claud
   - [Kimi CLI](https://github.com/MoonshotAI/kimi-cli) (`kimi-cli`)
 - Git (for shard/worktree functionality)
 - `bwrap` (bubblewrap), on Linux, for filesystem-contained shards and every
-  non-`full` Kimi launch
+  non-`full` Kimi launch. Bubblewrap does not exist on macOS: shards there are
+  plain git worktrees with no filesystem containment, and `spindle doctor` says
+  so. On macOS, treat `shard` / `careful+shard` as conflict isolation, not a
+  sandbox.
 
 ## Install
 
 ```bash
-pip install spindle-mcp
+uv tool install spindle-mcp
 ```
+
+`pip install spindle-mcp` also works, in a virtualenv on Python 3.11+.
+
+> **macOS:** use `uv`. macOS ships Python 3.9 and no `pip` on `PATH`, so the
+> `pip` line above fails before it starts, and `python3 -m pip install
+> spindle-mcp` reports `No matching distribution found`, which looks like the
+> package does not exist when it means the interpreter is too old.
+> `uv tool install` fetches a suitable Python itself. `brew install python@3.12`
+> and a venv works too.
 
 Check what the install can actually see and do:
 
@@ -60,10 +82,23 @@ Add to Claude Code's MCP config (`~/.claude.json`):
 {
   "mcpServers": {
     "spindle": {
-      "command": "spindle"
+      "command": "spindle",
+      "args": ["serve"]
     }
   }
 }
+```
+
+The `serve` argument is required. Bare `spindle` is a subcommand dispatcher with
+no default: it prints its usage message to stdout, the same pipe the MCP client
+reads, and exits 0, so a config without `args` fails as an unexplained
+`CONNECTION_CLOSED` with nothing logged anywhere.
+
+Or let the CLI write it for you:
+
+```bash
+claude mcp add spindle --scope user -- spindle serve
+claude mcp list   # spindle: ... - Connected
 ```
 
 That runs spindle over stdio, which needs no background service. Run a service
@@ -170,7 +205,7 @@ spin("Set up a new Python project with dependencies", permission="full", working
 # Shard: Full access + auto-isolated worktree (common for risky work)
 spin("Refactor the auth system", permission="shard", working_dir="/project")
 
-# Careful + shard: classifier-vetted, isolated in a bwrap-contained worktree
+# Careful + shard: classifier-vetted, isolated worktree (bwrap-contained on Linux)
 spin("Update configs", permission="careful+shard", working_dir="/project")
 
 # Research: web/file research routed to a SKEIN site, a single file, or a directory
@@ -181,8 +216,8 @@ Profiles (claude-code harness):
 - `readonly` (alias `manual`): Read, Grep, Glob, safe bash (ls, cat, git status/log/diff). The only tier still governed by an allowlist — no python, no find, no write. This is the tight, inspectable, manual option.
 - `careful` (default): now an alias of `auto`. No allowlist; runs under `--permission-mode auto`, where Claude Code vets each tool call server-side on intent. Use it for most code work including reviews/fells. (It used to be a Bash allowlist that gated capability on command *phrasing*, not security — `auto` removes that gate.)
 - `full`: No restrictions
-- `shard`: Full access + auto-creates isolated worktree (bypass inside the bwrap-contained shard)
-- `careful+shard`: `auto` semantics + auto-creates isolated worktree (bypass inside the bwrap-contained shard)
+- `shard`: Full access + auto-creates isolated worktree (bypass inside the shard; bwrap-contained on Linux only)
+- `careful+shard`: `auto` semantics + auto-creates isolated worktree (bypass inside the shard; bwrap-contained on Linux only)
 - `research`: Read, Grep, Glob, WebFetch, WebSearch, curl, jq, safe bash; no python/find; requires `research_target` (Write/Edit added when target is `file:` or `dir:`)
 - `research+shard`: research tools + auto-creates isolated worktree
 
@@ -371,18 +406,15 @@ Spindle supports multiple AI agent harnesses, allowing you to choose the best to
 **Claude Code** (default) - Anthropic's Claude models via `claude` CLI
 - Superior code understanding and reasoning
 - Best for complex refactoring, architecture decisions
-- Slower startup (~3-4 minutes to first response)
 - Use `harness="claude-code"` or omit harness parameter
 
 **Codex CLI** - OpenAI models via `codex` CLI
-- Extremely fast startup (~10 seconds to first response)
 - Good for quick edits, simple tasks, prototyping
 - Requires ChatGPT Plus/Pro/Enterprise
 - Models include `"astra"` (`gpt-6-astra`), `"sol"` (default), `"terra"`, `"luna"`, `"reserve"` (`gpt-reserve`, fast/affordable coding tier), or any full model name
 - Use `harness="codex"`
 
 **Gemini CLI** - Google's Gemini models via `gemini` CLI
-- Fast startup (~5-10 seconds to first response)
 - Full agent with tool use, file access, multi-step reasoning
 - Generous free tier (1000 req/day with Google account)
 - Models: `"flash"`/`"video"` (3.8 Flash), `"pro"` (3.1 Pro Preview, default), `"flash-lite"` (3.5 Flash-Lite), or any full model name
@@ -390,7 +422,6 @@ Spindle supports multiple AI agent harnesses, allowing you to choose the best to
 - Use `harness="gemini"`
 
 **Kimi CLI** - Moonshot AI's Kimi models via `kimi-cli`
-- Fast startup (~5-10 seconds to first response)
 - Thinking mode for complex reasoning
 - Models: `"k3"`/`"latest"`/`"thinking"` (K3, always thinking; default), `"k2.7-code"`, `"k2.6"`, or any full model name
 - Kimi headless mode auto-approves its tool calls; it has no classifier-vetted
@@ -450,7 +481,6 @@ result = unspool(spool_id)  # Auto-detects harness
 
 **Use Kimi when:**
 - Need thinking mode for complex reasoning at speed
-- Want fast startup with strong reasoning capabilities
 
 ### Requirements
 
@@ -541,12 +571,12 @@ for a worked example and the full schema reference.
 
 | Tool | Purpose |
 |------|---------|
-| `spin(prompt, permission?, shard?, system_prompt?, working_dir?, allowed_tools?, tags?, model?, timeout?, harness?, wait?, wait_timeout?)` | Spawn agent and return {spool_id, status, result}; wait=False returns ID immediately |
-| `unspool(spool_id, full?, offset?, limit?)` | Get result (auto-detects harness, non-blocking; truncates huge results to head+tail by default) |
-| `respin(session_id, prompt, wait?, wait_timeout?)` | Continue session and wait for result (auto-detects harness) |
+| `spin(prompt, permission?, research_target?, shard?, system_prompt?, working_dir, allowed_tools?, tags?, model?, timeout?, skeinless?, harness?, env?, base_branch?, wait?, wait_timeout?)` | Spawn agent and return {spool_id, status, result}; wait=False returns ID immediately |
+| `unspool(spool_id, full?, offset?, limit?)` | Read a spool's saved result (auto-detects harness, non-blocking; truncates huge results to head+tail by default) |
+| `respin(session_id, prompt, rebuild?, wait?, wait_timeout?)` | Continue session and wait for result (auto-detects harness) |
 
-The MCP tool spindle_repair(spool_id, attest_dead) provides the same
-human-attested indeterminate settlement.
+The MCP tool `spindle_repair(spool_id, attest_dead)` provides the same
+human-attested indeterminate settlement as `spindle repair <spool_id> --attest-dead`.
 
 Both repair entry points refuse unless the owner episode is lock_bound or
 accepted, its exact lock inode is released, and the recorded owner and
@@ -559,7 +589,7 @@ abandonment.
 
 **spin() parameters:**
 - `prompt` (required): The task for the agent
-- `harness` (optional): "claude-code" (default), "codex", "gemini", or "kimi"
+- `harness` (optional): "claude-code" (default), "codex", "gemini", "kimi", or a lodged profile name (see [Profiles](#profiles))
 - `working_dir` (required): Project directory for every harness
 - `permission` (optional): "readonly" (alias "manual"), "careful" (default, = auto), "full", "shard", "careful+shard", "research", "research+shard", "auto", "auto+shard" (readonly/manual cannot be combined with shard intent; `auto` variants are Claude-only; other names map to harness-specific enforcement, and Kimi accepts them for compatibility but has no "careful" approval mode)
 - `model` (optional): Model to use ("sonnet", "opus", "fable", "haiku" rolling aliases or pinned "fable-5.1", "opus-5.5", "sonnet-5", "opus-5" for Claude; "astra", "sol", "terra", "luna", "reserve" for Codex; "flash", "pro", "video" for Gemini; "k3", "latest", "thinking", "k2.7-code", "k2.6" for Kimi)
@@ -570,6 +600,16 @@ abandonment.
 - `shard` (optional): Create isolated git worktree (can also use `permission="shard"`)
 - `system_prompt` (optional): Custom system prompt for Claude Code
 - `allowed_tools` (optional): Override permission profile with explicit tool list
+- `research_target` (required for `research` tiers): `site:<id>`, `file:<absolute-path>`, or `dir:<absolute-path>`
+- `base_branch` (optional): Branch to fork a shard from (default: detected from the repo)
+- `env` (optional): Extra environment variables for the spawned agent
+- `skeinless` (optional): Skip SKEIN context injection for shard agents
+
+**respin() parameters:** `session_id` takes a spool ID (preferred) or a raw
+provider session ID. `rebuild=True` (Claude Code only) rebuilds a fresh session
+from the sanitized transcript instead of resuming; use it for a legacy spool
+whose stored result is a background-wait stub. `wait` and `wait_timeout` work as
+for `spin`.
 
 ### Spool Management (works with all harnesses)
 
@@ -582,15 +622,19 @@ abandonment.
 | `spool_search(query, field?)` | Search prompts/results |
 | `spool_results(status?, since?, limit?)` | Bulk fetch with filters |
 | `spool_grep(pattern, spool_id?, context?)` | Regex search results; pass spool_id for line-level matches with context in one result |
-| `spool_retry(spool_id)` | Re-run with same params |
+| `spool_retry(spool_id)` | Re-run with same params; detached, returns the new ID |
 | `spool_peek(spool_id, lines?)` | See partial output while running |
+| `spool_info(spool_id)` | Full spool record for debugging |
 | `spool_dashboard()` | Overview of running/complete/needs-attention |
 | `spool_stats()` | Get summary statistics |
 | `spin_harnesses()` | List available harnesses, models, and defaults |
 | `spool_export(spool_ids, format?, output_path?)` | Export to file |
 | `shard_status(spool_id)` | Check shard worktree status |
-| `shard_merge(spool_id, keep_branch?)` | Merge shard to master |
-| `shard_abandon(spool_id, keep_branch?)` | Discard shard |
+| `shard_merge(spool_id, keep_branch?, caller_cwd?)` | Merge shard into the branch it was forked from |
+| `shard_abandon(spool_id, keep_branch?, caller_cwd?)` | Discard shard |
+| `triage(worktree_path)` | Spin an agent to assess an orphaned worktree and create a SKEIN tender; detached, returns its spool ID |
+| `spindle_repair(spool_id, attest_dead)` | Settle an abandoned-custody spool (see above) |
+| `spindle_reload(force?)` | Restart the service; drains first unless `force=True` (see [Hot Reload](#hot-reload-mcp-tool)) |
 
 ## Storage
 
@@ -620,7 +664,7 @@ Spools persist to `~/.spindle/spools/{spool_id}.json`:
 ## Service commands
 
 ```bash
-spindle install-service  # Install background service (Linux/macOS)
+spindle install-service  # Install background service (systemd; launchd on macOS)
 spindle start            # Start via systemd (or background if no service)
 spindle reload           # Drain (wait for spools to finish), then restart
 spindle reload --force   # Restart immediately, interrupting in-flight spools
@@ -643,7 +687,7 @@ spindle start
 
 **Linux**: Writes a systemd user service to `~/.config/systemd/user/spindle.service`
 
-**macOS**: Writes a launchd plist to `~/Library/LaunchAgents/com.spindle.server.plist` and loads it immediately
+**macOS**: Writes a launchd plist to `~/Library/LaunchAgents/com.spindle.server.plist` and loads it immediately. The launchd path is not tested extensively; reports and fixes are welcome.
 
 The generated unit bakes in the current `PATH`, `SPINDLE_PORT`, and
 `SPINDLE_HOME`. `PATH` matters: a systemd user unit otherwise starts with a
@@ -657,11 +701,12 @@ so, naming the service. The fix is to re-run `install-service --name <name>
 --port <port> --force` from a shell with the right `PATH`, then
 `spindle reload --name <name>`.
 
-`--force` overwrites a service file spindle wrote earlier. If the file does not
-carry spindle's marker — because you wrote it, or because you copied an example
-and edited it — `--force` first copies it aside as `<name>.service.bak-<date>`
-and says where. Ownership of a service file cannot be inferred reliably, so
-spindle keeps a copy rather than guess.
+`install-service` never replaces an existing service file without `--force`.
+With `--force` it always copies the old file aside first, as
+`<name>.service.bak-<timestamp>`, and says where: a regenerated unit is built
+from the command line, so anything hand-added to the old one would otherwise be
+lost. A file without spindle's marker (one you wrote, or an example you copied
+and edited) is replaced the same way; the marker only changes the message.
 
 Then `spindle reload` restarts the service to pick up code changes.
 
@@ -685,13 +730,7 @@ or set `SPINDLE_PORT` once in the environment.
 
 ### Windows
 
-On Windows, run spindle manually:
-
-```bash
-spindle serve --http
-```
-
-Or use [NSSM](https://nssm.cc/) to create a Windows service.
+Windows is not supported. Use WSL2.
 
 ### WSL
 
@@ -733,7 +772,8 @@ layers, and ephemeral filesystems such as tmpfs are unsupported because they
 may not preserve Spindle's locking, inode-identity, and crash-durability
 assumptions. In a container, bind-mount a directory from a local host
 filesystem; in WSL, keep the store in the Linux filesystem rather than under
-`/mnt/c`.
+`/mnt/c`. The filesystem research behind this list is in
+[docs/research/](docs/research/).
 
 `spindle doctor` reports the store it resolved, whether it is writable, and
 whether its existing ownership artifacts are healthy. It does not verify the
@@ -741,11 +781,22 @@ filesystem semantics above.
 
 ## How It Works
 
-1. **spin()** spawns a detached CLI process (claude, codex, gemini, or kimi-cli) with the given prompt
-2. The process runs in background, writing output to temporary files; the MCP call waits for its result unless `wait=False`
-3. A monitor thread polls for completion
-4. **unspool()** returns the result once complete (non-blocking check)
-5. Spool metadata persists to JSON files, surviving server restarts
+1. **spin()** reserves a spool record in `~/.spindle/spools/` and starts a
+   detached per-spool owner process (`spindle_owner.py`) under a watchdog that
+   contains the spool's processes if the owner crashes
+2. The owner runs the harness CLI (claude, codex, gemini, or kimi-cli) with the
+   prompt, writes its output beside the record, stops it at its timeout, and
+   records how it ended. Claude runs under a stream driver
+   (`spindle_claude_driver.py`) that keeps the session open while background
+   tasks the agent started are still pending
+3. A per-store supervisor process (`spindle_supervisor.py`) reconciles running
+   spools and finalizes each from its owner's evidence; it exits a few seconds
+   after the store goes idle
+4. MCP `spin` and `respin` wait for that final record and return the result,
+   unless `wait=False`. **unspool()** reads a spool's saved result at any time
+   and never waits
+5. Records persist as JSON files, so results stay readable across server
+   restarts until cleanup removes them (see Limits)
 
 For shards:
 1. A git worktree is created with a new branch
@@ -755,8 +806,11 @@ For shards:
 ## Limits
 
 - Max 15 concurrent spools (configurable via `SPINDLE_MAX_CONCURRENT`)
-- 24h auto-cleanup of old spools
-- Orphaned spools (dead process) marked as error on restart
+- Finished spools are deleted 24 hours after they were created; after that
+  `unspool` reports `Unknown spool_id` and `respin` reports `No spool found`
+- If a spool's owner and watchdog both die before publishing cleanup proof,
+  Spindle does not guess an outcome: `spindle doctor` lists the spool, and
+  `spindle repair <spool_id> --attest-dead` settles it as `abandoned`
 
 ## Contributing
 

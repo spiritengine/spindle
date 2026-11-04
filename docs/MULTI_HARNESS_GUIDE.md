@@ -37,7 +37,6 @@ Spindle abstracts the underlying AI agent implementation through a "harness" lay
 
 **CLI:** `claude` (Anthropic's Claude Code CLI)
 **Models:** Claude Fable, Opus, Sonnet, Haiku (Fable 5.1, Opus 5.5, Sonnet 5, Haiku 4.5 as of 2026-09-25)
-**Startup time:** ~3-4 minutes to first response
 **Strengths:** Complex reasoning, architecture design, code review
 
 The Claude Code harness is Spindle's default and most capable option. It excels at:
@@ -59,7 +58,6 @@ spin("Refactor auth to use dependency injection", working_dir="/project")
 
 **CLI:** `codex` (OpenAI's Codex CLI)
 **Models:** GPT-6 Astra (`astra`), GPT-5.6 Sol/Terra/Luna (`sol` is the default), GPT-Reserve (`reserve`); see [CODEX_SETUP.md](CODEX_SETUP.md) for what the ChatGPT-account route serves
-**Startup time:** ~10 seconds to first response
 **Strengths:** Speed, quick edits, prototyping
 
 The Codex harness prioritizes speed over depth. Ideal for:
@@ -73,7 +71,7 @@ The Codex harness prioritizes speed over depth. Ideal for:
 spin(prompt="Add error handling to process_data()", harness="codex", working_dir="/path/to/project")
 ```
 
-**Important:** Codex requires `working_dir` to be specified. Claude Code can infer it from the current session.
+**Important:** `working_dir` is required for Codex, as for every harness.
 
 **Claude model aliases:**
 - `"haiku"` / `"sonnet"` / `"opus"` / `"fable"` → passed through as the CLI's rolling "latest of this tier" alias (`fable` is Fable 5.1, `opus` is Opus 5.5 as of 2026-09-25)
@@ -86,8 +84,7 @@ spin(prompt="Add error handling to process_data()", harness="codex", working_dir
 
 **CLI:** `gemini` (Google's Gemini CLI)
 **Models:** Gemini 3.8 Flash, 3.1 Pro Preview (default), 3.5 Flash-Lite, and explicit older aliases
-**Startup time:** ~5-10 seconds to first response
-**Strengths:** Fast startup, generous free tier, good for quick tasks
+**Strengths:** Generous free tier, good for quick tasks
 
 The Gemini harness uses Google's Gemini CLI in headless mode. It's a full agent with tool use, file access, and multi-step reasoning. Auth is handled by the CLI (Google account login or API key).
 
@@ -114,9 +111,8 @@ See [video setup, trust, and limits](GEMINI_VIDEO.md).
 ### Kimi CLI
 
 **CLI:** `kimi-cli` (Moonshot AI's Kimi Code CLI)
-**Models:** Kimi K3, K2.7 Code, K2.6, K2.5
-**Startup time:** ~5-10 seconds to first response
-**Strengths:** Fast startup, reasoning, multimodal support
+**Models:** Kimi K3, K2.7 Code, K2.6
+**Strengths:** Reasoning, multimodal support
 
 The Kimi harness uses Moonshot AI's Kimi Code CLI in headless mode. Full agent with tool use, file access, and multi-step reasoning. Auth via Kimi/Moonshot API credentials configured in `~/.kimi/config.toml`.
 
@@ -189,7 +185,7 @@ spool_id = spin(prompt="Quick edit task", harness="codex", working_dir="/path/to
 - `working_dir` - Required project directory for every harness
 - `wait` - True waits for the result; False returns the ID immediately
 - `wait_timeout` - Optional wait deadline, which does not stop the spool
-- `harness` - "claude-code", "codex", "gemini", or "kimi" (use `spin_harnesses()` to discover)
+- `harness` - "claude-code", "codex", "gemini", "kimi", or a lodged profile name (use `spin_harnesses()` to discover)
 - `model` - Model to use (harness-specific)
 - `timeout` - Auto-kill after N seconds
 - `tags` - Organization tags
@@ -243,9 +239,8 @@ Session continuity is harness-aware - Spindle remembers which harness was used a
 
 | Metric | Claude Code | Codex CLI | Gemini CLI | Kimi CLI |
 |--------|-------------|-----------|------------|----------|
-| Startup time | 3-4 minutes | ~10 seconds | ~5-10 seconds | ~5-10 seconds |
 | Code understanding | Excellent | Good | Good | Good |
-| Reasoning depth | Deep | Moderate | Good (2.5 Pro) | Excellent (K2-Thinking) |
+| Reasoning depth | Deep | Moderate | Good (3.1 Pro) | Excellent (K3) |
 | Best for | Complex tasks | Quick edits | Fast general work | Fast reasoning tasks |
 | Cost per task | Higher | Lower | Free tier available | Varies by plan |
 
@@ -283,7 +278,7 @@ All harnesses support session continuity through `respin()`:
 - Keeps the saved transcript available for manual reconstruction in a new conversation
 
 **Codex:**
-- Uses `codex resume <session_id>` command
+- Uses `codex exec resume <session_id>`
 - Session IDs extracted from JSON output
 - Preserves conversation state
 
@@ -372,9 +367,9 @@ spin("Analyze this race condition and propose a fix", harness="kimi", working_di
 spin("Review this module for subtle bugs", harness="kimi", working_dir="/app", model="thinking")
 ```
 
-✅ **Fast general tasks**
+✅ **Coding tasks**
 ```python
-spin("Add input validation to the API endpoints", harness="kimi", working_dir="/app", model="turbo")
+spin("Add input validation to the API endpoints", harness="kimi", working_dir="/app", model="code")
 ```
 
 ## Sandbox and Permission Models
@@ -613,9 +608,8 @@ inconclusive probe (codex missing, `codex sandbox` erroring, a timeout) also ref
 If you get unexpected behavior, verify the harness:
 
 ```python
-# Check spool metadata
-spool = _read_spool(spool_id)
-print(spool.get("harness", "claude-code"))
+# Check spool metadata: the record's "harness" field
+spool_info(spool_id)
 ```
 
 Harness defaults to "claude-code" if not specified.
@@ -624,16 +618,10 @@ Harness defaults to "claude-code" if not specified.
 
 If `respin()` fails:
 
-1. **Check session exists:**
-   ```python
-   spool = _read_spool(original_spool_id)
-   session_id = spool.get("session_id")
-   ```
+1. **Check the session exists:** `spool_info(original_spool_id)` shows the record's
+   `session_id`
 
-2. **Verify harness:**
-   ```python
-   harness = spool.get("harness", "claude-code")
-   ```
+2. **Verify harness:** the same record's `harness` field (absent means `claude-code`)
 
 3. **Claude Code:** An unavailable or expired upstream session terminates the respin with
    the provider error; use the saved transcript to reconstruct context manually in a new
@@ -647,23 +635,21 @@ If `respin()` fails:
 Planned improvements to the harness system:
 
 - [ ] Add Horizon harness for specialized perspectives
-- [ ] Support Codex shard isolation (git worktrees)
-- [ ] SKEIN integration for Codex agents
 - [ ] Automatic harness selection based on task complexity
 - [ ] Cost tracking per harness
-- [ ] Harness-specific configuration profiles
+- [ ] Lodged profiles on base harnesses other than Claude Code
 - [ ] Provider auto-detection for Horizon models
 
 ## Best Practices
 
 1. **Default to Claude for complex work** - Better reasoning and code understanding
-2. **Use Codex or Gemini for speed** - Much faster startup for simple tasks
+2. **Use Codex or Gemini for quick tasks** - Simple edits and lookups
 3. **Use Gemini for budget work** - Generous free tier with Google account
-4. **Use Kimi for fast reasoning** - Thinking mode at speed
+4. **Use Kimi for reasoning** - Thinking mode
 5. **Always specify working_dir** - Required for every harness
-5. **Use tags to organize** - Tag by harness, task type, or project
-6. **Monitor with spool_dashboard()** - Track mixed harness workloads
-7. **Test on your chosen harness** - Validate that tasks work as expected
+6. **Use tags to organize** - Tag by harness, task type, or project
+7. **Monitor with spool_dashboard()** - Track mixed harness workloads
+8. **Test on your chosen harness** - Validate that tasks work as expected
 
 ## Examples
 
@@ -710,7 +696,7 @@ implementation = respin(analysis_id, "Implement your recommendation using the pr
 ```python
 import json
 
-# Launch 10 quick fixes with Codex (fast startup)
+# Launch 10 quick fixes with Codex
 tasks = [
     "Add type hints to utils.py",
     "Add docstrings to helpers.py",

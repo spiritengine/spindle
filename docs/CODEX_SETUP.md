@@ -6,7 +6,8 @@ Complete guide for setting up and using OpenAI's Codex CLI with Spindle.
 
 - **ChatGPT Plus, Pro, or Enterprise subscription** - Required for Codex CLI access
 - **Node.js and npm** - For installing the Codex CLI package
-- **Linux kernel 5.13+** - For sandbox support (automatically bypassed on older kernels)
+- **Linux with bubblewrap** - Codex sandboxes with bubblewrap plus seccomp; no kernel
+  Landlock or minimum kernel version is needed (see [Codex Sandboxing](#codex-sandboxing))
 
 ## Installation
 
@@ -21,7 +22,7 @@ Verify installation:
 codex --version
 ```
 
-Expected output: `@openai/codex version X.X.X`
+Expected output: `codex-cli X.Y.Z` (for example `codex-cli 0.154.0`)
 
 ### 2. Authenticate
 
@@ -36,9 +37,10 @@ This will:
 2. Require a ChatGPT Plus/Pro/Enterprise account
 3. Store credentials for future use
 
-Verify authentication:
+Verify authentication from inside a git repository (codex refuses to start in an
+untrusted directory otherwise; `--skip-git-repo-check` lifts that for a one-off test):
 ```bash
-codex exec "print('Hello from Codex')"
+codex exec --sandbox read-only "print('Hello from Codex')"
 ```
 
 If successful, you'll see Codex execute the command.
@@ -117,7 +119,7 @@ Specify model via the `model` parameter:
 spin(
     prompt="Your task",
     harness="codex",
-    model="gpt-5.5",  # Explicit model
+    model="sol",  # Alias for gpt-5.6-sol, the default
     working_dir="/path/to/project",
 )
 ```
@@ -132,7 +134,7 @@ Available models (account catalog checked 2026-09-25 on codex 0.154.0):
   but mapped to `gpt-5.6-sol` when `codex login status` reports ChatGPT authentication
   because that route rejects the umbrella ID on this installation
 - `gpt-5.6-terra` / `gpt-5.6-luna` — explicit faster tiers; aliases `terra` and `luna`
-- `gpt-5.5` — prior default; retires 2026-10-14 (the catalog points it at `gpt-5.6-sol`)
+- `gpt-5.5` — prior default; retired 2026-10-14, so a pin to it now fails
 - `gpt-6-sol` / `gpt-6-luna` — on the public API docs but API-only here; 400 on
   ChatGPT-account auth. Aliases `6-sol` / `6-luna` pass them through for API-key installs
 - `gpt-5.3-codex` and other `-codex` ids — API-only; 400 on ChatGPT-account auth
@@ -190,23 +192,14 @@ next_completion = respin(completion["spool_id"], "Add validation methods to the 
 spin(prompt="Quick fix task", harness="codex", working_dir="/path/to/project", timeout=60)
 ```
 
-## Performance Characteristics
+## Parallel Batches
 
-### Startup Time
-
-**Codex:** ~10 seconds to first response
-**Claude Code:** ~3-4 minutes to first response
-
-This makes Codex **~20-30x faster** for quick tasks.
-
-### Throughput
-
-For parallel batch work, Codex's speed provides higher throughput:
+For parallel batch work, launch every spool detached and collect them as they finish:
 
 ```python
 import json
 
-# Launch 10 tasks - all start within seconds
+# Launch 10 tasks without waiting on any of them
 tasks = ["Task 1", "Task 2", ..., "Task 10"]
 spool_ids = [spin(task, harness="codex", working_dir="/app", wait=False) for task in tasks]
 
@@ -218,9 +211,7 @@ while remaining:
     remaining = completion.get("remaining", [])
 ```
 
-With Codex, all 10 tasks start immediately. With Claude, you'd wait 3-4 minutes per task startup.
-
-### When Speed Matters
+## When to Use Which
 
 **Use Codex for:**
 - Interactive development workflows
@@ -263,25 +254,15 @@ codex  # Re-authenticate interactively
 
 Verify you have an active ChatGPT Plus/Pro/Enterprise subscription.
 
-### 3. Sandbox Errors on Older Kernels
+### 3. Sandbox Errors
 
-**Symptom:** Codex fails with sandbox errors on kernel < 5.13
+**Symptom:** every shell command in a codex spool fails, or a restrictive spool is refused
+with `REFUSED: codex sandbox is not enforcing …`
 
-**Automatic Fix:** Spindle detects this and uses bypass mode automatically
-
-**Manual Verification:**
-```bash
-uname -r  # Check kernel version
-python3 -c "
-import platform
-import re
-v = platform.release()
-m = re.match(r'(\d+)\.(\d+)', v)
-if m:
-    major, minor = int(m.group(1)), int(m.group(2))
-    print(f'Landlock: {major > 5 or (major == 5 and minor >= 13)}')
-"
-```
+Spindle never falls back to an unsandboxed run: it always passes the tier, and refuses a
+restrictive spool whose codex does not enforce it. See
+[Codex Sandbox Enforcement](MULTI_HARNESS_GUIDE.md#codex-sandbox-enforcement) and
+[Sandbox Errors (Codex)](MULTI_HARNESS_GUIDE.md#sandbox-errors-codex) for causes and fixes.
 
 ### 4. JSON Output Parsing Failures
 
@@ -289,9 +270,9 @@ if m:
 
 **Cause:** Codex CLI changed JSON output format
 
-**Workaround:** Check Spindle logs for raw output:
+**Workaround:** Check the raw output Spindle captured:
 ```bash
-cat ~/.spindle/<spool_id>.stdout
+cat ~/.spindle/spools/<spool_id>.stdout   # or $SPINDLE_HOME/spools/
 ```
 
 Report format changes as an issue.
@@ -302,7 +283,7 @@ Report format changes as an issue.
 
 **Cause:** Cold start - Codex CLI initializing
 
-**Solution:** Subsequent executions will be faster (~10s typical)
+**Solution:** Subsequent executions are usually faster
 
 ### 6. Max Concurrent Limit
 
@@ -334,9 +315,9 @@ npm update -g @openai/codex
 
 ### After Upgrade
 
-Verify Spindle compatibility:
+Verify Spindle compatibility (run inside a git repository):
 ```bash
-codex exec --json --full-auto "print('test')"
+codex exec --json --sandbox read-only "print('test')"
 ```
 
 If the JSON format changed, Spindle may need updates to parsing logic.
@@ -355,10 +336,10 @@ logging.basicConfig(level=logging.DEBUG)
 
 ### Check Codex Output
 
-Raw output is stored in:
+Raw output is stored in the spool store (`~/.spindle/spools/`, or `$SPINDLE_HOME/spools/`):
 ```bash
-cat ~/.spindle/<spool_id>.stdout
-cat ~/.spindle/<spool_id>.stderr
+cat ~/.spindle/spools/<spool_id>.stdout
+cat ~/.spindle/spools/<spool_id>.stderr
 ```
 
 ### Verify Sandbox Enforcement
@@ -390,43 +371,31 @@ this codex is not enforcing `--sandbox` — do not use it for readonly spools.
 Isolate Spindle vs Codex issues:
 
 ```bash
-# Direct Codex test
-codex exec --json --full-auto "create a hello world script"
-
-# With bypass (for older kernels)
-codex exec --json --dangerously-bypass-approvals-and-sandbox "create a hello world script"
+# Direct Codex test, at the tier a careful spool uses (run inside a git repository)
+codex exec --json --sandbox workspace-write "create a hello world script"
 ```
 
 If manual execution fails, the issue is with Codex CLI setup, not Spindle.
 
 ## Security Considerations
 
-### Bypass Mode Implications
+Spindle never passes `--dangerously-bypass-approvals-and-sandbox`. Every spool runs at the
+`--sandbox` tier its permission maps to (see [Sandbox Policies](#sandbox-policies)); only
+`permission="full"`, or `shard` through the `spindle spin` CLI, gets `danger-full-access`.
+A restrictive spool whose codex does not enforce its tier is refused, not run unsandboxed;
+see [Codex Sandbox Enforcement](MULTI_HARNESS_GUIDE.md#codex-sandbox-enforcement).
 
-When using `--dangerously-bypass-approvals-and-sandbox`:
-
-⚠️ **No filesystem restrictions** - Agent can read/write anywhere
-⚠️ **No approval prompts** - Agent executes without confirmation
-⚠️ **Full system access** - Use only in trusted environments
-
-**Mitigations:**
-1. Use `permission="careful"` for most tasks; use `readonly` only for pure inspection or synthesis where no code execution is needed
-2. Run in isolated environments (containers, VMs)
-3. Use `timeout` to limit execution time
-4. Review changes before merging (use shards when supported)
-
-### Sandbox Mode (Kernel >= 5.13)
-
-With Landlock sandboxing enabled:
-
-✅ **Filesystem restrictions** - Confined to workspace by default
-✅ **Policy enforcement** - read-only, workspace-write, or full-access
-✅ **Approval prompts** - For destructive operations (with `--full-auto`: on-failure only)
+Known gap: Spindle pins the sandbox tier but not codex's approval policy. If your
+`~/.codex/config.toml` lets escalation requests be approved without you (for example
+`approval_policy = "on-request"` with an automatic reviewer), a command the sandbox denied
+can be re-run outside it, so a `readonly` spool is not a hard boundary on that machine.
 
 **Still exercise caution:**
-- Review agent changes before production deployment
-- Use version control to track modifications
-- Test in non-production environments first
+- Use `permission="careful"` for most tasks; use `readonly` only for pure inspection or
+  synthesis where no code execution is needed
+- Use shards (`permission="shard"` or `careful+shard`) for code changes, and review them
+  before merging
+- Use `timeout` to limit execution time
 
 ## Best Practices
 
@@ -467,30 +436,17 @@ for attempt in range(3):
         break
 ```
 
-### 5. Monitor Kernel Version
-
-If you upgrade your kernel to >= 5.13, you'll automatically get sandbox support. No Spindle changes needed.
-
-```bash
-# After kernel upgrade
-uname -r  # Verify new version
-# Spindle will detect and use sandboxing on next run
-```
-
 ## Comparison: Claude vs Codex
 
 | Feature | Claude Code | Codex CLI |
 |---------|-------------|-----------|
-| **Startup time** | ~3-4 minutes | ~10 seconds |
 | **Code reasoning** | Excellent | Good |
 | **Complexity handling** | Deep | Moderate |
-| **Speed** | Slow | Fast |
 | **Best for** | Complex tasks | Quick tasks |
 | **Subscription** | Anthropic API/Claude | ChatGPT Plus/Pro |
-| **Sandboxing** | Tool-based | Landlock-based |
-| **Kernel requirement** | None | 5.13+ for sandbox |
-| **Session continuity** | `--resume` | `codex resume` |
-| **working_dir required** | No | Yes |
+| **Sandboxing** | Permission mode and tool allowlist | Codex `--sandbox` tier (bubblewrap + seccomp) |
+| **Session continuity** | `--resume` | `codex exec resume` |
+| **working_dir required** | Yes | Yes |
 
 ## FAQ
 
@@ -501,13 +457,22 @@ A: No, but having both gives you flexibility. Use Claude for complex work, Codex
 A: No, Codex CLI requires a paid ChatGPT subscription (Plus, Pro, or Enterprise).
 
 **Q: What if I'm on Windows or macOS?**
-A: Codex CLI works, but Landlock detection is Linux-specific. Spindle will use bypass mode on other platforms.
+A: Spindle does not support Windows; use WSL2. On macOS, which is supported but not tested
+extensively, Spindle passes the same `--sandbox` tier and runs the same enforcement probe as
+on Linux; shard worktrees there have no bwrap layer around codex.
 
 **Q: Can I force sandbox mode on?**
-A: Not through Spindle. If you need explicit sandbox control, run `codex` directly instead of through Spindle.
+A: It is always on. Spindle passes the tier on every launch and refuses a restrictive spool
+whose codex does not enforce it; only `danger-full-access` (see above) runs without one.
 
 **Q: Does Codex support shards (isolated worktrees)?**
-A: Not yet. Shard support is planned for future Codex integration.
+A: Yes. `shard` and `careful+shard` create a worktree, run codex there at `workspace-write`
+(the `spindle spin` CLI maps `shard` to `danger-full-access`), and on Linux wrap it in
+bwrap. Inside that wrapper the worktree, `/tmp`, the git metadata a commit needs, and
+these home directories when they exist are writable: `~/.codex` (or `$CODEX_HOME`),
+`~/.claude`, `~/.claude.json`, `~/.anthropic`, `~/.gemini`, `~/.spindle`, `~/.config` and
+`~/.cache`. Everything else is read-only. With `danger-full-access` this outer wrapper is
+the only boundary, so a full-access spool can write those home directories.
 
 **Q: How do I switch from Claude to Codex for an existing task?**
 A: You can't switch mid-session. Finish with Claude, then start a new spool with Codex if needed.
@@ -520,11 +485,8 @@ codex_id = spin("Quick fix", harness="codex", working_dir="/app", wait=False)
 spin_wait(f"{claude_id},{codex_id}")
 ```
 
-**Q: Why is working_dir required for Codex but not Claude?**
-A: Codex CLI requires an explicit working directory. Claude Code can infer from session context.
-
-**Q: How do I know which kernel version I have?**
-A: Run `uname -r` on Linux. For Ubuntu, `lsb_release -a` shows the distribution version (20.04 = kernel ~5.4, 22.04 = kernel ~5.15).
+**Q: Is working_dir required?**
+A: Yes, for every harness: the server's working directory is not your project.
 
 ## See Also
 

@@ -12,8 +12,8 @@ Preparing Spindle for open-source release.
   - Added keywords and classifiers
   - Added optional dev dependencies (pytest, ruff)
   - Added ruff and pytest configuration
-  - License field ready (commented, uncomment after adding LICENSE)
-  - URL fields ready (commented, fill in after repo created)
+  - License field set (`license = "MIT"`)
+  - URL fields point at github.com/spiritengine/spindle
 
 ### Code Cleanup
 - [x] No hardcoded paths found (clean!)
@@ -40,7 +40,7 @@ Preparing Spindle for open-source release.
   - Architecture overview
 
 ### Testing
-- [x] **Create basic test suite** (18 tests passing)
+- [x] **Create test suite** (about 2,500 tests as of 2026-11-03)
   - Permission profile tests
   - Spool storage tests
   - Process utility tests
@@ -74,9 +74,10 @@ Preparing Spindle for open-source release.
 - Debug logging removed
 - README polished
 - CONTRIBUTING.md
-- Test suite (18 tests)
+- Test suite
 - GitHub Actions CI
+- Published to PyPI as `spindle-mcp` (1.0.0 through 1.2.0)
 
 **Remaining:**
-- Uncomment badges in README after CI is running publicly
-- Publish to PyPI (name `spindle-mcp`) and tag the release
+- Uncomment badges in README once CI on master is green
+- Tag releases in git: no published version has a tag yet
