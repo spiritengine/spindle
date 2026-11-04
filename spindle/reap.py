@@ -177,9 +177,11 @@ def _decode_array_prefix(text: str) -> tuple[list[_RawEvent], int, list[_Issue]]
 
 
 def _decode_capture(data: bytes, *, terminal: bool) -> _Capture:
-    text = data.decode("utf-8", errors="replace")
     issues: list[_Issue] = []
-    if "\ufffd" in text:
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        text = data.decode("utf-8", errors="replace")
         issues.append(_Issue("invalid_utf8", "capture contains invalid UTF-8; replacement characters are shown"))
 
     stripped = text.lstrip()
@@ -225,16 +227,19 @@ def _decode_capture(data: bytes, *, terminal: bool) -> _Capture:
         ]
         return _Capture(None, len(data), len(data), 0, "json", events, issues)
 
-    # Stream formats are line-delimited.  A final non-newline fragment from a
-    # running process is withheld unless it is already a complete JSON value.
-    lines = text.splitlines(keepends=True)
+    # NDJSON is framed only by LF (optionally preceded by CR), not by Unicode
+    # line separators inside JSON strings. Count original bytes so replacement
+    # decoding cannot inflate the ignored suffix or move its source boundary.
+    # A final non-LF fragment is withheld while running unless it parses whole.
+    lines = data.split(b"\n")
     events: list[_RawEvent] = []
-    consumed_chars = 0
+    consumed_bytes = 0
     for line_no, line in enumerate(lines):
-        complete_line = line.endswith(("\n", "\r"))
-        raw = line.rstrip("\r\n")
+        complete_line = line_no < len(lines) - 1
+        framed_bytes = len(line) + int(complete_line)
+        raw = (line.removesuffix(b"\r") if complete_line else line).decode("utf-8", errors="replace")
         if not raw.strip():
-            consumed_chars += len(line)
+            consumed_bytes += framed_bytes
             continue
         if not complete_line and not terminal:
             try:
@@ -258,9 +263,8 @@ def _decode_capture(data: bytes, *, terminal: bool) -> _Capture:
                     f"capture record at source line {line_no + 1} is malformed and is available as raw evidence",
                 )
             )
-        consumed_chars += len(line)
-    ignored_text = text[consumed_chars:]
-    ignored = min(len(data), len(ignored_text.encode("utf-8", errors="replace")))
+        consumed_bytes += framed_bytes
+    ignored = len(data) - consumed_bytes
     capture_format = "ndjson" if events else "unparsed"
     if terminal and events and not any(event.parse_error is None for event in events):
         for issue in issues:
@@ -938,8 +942,7 @@ def _select_range(selector: str, run_by_id: dict[str, _Run]) -> tuple[list[_Entr
     return [item for item in candidates if start.position <= item.position <= end.position], None
 
 
-def _filter_entries(runs: list[_Run], filter_name: str, tool_name: Optional[str]) -> list[_Entry]:
-    entries = [item for run in runs for item in run.entries]
+def _filter_entries(entries: list[_Entry], filter_name: str, tool_name: Optional[str]) -> list[_Entry]:
     if filter_name == "user":
         return [item for item in entries if item.kind == "message" and item.role == "user"]
     if filter_name == "agent":
@@ -1071,12 +1074,20 @@ def reap_store(
         if error:
             return _error(handle, "invalid_address", error)
         selected.extend(items)
-    for filter_name in filter_names:
-        selected.extend(_filter_entries(runs, filter_name, tool_name))
+    if not selectors:
+        selected = [entry for run in runs for entry in run.entries]
 
-    # Deduplicate overlapping collections/ranges/filters while retaining source
-    # identity and order, not a renumbered filtered position.
+    # Union the explicit selections first, then narrow that set to entries
+    # matching any requested filter. Filters must never add out-of-range items.
     deduplicated = {entry.address: entry for entry in selected}
+    deduplicated_overlap = len(selected) - len(deduplicated)
+    candidates = list(deduplicated.values())
+    if filter_names:
+        deduplicated = {
+            entry.address: entry
+            for filter_name in filter_names
+            for entry in _filter_entries(candidates, filter_name, tool_name)
+        }
     run_order = {run.spool_id: index for index, run in enumerate(runs)}
 
     def source_order(entry: _Entry) -> tuple[int, int, int, int]:
@@ -1114,7 +1125,7 @@ def reap_store(
             "matched_entries": len(ordered),
             "returned_entries": len(returned),
             "entries_before_page": entry_start,
-            "deduplicated_overlap": len(selected) - len(deduplicated),
+            "deduplicated_overlap": deduplicated_overlap,
             "omitted_entries": omitted_entries,
             "available_tool_names": available_tools,
         },

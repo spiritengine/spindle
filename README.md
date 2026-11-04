@@ -417,7 +417,12 @@ Event and part positions come from the underlying saved capture; filtering does
 not renumber them, and appending later events leaves earlier addresses stable.
 An inclusive range joins two full entry addresses with `..`. CLI address
 arguments may be repeated; MCP accepts a comma-separated `addresses` string.
-Overlapping addresses, ranges, and filters are deduplicated in captured order.
+Batch addresses and ranges are combined and deduplicated in captured order.
+Filters then narrow that selection: an entry must match at least one requested
+filter. Without addresses, filters apply to all normalized entries in scope.
+`tool_name` restricts the `tool-calls` filter to one exact name; other requested
+filters still match their respective messages or results. Filtering preserves
+the original addresses and happens before entry pagination.
 
 ```python
 # Outline first
@@ -429,13 +434,17 @@ spool_reap(spool_id, filters="user,agent")
 # Calls of one exact provider tool type
 spool_reap(spool_id, filters="tool-calls", tool_name="command_execution")
 
+# Agent messages only within a captured range
+spool_reap(
+    spool_id,
+    addresses=f"run:{spool_id}/events/4/parts/0..run:{spool_id}/events/12/parts/0",
+    filters="agent",
+)
+
 # Batch a node and an inclusive stable-position range
 spool_reap(
     spool_id,
-    addresses=(
-        f"run:{spool_id}/final,"
-        f"run:{spool_id}/events/4/parts/0..run:{spool_id}/events/12/parts/0"
-    ),
+    addresses=(f"run:{spool_id}/final,run:{spool_id}/events/4/parts/0..run:{spool_id}/events/12/parts/0"),
 )
 
 # Read a large selected entry in chunks, or in full

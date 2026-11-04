@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 import spindle
-from spindle.reap import reap_store
+from spindle.reap import _decode_capture, reap_store
 
 
 def _record(store: Path, spool_id: str, **overrides):
@@ -25,7 +25,7 @@ def _record(store: Path, spool_id: str, **overrides):
 
 
 def _jsonl(*events):
-    return "".join(json.dumps(event) + "\n" for event in events)
+    return "".join(json.dumps(event, ensure_ascii=False) + "\n" for event in events)
 
 
 def _codex_call(item_id, command, output):
@@ -136,6 +136,63 @@ def test_addresses_stay_stable_when_live_capture_appends(tmp_path):
     ]
 
 
+@pytest.mark.parametrize("newline", [b"\n", b"\r\n"])
+def test_ndjson_unicode_framing_and_byte_positions_survive_append(tmp_path, newline):
+    spool_id = "unicode-live"
+    _record(tmp_path, spool_id, status="running", result=None)
+    values = ["first", "middle\u0085with\u2028JSON\u2029separators and literal \ufffd", "last π"]
+    events = [
+        {"type": "item.completed", "item": {"id": f"m{i}", "type": "agent_message", "text": text}}
+        for i, text in enumerate(values)
+    ]
+    lines = [json.dumps(event, ensure_ascii=False).encode("utf-8") for event in events]
+    prefix = newline.join(lines[:2]) + newline
+    suffix = lines[2][:-2]
+    path = tmp_path / f"{spool_id}.stdout"
+    path.write_bytes(prefix + suffix)
+    before = reap_store(tmp_path, spool_id, filters="agent")
+    assert [entry["content"] for entry in before["entries"]] == values[:2]
+    assert before["runs"][0]["capture"]["parsed_prefix_bytes"] == len(prefix)
+    assert before["runs"][0]["capture"]["ignored_trailing_bytes"] == len(suffix)
+    assert [issue["code"] for issue in before["runs"][0]["issues"]] == ["partial_trailing_record"]
+
+    # Complete the suffix without an LF yet; its JSON value is already readable.
+    with path.open("ab") as stream:
+        stream.write(lines[2][len(suffix) :])
+    after = reap_store(tmp_path, spool_id, filters="agent")
+    assert [entry["content"] for entry in after["entries"]] == values
+    assert [entry["address"] for entry in after["entries"]] == [f"run:{spool_id}/events/{i}/parts/0" for i in range(3)]
+    assert after["runs"][0]["capture"]["parsed_prefix_bytes"] == len(prefix + lines[2])
+    assert after["runs"][0]["capture"]["ignored_trailing_bytes"] == 0
+    assert after["runs"][0]["issues"] == []
+    raw = reap_store(tmp_path, spool_id, addresses=f"run:{spool_id}/raw", full=True)
+    assert [entry["content"] for entry in raw["entries"]] == [line.decode("utf-8") for line in lines]
+
+
+@pytest.mark.parametrize("framing", ["json", "array", "ndjson"])
+@pytest.mark.parametrize("encoded_text", [b"\xef\xbf\xbd", b"\xff", b"\xe2\x82"])
+def test_utf8_warning_requires_a_decode_failure(framing, encoded_text):
+    event = b'{"text":"' + encoded_text + b'"}'
+    data = {"json": event, "array": b"[" + event + b"]", "ndjson": event + b"\n{}\n"}[framing]
+    capture = _decode_capture(data, terminal=True)
+    assert capture.events[0].value == {"text": "\ufffd"}
+    assert [issue.code for issue in capture.issues] == ([] if encoded_text == b"\xef\xbf\xbd" else ["invalid_utf8"])
+    assert capture.observed_bytes == capture.parsed_prefix_bytes == len(data)
+    assert capture.ignored_trailing_bytes == 0
+
+
+@pytest.mark.parametrize("suffix", [b'{"text":"\xff\r', b'{"text":"\xe2\x82'])
+def test_ndjson_invalid_utf8_suffix_counts_original_bytes(suffix):
+    prefix = b'{"text":"\xff"}\r\n\r\n'
+    data = prefix + suffix
+    capture = _decode_capture(data, terminal=False)
+    assert [(event.index, event.value) for event in capture.events] == [(0, {"text": "\ufffd"})]
+    assert capture.observed_bytes == len(data)
+    assert capture.parsed_prefix_bytes == len(prefix)
+    assert capture.ignored_trailing_bytes == len(suffix)
+    assert [issue.code for issue in capture.issues] == ["invalid_utf8", "partial_trailing_record"]
+
+
 def test_growing_claude_array_reads_only_complete_observed_prefix(tmp_path):
     spool_id = "claude-live"
     _record(tmp_path, spool_id, harness="claude-code", status="running", result=None)
@@ -194,34 +251,102 @@ def test_batch_range_and_filter_overlap_deduplicate_in_source_order(tmp_path):
     ]
     (tmp_path / f"{spool_id}.stdout").write_text(_jsonl(*events))
     first = f"run:{spool_id}/events/0/parts/0"
-    last = f"run:{spool_id}/events/2/parts/0"
+    last = f"run:{spool_id}/events/1/parts/0"
     result = reap_store(
         tmp_path,
         spool_id,
         addresses=[first, f"{first}..{last}"],
         filters="agent",
     )
-    assert [entry["content"] for entry in result["entries"]] == ["one", "two", "three"]
-    assert result["selection"]["deduplicated_overlap"] == 4
+    assert [entry["content"] for entry in result["entries"]] == ["one", "two"]
+    assert result["selection"]["deduplicated_overlap"] == 1
+
+
+@pytest.mark.parametrize(
+    ("filters", "tool_name", "parts"),
+    [
+        ("agent,tool-calls", "Read", [(1, 0), (1, 1)]),
+        ("tool-calls,tool-results", "Read", [(1, 1), (2, 0)]),
+        (None, "Read", [(1, 1)]),
+        ("user", None, [(2, 1)]),
+        ("user,agent,messages", None, [(1, 0), (2, 1)]),
+        ("tool-calls", "missing-tool", []),
+    ],
+)
+def test_mixed_filters_narrow_batch_selections(tmp_path, filters, tool_name, parts):
+    spool_id = "mixed-filter"
+    _record(tmp_path, spool_id, harness="claude-code")
+    outside = {
+        "type": "assistant",
+        "message": {"role": "assistant", "content": [{"type": "text", "text": "outside range"}]},
+    }
+    events = [
+        outside,
+        {
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "inside range"},
+                    {"type": "tool_use", "id": "r1", "name": "Read", "input": {"path": "one"}},
+                    {"type": "tool_use", "id": "b1", "name": "Bash", "input": {"command": "pwd"}},
+                ],
+            },
+        },
+        {
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "r1", "content": "file body"},
+                    {"type": "text", "text": "follow up"},
+                ],
+            },
+        },
+        outside,
+    ]
+    (tmp_path / f"{spool_id}.stdout").write_text(_jsonl(*events))
+    first = f"run:{spool_id}/events/1/parts/0"
+    last = f"run:{spool_id}/events/2/parts/1"
+    # Both endpoints and the range overlap; final is selected but matches no filter.
+    result = reap_store(
+        tmp_path,
+        spool_id,
+        addresses=[last, f"run:{spool_id}/final", f"{first}..{last}", first],
+        filters=filters,
+        tool_name=tool_name,
+    )
+    assert result["ok"] is True
+    assert [entry["address"] for entry in result["entries"]] == [
+        f"run:{spool_id}/events/{event}/parts/{part}" for event, part in parts
+    ]
+    assert result["selection"]["deduplicated_overlap"] == 2
 
 
 def test_large_collection_continues_after_stable_address(tmp_path):
     spool_id = "many-messages"
     _record(tmp_path, spool_id)
-    events = [
-        {
-            "type": "item.completed",
-            "item": {"id": f"m{index}", "type": "agent_message", "text": str(index)},
-        }
-        for index in range(205)
-    ]
+    events = []
+    for index in range(210):
+        events.append(
+            {"type": "item.completed", "item": {"id": f"m{index}", "type": "agent_message", "text": str(index)}}
+        )
+        events.append(_codex_call(f"c{index}", "pwd", "")[0])
     (tmp_path / f"{spool_id}.stdout").write_text(_jsonl(*events))
-    first = reap_store(tmp_path, spool_id, filters="agent")
+    # The span has 205 messages interleaved with tool calls; filter before paging.
+    span = f"run:{spool_id}/events/2/parts/0..run:{spool_id}/events/410/parts/0"
+    first = reap_store(tmp_path, spool_id, addresses=span, filters="agent,messages")
     assert len(first["entries"]) == 200
+    assert first["selection"]["matched_entries"] == 205
+    assert first["entries"][0]["content"] == "1"
     after = first["entry_truncation"]["retrieve"]["after"]
-    second = reap_store(tmp_path, spool_id, filters="agent", after=after)
-    assert [entry["content"] for entry in second["entries"]] == ["200", "201", "202", "203", "204"]
+    second = reap_store(tmp_path, spool_id, addresses=span, filters="agent,messages", after=after)
+    assert [entry["content"] for entry in second["entries"]] == ["201", "202", "203", "204", "205"]
     assert second["selection"]["entries_before_page"] == 200
+    assert second["selection"]["omitted_entries"] == 0
+    for excluded in [f"run:{spool_id}/events/0/parts/0", f"run:{spool_id}/events/3/parts/0"]:
+        invalid = reap_store(tmp_path, spool_id, addresses=span, filters="agent", after=excluded)
+        assert invalid["error"]["code"] == "invalid_after"
 
 
 def test_session_view_inventories_only_exact_matching_saved_runs(tmp_path):
@@ -233,6 +358,10 @@ def test_session_view_inventories_only_exact_matching_saved_runs(tmp_path):
     assert result["scope"]["run_addresses"] == ["run:run-a", "run:run-b"]
     assert "provider history not captured" in result["scope"]["statement"]
     assert len(result["runs"]) == 2
+    scoped = reap_store(tmp_path, "run-a", session=True, filters="user")
+    assert [entry["address"] for entry in scoped["entries"]] == ["run:run-a/prompt", "run:run-b/prompt"]
+    narrowed = reap_store(tmp_path, "run-a", session=True, addresses="run:run-a/messages", filters="user")
+    assert [entry["address"] for entry in narrowed["entries"]] == ["run:run-a/prompt"]
 
 
 def test_missing_capture_is_visible_without_hiding_record_nodes(tmp_path):
@@ -339,16 +468,20 @@ def test_public_mcp_route_uses_shared_reader(tmp_path, monkeypatch):
     result = json.loads(asyncio.run(tool.fn(spool_id, filters="user")))
     assert result["ok"] is True
     assert result["entries"][0]["address"] == f"run:{spool_id}/prompt"
+    narrowed = json.loads(asyncio.run(tool.fn(spool_id, addresses=f"run:{spool_id}/final", filters="user")))
+    assert narrowed["ok"] is True
+    assert narrowed["entries"] == []
 
 
-def test_public_cli_reap_outputs_json_and_status(tmp_path, monkeypatch, capsys):
+@pytest.mark.parametrize("node", ["prompt", "final"])
+def test_public_cli_reap_outputs_json_and_status(tmp_path, monkeypatch, capsys, node):
     spool_id = "cli-one"
     _record(tmp_path, spool_id)
     monkeypatch.setattr(spindle, "SPINDLE_DIR", tmp_path)
-    monkeypatch.setattr(sys, "argv", ["spindle", "reap", spool_id, "--filter", "user"])
+    monkeypatch.setattr(sys, "argv", ["spindle", "reap", spool_id, f"run:{spool_id}/{node}", "--filter", "user"])
     with pytest.raises(SystemExit) as exc:
         spindle.main()
     assert exc.value.code == 0
     result = json.loads(capsys.readouterr().out)
     assert result["mode"] == "selection"
-    assert result["entries"][0]["role"] == "user"
+    assert [entry["address"] for entry in result["entries"]] == ([f"run:{spool_id}/prompt"] if node == "prompt" else [])

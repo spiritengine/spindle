@@ -5934,6 +5934,9 @@ async def spool_reap(
     qualified addresses from that outline to retrieve entries, collections, or
     inclusive ranges. Multiple addresses and filters are comma-separated;
     overlapping selections are deduplicated in original source order.
+    Filters narrow the selected addresses/ranges to entries matching any
+    requested filter, or filter all scoped entries when no addresses are given.
+    tool_name narrows tool-calls only. Filtering precedes entry pagination.
 
     Args:
         handle: A spool ID. With session=True, may instead be a session ID.
@@ -13436,7 +13439,7 @@ def main():
         dest="filters",
         action="append",
         choices=["user", "agent", "messages", "tool-calls", "tool-results"],
-        help="Add a normalized collection (repeatable)",
+        help="Keep entries matching any requested filter within the selection (repeatable)",
     )
     reap_parser.add_argument("--tool", dest="tool_name", help="Exact tool name; implies the tool-calls filter")
     reap_parser.add_argument(
