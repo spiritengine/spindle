@@ -57,7 +57,7 @@ except ImportError:  # checkout where the repo root is not on sys.path
 # warning category for the duration of the import and hand the machinery
 # straight back. It is the category, not any one message: authlib 1.7 added a
 # second import-time warning that a message match let through. The category is
-# matched by class name, subclasses included as a warnings filter would, because
+# matched by class name and authlib's module, subclasses included as a warnings filter would, because
 # spindle depends on fastmcp rather than on authlib and does not import it.
 # (The E402s below are the cost of having to sit in front of the import.)
 _AUTHLIB_DEPRECATION_CATEGORY = "AuthlibDeprecationWarning"
@@ -65,7 +65,10 @@ _real_showwarning = warnings.showwarning
 
 
 def _showwarning_without_authlib_noise(message, category, filename, lineno, file=None, line=None):
-    if any(cls.__name__ == _AUTHLIB_DEPRECATION_CATEGORY for cls in getattr(category, "__mro__", ())):
+    if any(
+        cls.__name__ == _AUTHLIB_DEPRECATION_CATEGORY and str(getattr(cls, "__module__", "")).split(".")[0] == "authlib"
+        for cls in getattr(category, "__mro__", ())
+    ):
         return
     _real_showwarning(message, category, filename, lineno, file, line)
 

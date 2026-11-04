@@ -14161,6 +14161,16 @@ class TestImportNoiseSuppression:
         spindle._showwarning_without_authlib_noise(message, category, "x.py", 1)
         assert len(seen) == 1
 
+    def test_same_named_category_outside_authlib_still_surfaces(self, monkeypatch):
+        """Only authlib's own class is dropped, not another package's class of that name."""
+        AuthlibDeprecationWarning = type(
+            "AuthlibDeprecationWarning", (DeprecationWarning,), {"__module__": "otherpkg.warn"}
+        )
+        seen = []
+        monkeypatch.setattr(spindle, "_real_showwarning", lambda *args: seen.append(args))
+        spindle._showwarning_without_authlib_noise("unrelated", AuthlibDeprecationWarning, "otherpkg/warn.py", 1)
+        assert len(seen) == 1
+
     def test_warnings_machinery_is_handed_back(self):
         """The shim must only be installed for the duration of the fastmcp import."""
         import warnings as warnings_module
