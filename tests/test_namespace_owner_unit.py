@@ -2856,6 +2856,136 @@ def test_terminal_output_state_existing_timestamps_remain_a_pure_read(tmp_path):
         owner.lock.close()
 
 
+def _scan_owner(tmp_path, spool_id, **spool_fields):
+    owner = _spawning_owner(tmp_path, spool_id)
+    owner.spool_path.write_text(json.dumps({"id": owner.spool_id, "status": "running", **spool_fields}, sort_keys=True))
+    return owner
+
+
+def _instrument_capture_reads(monkeypatch, *, fail_once=()):
+    """Count Path.read_text per path; raise EIO once for each path in fail_once."""
+    reads = {}
+    pending = list(fail_once)
+    real_read_text = Path.read_text
+
+    def read_text(path, *args, **kwargs):
+        reads[path] = reads.get(path, 0) + 1
+        if path in pending:
+            pending.remove(path)
+            raise OSError(errno.EIO, "transient capture read failure")
+        return real_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read_text)
+    return reads
+
+
+def _sentinel_line() -> str:
+    return (
+        json.dumps(
+            {
+                "type": "spindle_driver_terminal",
+                "subtype": "complete",
+                "protocol": spindle.CLAUDE_PROTOCOL_STREAM_V1,
+                "unresolved_tasks": [],
+            }
+        )
+        + "\n"
+    )
+
+
+def test_terminal_output_state_rescans_captures_only_after_they_change(tmp_path, monkeypatch):
+    """The owner asks every interval; an unchanged capture is not re-read.
+
+    Reading and parsing the whole capture on every ask made an idle owner's
+    cost grow with the capture (issue-20260830-i7q8).  Any append must still
+    reach the real scan, including the one that publishes the sentinel.
+    """
+    owner = _scan_owner(
+        tmp_path,
+        "terminal-output-rescan",
+        harness="claude-code",
+        claude_protocol=spindle.CLAUDE_PROTOCOL_STREAM_V1,
+    )
+    owner.stdout_path.write_text(json.dumps({"type": "assistant", "message": {"content": []}}) + "\n")
+    reads = _instrument_capture_reads(monkeypatch)
+    try:
+        assert owner._terminal_output_state() == (False, False, None)
+        assert owner._terminal_output_state() == (False, False, None)
+        assert reads[owner.stdout_path] == 1
+        with owner.stdout_path.open("a") as stream:
+            stream.write(json.dumps({"type": "result", "subtype": "success", "result": "done"}) + "\n")
+        assert owner._terminal_output_state() == (False, False, None)
+        assert reads[owner.stdout_path] == 2
+        with owner.stdout_path.open("a") as stream:
+            stream.write(_sentinel_line())
+        terminal, _shutdown_due, written_at = owner._terminal_output_state()
+        assert terminal is True and written_at is not None
+        assert reads[owner.stdout_path] == 3
+        terminal, _shutdown_due, _written_at = owner._terminal_output_state()
+        assert terminal is True
+        assert reads[owner.stdout_path] == 3
+    finally:
+        owner.lock.close()
+
+
+def test_terminal_output_state_retries_a_failed_capture_read_on_the_next_pass(tmp_path, monkeypatch):
+    """A read that failed is not an answer about the capture's bytes.
+
+    The shared scan reports an unreadable capture as no terminal output.
+    Caching that answer would hide a sentinel already on disk until the capture
+    next changed, where an uncached owner reads it again on the next pass.
+    """
+    owner = _scan_owner(
+        tmp_path,
+        "terminal-output-read-failure",
+        harness="claude-code",
+        claude_protocol=spindle.CLAUDE_PROTOCOL_STREAM_V1,
+    )
+    owner.stdout_path.write_text(_sentinel_line())
+    reads = _instrument_capture_reads(monkeypatch, fail_once=[owner.stdout_path])
+    try:
+        assert owner._terminal_output_state() == (False, False, None)
+        terminal, _shutdown_due, written_at = owner._terminal_output_state()
+        assert terminal is True and written_at is not None
+        assert reads[owner.stdout_path] == 2
+        assert owner._terminal_output_state()[0] is True
+        assert reads[owner.stdout_path] == 2
+    finally:
+        owner.lock.close()
+
+
+@pytest.mark.parametrize(
+    "harness,spool_fields,stderr_change_rescans",
+    [
+        ("claude-code", {"claude_protocol": spindle.CLAUDE_PROTOCOL_STREAM_V1}, False),
+        ("claude-code", {}, False),
+        ("gemini", {}, True),
+    ],
+)
+def test_terminal_output_state_keys_on_stderr_only_where_detection_reads_it(
+    tmp_path, monkeypatch, harness, spool_fields, stderr_change_rescans
+):
+    """Only Gemini's terminal output can live in stderr.
+
+    For the other harnesses, stderr chatter is no reason to re-read a large
+    stdout capture; for Gemini, a stderr append must reach the scan.
+    """
+    owner = _scan_owner(tmp_path, f"terminal-output-stderr-{harness}", harness=harness, **spool_fields)
+    owner.stdout_path.write_text("partial provider output\n")
+    owner.stderr_path.write_text("provider warning\n")
+    reads = _instrument_capture_reads(monkeypatch)
+    try:
+        assert owner._terminal_output_state() == (False, False, None)
+        assert reads[owner.stdout_path] == 1
+        with owner.stderr_path.open("a") as stream:
+            stream.write("another provider warning\n")
+        assert owner._terminal_output_state() == (False, False, None)
+        assert reads[owner.stdout_path] == (2 if stderr_change_rescans else 1)
+        assert reads.get(owner.stderr_path, 0) == (2 if stderr_change_rescans else 0)
+    finally:
+        owner.lock.close()
+
+
 def test_bounded_custody_pass_uses_only_live_kernel_children(tmp_path, monkeypatch):
     """Containment after the latch signals current custody, never persisted ids.
 

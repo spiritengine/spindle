@@ -4060,31 +4060,54 @@ def _spool_complete_output_path(spool: dict, stdout_path: Path, stderr_path: Pat
     unresolved, so finalizing on a result would recreate the parked-stub false
     completion the driver exists to prevent.
     """
+    return _spool_terminal_output_scan(spool, stdout_path, stderr_path)[0]
+
+
+def _spool_terminal_output_reads_stderr(spool: dict) -> bool:
+    """Whether terminal-output detection reads the stderr capture (Gemini only)."""
+    return spool.get("harness") == "gemini"
+
+
+def _spool_terminal_output_scan(spool: dict, stdout_path: Path, stderr_path: Path) -> tuple[Optional[Path], bool]:
+    """Answer _spool_complete_output_path and also say whether a capture read failed.
+
+    A read that raised OSError is treated as "no terminal output here", as it
+    always was, but that answer says nothing about the capture's bytes.  The
+    logical owner caches answers by capture signature and must not cache one
+    that came from a failed read, or a transient error would hide terminal
+    output until the capture next changes.
+    """
+    read_failed = False
     if spool.get("harness") != "codex" and stdout_path.exists():
         try:
             content = stdout_path.read_text()
-            if content.strip():
-                if spool.get("claude_protocol") == CLAUDE_PROTOCOL_STREAM_V1:
-                    if _claude_driver.ndjson_has_sentinel(content):
-                        return stdout_path
-                    return None
-                data = json.loads(content)
-                result = _extract_cc_result(data)
-                if result and ("result" in result or "error" in result or "response" in result):
-                    return stdout_path
-        except (IOError, json.JSONDecodeError):
-            pass
+        except IOError:
+            read_failed = True
+        else:
+            try:
+                if content.strip():
+                    if spool.get("claude_protocol") == CLAUDE_PROTOCOL_STREAM_V1:
+                        if _claude_driver.ndjson_has_sentinel(content):
+                            return stdout_path, read_failed
+                        return None, read_failed
+                    data = json.loads(content)
+                    result = _extract_cc_result(data)
+                    if result and ("result" in result or "error" in result or "response" in result):
+                        return stdout_path, read_failed
+            except json.JSONDecodeError:
+                pass
 
-    if spool.get("harness") == "gemini" and stderr_path.exists():
+    if _spool_terminal_output_reads_stderr(spool) and stderr_path.exists():
         try:
             stderr_content = stderr_path.read_text()
+        except IOError:
+            read_failed = True
+        else:
             if stderr_content.strip():
                 parsed = _extract_last_json_object(stderr_content)
                 if parsed and ("error" in parsed or "session_id" in parsed):
-                    return stderr_path
-        except IOError:
-            pass
-    return None
+                    return stderr_path, read_failed
+    return None, read_failed
 
 
 def _spool_has_complete_output(spool: dict, stdout_path: Path, stderr_path: Path) -> bool:

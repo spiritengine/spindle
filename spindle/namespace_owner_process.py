@@ -127,6 +127,34 @@ def _resolve_containment_bound_seconds() -> float:
 
 CONTAINMENT_BOUND_SECONDS = _resolve_containment_bound_seconds()
 
+# Longest the steady-state owner loop idles between its polled checks while the
+# provider runs: mailbox requests, the wall deadline and terminal output.  The
+# provider pidfd and the watchdog lease end the idle wait at once, so provider
+# exit and watchdog loss are not delayed by it.  ``--poll-interval`` stays the
+# short retry cadence for transient conditions (an unreadable lock, a moved
+# episode revision); spending it as the idle cadence woke an owner fifty times
+# a second for the whole life of every spool (issue-20260830-i7q8).  Polling
+# remains the authority for the mailbox (DECISIONS item 13); this only bounds
+# how late a request or deadline is noticed.
+STEADY_STATE_POLL_SECONDS = 0.1
+
+
+def _capture_signature(path: Path):
+    """Stat facts that change whenever an append-only capture gains bytes.
+
+    A missing file has the stable signature None, as it reads the same as
+    before.  Any other stat failure returns a fresh object that equals nothing,
+    so the caller falls through to a real read and keeps its error behavior.
+    """
+    try:
+        info = os.stat(path)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return object()
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
 # Outcomes of one attempt to durably settle a pre-provider failure.
 # ``published`` is durable.  ``retry`` is the recoverable case - an unreadable
 # ownership pathname, or an episode revision another actor moved between this
@@ -741,7 +769,7 @@ class LogicalOwner:
         spool = self._read_spool()
         if (spool.get("harness") or "claude-code").lower() not in {"claude-code", "gemini"}:
             return False, False, None
-        output_path = spindle._spool_complete_output_path(spool, self.stdout_path, self.stderr_path)
+        output_path = self._complete_output_path(spool)
         if output_path is None:
             return False, False, None
         try:
@@ -782,6 +810,42 @@ class LogicalOwner:
             now - detected.astimezone(timezone.utc)
         ).total_seconds() >= spindle.OUTPUT_COMPLETION_GRACE_SECONDS
         return True, shutdown_due, written.astimezone(timezone.utc)
+
+    def _complete_output_path(self, spool: dict) -> Optional[Path]:
+        """Ask the shared terminal-output scan again only when a capture changed.
+
+        ``_spool_complete_output_path`` reads and parses the whole capture, and
+        the steady-state loop asks every interval, so an idle owner's cost grew
+        with its capture: a 5 MB Claude stream took 40 ms a scan on this box,
+        at fifty scans a second (issue-20260830-i7q8).  The answer depends only
+        on the harness, the Claude protocol and the bytes of the captures the
+        scan reads (stdout, plus stderr for Gemini alone), which providers only
+        append to, so an unchanged stat signature reuses the previous answer.
+        Signatures are taken before the scan reads: a write that lands during
+        the scan changes the next signature, which forces another scan rather
+        than trusting a stale one.  An answer from a failed read is never
+        cached, so a transient read error is retried on the next pass.
+
+        Blind spot, accepted because providers append: a rewrite that keeps a
+        capture's size and lands in the same timestamp tick as the previous
+        signature (mtime and ctime are only as fine as the kernel's coarse
+        clock, a jiffy on 5.4) leaves the signature unchanged, so its bytes
+        are not seen until the capture next changes.
+        """
+        import spindle
+
+        key = (
+            spool.get("harness"),
+            spool.get("claude_protocol"),
+            _capture_signature(self.stdout_path),
+            _capture_signature(self.stderr_path) if spindle._spool_terminal_output_reads_stderr(spool) else None,
+        )
+        previous = getattr(self, "_output_scan", None)
+        if previous is not None and previous[0] == key:
+            return previous[1]
+        output_path, read_failed = spindle._spool_terminal_output_scan(spool, self.stdout_path, self.stderr_path)
+        self._output_scan = None if read_failed else (key, output_path)
+        return output_path
 
     def _terminal_output_precedes_timeout(self, request, written_at: Optional[datetime]) -> bool:
         """Whether terminal evidence was durably written before this timeout."""
@@ -1249,6 +1313,60 @@ class LogicalOwner:
             reaped += 1
         self.adopted_reaped += reaped
         return reaped
+
+    def _reap_exited_adopted_children(self) -> int:
+        """Reap adopted descendants that already exited, never the provider.
+
+        Any process below the provider whose parent exits first reparents to
+        this subreaper, as a command does when the shell that started it
+        (``cmd &``) exits before it.  Only the exit paths used to wait for
+        them, so a long spool kept each one as a zombie until it ended (117
+        under one owner in issue-20261103-13yg).  ``waitid(WNOWAIT)`` names an
+        exited child without
+        consuming it: anything but the provider is reaped by its exact PID,
+        while the provider's status stays for Popen, which would read a stolen
+        one as ECHILD and report exit 0.  An exited provider ends the pass; the
+        natural-exit path reaps it next and then drains the rest.
+
+        While the provider is unreaped it pins its own PID and process group,
+        so reaping other group members here cannot free the PGID that
+        ``_signal_provider_group`` signals.
+        """
+        if self.provider is None or not hasattr(os, "waitid"):
+            return 0
+        reaped = 0
+        while True:
+            try:
+                exited = os.waitid(os.P_ALL, 0, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+            except ChildProcessError:
+                break
+            if exited is None or exited.si_pid == self.provider.pid:
+                break
+            try:
+                pid, _status = os.waitpid(exited.si_pid, os.WNOHANG)
+            except ChildProcessError:
+                break
+            if pid == 0:
+                break
+            reaped += 1
+        self.adopted_reaped += reaped
+        return reaped
+
+    def _idle_until_next_check(self) -> None:
+        """Reap exited adoptees, then idle until there is something to check.
+
+        The provider pidfd and the watchdog lease end the wait as soon as the
+        provider exits or the watchdog goes, which is what the loop's next pass
+        acts on; otherwise it returns after STEADY_STATE_POLL_SECONDS for the
+        polled checks.  With neither descriptor available this is a plain sleep
+        of that length.
+        """
+        self._reap_exited_adopted_children()
+        poller = select.poll()
+        for fd in (self.provider_pidfd, getattr(self.args, "watchdog_fd", None)):
+            if fd is not None:
+                poller.register(fd, select.POLLIN | select.POLLHUP | select.POLLERR)
+        poller.poll(STEADY_STATE_POLL_SECONDS * 1000)
 
     def _direct_children(self) -> list[int]:
         path = Path(f"/proc/self/task/{os.getpid()}/children")
@@ -1762,7 +1880,7 @@ class LogicalOwner:
                     natural_exit_settled = True
                     result = returncode
                     break
-                time.sleep(self.args.poll_interval)
+                self._idle_until_next_check()
         finally:
             # These closes run while an AuthorityLost may be unwinding through
             # this block.  An OSError raised here would replace that exception,
