@@ -4450,15 +4450,24 @@ class TestGeminiHarness:
 
 
 def _codex_research_filesystem(cmd):
-    """The filesystem table of Spindle's codex research permissions profile in an argv."""
+    """The filesystem table of the codex research permissions profile in an argv.
+
+    Each launch names its own profile (spindle-research-<id>), so find the name first.
+    """
     import tomllib
 
-    key = f"permissions.{spindle._CODEX_RESEARCH_PROFILE}.filesystem="
-    values = [
-        cmd[i + 1].split("=", 1)[1] for i, tok in enumerate(cmd[:-1]) if tok == "-c" and cmd[i + 1].startswith(key)
-    ]
-    assert values, f"no research permissions profile in {cmd!r}"
-    return tomllib.loads(f"v = {values[-1]}")["v"]
+    def last(prefix):
+        values = [
+            cmd[i + 1].split("=", 1)[1]
+            for i, tok in enumerate(cmd[:-1])
+            if tok == "-c" and cmd[i + 1].startswith(prefix)
+        ]
+        assert values, f"no {prefix} in {cmd!r}"
+        return tomllib.loads(f"v = {values[-1]}")["v"]
+
+    name = last("default_permissions=")
+    assert name.startswith("spindle-research-"), name
+    return last(f"permissions.{name}.filesystem=")
 
 
 def _codex_shard_sandbox_starts():
@@ -6238,7 +6247,7 @@ class TestSpinHarnesses:
         assert result.startswith("codex-")
         assert "--sandbox" not in captured_cmd
         assert "--add-dir" not in captured_cmd
-        assert _codex_research_filesystem(captured_cmd) == {":root": "read", str(tmp_path): "write"}
+        assert _codex_research_filesystem(captured_cmd) == {":root": "read", str(tmp_path): {".": "write"}}
 
     def test_spin_codex_research_file_maps_to_workspace_write(self, tmp_path):
         """spin() must choose workspace-write for writable Codex research targets."""
@@ -7172,6 +7181,7 @@ class TestDetectExistingShard:
             f"main_repo derived via .parent.parent {main_repo!r} must match the actual repo root {repo!r}"
         )
 
+    @_codex_shard_sandbox_starts()
     def test_codex_spin_sync_reuses_existing_shard(self, tmp_path):
         """
         Mirror of test_spin_reuses_existing_shard_instead_of_spawning_new for
@@ -8190,6 +8200,7 @@ class TestCodexRespinPreservesGitAccess:
             f"--cd at index {cd_idx} must come before `resume` at index {resume_idx}; cmd={cmd!r}"
         )
 
+    @_codex_shard_sandbox_starts()
     def test_codex_respin_sets_cd_to_shard_worktree(self, tmp_path):
         session_id = "codex-session-cd"
         worktree_path = tmp_path / "worktrees" / "codex-respin-001"
@@ -8320,6 +8331,7 @@ class TestCodexRespinPreservesGitAccess:
         assert "--chdir" in cmd
         assert "/usr/bin/codex" in cmd
 
+    @_codex_shard_sandbox_starts()
     def test_codex_respin_sync_warns_when_bwrap_unavailable_for_shard(self, tmp_path, capsys):
         """Warning is logged when bwrap is absent for a respin shard."""
         worktree_path = tmp_path / "worktrees" / "codex-respin-nobwrap"
@@ -8404,7 +8416,7 @@ class TestCodexRespinPreservesGitAccess:
         wt_bound = any(cmd[i] == "--bind" and cmd[i + 1] == wt and cmd[i + 2] == wt for i in range(len(cmd) - 2))
         assert not wt_bound, f"worktree root must not be the writable bind for a research respin: {cmd!r}"
         # And codex's research permissions profile makes that dir, and only it, writable.
-        assert _codex_research_filesystem(cmd) == {":root": "read", out: "write"}, cmd
+        assert _codex_research_filesystem(cmd) == {":root": "read", out: {".": "write"}}, cmd
         assert "--sandbox" not in cmd, "a research respin runs the permissions profile, not --sandbox"
 
 
@@ -10762,7 +10774,7 @@ class TestCodexSandboxEnforcement:
         assert not result.startswith("Error"), result
         assert len(captured_cmd) == 1
         cmd = captured_cmd[0]
-        assert _codex_research_filesystem(cmd) == {":root": "read", str(output_dir): "write"}, (
+        assert _codex_research_filesystem(cmd) == {":root": "read", str(output_dir): {".": "write"}}, (
             f"retried codex research spool must keep its {output_dir} grant; got {cmd!r}"
         )
         # The new spool record carries the research target + permission forward.

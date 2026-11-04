@@ -43,7 +43,7 @@ spool_id = completion["spool_id"]
   - `"readonly"` / `"manual"` → `"read-only"`
   - `"full"` → `"danger-full-access"`
   - `"shard"` → `"workspace-write"` through MCP `spin`; the `spindle spin` CLI maps it to `"danger-full-access"`
-  - `"research"` / `"research+shard"` → the `spindle-research` permissions profile instead of `--sandbox`: the filesystem is read-only except a `file:`/`dir:` target's directory, and the network is on (recorded as `"read-only"` for a `site:` target, `"workspace-write"` for a `file:` or `dir:` target)
+  - `"research"` / `"research+shard"` → a `spindle-research-<id>` permissions profile (fresh per launch) instead of `--sandbox`: the filesystem is read-only except a `file:`/`dir:` target's directory, and the network is on (recorded as `"read-only"` for a `site:` target, `"workspace-write"` for a `file:` or `dir:` target)
   - Other → `"workspace-write"`
 - `shard` (optional): Run in an isolated git worktree (also via `permission="shard"` or `"careful+shard"`)
 - `timeout` (optional): Kill spool after this many seconds
@@ -90,18 +90,21 @@ The harness uses `codex exec` with the following flags:
 - `--skip-git-repo-check`: a spool's working dir need not be a git repository (a
   `spindle doctor --smoke` temp dir, a scratch research dir); codex refuses to start in one
   without it. The check only gates startup.
-- `--sandbox <mode>`: the tier the spool's permission maps to, always passed explicitly
-- `-c sandbox_mode=<mode>`: the same tier, so `~/.codex/config.toml` cannot widen it
+- `--sandbox <mode>`: the tier the spool's permission maps to, passed explicitly on every
+  non-research launch
+- `-c sandbox_mode=<mode>`: the same tier (non-research), so `~/.codex/config.toml` cannot
+  widen it
 - `-c approval_policy=never`: on every tier except `danger-full-access`, so an approval
   setting in config.toml cannot re-run a denied command outside the sandbox (a command
   matching a saved codex `allow` rule still runs outside it; see
   [CODEX_SETUP.md](docs/CODEX_SETUP.md#saved-allow-rules))
-- Research tiers: no `--sandbox`; `-c default_permissions="spindle-research"` plus the
-  profile's filesystem and `network.enabled=true` (see
-  [CODEX_SETUP.md](docs/CODEX_SETUP.md#how-spindle-invokes-it))
-- In a shard: `--cd <worktree>`, plus `--add-dir` and a pinned
-  `-c sandbox_workspace_write.writable_roots` for the git metadata the bwrap wrapper makes
-  writable and the worktree root (see [CODEX_SETUP.md](docs/CODEX_SETUP.md#codex-in-shards))
+- Research tiers: no `--sandbox`, no `sandbox_mode`, no `--add-dir`;
+  `-c default_permissions="spindle-research-<id>"` plus that profile's filesystem and
+  `network.enabled=true` (see [CODEX_SETUP.md](docs/CODEX_SETUP.md#how-spindle-invokes-it))
+- In a shard: `--cd <worktree>`; for a non-research shard at `workspace-write`, also
+  `--add-dir` and a pinned `-c sandbox_workspace_write.writable_roots` for the git metadata
+  the bwrap wrapper makes writable and the worktree root (see
+  [CODEX_SETUP.md](docs/CODEX_SETUP.md#codex-in-shards))
 
 `--full-auto` is deliberately not used. It combines a workspace-write sandbox with
 on-failure approvals, and that bundled tier silently overrides `--sandbox` regardless of

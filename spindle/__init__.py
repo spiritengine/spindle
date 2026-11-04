@@ -8253,6 +8253,59 @@ def _codex_sandbox_probe_argvs(codex_bin: str, shell_cmd: str, config_args: Opti
     ]
 
 
+_MOUNTINFO_ESCAPE = re.compile(r"\\([0-7]{3})")
+
+
+def _codex_writable_mount_points(mountinfo: str) -> set:
+    """Mount points a /proc/self/mountinfo table lists as read-write, octal escapes decoded."""
+    points = set()
+    for line in mountinfo.splitlines():
+        fields = line.split(" ")
+        if len(fields) < 7 or "-" not in fields[6:]:
+            continue
+        if "rw" in fields[5].split(","):
+            points.add(_MOUNTINFO_ESCAPE.sub(lambda match: chr(int(match.group(1), 8)), fields[4]))
+    return points
+
+
+def _codex_unexpected_writable_mounts(mountinfo: str, allowed: str, baseline: str) -> Optional[list]:
+    """Writable mounts a research profile adds beyond its `allowed` path; None if unreadable.
+
+    codex's Linux sandbox is bwrap: everything starts as a read-only bind of /, and each
+    writable path is a read-write bind on top of it, so the read-write mounts a sandboxed
+    command sees are its write set, whatever config produced them. `baseline` is the mount
+    table under codex's plain read-only sandbox on the same host: whatever is writable there
+    too (/dev, /proc, and any host mount bwrap could not remount read-only) is not something
+    the profile added.
+    """
+    if not any(line.strip() for line in mountinfo.splitlines()):
+        return None
+    if not any(line.strip() for line in baseline.splitlines()):
+        return None
+    expected = {os.path.realpath(allowed)}
+    already = _codex_writable_mount_points(baseline)
+    return sorted(
+        point
+        for point in _codex_writable_mount_points(mountinfo) - already - expected
+        if point not in {"/dev", "/proc"} and not point.startswith(("/dev/", "/proc/"))
+    )
+
+
+def _codex_probe_baseline_mounts(codex_bin: str, shape: int, cwd: str, process_env: Optional[Dict[str, str]]) -> str:
+    """The mount table under codex's plain read-only sandbox, or "" if it could not be read."""
+    shell_cmd = f"echo {_CODEX_SANDBOX_PROBE_MARKER}; cat /proc/self/mountinfo 2>/dev/null"
+    argv = _codex_sandbox_probe_argvs(
+        codex_bin, shell_cmd, ["-c", "sandbox_mode=read-only", "-c", "approval_policy=never"]
+    )[shape]
+    try:
+        proc = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=30, env=process_env)
+    except Exception as exc:
+        logger.warning("spindle: codex sandbox probe baseline failed on %s: %s", codex_bin, exc)
+        return ""
+    stdout = proc.stdout or ""
+    return stdout.split(_CODEX_SANDBOX_PROBE_MARKER, 1)[1] if _CODEX_SANDBOX_PROBE_MARKER in stdout else ""
+
+
 def _codex_sandbox_probe(codex_bin: str, process_env: Optional[Dict[str, str]] = None, research: bool = False) -> bool:
     """One uncached run of the enforcement probe. See _codex_sandbox_enforces.
 
@@ -8260,11 +8313,15 @@ def _codex_sandbox_probe(codex_bin: str, process_env: Optional[Dict[str, str]] =
     the write succeeded (fail open), no known CLI shape executed the command, an error or
     timeout — returns False, so uncertainty fails closed.
 
-    With `research`, the probe runs under the research permissions profile instead of
-    `-c sandbox_mode=read-only`, with one probe-only directory as the profile's writable
-    path. Both halves must hold: the write to the probe's cwd is blocked, and the write to
-    that directory lands. A codex that does not honor the profile resolves some other policy
-    (config.toml's sandbox_mode, or plain read-only), which fails one half or the other.
+    With `research`, the probe runs under a research permissions profile (its own fresh
+    name) instead of `-c sandbox_mode=read-only`, with one probe-only directory as the
+    profile's writable path. Both halves must hold: the write to the probe's cwd is blocked,
+    and the write to that directory lands. A codex that does not honor the profile resolves
+    some other policy (config.toml's sandbox_mode, or plain read-only), which fails one half
+    or the other. On Linux the sandboxed command also prints its own mount table, and any
+    writable mount beyond the probe's directory and what codex's plain read-only sandbox
+    already has fails the probe: that is a write set wider than the profile asked for,
+    wherever it came from.
     """
     label = "research profile" if research else "read-only"
     probe_dir = None
@@ -8286,9 +8343,9 @@ def _codex_sandbox_probe(codex_bin: str, process_env: Optional[Dict[str, str]] =
             config_args = _codex_research_profile_args([allowed_dir])
             shell_cmd = (
                 "printf BROKEN > enforce_probe.txt; write_rc=$?; printf OK > allowed/ok.txt; "
-                f"echo {_CODEX_SANDBOX_PROBE_MARKER}; exit $write_rc"
+                f"echo {_CODEX_SANDBOX_PROBE_MARKER}; cat /proc/self/mountinfo 2>/dev/null; exit $write_rc"
             )
-        for argv in _codex_sandbox_probe_argvs(codex_bin, shell_cmd, config_args=config_args):
+        for shape, argv in enumerate(_codex_sandbox_probe_argvs(codex_bin, shell_cmd, config_args=config_args)):
             Path(target).unlink(missing_ok=True)  # no stale file from a prior shape
             if allowed_file:
                 Path(allowed_file).unlink(missing_ok=True)
@@ -8335,6 +8392,27 @@ def _codex_sandbox_probe(codex_bin: str, process_env: Optional[Dict[str, str]] =
                     codex_bin,
                 )
                 return False
+            if allowed_file and not wrote and sys.platform.startswith("linux"):
+                mountinfo = (proc.stdout or "").split(_CODEX_SANDBOX_PROBE_MARKER, 1)[1]
+                baseline = _codex_probe_baseline_mounts(codex_bin, shape, probe_dir, process_env)
+                extra = _codex_unexpected_writable_mounts(mountinfo, os.path.dirname(allowed_file), baseline)
+                if extra is None:
+                    logger.warning(
+                        "spindle: codex sandbox probe (%s) on %s could not read the sandbox's mount table "
+                        "(or the read-only baseline's); failing closed",
+                        label,
+                        codex_bin,
+                    )
+                    return False
+                if extra:
+                    logger.warning(
+                        "spindle: codex sandbox probe (%s) on %s: the profile also made %s writable, "
+                        "a wider write set than Spindle asked for; failing closed",
+                        label,
+                        codex_bin,
+                        ", ".join(extra),
+                    )
+                    return False
             # The command demonstrably ran: blocked write -> enforcing, landed write -> fail
             # open. This shape is authoritative; do not fall through to another.
             return not wrote
@@ -8376,7 +8454,7 @@ def _codex_sandbox_enforces(
 
     key = _codex_sandbox_probe_key(codex_bin, process_env)
     if research:
-        key = (key, _CODEX_RESEARCH_PROFILE)
+        key = (key, _CODEX_RESEARCH_PROFILE_PREFIX)
     cached = _CODEX_SANDBOX_ENFORCES_CACHE.get(key)
     if cached is not None:
         return cached
@@ -8408,7 +8486,7 @@ def _codex_sandbox_refusal(
     if _codex_uses_research_profile(permission, sandbox):
         if _codex_sandbox_enforces(codex_bin, process_env, research=True):
             return None
-        enforced = f"Spindle's research permissions profile ({_CODEX_RESEARCH_PROFILE})"
+        enforced = "Spindle's research permissions profile"
     else:
         if _codex_sandbox_enforces(codex_bin, process_env):
             return None
@@ -8966,7 +9044,18 @@ def _codex_sandbox_config_args(sandbox: str, shard_info: Optional[dict], grants:
 # unshares the network, loopback included, so with approval pinned to never a site research
 # spool could not run the `skein post` its preamble asks for. See _codex_research_profile_args.
 _CODEX_RESEARCH_PERMISSIONS = frozenset({"research", "research+shard"})
-_CODEX_RESEARCH_PROFILE = "spindle-research"
+_CODEX_RESEARCH_PROFILE_PREFIX = "spindle-research"
+
+
+def _codex_research_profile_name() -> str:
+    """A fresh profile name for one research launch or probe.
+
+    codex merges a `-c permissions.<name>...` table recursively into a same-named table in
+    config.toml rather than replacing it, so under a fixed name an operator's
+    [permissions.spindle-research] could add writable paths to every research spool (fell r2,
+    finding-20261104-uxnt). A name that exists only on one command line has nothing to merge.
+    """
+    return f"{_CODEX_RESEARCH_PROFILE_PREFIX}-{uuid.uuid4().hex[:12]}"
 
 
 def _codex_uses_research_profile(permission: Optional[str], sandbox: Optional[str]) -> bool:
@@ -8974,8 +9063,8 @@ def _codex_uses_research_profile(permission: Optional[str], sandbox: Optional[st
     return permission in _CODEX_RESEARCH_PERMISSIONS and sandbox in _CODEX_RESTRICTIVE_SANDBOX_MODES
 
 
-def _codex_research_profile_args(writable_paths: list) -> list:
-    """The `-c` pins that run codex under Spindle's research permissions profile.
+def _codex_research_profile_args(writable_paths: list, profile: Optional[str] = None) -> list:
+    """The `-c` pins that run codex under a Spindle research permissions profile.
 
     The profile reads the whole filesystem, writes only `writable_paths` (a file/dir research
     target's directory, or nothing for a site target), and has the network on, so `skein
@@ -8983,14 +9072,22 @@ def _codex_research_profile_args(writable_paths: list) -> list:
     `default_permissions` on the command line ahead of a `sandbox_mode` in config.toml, but a
     `--sandbox` flag forces its legacy syntax and the profile is then ignored
     (core/src/config/mod.rs resolve_permission_config_syntax), so a research launch passes
-    no `--sandbox` and no `-c sandbox_mode`. Whether the binary honors the profile is checked
-    by behavior before launch (_codex_sandbox_probe with research=True).
+    no `--sandbox` and no `-c sandbox_mode`.
+
+    `profile` defaults to a fresh name (_codex_research_profile_name), so config.toml cannot
+    merge entries into it. Each writable path is a scoped entry, `{"<path>" = {"." =
+    "write"}}`: codex reads a plain key containing `*`, `?`, `[` or `]` as a glob and refuses
+    write access to globs, while a scoped entry's base path is always literal. Whether the
+    binary honors the profile, exactly, is checked by behavior before launch
+    (_codex_sandbox_probe with research=True).
     """
-    profile = _CODEX_RESEARCH_PROFILE
-    entries = [(":root", "read"), *((path, "write") for path in writable_paths)]
-    filesystem = (
-        "{" + ", ".join(f"{_toml_basic_string(key)} = {_toml_basic_string(mode)}" for key, mode in entries) + "}"
-    )
+    profile = profile or _codex_research_profile_name()
+    entries = [f"{_toml_basic_string(':root')} = {_toml_basic_string('read')}"]
+    entries += [
+        f"{_toml_basic_string(path)} = {{{_toml_basic_string('.')} = {_toml_basic_string('write')}}}"
+        for path in writable_paths
+    ]
+    filesystem = "{" + ", ".join(entries) + "}"
     return [
         "-c",
         f"default_permissions={_toml_basic_string(profile)}",
@@ -9001,6 +9098,14 @@ def _codex_research_profile_args(writable_paths: list) -> list:
         "-c",
         "approval_policy=never",
     ]
+
+
+def _codex_profile_name(config_args: list) -> Optional[str]:
+    """The permissions profile a launch's `-c` pins select, or None for a `--sandbox` tier."""
+    for index, token in enumerate(config_args[:-1]):
+        if token == "-c" and config_args[index + 1].startswith("default_permissions="):
+            return config_args[index + 1].split("=", 1)[1].strip('"')
+    return None
 
 
 def _codex_research_writable_paths(research_target_info: Optional[Dict[str, str]]) -> list:
@@ -9375,7 +9480,8 @@ Your task:
 
     # Build codex exec command.
     #
-    # --sandbox is always passed and always decides the tier, and it is paired with a matching
+    # --sandbox is passed on every non-research launch and decides the tier (a research tier
+    # passes a permissions profile instead; see _codex_launch_policy), paired with a matching
     # `-c sandbox_mode=<tier>` so ~/.codex/config.toml's sandbox_mode can never override it: a
     # command-line -c beats config.toml (verified on codex 0.144.5: config.toml sandbox_mode is
     # ignored once -c sandbox_mode is on the CLI). The two always agree, so this is a no-op on
@@ -9455,7 +9561,7 @@ Your task:
         # The tier actually passed to codex, not the one that was merely asked for. A
         # research tier passes it as the permissions profile named below, not as --sandbox.
         "sandbox": effective_sandbox,
-        "codex_permissions_profile": _CODEX_RESEARCH_PROFILE if research_profile else None,
+        "codex_permissions_profile": _codex_profile_name(config_args),
         # The requested tier, kept so a respin can re-derive the same sandbox.
         "permission": permission,
         # Which codex actually ran: enforcement varies by version, and PATH decides.
@@ -9596,7 +9702,6 @@ def _codex_respin_sync(session_id: str, prompt: str) -> str:
     #
     # Grants are resolved via the worktree root (shard_info), not working_dir, since
     # working_dir may be a subdirectory inside the worktree.
-    research_profile = _codex_uses_research_profile(permission, sandbox)
     sandbox_flags, config_args, grants = _codex_launch_policy(sandbox, permission, shard_info, research_target_info)
     codex_cmd = [codex_bin or "codex", "exec", "--skip-git-repo-check", *sandbox_flags, *config_args]
     if shard_info:
@@ -9641,7 +9746,7 @@ def _codex_respin_sync(session_id: str, prompt: str) -> str:
         # resolve to this record instead of the original spin (both share the session_id,
         # and _list_spools globs in arbitrary order), so the tier has to survive here too.
         "sandbox": sandbox,
-        "codex_permissions_profile": _CODEX_RESEARCH_PROFILE if research_profile else None,
+        "codex_permissions_profile": _codex_profile_name(config_args),
         "permission": permission,
         "research_target": research_target,
         "codex_bin": codex_bin,

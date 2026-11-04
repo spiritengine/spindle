@@ -405,21 +405,23 @@ spin(
 
 Codex uses OpenAI's sandbox policies, mapped from Claude permissions:
 
-Every codex spool is launched with an explicit `--sandbox` tier, mapped from Claude permissions:
+Every codex spool except research is launched with an explicit `--sandbox` tier, mapped from Claude permissions:
 
 - `permission="readonly"` → `--sandbox read-only`
 - `permission="careful"` → `--sandbox workspace-write`
 - `permission="full"` → `--sandbox danger-full-access`
 - `permission="shard"` → `--sandbox workspace-write` (the `spindle spin` CLI maps `shard` to `danger-full-access`)
-- `permission="research"` → no `--sandbox`; the `spindle-research` permissions profile instead: the filesystem is read-only except a `file:`/`dir:` target's directory, and the network is on so `skein post` and `curl` work (no bwrap; codex's own sandbox only)
+- `permission="research"` → no `--sandbox`; a `spindle-research-<id>` permissions profile instead (a fresh name per launch): the filesystem is read-only except a `file:`/`dir:` target's directory, and the network is on so `skein post` and `curl` work (no bwrap; codex's own sandbox only)
 - `permission="research+shard"` → the same profile + isolated worktree, inside the bwrap wrapper; nothing in the worktree is writable (see [CODEX_SETUP.md](CODEX_SETUP.md#codex-in-shards))
 
 Every tier except `danger-full-access` also gets `-c approval_policy=never`, so a command the
 sandbox denies cannot be approved again outside it by an approval setting in
 `~/.codex/config.toml`. A command matching a saved codex `allow` rule still runs outside the
-sandbox (see [CODEX_SETUP.md](CODEX_SETUP.md#saved-allow-rules)). In a shard, codex's own writable roots are exactly the git metadata
-Spindle's bwrap wrapper makes writable, and a shard spool whose codex sandbox cannot start
-inside the wrapper is refused (see [Codex Sandbox Enforcement](#codex-sandbox-enforcement)).
+sandbox (see [CODEX_SETUP.md](CODEX_SETUP.md#saved-allow-rules)). In a non-research shard at
+`workspace-write`, codex's own writable roots are the worktree root, `/tmp`, `$TMPDIR` and the
+git metadata Spindle's bwrap wrapper makes writable; a research shard's only writable path is
+its target's directory. A shard spool whose codex sandbox cannot start inside the wrapper is
+refused (see [Codex Sandbox Enforcement](#codex-sandbox-enforcement)).
 
 The mapping happens automatically in `_codex_spin_sync()`, and the tier that was actually
 passed is stored on the spool record as `sandbox` (alongside the requested `permission`).
@@ -464,7 +466,8 @@ uncontained and does not apply this sanitization.
 
 Codex does **not** need kernel Landlock. It sandboxes with its own vendored bubblewrap plus
 seccomp (`--use-legacy-landlock` is a fallback for older codex builds), so `--sandbox` is
-passed unconditionally and enforces on pre-5.13 kernels. Verified 2026-07-16 on kernel 5.4
+passed on every non-research launch (research passes a permissions profile instead) and
+enforces on pre-5.13 kernels. Verified 2026-07-16 on kernel 5.4
 against codex-cli 0.125.0: a `read-only` spool cannot write even inside its own cwd, and a
 `workspace-write` spool can write inside cwd but not to `$HOME`.
 
@@ -520,12 +523,16 @@ That check fails closed: no marker, an error or a timeout all refuse.
 
 **The research tiers run a permissions profile, probed the same way.** codex's `read-only`
 sandbox blocks all network, loopback included, so a research spool on it could not
-`skein post` to its site. Research tiers therefore pass no `--sandbox`; they select the
-`spindle-research` profile on the command line (read the whole filesystem, write only a
-`file:`/`dir:` target's directory, network on, approval never). The enforcement probe has a
-research variant: under that profile, with a probe-only directory as its one writable path,
-the write to the probe's cwd must be refused and the write to that directory must land. A
-codex that ignores the profile falls back to some other policy, fails one half, and research
+`skein post` to its site. Research tiers therefore pass no `--sandbox`; they select a
+`spindle-research-<id>` profile on the command line (read the whole filesystem, write only a
+`file:`/`dir:` target's directory, network on, approval never). The name is fresh for each
+launch, so a same-named `[permissions.*]` table in config.toml cannot merge writable paths
+into it, and the target is a scoped literal entry, so brackets or other glob characters in
+its path work. The enforcement probe has a research variant: under such a profile, with a
+probe-only directory as its one writable path, the write to the probe's cwd must be refused
+and the write to that directory must land, and on Linux the sandboxed command's mount table
+must show no writable mount beyond that directory and what codex's plain read-only sandbox
+already has. A codex that ignores or widens the profile fails one of these, and research
 spools are refused.
 
 ## Spool Management

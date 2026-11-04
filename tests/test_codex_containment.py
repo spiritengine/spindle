@@ -89,20 +89,35 @@ def _toml_list(value):
     return tomllib.loads(f"v = {value}")["v"]
 
 
-RESEARCH_PROFILE = "spindle-research"
+# Each research launch gets its own profile name under this prefix, so no profile of the same
+# name in the operator's config.toml can merge extra paths into it (fell r2, finding-20261104-uxnt).
+RESEARCH_PREFIX = "spindle-research-"
+
+
+def _research_profile_name(cmd):
+    value = _config_value(cmd, "default_permissions")
+    assert value is not None, f"no research permissions profile in {cmd!r}"
+    name = tomllib.loads(f"v = {value}")["v"]
+    assert name.startswith(RESEARCH_PREFIX) and len(name) > len(RESEARCH_PREFIX), name
+    return name
 
 
 def _research_filesystem(cmd):
     """The research permissions profile's filesystem table in an argv."""
-    value = _config_value(cmd, f"permissions.{RESEARCH_PROFILE}.filesystem")
-    assert value is not None, f"no research permissions profile in {cmd!r}"
+    value = _config_value(cmd, f"permissions.{_research_profile_name(cmd)}.filesystem")
+    assert value is not None, f"no research filesystem table in {cmd!r}"
     return tomllib.loads(f"v = {value}")["v"]
 
 
 def _research_args(cmd):
     """The four `-c` pairs that select and define the research profile, as they appear in cmd."""
-    start = cmd.index(f'default_permissions="{RESEARCH_PROFILE}"') - 1
+    start = cmd.index(f'default_permissions="{_research_profile_name(cmd)}"') - 1
     return cmd[start : start + 8]
+
+
+def _research_table(writable):
+    # A writable path is a scoped literal entry, so codex never reads it as a glob.
+    return {":root": "read", **{path: {".": "write"} for path in writable}}
 
 
 def _assert_research_profile(cmd, writable):
@@ -110,18 +125,18 @@ def _assert_research_profile(cmd, writable):
     # silently drop the profile (codex core/src/config/mod.rs resolve_permission_config_syntax).
     assert "--sandbox" not in cmd, cmd
     assert _config_value(cmd, "sandbox_mode") is None, cmd
-    assert _config_value(cmd, "default_permissions") == f'"{RESEARCH_PROFILE}"', cmd
-    assert _research_filesystem(cmd) == {":root": "read", **{path: "write" for path in writable}}
-    assert _config_value(cmd, f"permissions.{RESEARCH_PROFILE}.network.enabled") == "true", cmd
+    name = _research_profile_name(cmd)
+    assert _research_filesystem(cmd) == _research_table(writable)
+    assert _config_value(cmd, f"permissions.{name}.network.enabled") == "true", cmd
     assert _config_value(cmd, "approval_policy") == "never", cmd
     assert "--add-dir" not in cmd, cmd
 
 
-def _research_target(tmp_path, kind):
+def _research_target(tmp_path, kind, dirname="research-out"):
     """(research_target, the directory the profile should make writable) for one kind."""
     if kind == "site":
         return "site:spindle-development", []
-    out = tmp_path / "research-out"
+    out = tmp_path / dirname
     out.mkdir(exist_ok=True)
     if kind == "file":
         return f"file:{out / 'report.md'}", [str(out)]
@@ -399,8 +414,27 @@ class TestResearchProfile:
             record = _latest_record(tmp_path / "state")
 
         _assert_research_profile(captured[0], writable)
-        assert record["codex_permissions_profile"] == RESEARCH_PROFILE
+        assert record["codex_permissions_profile"] == _research_profile_name(captured[0])
         assert record["permission"] == "research"
+
+    def test_each_launch_gets_its_own_profile_name(self, tmp_path):
+        """A fixed name merges with a same-named [permissions.<name>] table in config.toml."""
+        with _codex_launch(tmp_path) as (captured, _):
+            _spin(tmp_path, "research", research_target="site:spindle-development")
+            _spin(tmp_path, "research", research_target="site:spindle-development")
+
+        first, second = (_research_profile_name(cmd) for cmd in captured)
+        assert first != second
+        assert "spindle-research" not in {first, second}
+
+    @pytest.mark.parametrize("kind", ["file", "dir"])
+    def test_glob_characters_in_the_target_stay_literal(self, tmp_path, kind):
+        """codex rejects a write entry whose key has glob characters; a scoped entry is literal."""
+        research_target, writable = _research_target(tmp_path, kind, dirname="sources [2026]")
+        with _codex_launch(tmp_path) as (captured, _):
+            _spin(tmp_path, "research", research_target=research_target)
+
+        assert _research_filesystem(captured[0]) == {":root": "read", writable[0]: {".": "write"}}
 
     @pytest.mark.parametrize("kind", ["site", "dir"])
     def test_respin_runs_the_research_profile_before_resume(self, tmp_path, kind):
@@ -492,40 +526,66 @@ class TestResearchProfile:
         paths = ['/w/with "quote"', "/w/back\\slash", "/w/tab\there", "/w/naïve"]
         args = spindle._codex_research_profile_args(paths)
 
-        assert _research_filesystem(args) == {":root": "read", **{path: "write" for path in paths}}
+        assert _research_filesystem(args) == _research_table(paths)
+
+
+def _mount_point(path):
+    return str(path).replace("\\", "\\134").replace(" ", "\\040").replace("\t", "\\011").replace("\n", "\\012")
+
+
+def _mountinfo(writable):
+    """A /proc/self/mountinfo as codex's bwrap leaves it: / read-only, /dev and /proc writable."""
+    lines = ["21 1 8:1 / / ro,relatime shared:1 - ext4 /dev/sda1 rw"]
+    always = ["/dev", "/dev/pts", "/proc", "/proc/sys/fs/binfmt_misc"]
+    for index, point in enumerate([*always, *writable]):
+        lines.append(f"{30 + index} 21 0:{index} / {_mount_point(point)} rw,nosuid,relatime - tmpfs none rw")
+    lines.append("60 21 8:1 /etc /etc ro,relatime - ext4 /dev/sda1 rw")
+    return "\n".join(lines) + "\n"
 
 
 class TestResearchEnforcementProbe:
-    """`_codex_sandbox_probe(research=True)`: the profile must be honored, both halves."""
+    """`_codex_sandbox_probe(research=True)`: the profile must be honored, exactly."""
 
     @staticmethod
-    def _probe(tmp_path, behave):
-        """Run the probe with a fake codex that does `behave(cwd)` and then prints the marker."""
+    def _probe(tmp_path, behave, mounts=lambda cwd: [cwd / "allowed"], baseline=lambda cwd: []):
+        """Run the probe with a fake codex. Under the research profile it does `behave(cwd)`,
+        prints the marker and the mount table with `mounts(cwd)` writable; under the plain
+        read-only baseline it prints the table with `baseline(cwd)` writable."""
         runs = []
 
         def fake_run(argv, **kwargs):
             runs.append((list(argv), kwargs))
-            behave(Path(kwargs["cwd"]))
-            return subprocess.CompletedProcess(argv, 0, stdout=f"{spindle._CODEX_SANDBOX_PROBE_MARKER}\n", stderr="")
+            cwd = Path(kwargs["cwd"])
+            if "sandbox_mode=read-only" in argv:
+                writable = baseline(cwd)
+            else:
+                behave(cwd)
+                writable = mounts(cwd) if mounts else None
+            table = "" if writable is None else _mountinfo(writable)
+            stdout = f"{spindle._CODEX_SANDBOX_PROBE_MARKER}\n{table}"
+            return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
 
         with patch("spindle.subprocess.run", side_effect=fake_run):
             result = spindle._codex_sandbox_probe(FAKE_CODEX, {"PATH": "/usr/bin"}, research=True)
         return result, runs
 
-    def test_honored_profile_passes(self, tmp_path):
-        def honored(cwd):
-            (cwd / "allowed" / "ok.txt").write_text("OK")
+    @staticmethod
+    def _honored(cwd):
+        (cwd / "allowed" / "ok.txt").write_text("OK")
 
-        result, runs = self._probe(tmp_path, honored)
+    def test_honored_profile_passes(self, tmp_path):
+        result, runs = self._probe(tmp_path, self._honored)
 
         assert result is True
         argv, kwargs = runs[0]
         allowed = os.path.join(kwargs["cwd"], "allowed")
-        assert argv[: 1 + 8] == [FAKE_CODEX, *spindle._codex_research_profile_args([allowed])]
+        name = _research_profile_name(argv)
+        assert argv[: 1 + 8] == [FAKE_CODEX, *spindle._codex_research_profile_args([allowed], profile=name)]
         assert _config_value(argv, "sandbox_mode") is None
+        assert "/proc/self/mountinfo" in argv[-1]
 
     def test_profile_ignored_as_plain_read_only_fails_closed(self, tmp_path):
-        result, _ = self._probe(tmp_path, lambda cwd: None)
+        result, _ = self._probe(tmp_path, lambda cwd: None, mounts=lambda cwd: [])
 
         assert result is False
 
@@ -534,9 +594,44 @@ class TestResearchEnforcementProbe:
             (cwd / "enforce_probe.txt").write_text("BROKEN")
             (cwd / "allowed" / "ok.txt").write_text("OK")
 
-        result, _ = self._probe(tmp_path, wide)
+        result, _ = self._probe(tmp_path, wide, mounts=lambda cwd: [cwd])
 
         assert result is False
+
+    def test_a_widened_write_set_fails_closed(self, tmp_path):
+        """Both write halves look right, but config added a writable path the probe never wrote."""
+        result, _ = self._probe(
+            tmp_path, self._honored, mounts=lambda cwd: [cwd / "allowed", "/home/someone/project notes"]
+        )
+
+        assert result is False
+
+    def test_a_mount_the_read_only_sandbox_also_has_is_not_a_widening(self, tmp_path):
+        """A host mount bwrap leaves writable everywhere is not something the profile added."""
+        quirk = "/run/user/1000/doc"
+        result, runs = self._probe(
+            tmp_path, self._honored, mounts=lambda cwd: [cwd / "allowed", quirk], baseline=lambda cwd: [quirk]
+        )
+
+        assert result is True
+        assert len(runs) == 2, "the probe compares against codex's plain read-only sandbox"
+
+    def test_a_missing_mount_table_fails_closed_on_linux(self, tmp_path):
+        result, _ = self._probe(tmp_path, self._honored, mounts=None)
+
+        assert result is False
+
+    def test_other_platforms_rely_on_the_write_halves(self, tmp_path):
+        with patch("spindle.sys.platform", "darwin"):
+            result, _ = self._probe(tmp_path, self._honored, mounts=None)
+
+        assert result is True
+
+    def test_mount_points_are_unescaped(self):
+        points = spindle._codex_writable_mount_points(_mountinfo(["/data/my notes", "/data/back\\slash"]))
+
+        assert {"/data/my notes", "/data/back\\slash"} <= points
+        assert "/" not in points and "/etc" not in points, "read-only mounts are not part of the write set"
 
     def test_research_result_is_cached_apart_from_read_only(self):
         spindle._CODEX_SANDBOX_ENFORCES_CACHE.clear()
@@ -560,13 +655,13 @@ class TestResearchEnforcementProbe:
 
 _SANDBOX_REPORT = r"""
 import socket, sys
-port, cwd_target, out_target = int(sys.argv[1]), sys.argv[2], sys.argv[3]
 try:
-    socket.create_connection(("127.0.0.1", port), 3).close()
+    socket.create_connection(("127.0.0.1", int(sys.argv[1])), 3).close()
     print("NET_OK")
 except OSError:
     print("NET_BLOCKED")
-for label, path in (("CWD", cwd_target), ("OUT", out_target)):
+for item in sys.argv[2:]:
+    label, path = item.split("=", 1)
     try:
         with open(path, "w") as handle:
             handle.write("x")
@@ -574,6 +669,52 @@ for label, path in (("CWD", cwd_target), ("OUT", out_target)):
     except OSError:
         print(label + "_DENIED")
 """
+
+_OPERATOR_CONFIG = (
+    'approval_policy = "on-request"\napprovals_reviewer = "auto_review"\nsandbox_mode = "workspace-write"\n'
+    "check_for_update_on_startup = false\n[sandbox_workspace_write]\nnetwork_access = true\n"
+)
+
+
+class _RealCodex:
+    """A real codex with a scratch CODEX_HOME (no credentials), a local listener standing in
+    for the SKEIN service, and a runner for _SANDBOX_REPORT under given `-c` pins."""
+
+    def __init__(self, tmp_path, extra_config=""):
+        import socket
+
+        self.codex = shutil.which("codex")
+        codex_home = tmp_path / "codex-home"
+        codex_home.mkdir()
+        (codex_home / "config.toml").write_text(_OPERATOR_CONFIG + extra_config)
+        self.work = tmp_path / "work"
+        self.work.mkdir()
+        self.env = {
+            key: value for key, value in os.environ.items() if key not in {"CODEX_API_KEY", "OPENAI_API_KEY", "TMPDIR"}
+        }
+        self.env.update(
+            HOME=str(tmp_path),
+            CODEX_HOME=str(codex_home),
+            PATH=os.path.dirname(self.codex) + os.pathsep + self.env.get("PATH", ""),
+        )
+        self.listener = socket.socket()
+        self.listener.bind(("127.0.0.1", 0))
+        self.listener.listen(8)
+
+    def run(self, config_args, **targets):
+        port = self.listener.getsockname()[1]
+        argv = [self.codex, *config_args, "sandbox", "--", sys.executable, "-I", "-c", _SANDBOX_REPORT, str(port)]
+        argv += [f"{label}={path}" for label, path in targets.items()]
+        proc = subprocess.run(argv, cwd=self.work, env=self.env, capture_output=True, text=True, timeout=60)
+        return proc.stdout.split(), proc.stderr
+
+    def close(self):
+        self.listener.close()
+
+
+def _operator_profile(name, writable_path):
+    """config.toml lines that define [permissions.<name>] with one extra writable path."""
+    return f'[permissions.{name}.filesystem]\n{spindle._toml_basic_string(str(writable_path))} = "write"\n'
 
 
 @pytest.mark.ns_required
@@ -583,49 +724,57 @@ def test_real_codex_research_profile_reaches_loopback_and_writes_only_its_target
 
     The scratch config.toml is shaped like the operator config that motivated the pins
     (sandbox_mode workspace-write, approval on-request with an automatic reviewer, network
-    on), to show that the command-line profile wins over it. A local listener stands in for
-    the SKEIN service. The legacy read-only sandbox is run as the control.
+    on), and also defines a [permissions.spindle-research] profile with one more writable
+    directory (fell r2's reproduction): the command-line profile, under its own per-launch
+    name, wins over the first and never inherits the second. The target directory's name has
+    glob characters, which codex must read literally. The legacy read-only sandbox is run as
+    the control.
     """
-    import socket
-
-    codex = shutil.which("codex")
-    codex_home = tmp_path / "codex-home"
-    codex_home.mkdir()
-    (codex_home / "config.toml").write_text(
-        'approval_policy = "on-request"\napprovals_reviewer = "auto_review"\nsandbox_mode = "workspace-write"\n'
-        "check_for_update_on_startup = false\n[sandbox_workspace_write]\nnetwork_access = true\n"
-    )
-    work = tmp_path / "work"
-    work.mkdir()
-    out = tmp_path / "research-out"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    out = tmp_path / "sources [2026]"
     out.mkdir()
-    env = {key: value for key, value in os.environ.items() if key not in {"CODEX_API_KEY", "OPENAI_API_KEY", "TMPDIR"}}
-    env.update(
-        HOME=str(tmp_path),
-        CODEX_HOME=str(codex_home),
-        PATH=os.path.dirname(codex) + os.pathsep + env.get("PATH", ""),
-    )
-    listener = socket.socket()
-    listener.bind(("127.0.0.1", 0))
-    listener.listen(4)
-    port = listener.getsockname()[1]
-
-    def run(config_args):
-        argv = [codex, *config_args, "sandbox", "--", sys.executable, "-I", "-c", _SANDBOX_REPORT]
-        argv += [str(port), str(work / "cwd.txt"), str(out / "report.md")]
-        proc = subprocess.run(argv, cwd=work, env=env, capture_output=True, text=True, timeout=60)
-        return proc.stdout.split(), proc.stderr
-
+    real = _RealCodex(tmp_path, extra_config=_operator_profile("spindle-research", outside))
+    targets = {"CWD": real.work / "cwd.txt", "OUT": out / "report.md", "OUTSIDE": outside / "x.txt"}
     try:
-        research, research_err = run(spindle._codex_research_profile_args([str(out)]))
-        legacy, _ = run(["-c", "sandbox_mode=read-only", "-c", "approval_policy=never"])
-        probe_passes = spindle._codex_sandbox_probe(codex, env, research=True)
+        research, research_err = real.run(spindle._codex_research_profile_args([str(out)]), **targets)
+        legacy, _ = real.run(["-c", "sandbox_mode=read-only", "-c", "approval_policy=never"], **targets)
+        probe_passes = spindle._codex_sandbox_probe(real.codex, real.env, research=True)
     finally:
-        listener.close()
+        real.close()
 
-    assert research == ["NET_OK", "CWD_DENIED", "OUT_WROTE"], research_err
-    assert legacy == ["NET_BLOCKED", "CWD_DENIED", "OUT_DENIED"]
+    assert research == ["NET_OK", "CWD_DENIED", "OUT_WROTE", "OUTSIDE_DENIED"], research_err
+    assert legacy == ["NET_BLOCKED", "CWD_DENIED", "OUT_DENIED", "OUTSIDE_DENIED"]
     assert probe_passes is True
+
+
+@pytest.mark.ns_required
+@pytest.mark.skipif(not shutil.which("codex"), reason="codex CLI is not installed")
+def test_real_codex_probe_refuses_a_widened_research_write_set(tmp_path):
+    """The enforcement probe reads the sandbox's own mount table, so it catches any widening.
+
+    The profile name is pinned here so that config.toml can widen exactly that profile, the
+    way a fixed name could be widened before. The widening is real (the outside write lands)
+    and the probe refuses it; the same probe under a name config does not know passes.
+    """
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    widened = "spindle-research-widened"
+    real = _RealCodex(tmp_path, extra_config=_operator_profile(widened, outside))
+    try:
+        merged, merged_err = real.run(
+            spindle._codex_research_profile_args([], profile=widened), OUTSIDE=outside / "x.txt"
+        )
+        with patch("spindle._codex_research_profile_name", return_value=widened):
+            widened_probe = spindle._codex_sandbox_probe(real.codex, real.env, research=True)
+        with patch("spindle._codex_research_profile_name", return_value="spindle-research-unknown"):
+            clean_probe = spindle._codex_sandbox_probe(real.codex, real.env, research=True)
+    finally:
+        real.close()
+
+    assert merged == ["NET_OK", "OUTSIDE_WROTE"], merged_err
+    assert widened_probe is False
+    assert clean_probe is True
 
 
 # --------------------------------------------------------------------------------------
@@ -695,7 +844,7 @@ class TestShardWritableRoots:
 
         cmd = captured[0]
         assert _add_dirs(cmd) == [], "a research launch's one writable path is in its permissions profile"
-        assert _research_filesystem(cmd) == {":root": "read", str(out): "write"}
+        assert _research_filesystem(cmd) == _research_table([str(out)])
         assert _config_value(cmd, "sandbox_workspace_write.writable_roots") is None
         outer = _outer_writable_binds(cmd, cmd.index(FAKE_CODEX))
         assert str(out) in outer

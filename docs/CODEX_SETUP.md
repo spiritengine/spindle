@@ -98,13 +98,14 @@ codex exec --json --skip-git-repo-check --sandbox <mode> -c sandbox_mode=<mode> 
   (a `spindle doctor --smoke` temp dir, a scratch research dir). codex refuses to start
   there without it. The check only gates startup; it relaxes no sandbox setting.
 
-The research tiers run through a codex permissions profile instead of `--sandbox`:
+The research tiers run through a codex permissions profile instead of `--sandbox`, under a
+name made fresh for each launch:
 
 ```bash
 codex exec --json --skip-git-repo-check \
-  -c 'default_permissions="spindle-research"' \
-  -c 'permissions.spindle-research.filesystem={":root" = "read", "<target dir>" = "write"}' \
-  -c 'permissions.spindle-research.network.enabled=true' \
+  -c 'default_permissions="spindle-research-<id>"' \
+  -c 'permissions.spindle-research-<id>.filesystem={":root" = "read", "<target dir>" = {"." = "write"}}' \
+  -c 'permissions.spindle-research-<id>.network.enabled=true' \
   -c approval_policy=never "your task"
 ```
 
@@ -113,9 +114,17 @@ for a `site:` target), and has the network on, so `skein post` and `curl` work. 
 `read-only` sandbox cannot do this: it blocks all network, loopback included. A research
 launch passes no `--sandbox` and no `-c sandbox_mode`, because either one makes codex ignore
 the profile; a profile selected on the command line wins over a `sandbox_mode` in
-config.toml. Before the first research spool, Spindle checks by behavior that the resolved
-codex honors the profile (a write to the probe's directory is refused and a write to its
-one allowed path lands), and refuses research spools if it does not.
+config.toml. The name is new on every launch because codex merges a command-line
+`permissions.<name>` table into a same-named table in config.toml rather than replacing it;
+a fixed name would let a `[permissions.spindle-research]` in your config add writable paths
+to every research spool. The target is a scoped entry (`{"." = "write"}`) because codex reads
+a plain key containing `*`, `?`, `[` or `]` as a glob and refuses write access to globs.
+
+Before the first research spool, Spindle checks by behavior that the resolved codex honors
+the profile exactly: a write to the probe's directory is refused, a write to its one allowed
+path lands, and on Linux the sandboxed command's own mount table shows no writable mount
+beyond that path and what codex's plain read-only sandbox already has. Research spools are
+refused if any of that fails.
 
 `--full-auto` is never passed: it carries its own workspace-write tier that overrides
 `--sandbox` regardless of order, and `codex exec` is already non-interactive without it.
@@ -518,7 +527,9 @@ What the tier does not cover:
 
 - A command matching a saved `allow` rule runs outside codex's sandbox, even with approval
   pinned to `never` (see [Saved allow rules](#saved-allow-rules)).
-- MCP servers configured in your codex config run outside codex's sandbox.
+- Hooks (`$CODEX_HOME/hooks.json`) and MCP servers configured for codex run in codex's own
+  process, outside its sandbox (and, outside a shard, outside any sandbox). The agent cannot
+  edit them from inside the sandbox, but whatever they do is not bounded by the tier.
 - Network access inside `workspace-write` follows `[sandbox_workspace_write] network_access`
   in your config.toml.
 - Inside a shard, `refs/heads` is writable as a directory, so a shard agent can move any
