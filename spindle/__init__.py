@@ -5943,6 +5943,10 @@ async def spool_reap(
     addresses/counts; follow run_truncation.retrieve.after for more runs.
     Selection pages also have a 200-entry cap; follow entry_truncation.retrieve.after
     for more entries and each entry's truncation.retrieve for more content.
+    In both modes, runs and scope.run_addresses describe only represented runs;
+    matched_runs and compact scope.diagnostics cover the complete saved scope.
+    Page ok reflects represented runs (scope errors for an empty page). Empty
+    selections retain support/error counts and retrieve_outline arguments.
 
     Args:
         handle: A spool ID. With session=True, may instead be a session ID.

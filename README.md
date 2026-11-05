@@ -474,10 +474,22 @@ Ordinary pages obey the existing `SPINDLE_UNSPOOL_MAX_CHARS` read budget (50,000
 rendered JSON characters by default, including escaping and metadata).
 Session outlines page through runs in creation order. Their `scope` states
 `matched_runs`, `returned_runs`, `runs_before_page`, and `omitted_runs` (runs
-remaining after this page); `scope.run_addresses` lists only the returned page,
-not every matching run. If runs remain, pass `run_truncation.retrieve.after`
+remaining after this page). If runs remain, pass `run_truncation.retrieve.after`
 back as `after` with the same handle and session setting, without addresses or
 filters. CLI equivalent: `spindle reap ID --session --after run:SPOOL_ID`.
+
+In both modes, `scope.run_addresses` and `runs` describe only the runs
+represented on the returned page: outlined runs, or owners of selected entries.
+`scope.matched_runs` still counts the complete saved-run scope; `returned_runs`
+counts its represented runs. Selection `available_tool_names` lists names on
+returned entries, not an inventory of tools elsewhere in the session.
+Page `ok` reflects its represented runs. Compact `scope.diagnostics` counts
+error/warning runs, missing captures, and support levels across the whole scope;
+it never repeats every run or individual error. For an empty page, `ok` reflects
+that scope's error count, so malformed captures are not reported as a clean
+absence of matches. Unsupported/partially supported sources remain explicit in
+`support_counts` even when no entries match. To inspect those sources, make a
+new outline request using only `scope.diagnostics.retrieve_outline` arguments.
 
 Selected-content pages also have a 200-entry cap. If more entries matched,
 `entry_truncation.retrieve.after` gives a stable selected-entry address to pass
@@ -497,6 +509,9 @@ that run and its raw evidence address; use its run address as an outline
 `after` cursor to continue past it. If selected-content metadata cannot fit,
 narrow the scope/selection or request selected addresses with `full`. Neither
 case returns an empty page with a continuation that cannot advance.
+Repeated malformed NDJSON records produce one capture issue with
+`details.count` and one-based `details.first_source_line`; each raw event retains
+its own `parse_error`, content and address.
 
 ### Search and filter
 

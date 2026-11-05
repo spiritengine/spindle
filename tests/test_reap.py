@@ -534,7 +534,10 @@ def test_session_budget_continuation_keeps_saved_run_scope(tmp_path):
     assert len(first["entries"]) == 2
     after = first["entry_truncation"]["retrieve"]["after"]
     second = reap_store(tmp_path, "page-0", session=True, filters="user", after=after)
-    assert first["scope"] == second["scope"]
+    assert first["scope"]["matched_runs"] == second["scope"]["matched_runs"] == 3
+    assert first["scope"]["diagnostics"] == second["scope"]["diagnostics"]
+    assert first["scope"]["run_addresses"] == ["run:page-0", "run:page-1"]
+    assert second["scope"]["run_addresses"] == ["run:page-2"]
     assert len(render_response(second)) <= DEFAULT_RESPONSE_CHARS
     assert [entry["address"] for entry in first["entries"] + second["entries"]] == [
         f"run:page-{i}/prompt" for i in range(3)
@@ -603,7 +606,7 @@ def test_session_outline_pages_every_run_once_with_honest_scope(tmp_path, count)
         assert scope["runs_before_page"] == len(seen)
         assert scope["omitted_runs"] == count - len(seen) - len(addresses)
         assert f"exactly {count} readable saved" in scope["statement"]
-        assert "only the runs returned on this outline page" in scope["statement"]
+        assert "only the evidence represented on this page" in scope["statement"]
         assert "provider history not captured" in scope["statement"]
         seen.extend(addresses)
         pages += 1
@@ -751,6 +754,142 @@ def test_malformed_record_and_capture_are_not_empty_successes(tmp_path):
     fatal = reap_store(tmp_path, only_bad)
     assert fatal["ok"] is False
     assert fatal["runs"][0]["collections"][-1]["count"] == 1
+
+
+@pytest.mark.parametrize("terminal", [False, True])
+@pytest.mark.parametrize("valid_prefix", [False, True])
+def test_malformed_summary_preserves_severity_line_and_byte_accounting(terminal, valid_prefix):
+    prefix = b"\r\n" + (b"{}\r\n" if valid_prefix else b"")
+    complete = prefix + "bad π\r\nalso bad\r\n".encode("utf-8")
+    suffix = b'{"partial'
+    capture = _decode_capture(complete + suffix, terminal=terminal)
+    issue = next(issue for issue in capture.issues if issue.code == "malformed_capture_record")
+    assert issue.details == {"count": 2 + terminal, "first_source_line": 2 + valid_prefix}
+    assert issue.severity == ("error" if terminal and not valid_prefix else "warning")
+    assert capture.observed_bytes == len(complete + suffix)
+    assert capture.parsed_prefix_bytes == len(complete) + (len(suffix) if terminal else 0)
+    assert capture.ignored_trailing_bytes == (0 if terminal else len(suffix))
+    assert [event.index for event in capture.events] == list(range(len(capture.events)))
+    assert sum(event.parse_error is not None for event in capture.events) == issue.details["count"]
+
+
+def test_plain_text_capture_remains_readable_and_does_not_block_healthy_selection(tmp_path):
+    _record(tmp_path, "bad", session_id="shared")
+    _record(tmp_path, "good", session_id="shared")
+    (tmp_path / "good.stdout").write_text(_jsonl({"type": "thread.started"}))
+    lines = [f"plain output {i} π" for i in range(400)]
+    (tmp_path / "bad.stdout").write_text("\n".join(lines) + "\n")
+    outline = reap_store(tmp_path, "bad")
+    assert "error" not in outline and outline["ok"] is False
+    assert len(render_response(outline)) <= DEFAULT_RESPONSE_CHARS
+    issue = outline["runs"][0]["issues"][0]
+    assert issue["details"] == {"count": 400, "first_source_line": 1}
+    assert issue["severity"] == "error"
+    seen, after = [], None
+    for _ in range(10):
+        page = reap_store(tmp_path, "bad", addresses="run:bad/raw", after=after)
+        assert "error" not in page and page["ok"] is False
+        assert len(render_response(page)) <= DEFAULT_RESPONSE_CHARS
+        assert page["runs"][0]["issues"] == [issue]
+        assert page["entries"]
+        for entry in page["entries"]:
+            assert entry["address"] == f"run:bad/events/{len(seen)}"
+            assert entry["content"] == lines[len(seen)]
+            assert entry["details"]["parse_error"]
+            seen.append(entry["address"])
+        after = page.get("entry_truncation", {}).get("retrieve", {}).get("after")
+        if after is None:
+            break
+    assert len(seen) == 400
+    full = reap_store(tmp_path, "bad", addresses="run:bad/raw", full=True)
+    assert len(full["entries"]) == 200 and full["runs"][0]["issues"] == [issue]
+
+    healthy = reap_store(tmp_path, "shared", session=True, addresses="run:good/final")
+    assert healthy["ok"] is True
+    assert healthy["entries"][0]["content"] == "final for good"
+    assert [run["address"] for run in healthy["runs"]] == healthy["scope"]["run_addresses"] == ["run:good"]
+    assert healthy["scope"]["matched_runs"] == 2
+    assert healthy["scope"]["diagnostics"]["error_runs"] == 1
+    empty = reap_store(tmp_path, "shared", session=True, filters="agent")
+    assert empty["ok"] is False and empty["entries"] == empty["runs"] == []
+    assert empty["scope"]["diagnostics"]["error_runs"] == 1
+
+
+def test_large_session_selection_metadata_tracks_only_page_owners(tmp_path):
+    ids = [f"codex-{i:08x}" for i in range(110)]
+    for i, spool_id in enumerate(ids):
+        _record(tmp_path, spool_id, session_id="shared", prompt="p", result="r")
+        event = {
+            "type": "item.started",
+            "item": {"id": f"c{i}", "type": "command_execution", "name": f"tool-{i}", "command": "pwd"},
+        }
+        (tmp_path / f"{spool_id}.stdout").write_text(_jsonl(event))
+    single = reap_store(tmp_path, "shared", session=True, addresses=f"run:{ids[0]}/final")
+    assert single["ok"] is True
+    assert single["scope"]["matched_runs"] == 110 and single["scope"]["returned_runs"] == 1
+    assert single["scope"]["run_addresses"] == [f"run:{ids[0]}"]
+    assert single["selection"]["available_tool_names"] == []
+    assert len(render_response(single)) < 4000
+    seen, after = [], None
+    for _ in range(10):
+        page = reap_store(tmp_path, "shared", session=True, filters="user", after=after)
+        assert page["ok"] is True
+        assert len(render_response(page)) <= DEFAULT_RESPONSE_CHARS
+        owners = [entry["address"].removesuffix("/prompt") for entry in page["entries"]]
+        assert owners == [f"run:{spool_id}" for spool_id in ids[len(seen) : len(seen) + len(owners)]]
+        assert page["scope"]["run_addresses"] == [run["address"] for run in page["runs"]] == owners
+        assert page["scope"]["matched_runs"] == 110 and page["scope"]["returned_runs"] == len(owners)
+        seen.extend(owners)
+        after = page.get("entry_truncation", {}).get("retrieve", {}).get("after")
+        if after is None:
+            break
+    assert seen == [f"run:{spool_id}" for spool_id in ids]
+    empty = reap_store(tmp_path, "shared", session=True, filters="agent")
+    assert empty["ok"] is True and empty["entries"] == empty["runs"] == []
+    assert empty["scope"]["diagnostics"]["support_counts"]["normalized"] == 110
+    assert len(render_response(empty)) < 3000
+
+
+def test_page_ok_is_explained_by_represented_runs_or_empty_scope_diagnostics(tmp_path):
+    ids = _outline_session(tmp_path, 9)
+    (tmp_path / f"{ids[-1]}.stdout").write_text("not json\n")
+    first = reap_store(tmp_path, "shared", session=True)
+    assert first["ok"] is True
+    assert first["scope"]["diagnostics"]["error_runs"] == 1
+    assert all(issue["severity"] != "error" for run in first["runs"] for issue in run["issues"])
+    second = reap_store(tmp_path, "shared", session=True, after=first["run_truncation"]["retrieve"]["after"])
+    assert second["ok"] is False
+    assert any(issue["severity"] == "error" for run in second["runs"] for issue in run["issues"])
+    for index, expected_ok in [(0, True), (-1, False)]:
+        page = reap_store(tmp_path, "shared", session=True, addresses=f"run:{ids[index]}/final")
+        assert page["ok"] is expected_ok
+        assert page["scope"]["run_addresses"] == [f"run:{ids[index]}"]
+    end = reap_store(tmp_path, "shared", session=True, after=f"run:{ids[-1]}")
+    assert end["ok"] is False and end["runs"] == []
+    assert end["scope"]["diagnostics"]["error_runs"] == 1
+
+
+@pytest.mark.parametrize(
+    "harness, capture, support, errors",
+    [
+        ("gemini", '{"response":"captured"}', "raw-only", 0),
+        ("claude-code", '{"type":"system"}', "partial", 0),
+        ("codex", "malformed\n", "normalized", 1),
+    ],
+)
+def test_empty_selection_preserves_scope_support_and_error_diagnostics(tmp_path, harness, capture, support, errors):
+    _record(tmp_path, "empty", harness=harness)
+    (tmp_path / "empty.stdout").write_text(capture)
+    result = reap_store(tmp_path, "empty", filters="agent")
+    assert result["entries"] == result["runs"] == result["scope"]["run_addresses"] == []
+    assert result["ok"] is (errors == 0)
+    assert result["scope"]["matched_runs"] == 1 and result["scope"]["returned_runs"] == 0
+    diagnostics = result["scope"]["diagnostics"]
+    assert diagnostics["error_runs"] == errors and diagnostics["support_counts"][support] == 1
+    assert len(render_response(result)) < 3000
+    outline = reap_store(tmp_path, **diagnostics["retrieve_outline"])
+    assert outline["mode"] == "outline" and outline["runs"][0]["address"] == "run:empty"
+    assert outline["runs"][0]["support"] == support
 
 
 @pytest.mark.parametrize("harness", ["gemini", "private-profile"])

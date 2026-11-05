@@ -30,9 +30,13 @@ class _Issue:
     code: str
     message: str
     severity: str = "warning"
+    details: dict[str, Any] = field(default_factory=dict)
 
-    def as_dict(self) -> dict[str, str]:
-        return {"severity": self.severity, "code": self.code, "message": self.message}
+    def as_dict(self) -> dict[str, Any]:
+        result: dict[str, Any] = {"severity": self.severity, "code": self.code, "message": self.message}
+        if self.details:
+            result["details"] = self.details
+        return result
 
 
 @dataclass
@@ -267,6 +271,7 @@ def _decode_capture(data: bytes, *, terminal: bool) -> _Capture:
     lines = data.split(b"\n")
     events: list[_RawEvent] = []
     consumed_bytes = 0
+    malformed_issue: Optional[_Issue] = None
     for line_no, line in enumerate(lines):
         complete_line = line_no < len(lines) - 1
         framed_bytes = len(line) + int(complete_line)
@@ -290,12 +295,14 @@ def _decode_capture(data: bytes, *, terminal: bool) -> _Capture:
             events.append(_RawEvent(len(events), parsed, raw))
         except json.JSONDecodeError as exc:
             events.append(_RawEvent(len(events), None, raw, str(exc)))
-            issues.append(
-                _Issue(
+            if malformed_issue is None:
+                malformed_issue = _Issue(
                     "malformed_capture_record",
-                    f"capture record at source line {line_no + 1} is malformed and is available as raw evidence",
+                    "capture contains malformed records; individual parse errors remain available as raw evidence",
+                    details={"count": 0, "first_source_line": line_no + 1},
                 )
-            )
+                issues.append(malformed_issue)
+            malformed_issue.details["count"] += 1
         consumed_bytes += framed_bytes
     ignored = len(data) - consumed_bytes
     capture_format = "ndjson" if events else "unparsed"
@@ -823,26 +830,49 @@ def _run_outline(run: _Run) -> dict[str, Any]:
 
 
 def _scope(handle: str, session: bool, runs: list[_Run], session_id: Optional[str]) -> dict[str, Any]:
+    scope = {
+        "view": "session" if session else "spool",
+        "address": f"session:{session_id}" if session else runs[0].address,
+        "requested_handle": handle,
+        "matched_runs": len(runs),
+        "returned_runs": 0,
+        "run_addresses": [],
+        # These fixed-size totals explain incomplete/unsupported scope even when
+        # no entries match. Individual run facts belong only to the returned page.
+        "diagnostics": {
+            "error_runs": sum(any(issue.severity == "error" for issue in run.issues) for run in runs),
+            "warning_runs": sum(any(issue.severity == "warning" for issue in run.issues) for run in runs),
+            "missing_capture_runs": sum(run.capture.source is None for run in runs),
+            "support_counts": {
+                kind: sum(run.support == kind for run in runs) for kind in ("normalized", "partial", "raw-only")
+            },
+            "retrieve_outline": {"handle": handle, "session": session},
+        },
+    }
     if session:
         statement = (
             f"exactly {len(runs)} readable saved Spindle run(s) whose records carry session_id={session_id!r}; "
             "provider history not captured by Spindle is not included"
         )
-        return {
-            "view": "session",
-            "address": f"session:{session_id}",
-            "requested_handle": handle,
-            "session_id": session_id,
-            "statement": statement,
-            "run_addresses": [run.address for run in runs],
-        }
-    return {
-        "view": "spool",
-        "address": runs[0].address,
-        "requested_handle": handle,
-        "statement": "one saved Spindle run; provider history outside this run's saved capture is not included",
-        "run_addresses": [runs[0].address],
-    }
+        scope["session_id"] = session_id
+    else:
+        statement = "one saved Spindle run; provider history outside this run's saved capture is not included"
+    scope["statement"] = statement + "; run_addresses and runs describe only the evidence represented on this page"
+    return scope
+
+
+def _update_page_scope(response: dict[str, Any]) -> None:
+    """Keep run identity and success tied to the metadata actually on the page."""
+    page_runs = response["runs"]
+    scope = response["scope"]
+    scope.update(run_addresses=[run["address"] for run in page_runs], returned_runs=len(page_runs))
+    # Empty pages still disclose scope failures through bounded diagnostics,
+    # rather than making an empty-success claim about an unreadable capture.
+    response["ok"] = (
+        not any(issue["severity"] == "error" for run in page_runs for issue in run["issues"])
+        if page_runs
+        else scope["diagnostics"]["error_runs"] == 0
+    )
 
 
 def _error(handle: str, code: str, message: str) -> dict[str, Any]:
@@ -1105,7 +1135,6 @@ def reap_store(
     if resolution_error:
         return resolution_error
     scope = _scope(handle, session, runs, session_id)
-    fatal_issues = [issue for run in runs for issue in run.issues if issue.severity == "error"]
 
     if not selectors and not filter_names:
         if full or offset or limit is not None:
@@ -1117,7 +1146,7 @@ def reap_store(
         run_start = 0
         if after is not None:
             try:
-                run_start = scope["run_addresses"].index(after) + 1
+                run_start = [run.address for run in runs].index(after) + 1
             except ValueError:
                 return _error(
                     handle,
@@ -1125,15 +1154,9 @@ def reap_store(
                     f"outline after address {after!r} is not a run in this scope; "
                     "use a run:<spool-id> address with the same handle and session setting",
                 )
-        scope["run_addresses"] = []
-        scope.update(
-            matched_runs=len(runs), returned_runs=0, runs_before_page=run_start, omitted_runs=len(runs) - run_start
-        )
-        if session:
-            scope["statement"] += "; run_addresses lists only the runs returned on this outline page"
+        scope.update(runs_before_page=run_start, omitted_runs=len(runs) - run_start)
         outline = {
             "schema": REAP_SCHEMA,
-            "ok": not fatal_issues,
             "mode": "outline",
             "scope": scope,
             "address_scheme": {
@@ -1150,9 +1173,8 @@ def reap_store(
         def update_outline_page() -> None:
             count = len(outline["runs"])
             omitted = len(runs) - run_start - count
-            scope.update(
-                run_addresses=[item["address"] for item in outline["runs"]], returned_runs=count, omitted_runs=omitted
-            )
+            scope["omitted_runs"] = omitted
+            _update_page_scope(outline)
             if count and omitted:
                 last_address = outline["runs"][-1]["address"]
                 outline["run_truncation"] = {
@@ -1166,6 +1188,7 @@ def reap_store(
             else:
                 outline.pop("run_truncation", None)
 
+        update_outline_page()
         for run in runs[run_start:]:
             outline["runs"].append(_run_outline(run))
             update_outline_page()
@@ -1223,12 +1246,8 @@ def reap_store(
                 "invalid_after",
                 f"after address {after!r} is not in this selection; repeat the same addresses and filters",
             )
-    available_tools = sorted(
-        {item.tool_name for run in runs for item in run.entries if item.kind == "tool_call" and item.tool_name}
-    )
     response: dict[str, Any] = {
         "schema": REAP_SCHEMA,
-        "ok": not fatal_issues,
         "mode": "selection",
         "scope": scope,
         "selection": {
@@ -1240,10 +1259,15 @@ def reap_store(
             "entries_before_page": entry_start,
             "deduplicated_overlap": deduplicated_overlap,
             "omitted_entries": len(ordered) - entry_start,
-            "available_tool_names": available_tools,
+            "available_tool_names": [],
         },
         "entries": [],
-        "runs": [
+        "runs": [],
+    }
+
+    def update_page() -> None:
+        owning_ids = dict.fromkeys(_RUN_ADDRESS.fullmatch(entry["address"]).group(1) for entry in response["entries"])
+        response["runs"] = [
             {
                 "address": run.address,
                 "support": run.support,
@@ -1251,14 +1275,18 @@ def reap_store(
                 "capture": _capture_facts(run),
                 "issues": [issue.as_dict() for issue in run.issues],
             }
-            for run in runs
-        ],
-    }
-
-    def update_page() -> None:
+            for run in (run_by_id[spool_id] for spool_id in owning_ids)
+        ]
+        _update_page_scope(response)
         count = len(response["entries"])
         omitted = len(ordered) - entry_start - count
-        response["selection"].update(returned_entries=count, omitted_entries=omitted)
+        response["selection"].update(
+            returned_entries=count,
+            omitted_entries=omitted,
+            available_tool_names=sorted(
+                {entry["tool_name"] for entry in response["entries"] if entry.get("tool_name")}
+            ),
+        )
         if count and omitted:
             last_address = response["entries"][-1]["address"]
             response["entry_truncation"] = {
@@ -1276,6 +1304,7 @@ def reap_store(
         else:
             response.pop("entry_truncation", None)
 
+    update_page()
     for entry in ordered[entry_start : entry_start + MAX_RETURNED_ENTRIES]:
         response["entries"].append(_render_entry(entry, offset=offset, limit=limit, full=full))
         update_page()
