@@ -398,7 +398,10 @@ Tune the thresholds with `SPINDLE_UNSPOOL_MAX_CHARS` (default 50000),
 ### Addressable capture reading
 
 `spool_reap` and `spindle reap` inspect the spool record and its existing
-stdout/transcript capture without launching, resuming, or finalizing anything.
+stdout/transcript capture. The reader adds no launch, resume, or finalization
+calls. As with other Spindle CLI commands, starting the CLI retains existing
+store cleanup and recovery; the MCP reader itself does not request maintenance.
+
 A bare spool ID returns a compact outline. Every preview carries a fully
 qualified address that can be copied into a later request:
 
