@@ -657,7 +657,6 @@ def _link_calls_and_results(entries: list[_Entry]) -> None:
         if call is None:
             continue
         entry.call_address = call.address
-        entry.tool_name = call.tool_name
         if entry.address not in call.result_addresses:
             call.result_addresses.append(entry.address)
 
@@ -1107,6 +1106,7 @@ def _logical_entries(run: _Run) -> list[_Entry]:
     addresses = {entry.address: f"{run.spool_id}/events/{i}" for i, entry in enumerate(chronology)}
     addresses.update({entry.address: f"{run.spool_id}/raw/{i}" for i, entry in enumerate(run.raw_entries)})
     addresses[f"{run.address}/final"] = f"{run.spool_id}/final"
+    calls = {entry.address: entry for entry in run.entries if entry.kind == "tool_call"}
     return [
         replace(
             entry,
@@ -1116,6 +1116,7 @@ def _logical_entries(run: _Run) -> list[_Entry]:
             else f"{run.spool_id}/" + ("raw" if entry.kind == "raw_event" else "events"),
             call_address=addresses.get(entry.call_address),
             result_addresses=[addresses[address] for address in entry.result_addresses],
+            tool_name=calls[entry.call_address].tool_name if entry.call_address in calls else entry.tool_name,
             details={**entry.details, "legacy_address": entry.address},
         )
         for entry in run.all_entries()
@@ -1618,6 +1619,20 @@ def reap_store(
         deduplicated.setdefault(identity, entry)
     deduplicated_overlap = len(selected) - len(deduplicated)
     ordered = _narrow(list(deduplicated.values()), filter_names, tool_name)
+    legacy_json = (
+        format == "json" and not compact_outline and all(selector.startswith("run:") for selector in selectors)
+    )
+    if legacy_json:
+        # Legacy JSON unions selections in capture order. Logical selectors
+        # instead preserve Python slice order and the supplied batch order.
+        run_order = {run.spool_id: index for index, run in enumerate(runs)}
+        ordered.sort(
+            key=lambda entry: (
+                run_order[_owner(entry.address)],
+                *entry.position,
+                0 if entry.kind == "raw_event" else 1,
+            )
+        )
     entry_start = 0
     if after is not None:
         selected_addresses = [entry.address for entry in ordered]
@@ -1702,10 +1717,7 @@ def reap_store(
                 ),
                 "last_returned_address": last_address,
                 "retrieve": {
-                    **request,
-                    "offset": offset,
-                    "limit": limit,
-                    "full": full,
+                    **({} if legacy_json else {**request, "offset": offset, "limit": limit, "full": full}),
                     "after": last_address,
                     "instruction": "repeat the same addresses, filters and content controls with this stable after address",
                 },

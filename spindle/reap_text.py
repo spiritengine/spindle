@@ -42,10 +42,14 @@ def address_text(address: str, request: dict[str, Any]) -> str:
 
 
 def command(request: dict[str, Any]) -> str:
-    words = ["spindle", "reap", request["handle"]]
     addresses = request.get("addresses", [])
     if isinstance(addresses, str):
         addresses = [addresses]
+    handle = request["handle"]
+    # A complete logical selector already names its spool. Keep a separate
+    # handle only when it supplies session scope or legacy/relative context.
+    direct = not request.get("session") and "/" not in handle and addresses and addresses[0].startswith(handle + "/")
+    words = ["spindle", "reap"] + ([] if direct else [handle])
     for selector in addresses:
         words.append("..".join(address_text(part, request) for part in selector.split("..")))
     if request.get("session"):

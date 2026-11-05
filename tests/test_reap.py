@@ -390,7 +390,7 @@ def test_mixed_filters_narrow_batch_selections(tmp_path, filters, tool_name, par
     )
     assert result["ok"] is True
     assert [entry["address"] for entry in result["entries"]] == [
-        f"run:{spool_id}/events/{event}/parts/{part}" for event, part in sorted(parts, key=lambda pair: pair != (2, 1))
+        f"run:{spool_id}/events/{event}/parts/{part}" for event, part in parts
     ]
     assert result["selection"]["deduplicated_overlap"] == 2
 
@@ -1522,6 +1522,26 @@ def test_logical_selection_matches_literal_python(tmp_path, collection, index):
     else:
         assert selected["ok"], selected
         assert selected["entries"] == expected
+
+
+def test_legacy_json_retains_tool_metadata_and_continuation_shape(tmp_path):
+    _presentation_timeline(tmp_path, 90)
+    legacy = reap_store(tmp_path, "view", filters="tool-results", full=True)
+    logical = reap_store(tmp_path, "view/tool-results/command_execution", full=True)
+    assert [e["content"] for e in legacy["entries"]] == [e["content"] for e in logical["entries"]]
+    assert all("tool_name" not in e for e in legacy["entries"])
+    assert all(e["tool_name"] == "command_execution" for e in logical["entries"])
+    page = reap_store(tmp_path, "view", addresses="run:view", full=True)
+    assert set(page["entry_truncation"]["retrieve"]) == {"after", "instruction"}
+    logical_page = reap_store(tmp_path, "view/events", full=True)
+    assert logical_page["entry_truncation"]["retrieve"]["handle"] == "view/events"
+
+
+def test_printed_logical_command_does_not_repeat_the_spool(tmp_path):
+    _presentation_timeline(tmp_path, 1)
+    wire = render_response(reap_store(tmp_path, "view", format="text"), "text")
+    assert "Read: spindle reap view/events/0\n" in wire
+    assert "spindle reap view view/" not in wire
 
 
 def _interleaved_tools(store):
