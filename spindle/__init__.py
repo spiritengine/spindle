@@ -5939,8 +5939,10 @@ async def spool_reap(
     requested filter, or filter all scoped entries when no addresses are given.
     tool_name narrows tool-calls only. Filtering precedes entry pagination.
     Pages obey the shared read budget (50,000 rendered JSON characters by
-    default) and the 200-entry cap. Follow entry_truncation.retrieve.after for
-    more entries and each entry's truncation.retrieve for more content.
+    default). Outline scope reports total matching runs and this page's run
+    addresses/counts; follow run_truncation.retrieve.after for more runs.
+    Selection pages also have a 200-entry cap; follow entry_truncation.retrieve.after
+    for more entries and each entry's truncation.retrieve for more content.
 
     Args:
         handle: A spool ID. With session=True, may instead be a session ID.
@@ -5949,7 +5951,8 @@ async def spool_reap(
         tool_name: Exact provider tool name; implies/needs the tool-calls filter.
         session: Gather saved runs with the exact same session_id. This reports
             only Spindle captures, never unseen provider history.
-        after: Continue a large selection after this fully qualified address.
+        after: In outline mode, continue after a run:<spool-id> address. With a
+            selection, continue after a fully qualified selected entry address.
         offset: Character offset applied to every returned entry.
         limit: Maximum content characters per entry, also subject to page budget.
         full: Complete content and no character budget (may be large); still at
@@ -13452,7 +13455,7 @@ def main():
         action="store_true",
         help="Gather matching saved runs with the same session_id (captured history only)",
     )
-    reap_parser.add_argument("--after", help="Continue the same selection after this stable full address")
+    reap_parser.add_argument("--after", help="Continue after a run address (outline) or selected entry address")
     reap_parser.add_argument("--offset", type=int, default=0, help="Character offset within each selected entry")
     reap_parser.add_argument("--limit", type=int, help="Maximum characters from each selected entry")
     reap_parser.add_argument(

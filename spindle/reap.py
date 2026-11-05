@@ -1050,6 +1050,21 @@ def _budget_error(handle: str) -> dict[str, Any]:
     )
 
 
+def _outline_budget_error(run: _Run) -> dict[str, Any]:
+    # Identify the affected run without echoing potentially oversized session metadata.
+    error = _error(
+        "",
+        "outline_run_exceeds_budget",
+        f"outline for {run.address} cannot fit the read budget; inspect this spool alone "
+        f"with handle={run.spool_id!r}, addresses={run.address + '/raw'!r}, session=False. "
+        "To continue an outline past this run, "
+        f"use after={run.address!r} with the same handle and session setting",
+    )
+    error.pop("requested_handle")
+    error["error"]["run_address"] = run.address
+    return error
+
+
 def reap_store(
     store: Path,
     handle: str,
@@ -1093,14 +1108,29 @@ def reap_store(
     fatal_issues = [issue for run in runs for issue in run.issues if issue.severity == "error"]
 
     if not selectors and not filter_names:
-        if after is not None:
-            return _error(handle, "after_requires_selection", "after requires at least one address or filter")
         if full or offset or limit is not None:
             return _error(
                 handle,
                 "paging_requires_selection",
                 "full, offset, and limit apply to selected entries; provide an address or filter first",
             )
+        run_start = 0
+        if after is not None:
+            try:
+                run_start = scope["run_addresses"].index(after) + 1
+            except ValueError:
+                return _error(
+                    handle,
+                    "invalid_after",
+                    f"outline after address {after!r} is not a run in this scope; "
+                    "use a run:<spool-id> address with the same handle and session setting",
+                )
+        scope["run_addresses"] = []
+        scope.update(
+            matched_runs=len(runs), returned_runs=0, runs_before_page=run_start, omitted_runs=len(runs) - run_start
+        )
+        if session:
+            scope["statement"] += "; run_addresses lists only the runs returned on this outline page"
         outline = {
             "schema": REAP_SCHEMA,
             "ok": not fatal_issues,
@@ -1114,9 +1144,41 @@ def reap_store(
                 "direct": ["prompt", "final"],
                 "range": "<full-entry-address>..<full-entry-address>",
             },
-            "runs": [_run_outline(run) for run in runs],
+            "runs": [],
         }
-        return outline if len(render_response(outline)) <= max_chars else _budget_error(handle)
+
+        def update_outline_page() -> None:
+            count = len(outline["runs"])
+            omitted = len(runs) - run_start - count
+            scope.update(
+                run_addresses=[item["address"] for item in outline["runs"]], returned_runs=count, omitted_runs=omitted
+            )
+            if count and omitted:
+                last_address = outline["runs"][-1]["address"]
+                outline["run_truncation"] = {
+                    "reason": f"outline exceeds the {max_chars}-character response bound",
+                    "last_returned_address": last_address,
+                    "retrieve": {
+                        "after": last_address,
+                        "instruction": "repeat the outline request with the same handle and session setting",
+                    },
+                }
+            else:
+                outline.pop("run_truncation", None)
+
+        for run in runs[run_start:]:
+            outline["runs"].append(_run_outline(run))
+            update_outline_page()
+            if len(render_response(outline)) <= max_chars:
+                continue
+            outline["runs"].pop()
+            update_outline_page()
+            if not outline["runs"]:
+                return _outline_budget_error(run)
+            break
+        if len(render_response(outline)) > max_chars:
+            return _outline_budget_error(runs[min(run_start, len(runs) - 1)])
+        return outline
 
     run_by_id = {run.spool_id: run for run in runs}
     selected: list[_Entry] = []

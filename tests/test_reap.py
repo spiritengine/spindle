@@ -47,6 +47,22 @@ def _codex_call(item_id, command, output):
     )
 
 
+def _outline_session(store, count):
+    """Ordinary substantial runs matching the independent session-outline repro."""
+    text = "word " * 100
+    ids = [f"codex-{i:08x}" for i in range(count)]
+    for index, spool_id in enumerate(ids):
+        _record(
+            store, spool_id, session_id="shared", prompt=text, result=text, created_at=f"2026-11-05T12:{index:02d}:00"
+        )
+        events = [{"type": "thread.started", "thread_id": "shared"}]
+        for i in range(5):
+            events.append({"type": "item.completed", "item": {"id": f"m{i}", "type": "agent_message", "text": text}})
+            events.extend(_codex_call(f"c{i}", text, text))
+        (store / f"{spool_id}.stdout").write_text(_jsonl(*events))
+    return ids
+
+
 def test_claude_outline_normalizes_roles_and_links_tool_results(tmp_path):
     spool_id = "claude-one"
     _record(tmp_path, spool_id, harness="claude-code")
@@ -534,8 +550,13 @@ def test_metadata_that_cannot_fit_returns_error_not_empty_continuation(tmp_path)
     for options in [{}, {"filters": "tool-results"}]:
         result = reap_store(tmp_path, "huge-metadata", **options)
         assert result["ok"] is False
-        assert result["error"]["code"] == "response_metadata_exceeds_budget"
-        assert "full" in result["error"]["message"]
+        if options:
+            assert result["error"]["code"] == "response_metadata_exceeds_budget"
+            assert "full" in result["error"]["message"]
+        else:
+            assert result["error"]["code"] == "outline_run_exceeds_budget"
+            assert result["error"]["run_address"] == "run:huge-metadata"
+            assert "full" not in result["error"]["message"]
         assert "entry_truncation" not in result
         assert len(render_response(result)) <= DEFAULT_RESPONSE_CHARS
     full = reap_store(tmp_path, "huge-metadata", filters="tool-results", full=True)
@@ -555,6 +576,125 @@ def test_session_view_inventories_only_exact_matching_saved_runs(tmp_path):
     assert [entry["address"] for entry in scoped["entries"]] == ["run:run-a/prompt", "run:run-b/prompt"]
     narrowed = reap_store(tmp_path, "run-a", session=True, addresses="run:run-a/messages", filters="user")
     assert [entry["address"] for entry in narrowed["entries"]] == ["run:run-a/prompt"]
+
+
+@pytest.mark.parametrize("count", [7, 24])
+def test_session_outline_pages_every_run_once_with_honest_scope(tmp_path, count):
+    ids = _outline_session(tmp_path, count)
+    _record(tmp_path, "foreign", session_id="different")
+    expected = [f"run:{spool_id}" for spool_id in ids]
+    seen = []
+    after = None
+    pages = 0
+    while True:
+        page = reap_store(tmp_path, ids[0], session=True, after=after)
+        assert page["ok"] is True
+        wire = render_response(page)
+        assert len(wire) <= DEFAULT_RESPONSE_CHARS
+        assert json.loads(wire) == page
+        assert page["mode"] == "outline"
+        addresses = [run["address"] for run in page["runs"]]
+        assert addresses
+        assert addresses == expected[len(seen) : len(seen) + len(addresses)]
+        scope = page["scope"]
+        assert scope["run_addresses"] == addresses
+        assert scope["matched_runs"] == count
+        assert scope["returned_runs"] == len(addresses)
+        assert scope["runs_before_page"] == len(seen)
+        assert scope["omitted_runs"] == count - len(seen) - len(addresses)
+        assert f"exactly {count} readable saved" in scope["statement"]
+        assert "only the runs returned on this outline page" in scope["statement"]
+        assert "provider history not captured" in scope["statement"]
+        seen.extend(addresses)
+        pages += 1
+        if "run_truncation" not in page:
+            assert scope["omitted_runs"] == 0
+            break
+        assert scope["omitted_runs"] > 0
+        after = page["run_truncation"]["retrieve"]["after"]
+        assert after == page["run_truncation"]["last_returned_address"] == seen[-1]
+    assert pages > 1
+    assert seen == expected
+    end = reap_store(tmp_path, "shared", session=True, after=seen[-1])
+    assert end["runs"] == end["scope"]["run_addresses"] == []
+    assert end["scope"]["runs_before_page"] == count
+    assert end["scope"]["returned_runs"] == end["scope"]["omitted_runs"] == 0
+    assert "run_truncation" not in end
+
+
+def test_long_outline_does_not_repeat_all_run_addresses_in_page_metadata(tmp_path):
+    ids = [f"run-{i:04d}-" + "x" * 220 for i in range(240)]
+    for spool_id in ids:
+        _record(tmp_path, spool_id, session_id="shared", prompt="p", result="r")
+    # This list alone would exceed the response budget before adding any outline.
+    assert len(json.dumps([f"run:{spool_id}" for spool_id in ids])) > DEFAULT_RESPONSE_CHARS
+    page = reap_store(tmp_path, "shared", session=True)
+    assert page["ok"] is True
+    assert len(render_response(page)) <= DEFAULT_RESPONSE_CHARS
+    count = len(page["runs"])
+    assert 0 < count < len(ids)
+    assert page["scope"]["run_addresses"] == [f"run:{spool_id}" for spool_id in ids[:count]]
+    assert page["scope"]["matched_runs"] == len(ids)
+    assert page["scope"]["omitted_runs"] == len(ids) - count
+    assert page["run_truncation"]["retrieve"]["after"] == f"run:{ids[count - 1]}"
+
+
+@pytest.mark.parametrize(
+    "after", ["run:foreign", "run:missing", "member", "run:member/", "run:member/final", "session:shared"]
+)
+def test_outline_after_requires_an_exact_scoped_run_address(tmp_path, after):
+    _record(tmp_path, "member", session_id="shared")
+    _record(tmp_path, "foreign", session_id="different")
+    page = reap_store(tmp_path, "member", session=True, after=after)
+    assert page["ok"] is False
+    assert page["error"]["code"] == "invalid_after"
+    assert "run:<spool-id>" in page["error"]["message"]
+
+
+def test_single_run_outline_keeps_its_tree_and_can_reach_end(tmp_path):
+    spool_id = _outline_session(tmp_path, 1)[0]
+    single = reap_store(tmp_path, spool_id)
+    session = reap_store(tmp_path, spool_id, session=True)
+    assert single["runs"] == session["runs"]
+    assert single["scope"]["run_addresses"] == [f"run:{spool_id}"]
+    assert single["scope"]["matched_runs"] == single["scope"]["returned_runs"] == 1
+    assert single["scope"]["runs_before_page"] == single["scope"]["omitted_runs"] == 0
+    assert "run_truncation" not in single
+    end = reap_store(tmp_path, spool_id, after=f"run:{spool_id}")
+    assert end["ok"] is True and end["runs"] == []
+    assert "run_truncation" not in end
+    assert reap_store(tmp_path, spool_id, full=True)["error"]["code"] == "paging_requires_selection"
+
+
+def test_oversized_run_outline_reports_run_and_allows_continuing_past_it(tmp_path):
+    for spool_id in ["a", "b", "c"]:
+        _record(tmp_path, spool_id, session_id="shared")
+        (tmp_path / f"{spool_id}.stdout").write_text(_jsonl(*_codex_call("id", "pwd", "output")))
+    (tmp_path / "b.stdout").write_text(_jsonl(*_codex_call("id" * 30_000, "pwd", "output")))
+    first = reap_store(tmp_path, "shared", session=True)
+    assert first["scope"]["run_addresses"] == ["run:a"]
+    assert first["scope"]["omitted_runs"] == 2
+    error = reap_store(tmp_path, "shared", session=True, after=first["run_truncation"]["retrieve"]["after"])
+    assert error["error"]["code"] == "outline_run_exceeds_budget"
+    assert error["error"]["run_address"] == "run:b"
+    assert "run:b/raw" in error["error"]["message"] and "full" not in error["error"]["message"]
+    assert len(render_response(error)) <= DEFAULT_RESPONSE_CHARS
+    raw = reap_store(tmp_path, "b", addresses="run:b/raw")
+    assert raw["ok"] is True and raw["entries"]
+    last = reap_store(tmp_path, "shared", session=True, after=error["error"]["run_address"])
+    assert last["scope"]["run_addresses"] == ["run:c"]
+    assert last["scope"]["runs_before_page"] == 2
+    assert last["scope"]["omitted_runs"] == 0
+    assert "run_truncation" not in last
+
+
+def test_outline_budget_error_does_not_echo_oversized_session_metadata(tmp_path):
+    session_id = "s" * 60_000
+    _record(tmp_path, "one", session_id=session_id)
+    result = reap_store(tmp_path, session_id, session=True)
+    assert result["error"]["run_address"] == "run:one"
+    assert len(render_response(result)) <= DEFAULT_RESPONSE_CHARS
+    assert "full" not in result["error"]["message"]
 
 
 def test_missing_capture_is_visible_without_hiding_record_nodes(tmp_path):
@@ -578,7 +718,7 @@ def test_missing_capture_is_visible_without_hiding_record_nodes(tmp_path):
         ({"offset": -1}, "invalid_offset"),
         ({"limit": 0}, "invalid_limit"),
         ({"full": True, "limit": 2}, "incompatible_paging"),
-        ({"after": "run:bad-select/final"}, "after_requires_selection"),
+        ({"after": "run:bad-select/final"}, "invalid_after"),
         ({"offset": 1}, "paging_requires_selection"),
     ],
 )
@@ -664,6 +804,25 @@ def test_public_mcp_route_uses_shared_reader(tmp_path, monkeypatch):
     narrowed = json.loads(asyncio.run(tool.fn(spool_id, addresses=f"run:{spool_id}/final", filters="user")))
     assert narrowed["ok"] is True
     assert narrowed["entries"] == []
+
+
+def test_public_routes_accept_outline_after_cursors(tmp_path, monkeypatch, capsys):
+    ids = _outline_session(tmp_path, 7)
+    monkeypatch.setattr(spindle, "SPINDLE_DIR", tmp_path)
+    tool = asyncio.run(spindle.mcp.get_tool("spool_reap"))
+    first_wire = asyncio.run(tool.fn(ids[0], session=True))
+    first = json.loads(first_wire)
+    assert len(first_wire) <= DEFAULT_RESPONSE_CHARS
+    after = first["run_truncation"]["retrieve"]["after"]
+    second = json.loads(asyncio.run(tool.fn(ids[0], session=True, after=after)))
+    assert first["scope"]["run_addresses"] + second["scope"]["run_addresses"] == [f"run:{spool_id}" for spool_id in ids]
+    monkeypatch.setattr(sys, "argv", ["spindle", "reap", ids[0], "--session", "--after", after])
+    with pytest.raises(SystemExit) as exc:
+        spindle.main()
+    assert exc.value.code == 0
+    wire = capsys.readouterr().out
+    assert len(wire.rstrip("\n")) <= DEFAULT_RESPONSE_CHARS
+    assert json.loads(wire) == second
 
 
 @pytest.mark.parametrize("budget", [50_000, 4096])

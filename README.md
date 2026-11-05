@@ -435,6 +435,9 @@ human authorship or remove repeated text.
 # Outline first
 spool_reap(spool_id)
 
+# Continue a session outline using its run_truncation.retrieve.after cursor
+spool_reap(spool_id, session=True, after="run:codex-abcd1234")
+
 # Normalized conversational roles (Claude tool-result wrappers are excluded)
 spool_reap(spool_id, filters="user,agent")
 
@@ -468,10 +471,19 @@ observed byte boundary, with incomplete trailing material and all truncation
 reported in the response.
 
 Ordinary pages obey the existing `SPINDLE_UNSPOOL_MAX_CHARS` read budget (50,000
-rendered JSON characters by default, including escaping and metadata) and a
-200-entry cap. If more entries matched, `entry_truncation.retrieve.after` gives
-a stable address to pass as `after` while repeating the same selection and
-content controls. Overlap is deduplicated before paging.
+rendered JSON characters by default, including escaping and metadata).
+Session outlines page through runs in creation order. Their `scope` states
+`matched_runs`, `returned_runs`, `runs_before_page`, and `omitted_runs` (runs
+remaining after this page); `scope.run_addresses` lists only the returned page,
+not every matching run. If runs remain, pass `run_truncation.retrieve.after`
+back as `after` with the same handle and session setting, without addresses or
+filters. CLI equivalent: `spindle reap ID --session --after run:SPOOL_ID`.
+
+Selected-content pages also have a 200-entry cap. If more entries matched,
+`entry_truncation.retrieve.after` gives a stable selected-entry address to pass
+as `after` while repeating the same selection and content controls. Overlap is
+deduplicated before paging. Run cursors apply to outlines, entry cursors to
+selections; the reader rejects cursors outside the corresponding scope.
 
 Content defaults to at most 20,000 characters per entry. `offset` and `limit`
 select character ranges, but the page budget may further shorten a single
@@ -479,9 +491,12 @@ large entry. Follow that entry's `truncation.retrieve` address, offset and limit
 to get the rest; the content cursor is separate from the `after` entry cursor.
 `full=True` / `--full` explicitly returns complete content and bypasses the
 character budget, so it can be large. It still obeys the 200-entry cap and cannot
-be combined with `offset` or `limit`. If metadata alone cannot fit, the reader
-returns an actionable error instead of an empty continuation page: narrow the
-scope/selection or request selected addresses with `full`.
+be combined with `offset` or `limit`. These content controls do not apply to
+outlines. If a single run's outline metadata cannot fit, the error identifies
+that run and its raw evidence address; use its run address as an outline
+`after` cursor to continue past it. If selected-content metadata cannot fit,
+narrow the scope/selection or request selected addresses with `full`. Neither
+case returns an empty page with a continuation that cannot advance.
 
 ### Search and filter
 
