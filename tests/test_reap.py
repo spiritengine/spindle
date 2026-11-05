@@ -1055,7 +1055,9 @@ def test_compact_outline_covers_whole_large_chronology_and_recursively_progresse
     assert len(seen) == len(set(seen)) == 511
     assert seen[0] == "run:view/prompt" and seen[-1] == "run:view/events/509/parts/0"
     wire = render_response(overview, "text")
-    assert "Saved result: final" in wire and "Raw: raw · 510 events" in wire
+    assert "Saved result: 14 chars final" in wire and "Raw: 510 events raw" in wire
+    assert wire.splitlines()[0] == "complete; 171 messages, 170 calls; 511 selected entries view"
+    assert "0 remaining" not in wire and " · " not in wire
     assert "final for view" not in wire
     assert len(wire) < 3500
 
@@ -1069,6 +1071,10 @@ def test_compact_balanced_nine_and_bounded_leaves(tmp_path, count):
         assert all(len(clue["preview"]) <= 80 for clue in group["clues"])
         if group["count"] == 1:
             assert group["chars"] > 80 and group["leaf"]["role"] == "agent"
+    wire = render_response(overview, "text")
+    assert "  agent: message 0…" in wire
+    first_selector = overview["groups"][0]["selector"].replace("run:view/", "")
+    assert wire.splitlines()[2].endswith(" " + first_selector)
     if count == 9:
         nested = reap_store(tmp_path, **overview["groups"][0]["zoom"])
         assert [g["count"] for g in nested["groups"]] == [1, 1]
@@ -1294,9 +1300,15 @@ def test_compact_session_pages_eight_saved_spools_with_fallback(tmp_path):
     assert first["scope"]["omitted_runs"] == 2
     wire = render_response(first, "text")
     assert "timeout" in wire and "useful input" in wire
+    assert wire.splitlines()[0].startswith("Session: 10 saved spools; showing 8; 2 remaining; this page: ")
+    assert wire.splitlines()[1] == f"timeout; 1 call {ids[0]}"
     second = reap_store(tmp_path, **first["run_truncation"]["retrieve"], format="text")
     assert [r["spool_id"] for r in second["runs"]] == ids[8:]
     assert "run_truncation" not in second
+    assert (
+        render_response(second, "text").splitlines()[0]
+        == "Session: 10 saved spools; showing 2; this page: 12 messages, 10 calls"
+    )
     # An entry cursor cannot masquerade as a saved-spool cursor.
     invalid = reap_store(tmp_path, "shared", session=True, after=f"run:{ids[0]}/prompt", format="text")
     assert invalid["error"]["code"] == "invalid_after"

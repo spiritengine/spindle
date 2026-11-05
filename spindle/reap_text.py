@@ -7,6 +7,7 @@ the source of the copyable CLI commands, including filters and continuations.
 from __future__ import annotations
 
 import shlex
+from collections import Counter
 from typing import Any
 
 
@@ -77,7 +78,14 @@ def _counts(counts: dict[str, int]) -> str:
         "raw_event": "raw event",
         "final": "saved result",
     }
-    return ", ".join(_count(number, nouns[kind]) for kind, number in counts.items() if number) or "0 entries"
+    return (
+        ", ".join(
+            _count(number, nouns[kind])
+            for kind, number in counts.items()
+            if number and not (kind == "tool_result" and number == counts.get("tool_call"))
+        )
+        or "0 entries"
+    )
 
 
 def _label(entry: dict[str, Any]) -> str:
@@ -91,15 +99,21 @@ def _label(entry: dict[str, Any]) -> str:
     return label + (" " + entry["tool_name"] if entry.get("tool_name") else "")
 
 
+def _excerpt(preview: str, truncated: bool = False) -> str:
+    text = safe_text(preview)
+    if len(text) <= 80 and not truncated:
+        return text
+    prefix = text[:79]
+    if len(text) > 79 and not text[79].isspace() and " " in prefix:
+        prefix = prefix.rsplit(" ", 1)[0]
+    return prefix.rstrip() + "…"
+
+
 def _clues(row: dict[str, Any]) -> str:
-    clues = row.get("clues", [])
-    excerpts = []
-    for clue in clues:
-        text = safe_text(clue["preview"])
-        if len(text) > 80 or clue.get("preview_truncated"):
-            text = text[:79].rstrip() + "…"
-        excerpts.append(f"{_label(clue)}: {text}")
-    return " → ".join(excerpts)
+    return " → ".join(
+        f"{_label(clue)}: {_excerpt(clue['preview'], clue.get('preview_truncated', False))}"
+        for clue in row.get("clues", [])
+    )
 
 
 def _notices(response: dict[str, Any]) -> list[str]:
@@ -148,21 +162,36 @@ def render_text(response: dict[str, Any]) -> str:
     notices = _notices(response)
     if mode == "session-outline":
         scope = response["scope"]
-        lines.append(
-            f"{scope['matched_runs']} saved spools · showing {len(response['runs'])} · {scope['omitted_runs']} remaining"
-        )
+        total = scope["matched_runs"]
+        shown = len(response["runs"])
+        counts: Counter[str] = Counter()
         for run in response["runs"]:
-            lines.append(f"{run['spool_id']} · {run['status']} · {_counts(run['counts'])}")
+            counts.update(run["counts"])
+        title = f"Session: {_count(total, 'saved spool')}"
+        if shown != total:
+            title += f"; showing {shown}"
+        if scope["omitted_runs"]:
+            title += f"; {scope['omitted_runs']} remaining"
+        if shown:
+            title += ("; this page: " if shown != total else "; ") + _counts(counts)
+        lines.append(title)
+        for run in response["runs"]:
+            lines.append(f"{run['status']}; {_counts(run['counts'])} {run['spool_id']}")
             lines.append("  " + _clues(run))
         if response["runs"]:
             lines.extend(("", "Browse a spool: " + command({"handle": response["runs"][0]["spool_id"]})))
     elif mode == "selection-outline":
         selection = response["selection"]
         runs = response["runs"]
-        title = f"{runs[0]['spool_id']} · {runs[0]['status']}" if len(runs) == 1 else "Selection"
-        lines.append(
-            f"{title} · {_count(selection['matched_entries'], 'selected entry', 'selected entries')} · {selection['omitted_entries']} remaining"
-        )
+        title = runs[0]["status"] if len(runs) == 1 else "Selection"
+        if response["presentation"].get("bare") and runs:
+            title += "; " + _counts(runs[0]["counts"])
+        title += "; " + _count(selection["matched_entries"], "selected entry", "selected entries")
+        if selection["omitted_entries"]:
+            title += f"; {selection['omitted_entries']} remaining"
+        if len(runs) == 1:
+            title += " " + runs[0]["spool_id"]
+        lines.append(title)
         if request.get("filters"):
             lines.append(
                 "Filters: "
@@ -172,18 +201,18 @@ def render_text(response: dict[str, Any]) -> str:
         for group in response["groups"]:
             selector = "..".join(address_text(part, request) for part in group["selector"].split(".."))
             description = (
-                _label(group["leaf"]) + f" · {group['chars']} chars" if "leaf" in group else _counts(group["counts"])
+                _label(group["leaf"]) + f"; {group['chars']} chars" if "leaf" in group else _counts(group["counts"])
             )
-            lines.append(f"{selector} · {description}")
+            lines.append(f"{description} {selector}")
             lines.append("  " + _clues(group))
         if response["presentation"].get("bare") and runs:
             run = runs[0]
             if run.get("final"):
                 lines.append(
-                    f"Saved result: {address_text(run['final']['address'], request)} · {run['final']['chars']} chars"
+                    f"Saved result: {run['final']['chars']} chars {address_text(run['final']['address'], request)}"
                 )
             lines.append(
-                f"Raw: {address_text(run['address'] + '/raw', request)} · {_count(run['capture']['raw_event_count'], 'event')}"
+                f"Raw: {_count(run['capture']['raw_event_count'], 'event')} {address_text(run['address'] + '/raw', request)}"
             )
         if not response["groups"]:
             lines.append("No selected chronology entries.")
