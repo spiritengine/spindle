@@ -16,6 +16,7 @@ from typing import Any, Iterable, Optional
 
 REAP_SCHEMA = "spindle.reap/v1"
 DEFAULT_CONTENT_CHARS = 20_000
+DEFAULT_RESPONSE_CHARS = 50_000
 TREE_PREVIEW_CHARS = 160
 TREE_PREVIEW_ITEMS = 3
 MAX_RETURNED_ENTRIES = 200
@@ -176,12 +177,44 @@ def _decode_array_prefix(text: str) -> tuple[list[_RawEvent], int, list[_Issue]]
     return events, last_complete, issues
 
 
+def _decode_utf8(data: bytes, *, terminal: bool) -> tuple[str, list[tuple[int, int]], bool]:
+    """Replacement-decode while retaining original byte boundaries after repairs.
+
+    A running prefix can stop inside a valid codepoint. Keep its placeholder
+    for framing, but do not mistake that unfinished suffix for corrupt bytes.
+    """
+    pieces: list[str] = []
+    repairs: list[tuple[int, int]] = []
+    byte_offset = char_offset = 0
+    invalid = False
+    while byte_offset < len(data):
+        try:
+            pieces.append(data[byte_offset:].decode("utf-8"))
+            break
+        except UnicodeDecodeError as exc:
+            prefix = exc.object[: exc.start].decode("utf-8")
+            pieces.extend((prefix, "\ufffd"))
+            char_offset += len(prefix) + 1
+            byte_offset += exc.end
+            repairs.append((char_offset, byte_offset))
+            if terminal or exc.reason != "unexpected end of data":
+                invalid = True
+    return "".join(pieces), repairs, invalid
+
+
+def _original_byte_offset(text: str, position: int, repairs: list[tuple[int, int]]) -> int:
+    char_start = byte_start = 0
+    for char_end, byte_end in repairs:
+        if char_end > position:
+            break
+        char_start, byte_start = char_end, byte_end
+    return byte_start + len(text[char_start:position].encode("utf-8"))
+
+
 def _decode_capture(data: bytes, *, terminal: bool) -> _Capture:
     issues: list[_Issue] = []
-    try:
-        text = data.decode("utf-8")
-    except UnicodeDecodeError:
-        text = data.decode("utf-8", errors="replace")
+    text, repairs, invalid = _decode_utf8(data, terminal=terminal)
+    if invalid:
         issues.append(_Issue("invalid_utf8", "capture contains invalid UTF-8; replacement characters are shown"))
 
     stripped = text.lstrip()
@@ -210,8 +243,8 @@ def _decode_capture(data: bytes, *, terminal: bool) -> _Capture:
                     "error" if not events[:-1] else "warning",
                 )
             )
-        consumed = leading + parsed_chars
-        ignored = min(len(data), len(text[consumed:].encode("utf-8", errors="replace")))
+        consumed = _original_byte_offset(text, leading + parsed_chars, repairs)
+        ignored = len(data) - consumed
         return _Capture(None, len(data), len(data) - ignored, ignored, "json-array", events, issues)
 
     # A complete top-level JSON value is common for Gemini and legacy Claude.
@@ -432,6 +465,7 @@ def _claude_entries(spool_id: str, events: list[_RawEvent]) -> list[_Entry]:
                     "message",
                     text,
                     role=role,
+                    details={key: event[key] for key in ("isReplay", "isSynthetic") if key in event},
                 )
     return entries
 
@@ -998,6 +1032,24 @@ def _render_entry(entry: _Entry, *, offset: int, limit: Optional[int], full: boo
     return rendered
 
 
+def render_response(response: dict[str, Any]) -> str:
+    """The shared wire representation, including JSON escaping in size counts.
+
+    Keep ordinary Unicode readable, but escape lone surrogates from provider
+    JSON so both CLI stdout and MCP transports can encode this as UTF-8.
+    """
+    return json.dumps(response, ensure_ascii=False, indent=2).encode("utf-8", errors="backslashreplace").decode("utf-8")
+
+
+def _budget_error(handle: str) -> dict[str, Any]:
+    return _error(
+        handle,
+        "response_metadata_exceeds_budget",
+        "response metadata cannot fit the read budget; narrow the scope/selection, "
+        "or retrieve selected addresses with full=True (--full) to bypass the character budget",
+    )
+
+
 def reap_store(
     store: Path,
     handle: str,
@@ -1010,6 +1062,7 @@ def reap_store(
     offset: int = 0,
     limit: Optional[int] = None,
     full: bool = False,
+    max_chars: int = DEFAULT_RESPONSE_CHARS,
 ) -> dict[str, Any]:
     """Build an addressable, read-only view of saved spool evidence."""
     if offset < 0:
@@ -1048,7 +1101,7 @@ def reap_store(
                 "paging_requires_selection",
                 "full, offset, and limit apply to selected entries; provide an address or filter first",
             )
-        return {
+        outline = {
             "schema": REAP_SCHEMA,
             "ok": not fatal_issues,
             "mode": "outline",
@@ -1063,6 +1116,7 @@ def reap_store(
             },
             "runs": [_run_outline(run) for run in runs],
         }
+        return outline if len(render_response(outline)) <= max_chars else _budget_error(handle)
 
     run_by_id = {run.spool_id: run for run in runs}
     selected: list[_Entry] = []
@@ -1107,9 +1161,6 @@ def reap_store(
                 "invalid_after",
                 f"after address {after!r} is not in this selection; repeat the same addresses and filters",
             )
-    page_end = min(len(ordered), entry_start + MAX_RETURNED_ENTRIES)
-    returned = ordered[entry_start:page_end]
-    omitted_entries = len(ordered) - page_end
     available_tools = sorted(
         {item.tool_name for run in runs for item in run.entries if item.kind == "tool_call" and item.tool_name}
     )
@@ -1123,13 +1174,13 @@ def reap_store(
             "filters": filter_names,
             "tool_name": tool_name,
             "matched_entries": len(ordered),
-            "returned_entries": len(returned),
+            "returned_entries": 0,
             "entries_before_page": entry_start,
             "deduplicated_overlap": deduplicated_overlap,
-            "omitted_entries": omitted_entries,
+            "omitted_entries": len(ordered) - entry_start,
             "available_tool_names": available_tools,
         },
-        "entries": [_render_entry(entry, offset=offset, limit=limit, full=full) for entry in returned],
+        "entries": [],
         "runs": [
             {
                 "address": run.address,
@@ -1141,13 +1192,58 @@ def reap_store(
             for run in runs
         ],
     }
-    if omitted_entries:
-        response["entry_truncation"] = {
-            "reason": f"selection exceeds the {MAX_RETURNED_ENTRIES}-entry response bound",
-            "last_returned_address": returned[-1].address,
-            "retrieve": {
-                "after": returned[-1].address,
-                "instruction": "repeat the same addresses and filters with this stable after address",
-            },
-        }
+
+    def update_page() -> None:
+        count = len(response["entries"])
+        omitted = len(ordered) - entry_start - count
+        response["selection"].update(returned_entries=count, omitted_entries=omitted)
+        if count and omitted:
+            last_address = response["entries"][-1]["address"]
+            response["entry_truncation"] = {
+                "reason": (
+                    f"selection exceeds the {MAX_RETURNED_ENTRIES}-entry response bound"
+                    if full
+                    else f"selection exceeds the {MAX_RETURNED_ENTRIES}-entry or {max_chars}-character response bound"
+                ),
+                "last_returned_address": last_address,
+                "retrieve": {
+                    "after": last_address,
+                    "instruction": "repeat the same addresses, filters and content controls with this stable after address",
+                },
+            }
+        else:
+            response.pop("entry_truncation", None)
+
+    for entry in ordered[entry_start : entry_start + MAX_RETURNED_ENTRIES]:
+        response["entries"].append(_render_entry(entry, offset=offset, limit=limit, full=full))
+        update_page()
+        if full or len(render_response(response)) <= max_chars:
+            continue
+        if len(response["entries"]) > 1:
+            response["entries"].pop()
+            update_page()
+            break
+
+        # One entry alone can overflow through escaping or an explicit limit.
+        # Find a fitting, nonempty content chunk; its offset cursor must advance.
+        # If metadata alone prevents progress, return an actionable error, not
+        # an empty page with a cursor that repeats forever. Explicit full is the
+        # escape hatch for unusually large provider metadata as well as content.
+        low, high = 1, len(response["entries"][0]["content"]) - 1
+        fitting = None
+        while low <= high:
+            count = (low + high) // 2
+            response["entries"][0] = _render_entry(entry, offset=offset, limit=count, full=False)
+            if len(render_response(response)) <= max_chars:
+                fitting = response["entries"][0]
+                low = count + 1
+            else:
+                high = count - 1
+        if fitting is None:
+            return _budget_error(handle)
+        response["entries"][0] = fitting
+        break
+
+    if not full and len(render_response(response)) > max_chars:
+        return _budget_error(handle)
     return response

@@ -151,7 +151,7 @@ from .namespace_owner import (  # noqa: E402
 from .namespace_owner import (  # noqa: E402
     update_control_receipt as update_control_receipt,
 )
-from .reap import reap_store  # noqa: E402
+from .reap import reap_store, render_response  # noqa: E402
 
 
 def _guard_mcp_final_replies(server: FastMCP) -> None:
@@ -5912,8 +5912,9 @@ def _spool_reap_sync(
         offset=offset,
         limit=limit,
         full=full,
+        max_chars=UNSPOOL_MAX_CHARS,
     )
-    return json.dumps(result, ensure_ascii=False, indent=2)
+    return render_response(result)
 
 
 @mcp.tool()
@@ -5937,6 +5938,9 @@ async def spool_reap(
     Filters narrow the selected addresses/ranges to entries matching any
     requested filter, or filter all scoped entries when no addresses are given.
     tool_name narrows tool-calls only. Filtering precedes entry pagination.
+    Pages obey the shared read budget (50,000 rendered JSON characters by
+    default) and the 200-entry cap. Follow entry_truncation.retrieve.after for
+    more entries and each entry's truncation.retrieve for more content.
 
     Args:
         handle: A spool ID. With session=True, may instead be a session ID.
@@ -5947,8 +5951,9 @@ async def spool_reap(
             only Spindle captures, never unseen provider history.
         after: Continue a large selection after this fully qualified address.
         offset: Character offset applied to every returned entry.
-        limit: Character count applied to every returned entry.
-        full: Return complete entry content; incompatible with offset/limit.
+        limit: Maximum content characters per entry, also subject to page budget.
+        full: Complete content and no character budget (may be large); still at
+            most 200 entries per page. Incompatible with offset/limit.
 
     Examples:
         spool_reap("codex-abcd1234")
@@ -13450,7 +13455,11 @@ def main():
     reap_parser.add_argument("--after", help="Continue the same selection after this stable full address")
     reap_parser.add_argument("--offset", type=int, default=0, help="Character offset within each selected entry")
     reap_parser.add_argument("--limit", type=int, help="Maximum characters from each selected entry")
-    reap_parser.add_argument("--full", action="store_true", help="Return complete selected entries")
+    reap_parser.add_argument(
+        "--full",
+        action="store_true",
+        help="Complete entry content; bypass character budget (still at most 200 entries)",
+    )
 
     # spools command - list all
     spools_parser = subparsers.add_parser("spools", help="List all spools (running and completed)")

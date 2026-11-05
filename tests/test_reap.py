@@ -1,12 +1,14 @@
 import asyncio
 import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
 import spindle
-from spindle.reap import _decode_capture, reap_store
+from spindle.reap import DEFAULT_RESPONSE_CHARS, _decode_capture, reap_store, render_response
 
 
 def _record(store: Path, spool_id: str, **overrides):
@@ -111,6 +113,24 @@ def test_codex_filters_multiple_calls_and_exact_tool_name(tmp_path):
     assert [entry["content"] for entry in agents["entries"]] == ["checking", "finished"]
 
 
+def test_claude_user_entries_preserve_replay_and_synthetic_provenance(tmp_path):
+    _record(tmp_path, "claude-flags", harness="claude-code", prompt="same text")
+    events = [
+        {"type": "user", "message": {"role": "user", "content": "same text"}, **flags}
+        for flags in [{"isReplay": True}, {"isSynthetic": True, "isReplay": False}, {}]
+    ]
+    (tmp_path / "claude-flags.stdout").write_text(_jsonl(*events))
+    entries = reap_store(tmp_path, "claude-flags", filters="user")["entries"]
+    assert [entry["content"] for entry in entries] == ["same text"] * 4
+    assert [entry.get("details", {}) for entry in entries] == [
+        {"source": "spool record prompt"},
+        {"isReplay": True},
+        {"isReplay": False, "isSynthetic": True},
+        {},
+    ]
+    assert len({entry["source_address"] for entry in entries}) == 4
+
+
 def test_addresses_stay_stable_when_live_capture_appends(tmp_path):
     spool_id = "codex-live"
     _record(tmp_path, spool_id, status="running", result=None)
@@ -191,6 +211,42 @@ def test_ndjson_invalid_utf8_suffix_counts_original_bytes(suffix):
     assert capture.parsed_prefix_bytes == len(prefix)
     assert capture.ignored_trailing_bytes == len(suffix)
     assert [issue.code for issue in capture.issues] == ["invalid_utf8", "partial_trailing_record"]
+
+
+@pytest.mark.parametrize("framing", ["json", "array", "ndjson"])
+@pytest.mark.parametrize("terminal", [False, True])
+def test_unfinished_utf8_is_not_invalid_until_terminal(framing, terminal):
+    event = json.dumps({"text": "日本"}, ensure_ascii=False).encode("utf-8")
+    cut = event[: event.index("本".encode("utf-8")) + 1]
+    prefix = {"json": b"", "array": b'[{"text":"first"}', "ndjson": b'{"text":"first"}\r\n'}[framing]
+    tail = (b"," if framing == "array" else b"") + cut
+    capture = _decode_capture(prefix + tail, terminal=terminal)
+    assert ("invalid_utf8" in [issue.code for issue in capture.issues]) is terminal
+    if not terminal:
+        assert [event.value for event in capture.events] == ([] if framing == "json" else [{"text": "first"}])
+        assert capture.parsed_prefix_bytes == len(prefix)
+        assert capture.ignored_trailing_bytes == len(tail)
+        assert any(issue.code.startswith("partial_") for issue in capture.issues)
+        completed = prefix + (b"," if framing == "array" else b"") + event + (b"]" if framing == "array" else b"")
+        after = _decode_capture(completed, terminal=False)
+        assert after.events[-1].value == {"text": "日本"}
+        assert after.issues == []
+        assert [event.index for event in after.events[: len(capture.events)]] == [
+            event.index for event in capture.events
+        ]
+
+
+@pytest.mark.parametrize("prefix_text", ["π\ufffd".encode("utf-8"), b"\xff\xe2\x82"])
+@pytest.mark.parametrize("tail", [b',{"t":"\xff\xff\xff', b',{"t":"\xe6'])
+def test_array_byte_accounting_uses_original_bytes_after_repairs(prefix_text, tail):
+    prefix = b'  [{"text":"' + prefix_text + b'"}'
+    capture = _decode_capture(prefix + tail, terminal=False)
+    assert len(capture.events) == 1
+    assert capture.events[0].value["text"] == prefix_text.decode("utf-8", errors="replace")
+    assert capture.parsed_prefix_bytes == len(prefix)
+    assert capture.ignored_trailing_bytes == len(tail)
+    assert capture.observed_bytes == len(prefix + tail)
+    assert ("invalid_utf8" in [issue.code for issue in capture.issues]) is (b"\xff" in prefix + tail)
 
 
 def test_growing_claude_array_reads_only_complete_observed_prefix(tmp_path):
@@ -323,7 +379,8 @@ def test_mixed_filters_narrow_batch_selections(tmp_path, filters, tool_name, par
     assert result["selection"]["deduplicated_overlap"] == 2
 
 
-def test_large_collection_continues_after_stable_address(tmp_path):
+@pytest.mark.parametrize("full", [False, True])
+def test_large_collection_continues_after_stable_address(tmp_path, full):
     spool_id = "many-messages"
     _record(tmp_path, spool_id)
     events = []
@@ -335,18 +392,154 @@ def test_large_collection_continues_after_stable_address(tmp_path):
     (tmp_path / f"{spool_id}.stdout").write_text(_jsonl(*events))
     # The span has 205 messages interleaved with tool calls; filter before paging.
     span = f"run:{spool_id}/events/2/parts/0..run:{spool_id}/events/410/parts/0"
-    first = reap_store(tmp_path, spool_id, addresses=span, filters="agent,messages")
-    assert len(first["entries"]) == 200
+    first = reap_store(tmp_path, spool_id, addresses=span, filters="agent,messages", full=full)
+    count = len(first["entries"])
+    assert 0 < count <= 200
+    if full:
+        assert count == 200
+        assert "character" not in first["entry_truncation"]["reason"]
+    else:
+        assert len(render_response(first)) <= DEFAULT_RESPONSE_CHARS
     assert first["selection"]["matched_entries"] == 205
     assert first["entries"][0]["content"] == "1"
     after = first["entry_truncation"]["retrieve"]["after"]
-    second = reap_store(tmp_path, spool_id, addresses=span, filters="agent,messages", after=after)
-    assert [entry["content"] for entry in second["entries"]] == ["201", "202", "203", "204", "205"]
-    assert second["selection"]["entries_before_page"] == 200
+    second = reap_store(tmp_path, spool_id, addresses=span, filters="agent,messages", after=after, full=full)
+    assert [entry["content"] for entry in second["entries"]] == [str(i) for i in range(count + 1, 206)]
+    assert second["selection"]["entries_before_page"] == count
     assert second["selection"]["omitted_entries"] == 0
     for excluded in [f"run:{spool_id}/events/0/parts/0", f"run:{spool_id}/events/3/parts/0"]:
         invalid = reap_store(tmp_path, spool_id, addresses=span, filters="agent", after=excluded)
         assert invalid["error"]["code"] == "invalid_after"
+
+
+@pytest.mark.parametrize("selection", ["filter", "collection", "batch-range", "raw"])
+def test_aggregate_budget_pages_all_selected_entries_in_source_order(tmp_path, selection):
+    spool_id = "budget"
+    _record(tmp_path, spool_id)
+    events = [event for i in range(12) for event in _codex_call(f"c{i}", "cat log", 'π\n"\\' * 7500)]
+    (tmp_path / f"{spool_id}.stdout").write_text(_jsonl(*events))
+    first, last = "run:budget/events/1/parts/0", "run:budget/events/23/parts/0"
+    options = {
+        "filter": {"filters": "tool-results"},
+        "collection": {"addresses": "run:budget/tool-results"},
+        "batch-range": {"addresses": [f"{first}..{last}", last], "filters": "tool-results"},
+        "raw": {"addresses": "run:budget/raw"},
+    }[selection]
+    complete = reap_store(tmp_path, spool_id, **options, full=True)
+    assert len(render_response(complete)) > DEFAULT_RESPONSE_CHARS
+    expected = {entry["address"]: entry["content"] for entry in complete["entries"]}
+    seen = []
+    after = None
+    pages = 0
+    while True:
+        page = reap_store(tmp_path, spool_id, **options, after=after)
+        assert page["ok"] is True
+        assert len(render_response(page)) <= DEFAULT_RESPONSE_CHARS
+        assert page["entries"]  # Every continuation must make progress.
+        assert page["selection"]["entries_before_page"] == len(seen)
+        assert page["selection"]["deduplicated_overlap"] == (1 if selection == "batch-range" else 0)
+        for entry in page["entries"]:
+            address = entry["address"]
+            seen.append(address)
+            content = entry["content"]
+            cursor = entry.get("truncation", {}).get("retrieve")
+            while cursor:
+                chunk = reap_store(
+                    tmp_path, spool_id, addresses=address, offset=cursor["offset"], limit=cursor["limit"]
+                )
+                assert len(render_response(chunk)) <= DEFAULT_RESPONSE_CHARS
+                part = chunk["entries"][0]
+                assert part["content"]
+                content += part["content"]
+                cursor = part.get("truncation", {}).get("retrieve")
+            assert content == expected[address]
+        pages += 1
+        if "entry_truncation" not in page:
+            break
+        after = page["entry_truncation"]["retrieve"]["after"]
+        assert after == seen[-1]
+    assert pages > 1
+    assert seen == list(expected)  # Same identities, order and deduplication as full.
+
+
+def test_single_entry_budget_counts_escaping_and_advances_content_cursor(tmp_path):
+    payload = "\x00\ud83dπ" * 10_000
+    _record(tmp_path, "escaped-budget", result=payload)
+    address = "run:escaped-budget/final"
+    offset = 0
+    pieces = []
+    while offset < len(payload):
+        page = reap_store(tmp_path, "escaped-budget", addresses=address, offset=offset, limit=100_000)
+        wire = render_response(page)
+        assert len(wire) <= DEFAULT_RESPONSE_CHARS
+        assert json.loads(wire) == page
+        assert wire.encode("utf-8")
+        entry = page["entries"][0]
+        assert entry["content"]
+        pieces.append(entry["content"])
+        offset += len(entry["content"])
+        assert entry["truncation"]["shown_chars"][1] == offset
+        cursor = entry["truncation"]["retrieve"]
+        assert cursor is None or cursor["offset"] == offset
+    assert "".join(pieces) == payload
+    full = reap_store(tmp_path, "escaped-budget", addresses=address, full=True)
+    assert len(render_response(full)) > DEFAULT_RESPONSE_CHARS
+    assert full["entries"][0]["content"] == payload
+    assert "truncation" not in full["entries"][0]
+
+
+def test_raw_small_limits_still_budget_metadata_and_keep_every_event(tmp_path):
+    _record(tmp_path, "raw-budget")
+    events = [{"role": "assistant", "content": "x" * 250} for _ in range(180)]
+    (tmp_path / "raw-budget.stdout").write_text(_jsonl(*events))
+    seen = []
+    after = None
+    pages = 0
+    while True:
+        page = reap_store(tmp_path, "raw-budget", addresses="run:raw-budget/raw", limit=200, after=after)
+        assert page["ok"] is True
+        assert len(render_response(page)) <= DEFAULT_RESPONSE_CHARS
+        assert page["entries"]
+        seen.extend(entry["address"] for entry in page["entries"])
+        assert all(len(entry["content"]) == 200 for entry in page["entries"])
+        pages += 1
+        if "entry_truncation" not in page:
+            break
+        after = page["entry_truncation"]["retrieve"]["after"]
+    assert pages > 1
+    assert seen == [f"run:raw-budget/events/{i}" for i in range(180)]
+
+
+def test_session_budget_continuation_keeps_saved_run_scope(tmp_path):
+    for index in range(3):
+        _record(tmp_path, f"page-{index}", session_id="shared", prompt=str(index) * 19_000)
+    first = reap_store(tmp_path, "page-0", session=True, filters="user")
+    assert len(render_response(first)) <= DEFAULT_RESPONSE_CHARS
+    assert len(first["entries"]) == 2
+    after = first["entry_truncation"]["retrieve"]["after"]
+    second = reap_store(tmp_path, "page-0", session=True, filters="user", after=after)
+    assert first["scope"] == second["scope"]
+    assert len(render_response(second)) <= DEFAULT_RESPONSE_CHARS
+    assert [entry["address"] for entry in first["entries"] + second["entries"]] == [
+        f"run:page-{i}/prompt" for i in range(3)
+    ]
+    assert second["selection"]["omitted_entries"] == 0
+    assert "entry_truncation" not in second
+
+
+def test_metadata_that_cannot_fit_returns_error_not_empty_continuation(tmp_path):
+    _record(tmp_path, "huge-metadata")
+    events = _codex_call("c" * 60_000, "pwd", "output")
+    (tmp_path / "huge-metadata.stdout").write_text(_jsonl(*events))
+    for options in [{}, {"filters": "tool-results"}]:
+        result = reap_store(tmp_path, "huge-metadata", **options)
+        assert result["ok"] is False
+        assert result["error"]["code"] == "response_metadata_exceeds_budget"
+        assert "full" in result["error"]["message"]
+        assert "entry_truncation" not in result
+        assert len(render_response(result)) <= DEFAULT_RESPONSE_CHARS
+    full = reap_store(tmp_path, "huge-metadata", filters="tool-results", full=True)
+    assert json.loads(full["entries"][0]["content"])["aggregated_output"] == "output"
 
 
 def test_session_view_inventories_only_exact_matching_saved_runs(tmp_path):
@@ -471,6 +664,38 @@ def test_public_mcp_route_uses_shared_reader(tmp_path, monkeypatch):
     narrowed = json.loads(asyncio.run(tool.fn(spool_id, addresses=f"run:{spool_id}/final", filters="user")))
     assert narrowed["ok"] is True
     assert narrowed["entries"] == []
+
+
+@pytest.mark.parametrize("budget", [50_000, 4096])
+def test_public_mcp_reap_uses_existing_budget_and_safe_encoding(tmp_path, monkeypatch, budget):
+    _record(tmp_path, "mcp-budget", result="\ud83dπ" * 30_000)
+    monkeypatch.setattr(spindle, "SPINDLE_DIR", tmp_path)
+    monkeypatch.setattr(spindle, "UNSPOOL_MAX_CHARS", budget)
+    tool = asyncio.run(spindle.mcp.get_tool("spool_reap"))
+    wire = asyncio.run(tool.fn("mcp-budget", addresses="run:mcp-budget/final"))
+    assert len(wire) <= budget
+    assert wire.encode("utf-8")
+    entry = json.loads(wire)["entries"][0]
+    assert entry["content"]
+    assert entry["truncation"]["retrieve"]["offset"] > 0
+
+
+def test_cli_subprocess_preserves_unicode_and_escapes_lone_surrogates(tmp_path):
+    store = tmp_path / "spools"
+    store.mkdir()
+    payload = "\ud83dπ\udc00😀\ufffd"
+    _record(store, "cli-unicode", result=payload)
+    env = {**os.environ, "SPINDLE_HOME": str(tmp_path), "PYTHONIOENCODING": "utf-8:strict"}
+    result = subprocess.run(
+        [sys.executable, "-B", "-m", "spindle", "reap", "cli-unicode", "run:cli-unicode/final"],
+        env=env,
+        capture_output=True,
+        timeout=30,
+        check=True,
+    )
+    wire = result.stdout.decode("utf-8")
+    assert "\\ud83d" in wire and "π" in wire and "😀" in wire
+    assert json.loads(wire)["entries"][0]["content"] == payload
 
 
 @pytest.mark.parametrize("node", ["prompt", "final"])

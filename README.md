@@ -423,6 +423,10 @@ filter. Without addresses, filters apply to all normalized entries in scope.
 `tool_name` restricts the `tool-calls` filter to one exact name; other requested
 filters still match their respective messages or results. Filtering preserves
 the original addresses and happens before entry pagination.
+Claude text entries retain provider `isReplay` and `isSynthetic` flags in
+`details` when present. The user-role filter includes captured delivered prompts
+and skill injections as well as the saved source prompt; it does not infer
+human authorship or remove repeated text.
 
 ```python
 # Outline first
@@ -458,9 +462,23 @@ does not claim provider history Spindle never captured. Unknown harnesses and
 formats retain explicit raw-event access and report `raw-only` support rather
 than presenting an empty conversation. Growing captures are read to one
 observed byte boundary, with incomplete trailing material and all truncation
-reported in the response. A collection response is bounded to 200 entries; if
-more matched, `entry_truncation.retrieve.after` gives a stable address to pass
-as `after` while repeating the same selection.
+reported in the response.
+
+Ordinary pages obey the existing `SPINDLE_UNSPOOL_MAX_CHARS` read budget (50,000
+rendered JSON characters by default, including escaping and metadata) and a
+200-entry cap. If more entries matched, `entry_truncation.retrieve.after` gives
+a stable address to pass as `after` while repeating the same selection and
+content controls. Overlap is deduplicated before paging.
+
+Content defaults to at most 20,000 characters per entry. `offset` and `limit`
+select character ranges, but the page budget may further shorten a single
+large entry. Follow that entry's `truncation.retrieve` address, offset and limit
+to get the rest; the content cursor is separate from the `after` entry cursor.
+`full=True` / `--full` explicitly returns complete content and bypasses the
+character budget, so it can be large. It still obeys the 200-entry cap and cannot
+be combined with `offset` or `limit`. If metadata alone cannot fit, the reader
+returns an actionable error instead of an empty continuation page: narrow the
+scope/selection or request selected addresses with `full`.
 
 ### Search and filter
 
