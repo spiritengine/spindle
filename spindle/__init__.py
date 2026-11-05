@@ -5935,36 +5935,43 @@ async def spool_reap(
     outline: bool = False,
     format: str = "text",
 ) -> str:
-    """Browse or read saved spool captures; compact text by default.
+    """Browse saved captures or read Python-indexed collection paths.
 
-    Bare browse shows eight chronological groups for one spool, or eight saved
-    spools in creation order with session=True. Addresses/filters read content;
-    outline=True zooms their entire selected chronology into up to eight rows.
-    Groups preserve selection gaps. Copy the printed read/zoom commands and
-    retain their filters. A selected outline must belong to one spool and one
-    address family (raw or normalized). A content batch can span spools.
+    Examples:
+        spool_reap("abc")
+        spool_reap("abc/messages/-10:")
+        spool_reap("abc/tool-results/Bash/-10:")
+        spool_reap("abc/prompts", addresses="def/events/-1,ghi/events/5:40")
+        spool_reap("abc", addresses="events/40:90", filters="message", outline=True)
 
     Args:
-        handle: Spool ID, or with session=True a spool/session ID.
-        addresses: Comma-separated addresses or inclusive address..address ranges.
-            Relative paths work only with session=False; session views require
-            run:<spool>/... for every address, endpoint and cursor.
-        filters: Comma-separated user, agent, messages, tool-calls, tool-results;
-            unioned filters narrow the addressed selection before pagination.
+        handle: Spool ID or first fully qualified selector. With session=True,
+            a spool/session ID selects only saved captures sharing session_id.
+        addresses: Comma-separated ID/collection[/index-or-slice] selectors;
+            relative paths also work with a bare spool handle. Collections are
+            events (normalized chronology, excluding saved final), messages
+            (model only), prompts, tool-calls, tool-results, raw, and final.
+            Tool collections accept an exact tool name before the slice.
+            Indexing/slicing uses literal Python semantics: zero-based, negative
+            indices, exclusive stop, omitted bounds, and nonzero signed steps.
+            Explicit run: paths retain legacy source-position semantics.
+        filters: Comma-separated prompt, message, messages (both roles),
+            tool-calls, tool-results; user/agent are aliases. Filters narrow
+            AFTER collection slicing; batches preserve order and deduplicate.
         tool_name: Exact tool name; implies/needs the tool-calls filter.
-        session: Saved records with the same session_id, never unseen history.
-        after: Run address for session browse; selected entry address for
-            content paging or fragmented chronological outlines.
+        session: Saved captures only, never unseen provider history.
+        after: Run address for session browse; last selected entry address for
+            other paging. Repeat the original selection, filters and controls.
         offset: Character offset in each content entry; not for outlines.
         limit: Content characters per entry (default 20,000); not for outlines.
-        full: Bypass content character budgets; still at most 200 entries.
+        full: Bypass character budgets; still at most 200 content entries.
             Incompatible with offset/limit and outlines.
-        outline: Zoom the selection into bounded previews instead of reading.
-        format: Strictly "text" or "json". JSON without explicit outline=True
-            preserves the original spindle.reap/v1 objects and tree outline.
+        outline: One-line message previews and consecutive tool groups.
+        format: "text" (default) or detailed "json". Bare JSON retains the
+            legacy collection tree. Source coordinates remain in JSON entries.
 
-    Text and JSON obey the configured rendered-character budget. Content
-    continuation (offset) is separate from the next-entry (after) cursor.
+    Content continuation (offset) is separate from next-entry paging (after).
+    New chronology indexes describe the observed capture, which can change.
     """
     wire, _ = await asyncio.to_thread(
         _spool_reap_sync,
@@ -13441,17 +13448,19 @@ def main():
 
     # reap command - addressable inspection of existing captures
     reap_parser = subparsers.add_parser("reap", help="Browse or retrieve addressable saved spool evidence")
-    reap_parser.add_argument("handle", help="Spool ID, or with --session a spool/session ID")
+    reap_parser.add_argument(
+        "handle", help="Spool ID or first ID/collection/index-or-slice selector; --session accepts a spool/session ID"
+    )
     reap_parser.add_argument(
         "addresses",
         nargs="*",
-        help="Relative or run:<spool>/... addresses, or inclusive address..address ranges (repeatable)",
+        help="ID/collection[/Python-index-or-slice] selectors, or relative paths after a bare ID (repeatable)",
     )
     reap_parser.add_argument(
         "--filter",
         dest="filters",
         action="append",
-        choices=["user", "agent", "messages", "tool-calls", "tool-results"],
+        choices=["prompt", "message", "user", "agent", "messages", "tool-calls", "tool-results"],
         help="Keep entries matching any requested filter within the selection (repeatable)",
     )
     reap_parser.add_argument("--tool", dest="tool_name", help="Exact tool name; implies the tool-calls filter")
@@ -13461,7 +13470,7 @@ def main():
         help="Gather matching saved runs with the same session_id (captured history only)",
     )
     reap_parser.add_argument(
-        "--outline", action="store_true", help="Zoom the selected chronology into at most eight rows"
+        "--outline", action="store_true", help="Show message previews and consecutive tool groups for the selection"
     )
     reap_parser.add_argument(
         "--json", action="store_true", help="Detailed JSON (legacy v1 unless --outline is explicit)"

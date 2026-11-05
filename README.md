@@ -130,8 +130,8 @@ spindle drop <spool_id>
 
 # Browse the saved capture, then retrieve an address or normalized collection
 spindle reap <spool_id>
-spindle reap <spool_id> run:<spool_id>/final
-spindle reap <spool_id> --filter agent --filter tool-calls
+spindle reap <spool_id>/final
+spindle reap <spool_id>/messages/-10:
 
 # Settle custody only when doctor reports an abandoned owner episode
 spindle repair <spool_id> --attest-dead
@@ -397,161 +397,135 @@ Tune the thresholds with `SPINDLE_UNSPOOL_MAX_CHARS` (default 50000),
 
 ### Addressable capture reading
 
-`spool_reap` and `spindle reap` inspect the spool record and its existing
-stdout/transcript capture. The reader adds no launch, resume, or finalization
-calls. As with other Spindle CLI commands, starting the CLI retains existing
-store cleanup and recovery; the MCP reader itself does not request maintenance.
+`spool_reap` and `spindle reap` read the saved spool record and stdout/transcript
+capture without requesting provider history. The reader creates no persistent
+index and does not launch, resume, or finalize work. Starting the CLI retains
+its existing store cleanup and recovery behavior; the MCP reader itself does
+not request maintenance.
 
-CLI and MCP return **compact text by default**. Existing JSON consumers must
-add CLI `--json` or MCP `format="json"`. Without explicit `--outline` /
-`outline=True`, JSON preserves the original `spindle.reap/v1` response objects,
-including the legacy collection-tree outline for a bare request.
-
-A bare spool ID shows its full chronology in at most eight balanced groups,
-with stable address endpoints, counts and opening/closing message excerpts.
-Eight or fewer selected entries appear as bounded leaf previews. The saved
-result is listed separately by address and size because it may repeat progress;
-raw evidence is listed separately by address and event count. A bare session
-view lists at most eight saved spools in creation order, with real statuses and
-opening/closing agent excerpts (or captured input/output when no agent spoke).
-
-Addresses or filters ordinarily **read content**. Add `--outline` /
-`outline=True` to **zoom** a selection instead. Every group provides reusable
-read/zoom requests; the text gives copyable commands. Keep the filters and exact
-tool name when substituting another row's address/range. Groups split at gaps
-in a sparse selection, so their ranges never widen the selection. More than
-eight disjoint groups page using an entry `after` cursor. A selected outline
-must stay within one spool and one address family (raw or normalized);
-cross-spool content batches remain supported.
+CLI and MCP return text by default. A bare spool ID shows each captured Prompt
+and model Message as a short line, with consecutive tool requests/results grouped
+into copyable ranges. Excerpts are at most 160 characters. Saved final output
+and raw records have separate addresses. Use collection paths directly without
+browsing first:
 
 ```bash
-spindle reap 10f717ab
-spindle reap 10f717ab 'events/638/parts/0..events/978/parts/0' --outline
-spindle reap 10f717ab 'events/638/parts/0..events/978/parts/0' --filter agent
-spindle reap 10f717ab events/638/parts/0
-spindle reap codex-a9b0fa82 --session
-spindle reap 10f717ab --json
+spindle reap abc
+spindle reap abc/messages/-10:
+spindle reap abc/prompts
+spindle reap abc/tool-results/Bash/-10:
+spindle reap abc/tool-calls/Bash/-10:
+spindle reap abc/events/5 def/events/-1 ghi/events/5:40
+spindle reap abc/events/-10:
+spindle reap abc/events/:10
+spindle reap abc/events/::2
+spindle reap abc/events/::-1
+spindle reap abc/events/40:90 --filter message
+spindle reap abc/messages/-10: --outline
+spindle reap abc events/5
+spindle reap abc/final
+spindle reap abc/raw/-1 --json
 ```
 
-Relative paths resolve against the handle only with `session=False`:
+Selectors use **literal Python list indexing and slicing**: zero-based indices,
+negative indices from the end, exclusive stop, omitted bounds, and positive or
+negative steps. Reverse slices return entries in reverse order. Out-of-range
+indices are errors; slices clamp, and empty slices return an ordinary empty
+selection. Step zero is an error. There are no one-based or inclusive hyphen
+ranges, and no `--last` flag.
 
-```
-prompt
-final
-messages
-tool-calls
-tool-results
-raw
-events/<source-position>
-events/<source-position>/parts/<part-position>
-```
+Collections:
 
-Canonical `run:<spool-id>/...` addresses always work and are always used in
-JSON. `session=True` requires canonical addresses for every selector, range
-endpoint and cursor, even if only one spool currently matches. There are no
-traversal aliases or display-row indexes.
+- `ID/events` is the ordered normalized chronology, including the saved source
+  prompt and captured prompts, model messages, tool requests and results. It
+  excludes separately saved final output, so duplicate finals do not change its
+  length. These indexes are not raw capture record numbers.
+- `ID/messages` contains model-authored messages only.
+- `ID/prompts` contains the saved source prompt and captured user-role prompts,
+  including injected/delivered prompts. It neither infers human authorship nor
+  removes repeated text. Provider replay/synthetic flags remain in JSON details.
+- `ID/tool-calls` and `ID/tool-results` contain requests and results. Add an exact
+  tool name before the optional index/slice, such as `ID/tool-results/Bash/-10:`.
+  Named results resolve through their linked originating request. Unlinked
+  results remain in the unqualified collection, with no invented association.
+- `ID/final` reads the separately saved result, which need not be the last message.
+- `ID/raw` contains raw captured records and accepts indexes and slices.
 
-Event and part positions come from the underlying saved capture; filtering does
-not renumber them, and appending later events leaves earlier addresses stable.
-An inclusive range joins two entry addresses with `..`. CLI address
-arguments may be repeated; MCP accepts a comma-separated `addresses` string.
-Batch addresses and ranges are combined and deduplicated in captured order.
-Filters then narrow that selection: an entry must match at least one requested
-filter. Without addresses, filters apply to all normalized entries in scope.
-`tool_name` restricts the `tool-calls` filter to one exact name; other requested
-filters still match their respective messages or results. Filtering preserves
-the original addresses and happens before entry pagination.
-Claude text entries retain provider `isReplay` and `isSynthetic` flags in
-`details` when present. The user-role filter includes captured delivered prompts
-and skill injections as well as the saved source prompt; it does not infer
-human authorship or remove repeated text.
+Indexing/slicing happens after choosing the collection and optional tool name.
+Additional `--filter` flags narrow the sliced selection; they never add entries.
+For example `abc/events/40:90 --filter message` keeps model messages among
+chronological entries 40 through 89. Filters are `prompt`, `message`,
+`tool-calls`, and `tool-results`; `user`/`agent` remain aliases and the legacy
+`messages` filter means both roles. Repeated filters are unioned. The legacy
+`--tool` flag implies/requires `tool-calls` and narrows that filter only.
+
+Multiple selectors may span unrelated spools. Results preserve selector order
+and Python order within each selector, deduplicating the first occurrence of
+an entry. Normalized hits carry canonical `ID/events/N` addresses regardless of
+which collection found them. A bare spool ID followed by relative paths remains
+convenient; use fully qualified selectors when spanning spools. A literal leaf
+selection returns its content directly. Collections and batches label kind and
+address, even when only one entry matches.
+
+`--outline` / `outline=True` shows previews of a selection. Every message keeps
+its own line. Tool groups retrieve exactly their shown members; sparse and
+reverse selections remain separate rows where grouping would widen or reorder
+them. Groups longer than 200 entries split into separately retrievable ranges.
+The reader never silently drops items to make an outline fit: follow the printed
+continuation when a page reaches the character budget. Cross-spool outlines
+keep addresses fully qualified. Session browse (`--session`) lists up to eight
+saved spools per page, ordered by creation time, with statuses and message
+excerpts. It explicitly covers saved captures sharing `session_id` only.
+
+The MCP tool uses the same syntax through its existing fields:
 
 ```python
-# Browse first, then zoom or read
-spool_reap(spool_id)
-spool_reap(spool_id, filters="agent", outline=True)
-
-# Original JSON contract (including the legacy bare collection tree)
-spool_reap(spool_id, format="json")
-
-# Continue a session outline using its run_truncation.retrieve.after cursor
-spool_reap(spool_id, session=True, after="run:codex-abcd1234")
-
-# Normalized conversational roles (Claude tool-result wrappers are excluded)
-spool_reap(spool_id, filters="user,agent")
-
-# Calls of one exact provider tool type
-spool_reap(spool_id, filters="tool-calls", tool_name="command_execution")
-
-# Agent messages only within a captured range
-spool_reap(
-    spool_id,
-    addresses=f"run:{spool_id}/events/4/parts/0..run:{spool_id}/events/12/parts/0",
-    filters="agent",
-)
-
-# Batch a node and an inclusive stable-position range
-spool_reap(
-    spool_id,
-    addresses=(f"run:{spool_id}/final,run:{spool_id}/events/4/parts/0..run:{spool_id}/events/12/parts/0"),
-)
-
-# Read a large selected entry in chunks, or in full
-spool_reap(spool_id, addresses=f"run:{spool_id}/final", offset=20000, limit=20000)
-spool_reap(spool_id, addresses=f"run:{spool_id}/final", full=True)
+spool_reap("abc")
+spool_reap("abc/messages/-10:")
+spool_reap("abc/prompts")
+spool_reap("abc/tool-results/Bash/-10:")
+spool_reap("abc/events/5", addresses="def/events/-1,ghi/events/5:40")
+spool_reap("abc", addresses="events/40:90", filters="message", outline=True)
+spool_reap("abc/events/::-1", format="json")
+spool_reap("abc/final", offset=20000, limit=20000)
+spool_reap("abc/final", full=True)
+spool_reap("abc", session=True, after="run:previous-spool")
 ```
 
-`session=True` explicitly gathers every readable saved record carrying the
-same `session_id`, ordered by creation time. The response states that scope; it
-does not claim provider history Spindle never captured. Unknown harnesses and
-formats retain explicit raw-event access and report `raw-only` support rather
-than presenting an empty conversation. Growing captures are read to one
-observed byte boundary, with incomplete trailing material and all truncation
-reported in the response.
+CLI `--json` and MCP `format="json"` return detailed `spindle.reap/v1` objects.
+A bare JSON request retains the legacy collection-tree outline unless explicit
+`outline=True` is supplied. Existing explicit `run:ID/events/N` paths still
+mean raw capture records, and `run:ID/events/N/parts/P` means normalized source
+positions. `run:ID/messages` retains both roles. Legacy inclusive
+`run:ID/... .. run:ID/...` ranges (without spaces) remain accepted. Relative
+`events/N/parts/P` and `prompt` remain legacy aliases; relative `events/N` now
+means the normalized chronology. Detailed JSON retains `source_address` and,
+for logical paths, `details.legacy_address`. New indexes describe the observed
+capture and may change if an unfinished capture is rewritten or reinterpreted;
+they are not a persistent index or a promise of provider-history stability.
 
-Ordinary pages obey the existing `SPINDLE_UNSPOOL_MAX_CHARS` read budget (50,000
-rendered characters by default), measured on the chosen text or JSON output.
-Text budget includes escaped terminal controls and printed navigation; hidden
-JSON metadata cannot shorten a text read. Text escapes C0/C1 controls except
-newline/tab, plus lone surrogates. Ordinary Unicode stays readable. JSON
-retains captured values losslessly. An exact leaf read returns direct content;
-collections, filters and batches label each entry with its role/tool and
-address. Reader notices follow a blank line and start with `Spindle:`. Healthy
-metadata is suppressed; abnormal capture/support/status facts remain visible,
-even for empty selections. The CLI exit code comes from the reader's structured
-success fact in either format.
+Unknown harnesses retain raw/final access with explicit support notices.
+Growing captures are read to one observed byte boundary. Incomplete trailing
+material, malformed records, warnings, and truncation remain visible, including
+for empty selections. Text uses Prompt/Message labels, escapes terminal controls
+(except newline/tab) and lone surrogates, and preserves ordinary Unicode. JSON
+retains captured values losslessly. Notices begin with `Spindle:`. The CLI exit
+code follows the reader's structured success fact.
 
-Session browse uses a run `after` cursor, for example
-`spindle reap ID --session --after run:SPOOL_ID`. Chronological outlines use
-selected-entry `after` cursors for sparse groups or character-budget paging.
-Copy the printed continuation, retaining the original selection and filters.
-Normal contiguous outlines cover the whole selected chronology in eight
-balanced groups, without the content reader's 200-entry cap.
+Ordinary pages obey `SPINDLE_UNSPOOL_MAX_CHARS` (50,000 rendered characters by
+default), measured on the chosen text or JSON output. Content defaults to at
+most 20,000 characters per entry and 200 entries per page. `offset` and `limit`
+apply to each selected entry; the total response budget may further shorten a
+large entry. Follow **more content** for the next character chunk of that exact
+entry, and **more entries** for subsequent entries. These are separate cursors;
+follow both if both appear. Entry continuations repeat the original selector,
+slice, filters and controls with `after` set to the last returned canonical
+address, preserving reverse order. Session continuations use a `run:ID` cursor.
 
-Content defaults to at most 20,000 characters per entry and at most 200 entries
-per page. `offset` and `limit` select character ranges; the page budget may
-further shorten a large entry. A **more content** command selects that exact
-entry with its next `offset`. A separate **more entries** command repeats the
-original selection with the last returned entry as `after`. Follow both when
-both are present. `full=True` / `--full` bypasses character budgets but keeps the
-200-entry cap. It cannot combine with `offset` or `limit`. Outlines reject all
-three content controls. If even navigation cannot fit the budget, the reader
-returns an actionable error instead of an empty continuation loop.
-
-For JSON consumers, legacy `scope.run_addresses` and `runs` describe only the
-runs represented on the page; `scope.matched_runs` counts the entire saved
-scope. Page `ok` reflects represented capture issues, or scope errors for an
-empty page. `scope.diagnostics` retains support/error counts even with no
-matches. Content cursors remain `entry_truncation.retrieve.after` and each
-entry's `truncation.retrieve`; legacy session/tree cursors remain
-`run_truncation.retrieve.after`. Explicit `outline=True, format="json"` is
-additive: `mode="selection-outline"` has structured groups and read/zoom
-requests; bare session browse has `mode="session-outline"`. Neither repurposes
-the original `mode="outline"` response.
-
-Repeated malformed NDJSON records produce one capture issue with
-`details.count` and one-based `details.first_source_line`; each raw event retains
-its own `parse_error`, content and address.
+`full=True` / `--full` bypasses content character budgets but retains the
+200-entry limit. It cannot combine with `offset` or `limit`; outlines reject
+all three controls. If even navigation cannot fit, the reader returns an
+explicit error rather than a continuation that cannot advance.
 
 ### Search and filter
 

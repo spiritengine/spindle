@@ -36,8 +36,8 @@ def _word(value: str) -> str:
 
 
 def address_text(address: str, request: dict[str, Any]) -> str:
-    if not request.get("session"):
-        return address.removeprefix(f"run:{request['handle']}/")
+    # Explicit legacy paths must retain run:; relative events/N now means
+    # chronological indexing rather than a raw captured record.
     return address
 
 
@@ -73,26 +73,19 @@ def _count(number: int, noun: str, plural: str | None = None) -> str:
 def _counts(counts: dict[str, int]) -> str:
     nouns = {
         "message": "message",
-        "tool_call": "call",
-        "tool_result": "result",
+        "tool_call": "tool request",
+        "tool_result": "tool result",
         "raw_event": "raw event",
         "final": "saved result",
     }
-    return (
-        ", ".join(
-            _count(number, nouns[kind])
-            for kind, number in counts.items()
-            if number and not (kind == "tool_result" and number == counts.get("tool_call"))
-        )
-        or "0 entries"
-    )
+    return ", ".join(_count(number, nouns[kind]) for kind, number in counts.items() if number) or "0 entries"
 
 
 def _label(entry: dict[str, Any]) -> str:
     label = {
-        "message": entry.get("role", "message"),
-        "tool_call": "tool call",
-        "tool_result": "tool result",
+        "message": "Prompt" if entry.get("role") == "user" else "Message",
+        "tool_call": "Tool request",
+        "tool_result": "Tool result",
         "raw_event": "raw event",
         "final": "saved result",
     }[entry["kind"]]
@@ -101,10 +94,10 @@ def _label(entry: dict[str, Any]) -> str:
 
 def _excerpt(preview: str, truncated: bool = False) -> str:
     text = safe_text(preview)
-    if len(text) <= 80 and not truncated:
+    if len(text) <= 160 and not truncated:
         return text
-    prefix = text[:79]
-    if len(text) > 79 and not text[79].isspace() and " " in prefix:
+    prefix = text[:159]
+    if len(text) > 159 and not text[159].isspace() and " " in prefix:
         prefix = prefix.rsplit(" ", 1)[0]
     return prefix.rstrip() + "…"
 
@@ -195,7 +188,6 @@ def render_text(response: dict[str, Any]) -> str:
         title = runs[0]["status"] if len(runs) == 1 else "Selection"
         if response["presentation"].get("bare") and runs:
             title += "; " + _counts(runs[0]["counts"])
-        title += "; " + _count(selection["matched_entries"], "selected entry", "selected entries")
         if selection["omitted_entries"]:
             title += f"; {selection['omitted_entries']} remaining"
         if len(runs) == 1:
@@ -209,26 +201,30 @@ def render_text(response: dict[str, Any]) -> str:
             )
         for group in response["groups"]:
             selector = "..".join(address_text(part, request) for part in group["selector"].split(".."))
-            description = (
-                _label(group["leaf"]) + f"; {group['chars']} chars" if "leaf" in group else _counts(group["counts"])
-            )
+            if "leaf" in group:
+                description = _clues(group)
+            else:
+                description = _counts(group["counts"])
+                if group.get("tool_names"):
+                    description += " (" + ", ".join(group["tool_names"]) + ")"
+                if group.get("clues"):
+                    description += ": " + _excerpt(
+                        group["clues"][0]["preview"], group["clues"][0].get("preview_truncated", False)
+                    )
             lines.append(f"{description} {selector}")
-            lines.append("  " + _clues(group))
         if response["presentation"].get("bare") and runs:
             run = runs[0]
             if run.get("final"):
                 lines.append(
                     f"Saved result: {run['final']['chars']} chars {address_text(run['final']['address'], request)}"
                 )
-            lines.append(
-                f"Raw: {_count(run['capture']['raw_event_count'], 'event')} {address_text(run['address'] + '/raw', request)}"
-            )
+            lines.append(f"Raw: {_count(run['capture']['raw_event_count'], 'event')} {run['spool_id'] + '/raw'}")
         if not response["groups"]:
             lines.append("No selected chronology entries.")
         else:
             first = response["groups"][0]
             lines.extend(("", "Read: " + command(first["read"]), "Zoom: " + command(first["zoom"])))
-            lines.append("Replace the address/range with any row above; keep the filters.")
+            lines.append("Read any row using its address; keep the filters.")
     else:
         exact = response["presentation"]["exact_leaf"]
         for entry in response["entries"]:
@@ -243,7 +239,9 @@ def render_text(response: dict[str, Any]) -> str:
                 )
                 if truncation["retrieve"]:
                     more = {
-                        "handle": request["handle"],
+                        "handle": entry["address"].split("/", 1)[0].removeprefix("run:")
+                        if not request.get("session")
+                        else request["handle"],
                         "session": request.get("session", False),
                         "addresses": [entry["address"]],
                         "offset": end,

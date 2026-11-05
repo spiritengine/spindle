@@ -10,7 +10,8 @@ from __future__ import annotations
 import json
 import os
 import re
-from dataclasses import dataclass, field
+import shlex
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
@@ -23,7 +24,7 @@ TREE_PREVIEW_CHARS = 160
 TREE_PREVIEW_ITEMS = 3
 MAX_RETURNED_ENTRIES = 200
 _TERMINAL_STATUSES = {"complete", "error", "timeout", "cancelled", "abandoned"}
-_FILTERS = {"user", "agent", "messages", "tool-calls", "tool-results"}
+_FILTERS = {"user", "agent", "prompt", "message", "messages", "tool-calls", "tool-results"}
 _RUN_ADDRESS = re.compile(r"^run:([^/]+)(?:/(.*))?$")
 
 
@@ -656,6 +657,7 @@ def _link_calls_and_results(entries: list[_Entry]) -> None:
         if call is None:
             continue
         entry.call_address = call.address
+        entry.tool_name = call.tool_name
         if entry.address not in call.result_addresses:
             call.result_addresses.append(entry.address)
 
@@ -1009,9 +1011,9 @@ def _select_range(selector: str, run_by_id: dict[str, _Run]) -> tuple[list[_Entr
 
 
 def _filter_entries(entries: list[_Entry], filter_name: str, tool_name: Optional[str]) -> list[_Entry]:
-    if filter_name == "user":
+    if filter_name in {"user", "prompt"}:
         return [item for item in entries if item.kind == "message" and item.role == "user"]
-    if filter_name == "agent":
+    if filter_name in {"agent", "message"}:
         return [item for item in entries if item.kind == "message" and item.role == "agent"]
     if filter_name == "messages":
         return [item for item in entries if item.kind == "message"]
@@ -1075,18 +1077,89 @@ def render_response(response: dict[str, Any], format: str = "json") -> str:
     return json.dumps(response, ensure_ascii=False, indent=2).encode("utf-8", errors="backslashreplace").decode("utf-8")
 
 
+def _owner(address: str) -> str:
+    return address.split("/", 1)[0].removeprefix("run:")
+
+
 def _canonical_address(address: str, handle: str, session: bool) -> str:
     if address.startswith("run:"):
         return address
-    if session:
-        raise ValueError(
-            "session=True requires canonical run:<spool-id>/... addresses, including range endpoints and after"
+    # Source-part paths and old inclusive ranges retain their explicit meaning.
+    if re.fullmatch(r"events/\d+/parts/\d+", address) or address == "prompt":
+        if session:
+            raise ValueError("session=True requires canonical addresses")
+        return f"run:{handle}/{address}"
+    if re.fullmatch(r"[^/.:]+/(?:events|messages|prompts|tool-calls|tool-results|final|raw)(?:/[^/]+)*", address):
+        return address
+    collection = address.split("/", 1)[0]
+    if collection in {"events", "messages", "prompts", "tool-calls", "tool-results", "final", "raw"}:
+        if session:
+            raise ValueError("session=True requires canonical ID/collection addresses")
+        return f"{handle}/{address}"
+    raise ValueError(
+        f"invalid address {address!r}; use ID/collection/index-or-slice (session browse cursors use run:<spool-id>)"
+    )
+
+
+def _logical_entries(run: _Run) -> list[_Entry]:
+    """Give the same parsed evidence chronological addresses, retaining sources."""
+    chronology = [entry for entry in run.entries if entry.kind != "final"]
+    addresses = {entry.address: f"{run.spool_id}/events/{i}" for i, entry in enumerate(chronology)}
+    addresses.update({entry.address: f"{run.spool_id}/raw/{i}" for i, entry in enumerate(run.raw_entries)})
+    addresses[f"{run.address}/final"] = f"{run.spool_id}/final"
+    return [
+        replace(
+            entry,
+            address=addresses[entry.address],
+            parent=run.spool_id
+            if entry.kind == "final"
+            else f"{run.spool_id}/" + ("raw" if entry.kind == "raw_event" else "events"),
+            call_address=addresses.get(entry.call_address),
+            result_addresses=[addresses[address] for address in entry.result_addresses],
+            details={**entry.details, "legacy_address": entry.address},
         )
-    if not re.fullmatch(r"(?:prompt|final|messages|tool-calls|tool-results|raw|events/\d+(?:/parts/\d+)?)", address):
-        raise ValueError(
-            f"invalid relative address {address!r}; use prompt, final, a collection, or events/N[/parts/M]"
-        )
-    return f"run:{handle}/{address}"
+        for entry in run.all_entries()
+    ]
+
+
+def _select_logical(address: str, run_by_id: dict[str, _Run]) -> tuple[list[_Entry], Optional[str]]:
+    spool_id, collection, *tail = address.split("/")
+    run = run_by_id.get(spool_id)
+    if run is None:
+        return [], f"address {address!r} is outside this reap scope"
+    entries = _logical_entries(run)
+    if collection == "events":
+        entries = [entry for entry in entries if entry.kind not in {"final", "raw_event"}]
+    elif collection in {"messages", "prompts"}:
+        role = "agent" if collection == "messages" else "user"
+        entries = [entry for entry in entries if entry.kind == "message" and entry.role == role]
+    elif collection in {"tool-calls", "tool-results"}:
+        kind = "tool_call" if collection == "tool-calls" else "tool_result"
+        entries = [entry for entry in entries if entry.kind == kind]
+        if tail and not re.fullmatch(r"[+-]?\d+|[+-]?\d*:[+-]?\d*(?::[+-]?\d*)?", tail[0]):
+            name = tail.pop(0)
+            # Only linked results can honestly belong to a named tool.
+            entries = [
+                entry for entry in entries if entry.tool_name == name and (kind != "tool_result" or entry.call_address)
+            ]
+    elif collection in {"raw", "final"}:
+        entries = [entry for entry in entries if entry.kind == ("raw_event" if collection == "raw" else "final")]
+    else:
+        return [], f"unknown collection {collection!r}"
+    if not tail:
+        return entries, None
+    if len(tail) != 1 or collection == "final":
+        return [], f"invalid selector {address!r}"
+    index = tail[0]
+    try:
+        if re.fullmatch(r"[+-]?\d+", index):
+            return [entries[int(index)]], None
+        if not re.fullmatch(r"[+-]?\d*:[+-]?\d*(?::[+-]?\d*)?", index):
+            raise ValueError("expected a Python integer or slice")
+        bounds = [int(part) if part else None for part in index.split(":")]
+        return entries[slice(*bounds)], None
+    except (IndexError, ValueError) as exc:
+        return [], f"invalid selection {address!r}: {exc}"
 
 
 def _narrow(entries: list[_Entry], filters: list[str], tool_name: Optional[str]) -> list[_Entry]:
@@ -1106,15 +1179,32 @@ def _counts(entries: list[_Entry]) -> dict[str, int]:
 def _clues(entries: list[_Entry], *, agent_only: bool = False) -> list[dict[str, Any]]:
     messages = [entry for entry in entries if entry.kind == "message" and (not agent_only or entry.role == "agent")]
     fallback = [entry for entry in entries if entry.kind != "message"] if agent_only else entries
+    if not agent_only:
+        fallback = [entry for entry in entries if entry.kind == "tool_call"] or entries
     chosen = ([messages[0], messages[-1]] if len(messages) > 1 else messages) if messages else (fallback or entries)[:1]
     clues = []
     for entry in chosen:
-        preview = re.sub(r"[\n\t ]+", " ", entry.content).strip(" ")
+        content = entry.content
+        if entry.kind == "tool_call":
+            try:
+                value = json.loads(content)
+            except (ValueError, TypeError):
+                value = None
+            if isinstance(value, dict):
+                content = _render(value.get("command", value.get("cmd", value.get("file_path", value))))
+            # Reveal the command inside a simple shell wrapper without executing it.
+            try:
+                words = shlex.split(content)
+            except ValueError:
+                words = []
+            if len(words) == 3 and Path(words[0]).name in {"sh", "bash", "zsh"} and words[1] in {"-c", "-lc"}:
+                content = words[2]
+        preview = " ".join(content.split())
         clues.append(
             {
                 **{key: value for key in ("kind", "role", "tool_name") if (value := getattr(entry, key)) is not None},
-                "preview": preview[:80],
-                "preview_truncated": len(preview) > 80,
+                "preview": preview[:TREE_PREVIEW_CHARS],
+                "preview_truncated": len(preview) > TREE_PREVIEW_CHARS,
             }
         )
     return clues
@@ -1133,7 +1223,7 @@ def _compact_run(run: _Run) -> dict[str, Any]:
         "issues": [issue.as_dict() for issue in run.issues],
         "counts": _counts(entries),
         "clues": _clues(entries + run.raw_entries + ([final] if final else []), agent_only=True),
-        "final": {"address": final.address, "chars": len(final.content)} if final else None,
+        "final": {"address": f"{run.spool_id}/final", "chars": len(final.content)} if final else None,
     }
 
 
@@ -1202,74 +1292,70 @@ def _chronological_outline(
     format: str,
     max_chars: int,
 ) -> dict[str, Any]:
-    owners = {entry.address.split("/", 1)[0] for entry in ordered}
-    if len(owners) > 1:
-        return _error(
-            request["handle"],
-            "multiple_spool_outline",
-            "selected outline spans multiple spools; choose one spool to zoom (cross-spool content batches remain available)",
-        )
-    families = {entry.kind == "raw_event" for entry in ordered}
-    if len(families) > 1:
-        return _error(
-            request["handle"],
-            "mixed_outline_families",
-            "choose raw events or normalized entries for one outline; these address families cannot share ranges",
-        )
-    page_runs = [run for run in runs if run.address in owners or len(runs) == 1]
-    remaining = ordered[entry_start:]
-    # Split at holes in the FILTERED underlying sequence. A range plus the
-    # same filters must round-trip to exactly its represented entries.
-    universe = [entry for run in page_runs for entry in (run.raw_entries if families == {True} else run.entries)]
-    universe = _narrow(universe, request["filters"], request["tool_name"])
-    ranks = {entry.address: rank for rank, entry in enumerate(universe)}
-    islands: list[list[_Entry]] = []
-    for entry in remaining:
-        if not islands or ranks[entry.address] != ranks[islands[-1][-1].address] + 1:
-            islands.append([])
-        islands[-1].append(entry)
-    # At most eight islands can appear on this page. Spend remaining rows on
-    # balanced subdivisions, never on spans across unselected gaps.
-    islands = islands[:8]
-    allocation = [1] * len(islands)
-    while sum(allocation) < min(8, sum(map(len, islands))):
-        index = max(
-            (i for i, island in enumerate(islands) if allocation[i] < len(island)),
-            key=lambda i: len(islands[i]) / allocation[i],
-        )
-        allocation[index] += 1
+    # Fold only adjacent chronological tool activity, never messages or holes.
+    # Reverse and sparse selections remain individual rows, preserving order.
+    ranks = {entry.address: (run.spool_id, i) for run in runs for i, entry in enumerate(run.entries)}
+    parts: list[list[_Entry]] = []
+    for entry in ordered[entry_start:]:
+        previous = parts[-1][-1] if parts else None
+        adjacent = False
+        if previous and _owner(previous.address) == _owner(entry.address):
+            if not entry.address.startswith("run:") and not previous.address.startswith("run:"):
+                adjacent = (
+                    "/events/" in entry.address
+                    and "/events/" in previous.address
+                    and int(entry.address.rsplit("/", 1)[1]) == int(previous.address.rsplit("/", 1)[1]) + 1
+                )
+            elif entry.address in ranks and previous.address in ranks:
+                adjacent = ranks[entry.address][1] == ranks[previous.address][1] + 1
+        if (
+            previous
+            and adjacent
+            and entry.kind in {"tool_call", "tool_result"}
+            and previous.kind in {"tool_call", "tool_result"}
+            and len(parts[-1]) < MAX_RETURNED_ENTRIES
+        ):
+            parts[-1].append(entry)
+        else:
+            parts.append([entry])
     groups = []
-    for island, count in zip(islands, allocation):
-        size, extra = divmod(len(island), count)
-        start = 0
-        for i in range(count):
-            part = island[start : start + size + (i < extra)]
-            start += len(part)
-            selector = part[0].address if len(part) == 1 else f"{part[0].address}..{part[-1].address}"
-            read = {key: request[key] for key in ("handle", "session", "filters", "tool_name")}
-            read["addresses"] = [selector]
-            group = {
-                "selector": selector,
-                "first_address": part[0].address,
-                "last_address": part[-1].address,
-                "count": len(part),
-                "counts": _counts(part),
-                "chars": sum(len(entry.content) for entry in part),
-                "clues": _clues(part),
-                "read": read,
-                "zoom": {**read, "outline": True},
+    for part in parts:
+        selector = part[0].address
+        if len(part) > 1:
+            if selector.startswith("run:"):
+                selector += ".." + part[-1].address
+            else:
+                selector += ":" + str(int(part[-1].address.rsplit("/", 1)[1]) + 1)
+        read = {key: request[key] for key in ("session", "filters", "tool_name")}
+        # The row is a complete selection, independent of the original first path.
+        read.update(
+            handle=_owner(part[0].address) if not request["session"] else request["handle"], addresses=[selector]
+        )
+        group = {
+            "selector": selector,
+            "first_address": part[0].address,
+            "last_address": part[-1].address,
+            "count": len(part),
+            "counts": _counts(part),
+            "tool_names": sorted(
+                {entry.tool_name or "unlinked" for entry in part if entry.kind in {"tool_call", "tool_result"}}
+            ),
+            "chars": sum(len(entry.content) for entry in part),
+            "clues": _clues(part),
+            "read": read,
+            "zoom": {**read, "outline": True},
+        }
+        if len(part) == 1:
+            group["leaf"] = {
+                key: value for key in ("kind", "role", "tool_name") if (value := getattr(part[0], key)) is not None
             }
-            if len(part) == 1:
-                group["leaf"] = {
-                    key: value for key in ("kind", "role", "tool_name") if (value := getattr(part[0], key)) is not None
-                }
-            groups.append(group)
+        groups.append(group)
     response = {
         "schema": REAP_SCHEMA,
         "ok": True,
         "mode": "selection-outline",
         "scope": scope,
-        "runs": [_compact_run(run) for run in page_runs],
+        "runs": [],
         "groups": [],
         "selection": {"matched_entries": len(ordered), "entries_before_page": entry_start},
         "presentation": {"request": request, "bare": bare},
@@ -1279,6 +1365,8 @@ def _chronological_outline(
         count = sum(group["count"] for group in response["groups"])
         omitted = len(ordered) - entry_start - count
         response["selection"].update(returned_entries=count, omitted_entries=omitted)
+        owners = {_owner(group["first_address"]) for group in response["groups"]}
+        response["runs"] = [_compact_run(run) for run in runs if run.spool_id in owners or len(runs) == 1]
         _update_page_scope(response)
         if count and omitted:
             response["entry_truncation"] = {"retrieve": {**request, "after": response["groups"][-1]["last_address"]}}
@@ -1355,6 +1443,11 @@ def reap_store(
         return _error(handle, "incompatible_paging", "full cannot be combined with offset or limit")
 
     selectors = _normalize_values(addresses)
+    original_handle = handle
+    handle_selector = "/" in handle
+    if handle_selector:
+        selectors.insert(0, handle)
+        handle = _owner(handle)
     filter_names = _normalize_values(filters)
     invalid_filters = [name for name in filter_names if name not in _FILTERS]
     if invalid_filters:
@@ -1389,9 +1482,9 @@ def reap_store(
         except ValueError as exc:
             return _error(handle, "invalid_after", str(exc))
     request = {
-        "handle": handle,
+        "handle": original_handle,
         "session": session,
-        "addresses": selectors,
+        "addresses": selectors[1:] if handle_selector else selectors,
         "filters": filter_names,
         "tool_name": tool_name,
         "outline": outline,
@@ -1401,7 +1494,23 @@ def reap_store(
     runs, session_id, resolution_error = _resolve_runs(Path(store), handle, session)
     if resolution_error:
         return resolution_error
+    if not session:
+        for selector in selectors:
+            for endpoint in selector.split(".."):
+                spool_id = _owner(endpoint)
+                if spool_id not in {run.spool_id for run in runs}:
+                    extra, _, error = _resolve_runs(Path(store), spool_id, False)
+                    if error:
+                        return error
+                    runs.extend(extra)
     scope = _scope(handle, session, runs, session_id)
+    if len(runs) > 1 and not session:
+        scope.update(view="batch", statement="Selected saved Spindle captures; provider history is not included")
+        scope["diagnostics"]["retrieve_outline"] = {
+            "handle": handle,
+            "addresses": [run.address for run in runs],
+            "outline": True,
+        }
     if format == "text":
         scope["diagnostics"]["abnormal_status_counts"] = {
             status: sum((run.record or {}).get("status") == status for run in runs)
@@ -1484,30 +1593,31 @@ def reap_store(
     for selector in selectors:
         if ".." in selector:
             items, error = _select_range(selector, run_by_id)
-        else:
+        elif selector.startswith("run:"):
             items, error = _select_exact(selector, run_by_id)
+        else:
+            items, error = _select_logical(selector, run_by_id)
         if error:
             return _error(handle, "invalid_address", error)
         selected.extend(items)
     if not selectors:
-        selected = [entry for run in runs for entry in run.entries]
+        selected = [
+            entry
+            for run in runs
+            for entry in (_logical_entries(run) if format == "text" or compact_outline else run.entries)
+            if entry.kind != "raw_event"
+        ]
         if compact_outline and bare:
             selected = [entry for entry in selected if entry.kind != "final"]
 
     # Union the explicit selections first, then narrow that set to entries
     # matching any requested filter. Filters must never add out-of-range items.
-    deduplicated = {entry.address: entry for entry in selected}
+    deduplicated = {}
+    for entry in selected:
+        identity = entry.details.get("legacy_address", entry.address)
+        deduplicated.setdefault(identity, entry)
     deduplicated_overlap = len(selected) - len(deduplicated)
-    candidates = list(deduplicated.values())
-    deduplicated = {entry.address: entry for entry in _narrow(candidates, filter_names, tool_name)}
-    run_order = {run.spool_id: index for index, run in enumerate(runs)}
-
-    def source_order(entry: _Entry) -> tuple[int, int, int, int]:
-        spool_id = _RUN_ADDRESS.fullmatch(entry.address).group(1)  # type: ignore[union-attr]
-        raw_rank = 0 if entry.kind == "raw_event" else 1
-        return (run_order[spool_id], entry.position[0], entry.position[1], raw_rank)
-
-    ordered = sorted(deduplicated.values(), key=source_order)
+    ordered = _narrow(list(deduplicated.values()), filter_names, tool_name)
     entry_start = 0
     if after is not None:
         selected_addresses = [entry.address for entry in ordered]
@@ -1548,17 +1658,17 @@ def reap_store(
         all_addresses = {entry.address for run in runs for entry in run.all_entries()}
         response["presentation"] = {
             "request": {**request, "offset": offset, "limit": limit, "full": full},
-            "exact_leaf": len(selectors) == 1 and selectors[0] in all_addresses,
+            "exact_leaf": len(selectors) == 1
+            and len(ordered) == 1
+            and (
+                selectors[0] in all_addresses
+                or selectors[0].endswith("/final")
+                or bool(re.search(r"/[+-]?\d+$", selectors[0]))
+            ),
         }
 
-    linked_names = (
-        {entry.address: entry.tool_name for run in runs for entry in run.entries if entry.kind == "tool_call"}
-        if format == "text"
-        else {}
-    )
-
     def update_page() -> None:
-        owning_ids = dict.fromkeys(_RUN_ADDRESS.fullmatch(entry["address"]).group(1) for entry in response["entries"])
+        owning_ids = dict.fromkeys(_owner(entry["address"]) for entry in response["entries"])
         if format == "text" and not owning_ids and len(runs) == 1:
             owning_ids = {runs[0].spool_id: None}
         response["runs"] = [
@@ -1592,7 +1702,10 @@ def reap_store(
                 ),
                 "last_returned_address": last_address,
                 "retrieve": {
-                    **(response["presentation"]["request"] if format == "text" else {}),
+                    **request,
+                    "offset": offset,
+                    "limit": limit,
+                    "full": full,
                     "after": last_address,
                     "instruction": "repeat the same addresses, filters and content controls with this stable after address",
                 },
@@ -1601,10 +1714,7 @@ def reap_store(
             response.pop("entry_truncation", None)
 
     def render_entry(entry: _Entry, content_limit: Optional[int], content_full: bool) -> dict[str, Any]:
-        rendered = _render_entry(entry, offset=offset, limit=content_limit, full=content_full)
-        if not rendered.get("tool_name") and linked_names.get(entry.call_address):
-            rendered["tool_name"] = linked_names[entry.call_address]
-        return rendered
+        return _render_entry(entry, offset=offset, limit=content_limit, full=content_full)
 
     update_page()
     for entry in ordered[entry_start : entry_start + MAX_RETURNED_ENTRIES]:
