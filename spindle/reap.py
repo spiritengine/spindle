@@ -1137,7 +1137,7 @@ def _select_logical(address: str, run_by_id: dict[str, _Run]) -> tuple[list[_Ent
     elif collection in {"tool-calls", "tool-results"}:
         kind = "tool_call" if collection == "tool-calls" else "tool_result"
         entries = [entry for entry in entries if entry.kind == kind]
-        if tail and not re.fullmatch(r"[+-]?\d+|[+-]?\d*:[+-]?\d*(?::[+-]?\d*)?", tail[0]):
+        if tail and (len(tail) > 1 or not re.fullmatch(r"[+-]?\d+|[+-]?\d*:[+-]?\d*(?::[+-]?\d*)?", tail[0])):
             name = tail.pop(0)
             # Only linked results can honestly belong to a named tool.
             entries = [
@@ -1610,6 +1610,19 @@ def reap_store(
         ]
         if compact_outline and bare:
             selected = [entry for entry in selected if entry.kind != "final"]
+
+    if format == "text" or compact_outline:
+        # Legacy JSON intentionally omits result tool names. Presenting those
+        # same entries must still distinguish a linked result from an orphan.
+        call_names = {
+            entry.address: entry.tool_name for run in runs for entry in run.entries if entry.kind == "tool_call"
+        }
+        selected = [
+            replace(entry, tool_name=call_names[entry.call_address])
+            if entry.kind == "tool_result" and entry.call_address in call_names
+            else entry
+            for entry in selected
+        ]
 
     # Union the explicit selections first, then narrow that set to entries
     # matching any requested filter. Filters must never add out-of-range items.

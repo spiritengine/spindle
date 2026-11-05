@@ -446,6 +446,8 @@ Collections:
   removes repeated text. Provider replay/synthetic flags remain in JSON details.
 - `ID/tool-calls` and `ID/tool-results` contain requests and results. Add an exact
   tool name before the optional index/slice, such as `ID/tool-results/Bash/-10:`.
+  For a name that looks like an index or slice, include the selector explicitly:
+  `ID/tool-results/0/:` means all results from the tool named `0`.
   Named results resolve through their linked originating request. Unlinked
   results remain in the unqualified collection, with no invented association.
 - `ID/final` reads the separately saved result, which need not be the last message.
@@ -503,6 +505,9 @@ means the normalized chronology. Detailed JSON retains `source_address` and,
 for logical paths, `details.legacy_address`. New indexes describe the observed
 capture and may change if an unfinished capture is rewritten or reinterpreted;
 they are not a persistent index or a promise of provider-history stability.
+JSON selections using exclusively legacy addresses retain their original
+capture-order unions and continuation shape; logical selectors use Python and
+request order as described above.
 
 Unknown harnesses retain raw/final access with explicit support notices.
 Growing captures are read to one observed byte boundary. Incomplete trailing

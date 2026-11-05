@@ -1544,6 +1544,18 @@ def test_printed_logical_command_does_not_repeat_the_spool(tmp_path):
     assert "spindle reap view view/" not in wire
 
 
+@pytest.mark.parametrize("format", ["text", "json"])
+def test_legacy_outline_resolves_linked_names_without_changing_legacy_json(tmp_path, format):
+    _presentation_timeline(tmp_path, 1)
+    address = "run:view/events/1/parts/0..run:view/events/2/parts/0"
+    page = reap_store(tmp_path, "view", addresses=address, outline=True, format=format)
+    assert page["groups"][0]["tool_names"] == ["command_execution"]
+    results = reap_store(tmp_path, "view", addresses="run:view/tool-results", format="text")
+    assert render_response(results, "text").startswith("Tool result command_execution run:view/events/2/parts/0\n")
+    legacy = reap_store(tmp_path, "view", addresses="run:view/tool-results", format="json")
+    assert "tool_name" not in legacy["entries"][0]
+
+
 def _interleaved_tools(store):
     _record(store, "tools", harness="claude-code", prompt="same prompt")
     events = [
@@ -1596,6 +1608,27 @@ def test_tool_result_names_follow_originating_requests_and_prompts_are_not_dedup
     assert len(reap_store(tmp_path, "tools", addresses="run:tools/messages")["entries"]) == 4
     assert len(reap_store(tmp_path, "tools/events")["entries"]) == 11
     assert reap_store(tmp_path, "tools/final")["entries"][0]["content"] == "final for tools"
+
+
+@pytest.mark.parametrize("name", ["0", "-1", "+2", "::2"])
+@pytest.mark.parametrize("collection", ["tool-calls", "tool-results"])
+def test_selector_shaped_tool_names_use_name_then_slice(tmp_path, name, collection):
+    _interleaved_tools(tmp_path)
+    expected = reap_store(tmp_path, f"tools/{collection}/Bash")["entries"]
+    capture = tmp_path / "tools.stdout"
+    events = [json.loads(line) for line in capture.read_text().splitlines()]
+    for event in events:
+        for block in event["message"]["content"]:
+            if block.get("type") == "tool_use" and block.get("name") == "Bash":
+                block["name"] = name
+    capture.write_text(_jsonl(*events))
+    whole = reap_store(tmp_path, f"tools/{collection}/{name}/:")
+    assert [e["content"] for e in whole["entries"]] == [e["content"] for e in expected]
+    last = reap_store(tmp_path, f"tools/{collection}/{name}/-1")
+    assert [e["content"] for e in last["entries"]] == [expected[-1]["content"]]
+    reverse = reap_store(tmp_path, f"tools/{collection}/{name}/::-1")
+    assert [e["content"] for e in reverse["entries"]] == [e["content"] for e in reversed(expected)]
+    assert reap_store(tmp_path, "tools/tool-results/0")["entries"][0]["content"] == "read output"
 
 
 @pytest.mark.parametrize(
