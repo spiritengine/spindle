@@ -1157,6 +1157,7 @@ def reap_store(
         scope.update(runs_before_page=run_start, omitted_runs=len(runs) - run_start)
         outline = {
             "schema": REAP_SCHEMA,
+            "ok": True,
             "mode": "outline",
             "scope": scope,
             "address_scheme": {
@@ -1248,6 +1249,7 @@ def reap_store(
             )
     response: dict[str, Any] = {
         "schema": REAP_SCHEMA,
+        "ok": True,
         "mode": "selection",
         "scope": scope,
         "selection": {
