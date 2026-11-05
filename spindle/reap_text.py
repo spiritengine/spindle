@@ -118,7 +118,20 @@ def _clues(row: dict[str, Any]) -> str:
 
 def _notices(response: dict[str, Any]) -> list[str]:
     notices = []
+    diagnostics = response["scope"]["diagnostics"]
+    # Page owners get their own details. Subtract each owner's contribution
+    # from the scope totals so filtered-out and paged-out spools still have a
+    # bounded summary, without repeating the evidence already on this page.
+    outside = Counter({key: diagnostics[key] for key in ("error_runs", "warning_runs", "missing_capture_runs")})
+    support = Counter(diagnostics["support_counts"])
+    statuses = Counter(diagnostics.get("abnormal_status_counts", {}))
     for run in response.get("runs", []):
+        for severity in ("error", "warning"):
+            outside[f"{severity}_runs"] -= any(issue["severity"] == severity for issue in run["issues"])
+        outside["missing_capture_runs"] -= run["capture"]["source"] is None
+        support[run["support"]] -= 1
+        if run.get("status") in statuses:
+            statuses[run["status"]] -= 1
         facts = []
         if run.get("status") in {"error", "timeout", "cancelled", "abandoned"} and response["mode"] == "selection":
             facts.append("status " + run["status"])
@@ -126,30 +139,26 @@ def _notices(response: dict[str, Any]) -> list[str]:
             facts.append(run["support"] + ": " + run["support_note"])
         facts.extend(dict.fromkeys(issue["message"] for issue in run["issues"]))
         if facts:
-            notices.append(f"{run['address']}: " + "; ".join(facts))
-    if not response.get("runs"):
-        diagnostics = response["scope"]["diagnostics"]
-        facts = [
-            f"{_count(diagnostics[key], 'spool')} {noun}"
-            for key, noun in (
-                ("error_runs", "with read errors"),
-                ("warning_runs", "with capture warnings"),
-                ("missing_capture_runs", "with missing capture"),
-            )
-            if diagnostics[key]
-        ]
-        facts.extend(
-            f"{_count(count, 'spool')} with {kind} capture"
-            for kind, count in diagnostics["support_counts"].items()
-            if kind != "normalized" and count
+            notices.append("; ".join(facts) + " " + run["address"])
+    facts = [
+        f"{_count(outside[key], 'spool')} {noun}"
+        for key, noun in (
+            ("error_runs", "with read errors"),
+            ("warning_runs", "with capture warnings"),
+            ("missing_capture_runs", "with missing capture"),
         )
-        facts.extend(
-            f"{_count(count, 'spool')} with status {status}"
-            for status, count in diagnostics.get("abnormal_status_counts", {}).items()
-            if count
+        if outside[key] > 0
+    ]
+    facts.extend(
+        f"{_count(count, 'spool')} with {kind} capture"
+        for kind, count in support.items()
+        if kind != "normalized" and count > 0
+    )
+    facts.extend(f"{_count(count, 'spool')} with status {status}" for status, count in statuses.items() if count > 0)
+    if facts:
+        notices.append(
+            "Elsewhere in this scope: " + "; ".join(facts) + ". Inspect: " + command(diagnostics["retrieve_outline"])
         )
-        if facts:
-            notices.append("; ".join(facts) + ". Inspect: " + command(diagnostics["retrieve_outline"]))
     return notices
 
 
@@ -230,7 +239,7 @@ def render_text(response: dict[str, Any]) -> str:
             if truncation:
                 start, end = truncation["shown_chars"]
                 notice = (
-                    f"{address_text(entry['address'], request)}: chars {start}..{end} of {truncation['total_chars']}"
+                    f"chars {start}..{end} of {truncation['total_chars']} {address_text(entry['address'], request)}"
                 )
                 if truncation["retrieve"]:
                     more = {

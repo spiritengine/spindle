@@ -1220,6 +1220,7 @@ def test_text_budget_counts_escaped_output_and_content_cursor_advances(tmp_path,
         continuation = entry.get("truncation", {}).get("retrieve")
         if continuation is None:
             break
+        assert f"Spindle: chars {offset}..{continuation['offset']} of {len(payload)} final; more content:" in wire
         assert continuation["offset"] > offset
         offset = continuation["offset"]
     assert "".join(chunks) == payload
@@ -1281,6 +1282,9 @@ def test_compact_empty_selection_keeps_abnormal_evidence(tmp_path, capture, harn
         result = reap_store(tmp_path, "empty", **kwargs, format="text")
         wire = render_response(result, "text")
         assert notice in wire and "Spindle:" in wire
+        notices = [line for line in wire.splitlines() if line.startswith("Spindle:")]
+        assert len(notices) == 1 and notices[0].endswith(" run:empty")
+        assert not notices[0].startswith("Spindle: run:")
         if status != "complete":
             assert status in wire
     if capture is not None:
@@ -1389,3 +1393,105 @@ def test_text_cli_subprocess_escapes_controls_in_exact_leaf(tmp_path):
         check=True,
     )
     assert result.stdout.decode() == "\\x1b[2J\\x0d\\x08\\x00\\x85\\x9b\\ud800π😀\n"
+
+
+@pytest.mark.parametrize(
+    "harness,capture,status,summary",
+    [
+        ("codex", None, "complete", "1 spool with missing capture"),
+        ("claude-code", "{}", "complete", "1 spool with partial capture"),
+        ("gemini", "{}", "complete", "1 spool with raw-only capture"),
+        ("codex", "broken\n", "complete", "1 spool with read errors"),
+        ("codex", "{}", "timeout", "1 spool with status timeout"),
+    ],
+)
+def test_text_session_notices_include_nonmatching_spools_without_repeating_owners(
+    tmp_path, harness, capture, status, summary
+):
+    _record(tmp_path, "good", session_id="shared")
+    (tmp_path / "good.stdout").write_text(
+        _jsonl({"type": "item.completed", "item": {"id": "m", "type": "agent_message", "text": "healthy answer"}})
+    )
+    _record(tmp_path, "other", session_id="shared", harness=harness, status=status)
+    if capture is not None:
+        (tmp_path / "other.stdout").write_text(capture)
+    for outline in (False, True):
+        page = reap_store(
+            tmp_path, "shared", session=True, filters="agent", outline=outline, format="text", max_chars=4096
+        )
+        assert page["ok"] is True and page["scope"]["run_addresses"] == ["run:good"]
+        snapshot = json.dumps(page)
+        wire = render_response(page, "text")
+        assert len(wire) <= 4096 and wire.count("Spindle: Elsewhere in this scope:") == 1
+        assert summary in wire and "Inspect: spindle reap shared --session" in wire
+        assert "run:other" not in wire
+        assert render_response(page, "text") == wire and json.dumps(page) == snapshot
+    empty = reap_store(tmp_path, "shared", session=True, filters="tool-calls", format="text")
+    assert not empty["entries"] and not empty["runs"]
+    assert empty["ok"] is (harness != "codex" or capture != "broken\n")
+    assert summary in render_response(empty, "text")
+    represented = reap_store(
+        tmp_path, "shared", session=True, addresses="run:good/final,run:other/final", format="text"
+    )
+    assert represented["ok"] == empty["ok"]
+    notices = [line for line in render_response(represented, "text").splitlines() if line.startswith("Spindle:")]
+    assert len(notices) == 1 and notices[0].endswith(" run:other")
+    assert not notices[0].startswith("Spindle: run:") and "Elsewhere" not in notices[0]
+
+
+def test_text_content_pages_budget_scope_notices_and_subtract_page_owners(tmp_path):
+    _record(tmp_path, "a", session_id="shared", result="π\x1b" * 6000)
+    _record(tmp_path, "b", session_id="shared", result="last")
+    (tmp_path / "b.stdout").write_text("{}")
+    # Many nonmatching spools must still produce one fixed-category summary,
+    # with no enumeration of their identities or repeated represented details.
+    for i in range(20):
+        _record(tmp_path, f"hidden-{i}", session_id="shared")
+    first = reap_store(
+        tmp_path, "shared", session=True, addresses="run:a/final,run:b/final", format="text", max_chars=1600
+    )
+    assert first["ok"] and first["scope"]["run_addresses"] == ["run:a"]
+    wire = render_response(first, "text")
+    assert len(wire) <= 1600 and "\x1b" not in wire and "\\x1b" in wire
+    assert wire.count("Spindle: Elsewhere in this scope:") == 1
+    assert "20 spools with missing capture" in wire and "21 spools with missing capture" not in wire
+    assert "hidden-" not in wire and "no stdout or saved transcript capture exists for this spool run:a" in wire
+    entry = first["entries"][0]
+    offset = entry["truncation"]["retrieve"]["offset"]
+    assert offset > 0
+    notice = next(line for line in wire.splitlines() if line.startswith("Spindle: chars"))
+    assert notice.startswith(f"Spindle: chars 0..{offset} of 12000 run:a/final; more content: ")
+    more_content = reap_store(
+        tmp_path, "shared", session=True, addresses="run:a/final", offset=offset, format="text", max_chars=1600
+    )
+    assert more_content["entries"][0]["truncation"]["retrieve"]["offset"] > offset
+    assert len(render_response(more_content, "text")) <= 1600
+    continuation = first["entry_truncation"]["retrieve"]
+    second = reap_store(
+        tmp_path, **{k: v for k, v in continuation.items() if k != "instruction"}, format="text", max_chars=1600
+    )
+    assert second["ok"] and [entry["address"] for entry in second["entries"]] == ["run:b/final"]
+    wire = render_response(second, "text")
+    assert len(wire) <= 1600 and "21 spools with missing capture" in wire
+    assert "no stdout" not in wire and "entry_truncation" not in second
+
+
+def test_text_session_outline_pages_keep_unrepresented_failures_visible(tmp_path):
+    ids = _outline_session(tmp_path, 9)
+    (tmp_path / f"{ids[0]}.stdout").unlink()
+    (tmp_path / f"{ids[-1]}.stdout").write_text("broken\n")
+    first = reap_store(tmp_path, "shared", session=True, format="text", max_chars=4096)
+    assert first["ok"] is True and len(first["runs"]) == 8
+    wire = render_response(first, "text")
+    assert len(wire) <= 4096
+    details, summary = [line for line in wire.splitlines() if line.startswith("Spindle:")][:2]
+    assert details.endswith(f" run:{ids[0]}") and details.startswith("Spindle: no stdout")
+    assert summary.startswith("Spindle: Elsewhere in this scope: 1 spool with read errors")
+    assert "missing capture" not in summary and "capture warnings" not in summary
+    second = reap_store(tmp_path, **first["run_truncation"]["retrieve"], format="text", max_chars=4096)
+    assert second["ok"] is False and len(second["runs"]) == 1
+    wire = render_response(second, "text")
+    assert len(wire) <= 4096
+    details, summary = [line for line in wire.splitlines() if line.startswith("Spindle:")]
+    assert details.endswith(f" run:{ids[-1]}") and details.startswith("Spindle: capture contains malformed")
+    assert "1 spool with missing capture" in summary and "read errors" not in summary
