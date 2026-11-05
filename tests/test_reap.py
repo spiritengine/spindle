@@ -937,10 +937,12 @@ def test_public_mcp_route_uses_shared_reader(tmp_path, monkeypatch):
         lambda *args, **kwargs: pytest.fail("reap must not finalize a spool"),
     )
     tool = asyncio.run(spindle.mcp.get_tool("spool_reap"))
-    result = json.loads(asyncio.run(tool.fn(spool_id, filters="user")))
+    result = json.loads(asyncio.run(tool.fn(spool_id, filters="user", format="json")))
     assert result["ok"] is True
     assert result["entries"][0]["address"] == f"run:{spool_id}/prompt"
-    narrowed = json.loads(asyncio.run(tool.fn(spool_id, addresses=f"run:{spool_id}/final", filters="user")))
+    narrowed = json.loads(
+        asyncio.run(tool.fn(spool_id, addresses=f"run:{spool_id}/final", filters="user", format="json"))
+    )
     assert narrowed["ok"] is True
     assert narrowed["entries"] == []
 
@@ -949,13 +951,13 @@ def test_public_routes_accept_outline_after_cursors(tmp_path, monkeypatch, capsy
     ids = _outline_session(tmp_path, 7)
     monkeypatch.setattr(spindle, "SPINDLE_DIR", tmp_path)
     tool = asyncio.run(spindle.mcp.get_tool("spool_reap"))
-    first_wire = asyncio.run(tool.fn(ids[0], session=True))
+    first_wire = asyncio.run(tool.fn(ids[0], session=True, format="json"))
     first = json.loads(first_wire)
     assert len(first_wire) <= DEFAULT_RESPONSE_CHARS
     after = first["run_truncation"]["retrieve"]["after"]
-    second = json.loads(asyncio.run(tool.fn(ids[0], session=True, after=after)))
+    second = json.loads(asyncio.run(tool.fn(ids[0], session=True, after=after, format="json")))
     assert first["scope"]["run_addresses"] + second["scope"]["run_addresses"] == [f"run:{spool_id}" for spool_id in ids]
-    monkeypatch.setattr(sys, "argv", ["spindle", "reap", ids[0], "--session", "--after", after])
+    monkeypatch.setattr(sys, "argv", ["spindle", "reap", ids[0], "--session", "--after", after, "--json"])
     with pytest.raises(SystemExit) as exc:
         spindle.main()
     assert exc.value.code == 0
@@ -970,7 +972,7 @@ def test_public_mcp_reap_uses_existing_budget_and_safe_encoding(tmp_path, monkey
     monkeypatch.setattr(spindle, "SPINDLE_DIR", tmp_path)
     monkeypatch.setattr(spindle, "UNSPOOL_MAX_CHARS", budget)
     tool = asyncio.run(spindle.mcp.get_tool("spool_reap"))
-    wire = asyncio.run(tool.fn("mcp-budget", addresses="run:mcp-budget/final"))
+    wire = asyncio.run(tool.fn("mcp-budget", addresses="run:mcp-budget/final", format="json"))
     assert len(wire) <= budget
     assert wire.encode("utf-8")
     entry = json.loads(wire)["entries"][0]
@@ -985,7 +987,7 @@ def test_cli_subprocess_preserves_unicode_and_escapes_lone_surrogates(tmp_path):
     _record(store, "cli-unicode", result=payload)
     env = {**os.environ, "SPINDLE_HOME": str(tmp_path), "PYTHONIOENCODING": "utf-8:strict"}
     result = subprocess.run(
-        [sys.executable, "-B", "-m", "spindle", "reap", "cli-unicode", "run:cli-unicode/final"],
+        [sys.executable, "-B", "-m", "spindle", "reap", "cli-unicode", "run:cli-unicode/final", "--json"],
         env=env,
         capture_output=True,
         timeout=30,
@@ -1001,10 +1003,377 @@ def test_public_cli_reap_outputs_json_and_status(tmp_path, monkeypatch, capsys, 
     spool_id = "cli-one"
     _record(tmp_path, spool_id)
     monkeypatch.setattr(spindle, "SPINDLE_DIR", tmp_path)
-    monkeypatch.setattr(sys, "argv", ["spindle", "reap", spool_id, f"run:{spool_id}/{node}", "--filter", "user"])
+    monkeypatch.setattr(
+        sys, "argv", ["spindle", "reap", spool_id, f"run:{spool_id}/{node}", "--filter", "user", "--json"]
+    )
     with pytest.raises(SystemExit) as exc:
         spindle.main()
     assert exc.value.code == 0
     result = json.loads(capsys.readouterr().out)
     assert result["mode"] == "selection"
     assert [entry["address"] for entry in result["entries"]] == ([f"run:{spool_id}/prompt"] if node == "prompt" else [])
+
+
+# Compact presentation exercises the same resolved entries as the JSON reader.
+def _presentation_timeline(store, count=24, **record):
+    _record(store, "view", **record)
+    events = []
+    for i in range(count):
+        events.append(
+            {
+                "type": "item.completed",
+                "item": {"id": f"m{i}", "type": "agent_message", "text": f"message {i} " + "π" * 100},
+            }
+        )
+        events.extend(_codex_call(f"c{i}", f"inspect {i}", f"output {i}"))
+    (store / "view.stdout").write_text(_jsonl(*events))
+    return reap_store(store, "view", addresses="run:view", full=True)["entries"]
+
+
+def _group_addresses(store, group):
+    result = reap_store(store, **group["read"], full=True)
+    assert result["ok"], result
+    addresses = [entry["address"] for entry in result["entries"]]
+    assert len(addresses) == group["count"]
+    return addresses
+
+
+def test_compact_outline_covers_whole_large_chronology_and_recursively_progresses(tmp_path):
+    _presentation_timeline(tmp_path, 170)
+    overview = reap_store(tmp_path, "view", format="text")
+    assert overview["selection"]["matched_entries"] == 511
+    assert len(overview["groups"]) == 8
+    assert max(g["count"] for g in overview["groups"]) - min(g["count"] for g in overview["groups"]) <= 1
+    seen = []
+    for group in overview["groups"]:
+        represented = _group_addresses(tmp_path, group)
+        seen.extend(represented)
+        zoom = reap_store(tmp_path, **group["zoom"])
+        assert len(zoom["groups"]) == 8
+        assert max(g["count"] for g in zoom["groups"]) < group["count"]
+        assert [a for g in zoom["groups"] for a in _group_addresses(tmp_path, g)] == represented
+    assert len(seen) == len(set(seen)) == 511
+    assert seen[0] == "run:view/prompt" and seen[-1] == "run:view/events/509/parts/0"
+    wire = render_response(overview, "text")
+    assert "Saved result: final" in wire and "Raw: raw · 510 events" in wire
+    assert "final for view" not in wire
+    assert len(wire) < 3500
+
+
+@pytest.mark.parametrize("count", [1, 8, 9])
+def test_compact_balanced_nine_and_bounded_leaves(tmp_path, count):
+    _presentation_timeline(tmp_path, count)
+    overview = reap_store(tmp_path, "view", filters="agent", outline=True)
+    assert [g["count"] for g in overview["groups"]] == ([2] + [1] * 7 if count == 9 else [1] * count)
+    for group in overview["groups"]:
+        assert all(len(clue["preview"]) <= 80 for clue in group["clues"])
+        if group["count"] == 1:
+            assert group["chars"] > 80 and group["leaf"]["role"] == "agent"
+    if count == 9:
+        nested = reap_store(tmp_path, **overview["groups"][0]["zoom"])
+        assert [g["count"] for g in nested["groups"]] == [1, 1]
+
+
+def test_filtered_outline_commands_roundtrip_and_preserve_tool_name(tmp_path, monkeypatch, capsys):
+    import shlex
+
+    _presentation_timeline(tmp_path, 12)
+    monkeypatch.setattr(spindle, "SPINDLE_DIR", tmp_path)
+    # Quotes/metacharacters are data in the emitted shell command.
+    tool_name = "inspect ' ; $(echo wrong)"
+    capture = (
+        (tmp_path / "view.stdout")
+        .read_text()
+        .replace(
+            '"command_execution", "command"', '"command_execution", "name": ' + json.dumps(tool_name) + ', "command"'
+        )
+    )
+    (tmp_path / "view.stdout").write_text(capture)
+    overview = reap_store(
+        tmp_path, "view", filters="agent,tool-calls", tool_name=tool_name, outline=True, format="text"
+    )
+    expected = reap_store(tmp_path, "view", filters="agent,tool-calls", tool_name=tool_name, full=True)
+    assert [a for g in overview["groups"] for a in _group_addresses(tmp_path, g)] == [
+        e["address"] for e in expected["entries"]
+    ]
+    wire = render_response(overview, "text")
+    read_line = next(line.removeprefix("Read: ") for line in wire.splitlines() if line.startswith("Read: "))
+    argv = shlex.split(read_line)
+    assert "--tool=" + tool_name in argv and argv.count("--filter") == 2
+    monkeypatch.setattr(sys, "argv", [*argv, "--json"])
+    with pytest.raises(SystemExit) as exc:
+        spindle.main()
+    assert exc.value.code == 0
+    assert [e["address"] for e in json.loads(capsys.readouterr().out)["entries"]] == _group_addresses(
+        tmp_path, overview["groups"][0]
+    )
+
+
+def test_sparse_filtered_outline_pages_gaps_without_widening(tmp_path):
+    _presentation_timeline(tmp_path, 30)
+    agents = reap_store(tmp_path, "view", filters="agent")["entries"]
+    chosen = [entry["address"] for entry in agents[::2]]
+    request = dict(handle="view", addresses=chosen, filters="agent", outline=True, format="text")
+    first = reap_store(tmp_path, **request)
+    assert len(first["groups"]) == 8 and first["selection"]["omitted_entries"] == 7
+    assert [a for g in first["groups"] for a in _group_addresses(tmp_path, g)] == chosen[:8]
+    second = reap_store(tmp_path, **first["entry_truncation"]["retrieve"], format="text")
+    assert [a for g in second["groups"] for a in _group_addresses(tmp_path, g)] == chosen[8:]
+    assert "entry_truncation" not in second
+    assert second["selection"]["entries_before_page"] == 8
+    assert "--after" in render_response(first, "text")
+
+
+def test_outline_separates_spools_and_raw_families_but_content_batches_work(tmp_path):
+    _presentation_timeline(tmp_path, 2, session_id="shared")
+    _record(tmp_path, "other", session_id="shared")
+    request = dict(handle="shared", session=True, addresses="run:view/prompt,run:other/final")
+    content = reap_store(tmp_path, **request, format="text")
+    assert len(content["entries"]) == 2
+    assert "run:view/prompt" in render_response(content, "text")
+    assert reap_store(tmp_path, **request, outline=True)["error"]["code"] == "multiple_spool_outline"
+    assert (
+        reap_store(tmp_path, "view", addresses="prompt,raw", outline=True)["error"]["code"] == "mixed_outline_families"
+    )
+    raw = reap_store(tmp_path, "view", addresses="raw", outline=True)
+    assert [a for g in raw["groups"] for a in _group_addresses(tmp_path, g)] == [
+        f"run:view/events/{i}" for i in range(6)
+    ]
+
+
+def test_outline_navigation_retains_meaning_after_live_append(tmp_path):
+    _presentation_timeline(tmp_path, 10, status="running", result=None)
+    before = reap_store(tmp_path, "view", format="text")
+    addresses = [_group_addresses(tmp_path, g) for g in before["groups"]]
+    with (tmp_path / "view.stdout").open("a") as stream:
+        stream.write(
+            _jsonl({"type": "item.completed", "item": {"id": "appended", "type": "agent_message", "text": "later"}})
+        )
+    assert [_group_addresses(tmp_path, g) for g in before["groups"]] == addresses
+    assert reap_store(tmp_path, "view", format="text")["selection"]["matched_entries"] == 32
+
+
+def test_relative_addresses_ranges_and_cursors_canonicalize(tmp_path):
+    _presentation_timeline(tmp_path, 3)
+    for relative in (
+        "prompt",
+        "final",
+        "messages",
+        "tool-calls",
+        "tool-results",
+        "raw",
+        "events/0",
+        "events/0/parts/0",
+    ):
+        actual = reap_store(tmp_path, "view", addresses=relative)
+        expected = reap_store(tmp_path, "view", addresses="run:view/" + relative)
+        assert actual == expected
+    ranged = reap_store(tmp_path, "view", addresses="prompt..events/3/parts/0", after="events/0/parts/0")
+    assert ranged == reap_store(
+        tmp_path, "view", addresses="run:view/prompt..run:view/events/3/parts/0", after="run:view/events/0/parts/0"
+    )
+    for kwargs in (
+        {"addresses": "prompt"},
+        {"addresses": "run:view/prompt..final"},
+        {"filters": "messages", "after": "prompt"},
+    ):
+        result = reap_store(tmp_path, "view", session=True, **kwargs)
+        assert not result["ok"] and "canonical" in result["error"]["message"]
+    for invalid in ("../prompt", "./final", "events/0/../1", "1", "/prompt"):
+        assert reap_store(tmp_path, "view", addresses=invalid)["error"]["code"] == "invalid_address"
+
+
+def test_exact_leaf_is_direct_but_singleton_collection_is_labelled(tmp_path):
+    _presentation_timeline(tmp_path, 1)
+    exact = reap_store(tmp_path, "view", addresses="final", format="text")
+    assert render_response(exact, "text") == "final for view"
+    collection = reap_store(tmp_path, "view", filters="agent", format="text")
+    assert render_response(collection, "text").startswith("agent events/0/parts/0\n")
+    results = reap_store(tmp_path, "view", addresses="tool-results", format="text")
+    assert render_response(results, "text").startswith("tool result command_execution events/2/parts/0\n")
+    final_newline = "\n body with trailing whitespace \n\t"
+    _record(tmp_path, "view", result=final_newline)
+    assert render_response(reap_store(tmp_path, "view", addresses="final", format="text"), "text") == final_newline
+
+
+@pytest.mark.parametrize("budget", [4096, 50_000])
+def test_text_budget_counts_escaped_output_and_content_cursor_advances(tmp_path, budget):
+    _presentation_timeline(tmp_path, 1, result="\x1b\r\b\0\x85\x9b\ud800π😀\t\n" * 7000)
+    offset, chunks = 0, []
+    payload = json.loads((tmp_path / "view.json").read_text())["result"]
+    for _ in range(150):
+        response = reap_store(
+            tmp_path, "view", addresses="final", offset=offset, limit=70_000, format="text", max_chars=budget
+        )
+        assert response["ok"] and response["entries"]
+        wire = render_response(response, "text")
+        assert len(wire) <= budget and wire.encode("utf-8")
+        assert not any((ord(c) < 32 and c not in "\n\t") or 127 <= ord(c) <= 159 for c in wire)
+        entry = response["entries"][0]
+        chunks.append(entry["content"])
+        continuation = entry.get("truncation", {}).get("retrieve")
+        if continuation is None:
+            break
+        assert continuation["offset"] > offset
+        offset = continuation["offset"]
+    assert "".join(chunks) == payload
+    assert (
+        json.loads(render_response(reap_store(tmp_path, "view", addresses="final", full=True)))["entries"][0]["content"]
+        == payload
+    )
+
+
+def test_text_budget_does_not_count_invisible_json_metadata(tmp_path):
+    _presentation_timeline(tmp_path, 1, result="r" * 6000, session_id="s" * 20_000)
+    response = reap_store(tmp_path, "view", addresses="final", format="text", max_chars=4096)
+    assert response["ok"]
+    assert len(response["entries"][0]["content"]) > 3700
+    assert len(render_response(response, "text")) <= 4096
+    # Full means complete content, with the pre-existing 200-entry cap.
+    _presentation_timeline(tmp_path, 210)
+    response = reap_store(tmp_path, "view", filters="agent", full=True, format="text", max_chars=10)
+    assert len(response["entries"]) == 200
+    assert response["entry_truncation"]["retrieve"]["full"] is True
+
+
+def test_text_entry_continuation_and_content_continuation_are_distinct(tmp_path):
+    _presentation_timeline(tmp_path, 12)
+    first = reap_store(tmp_path, "view", filters="agent", limit=10, format="text", max_chars=1000)
+    assert first["entries"] and first["entry_truncation"]
+    wire = render_response(first, "text")
+    assert "more content:" in wire and "more entries:" in wire
+    seen = [e["address"] for e in first["entries"]]
+    page = first
+    for _ in range(15):
+        continuation = page.get("entry_truncation", {}).get("retrieve")
+        if not continuation:
+            break
+        page = reap_store(
+            tmp_path, **{k: v for k, v in continuation.items() if k != "instruction"}, format="text", max_chars=1000
+        )
+        assert page["entries"] and len(render_response(page, "text")) <= 1000
+        seen.extend(e["address"] for e in page["entries"])
+    assert len(seen) == len(set(seen)) == 12
+    impossible = reap_store(tmp_path, "view", addresses="final", format="text", max_chars=1)
+    assert not impossible["ok"] and "truncation" not in impossible
+
+
+@pytest.mark.parametrize(
+    "capture,harness,status,notice",
+    [
+        (None, "codex", "complete", "no stdout"),
+        ('{"response":"saved"}', "gemini", "error", "raw-only"),
+        ('{"type":"system"}', "claude-code", "timeout", "partial"),
+        ("broken\n", "codex", "complete", "malformed"),
+    ],
+)
+def test_compact_empty_selection_keeps_abnormal_evidence(tmp_path, capture, harness, status, notice):
+    _record(tmp_path, "empty", harness=harness, status=status)
+    if capture is not None:
+        (tmp_path / "empty.stdout").write_text(capture)
+    for kwargs in ({}, {"filters": "agent"}, {"filters": "agent", "outline": True}):
+        result = reap_store(tmp_path, "empty", **kwargs, format="text")
+        wire = render_response(result, "text")
+        assert notice in wire and "Spindle:" in wire
+        if status != "complete":
+            assert status in wire
+    if capture is not None:
+        raw = reap_store(tmp_path, "empty", addresses="raw", outline=True, format="text")
+        assert raw["groups"][0]["count"] == 1
+        assert raw["groups"][0]["clues"][0]["preview"]
+
+
+def test_compact_session_pages_eight_saved_spools_with_fallback(tmp_path):
+    ids = _outline_session(tmp_path, 10)
+    record = json.loads((tmp_path / f"{ids[0]}.json").read_text())
+    record.update(prompt=None, result=None, status="timeout")
+    (tmp_path / f"{ids[0]}.json").write_text(json.dumps(record))
+    (tmp_path / f"{ids[0]}.stdout").write_text(_jsonl(*_codex_call("only", "useful input", "useful result")))
+    first = reap_store(tmp_path, "shared", session=True, format="text")
+    assert [r["spool_id"] for r in first["runs"]] == ids[:8]
+    assert first["scope"]["omitted_runs"] == 2
+    wire = render_response(first, "text")
+    assert "timeout" in wire and "useful input" in wire
+    second = reap_store(tmp_path, **first["run_truncation"]["retrieve"], format="text")
+    assert [r["spool_id"] for r in second["runs"]] == ids[8:]
+    assert "run_truncation" not in second
+    # An entry cursor cannot masquerade as a saved-spool cursor.
+    invalid = reap_store(tmp_path, "shared", session=True, after=f"run:{ids[0]}/prompt", format="text")
+    assert invalid["error"]["code"] == "invalid_after"
+
+
+@pytest.mark.parametrize("controls", [{"offset": 1}, {"limit": 1}, {"full": True}])
+def test_outline_rejects_content_controls(tmp_path, controls):
+    _presentation_timeline(tmp_path, 1)
+    for kwargs in ({"format": "text"}, {"outline": True}, {"outline": True, "filters": "agent"}):
+        assert reap_store(tmp_path, "view", **kwargs, **controls)["error"]["code"] == "outline_content_controls"
+
+
+def test_public_text_default_json_opt_in_parity_and_strict_format(tmp_path, monkeypatch, capsys):
+    _presentation_timeline(tmp_path, 2)
+    monkeypatch.setattr(spindle, "SPINDLE_DIR", tmp_path)
+    tool = asyncio.run(spindle.mcp.get_tool("spool_reap"))
+    for options, args in [
+        ({}, []),
+        ({"addresses": "final"}, ["final"]),
+        ({"filters": "agent", "outline": True}, ["--filter", "agent", "--outline"]),
+        ({"format": "json"}, ["--json"]),
+        ({"outline": True, "format": "json"}, ["--outline", "--json"]),
+        ({"addresses": "missing"}, ["missing"]),
+    ]:
+        wire = asyncio.run(tool.fn("view", **options))
+        monkeypatch.setattr(sys, "argv", ["spindle", "reap", "view", *args])
+        with pytest.raises(SystemExit) as exc:
+            spindle.main()
+        assert exc.value.code == (1 if options.get("addresses") == "missing" else 0)
+        assert capsys.readouterr().out == wire + "\n"
+        if options.get("format") == "json":
+            assert json.loads(wire)["mode"] == ("selection-outline" if options.get("outline") else "outline")
+    for invalid in ("xml", "TEXT", "", None):
+        assert asyncio.run(tool.fn("view", format=invalid)) == "Spindle: format must be 'text' or 'json'"
+    # The appended controls leave every historical positional argument intact.
+    assert asyncio.run(tool.fn("view", "final", None, None, False, None, 0, None, False)) == "final for view"
+    (tmp_path / "view.stdout").write_text("malformed\n")
+    monkeypatch.setattr(sys, "argv", ["spindle", "reap", "view", "final"])
+    with pytest.raises(SystemExit) as exc:
+        spindle.main()
+    assert exc.value.code == 1 and "Spindle:" in capsys.readouterr().out
+
+
+def test_emitted_navigation_quotes_shell_data_and_terminal_controls():
+    from spindle.reap_text import command
+
+    name = "shell ' ; $(printf WRONG) `printf WRONG` \x1b\x85 π"
+    emitted = command(
+        {"handle": "fixture", "addresses": ["run:fixture/prompt"], "filters": ["tool-calls"], "tool_name": name}
+    )
+    assert "\x1b" not in emitted and "\x85" not in emitted
+    # A local shell stub captures argv; no Spindle process or store is touched.
+    result = subprocess.run(
+        ["bash", "-c", 'spindle() { printf "%s\\0" "$@"; }; ' + emitted], capture_output=True, check=True, timeout=10
+    )
+    assert result.stdout.decode().split("\0") == [
+        "reap",
+        "fixture",
+        "prompt",
+        "--filter",
+        "tool-calls",
+        "--tool=" + name,
+        "",
+    ]
+
+
+def test_text_cli_subprocess_escapes_controls_in_exact_leaf(tmp_path):
+    store = tmp_path / "spools"
+    store.mkdir()
+    _record(store, "safe", result="\x1b[2J\r\b\0\x85\x9b\ud800π😀")
+    (store / "safe.stdout").write_text(_jsonl({"type": "thread.started"}))
+    env = {**os.environ, "SPINDLE_HOME": str(tmp_path), "PYTHONIOENCODING": "utf-8:strict"}
+    result = subprocess.run(
+        [sys.executable, "-B", "-m", "spindle", "reap", "safe", "final"],
+        env=env,
+        capture_output=True,
+        timeout=30,
+        check=True,
+    )
+    assert result.stdout.decode() == "\\x1b[2J\\x0d\\x08\\x00\\x85\\x9b\\ud800π😀\n"

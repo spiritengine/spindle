@@ -5899,7 +5899,9 @@ def _spool_reap_sync(
     offset: int = 0,
     limit: Optional[int] = None,
     full: bool = False,
-) -> str:
+    outline: bool = False,
+    format: str = "text",
+) -> tuple[str, bool]:
     """Synchronous shared implementation for CLI ``reap`` and MCP ``spool_reap``."""
     result = reap_store(
         SPINDLE_DIR,
@@ -5913,8 +5915,10 @@ def _spool_reap_sync(
         limit=limit,
         full=full,
         max_chars=UNSPOOL_MAX_CHARS,
+        outline=outline,
+        format=format,
     )
-    return render_response(result)
+    return render_response(result, format if format in ("text", "json") else "text"), result["ok"]
 
 
 @mcp.tool()
@@ -5928,47 +5932,41 @@ async def spool_reap(
     offset: int = 0,
     limit: Optional[int] = None,
     full: bool = False,
+    outline: bool = False,
+    format: str = "text",
 ) -> str:
-    """Browse and retrieve addressable evidence from saved spool captures.
+    """Browse or read saved spool captures; compact text by default.
 
-    With no addresses or filters, returns a bounded outline. Copy fully
-    qualified addresses from that outline to retrieve entries, collections, or
-    inclusive ranges. Multiple addresses and filters are comma-separated;
-    overlapping selections are deduplicated in original source order.
-    Filters narrow the selected addresses/ranges to entries matching any
-    requested filter, or filter all scoped entries when no addresses are given.
-    tool_name narrows tool-calls only. Filtering precedes entry pagination.
-    Pages obey the shared read budget (50,000 rendered JSON characters by
-    default). Outline scope reports total matching runs and this page's run
-    addresses/counts; follow run_truncation.retrieve.after for more runs.
-    Selection pages also have a 200-entry cap; follow entry_truncation.retrieve.after
-    for more entries and each entry's truncation.retrieve for more content.
-    In both modes, runs and scope.run_addresses describe only represented runs;
-    matched_runs and compact scope.diagnostics cover the complete saved scope.
-    Page ok reflects represented runs (scope errors for an empty page). Empty
-    selections retain support/error counts and retrieve_outline arguments.
+    Bare browse shows eight chronological groups for one spool, or eight saved
+    spools in creation order with session=True. Addresses/filters read content;
+    outline=True zooms their entire selected chronology into up to eight rows.
+    Groups preserve selection gaps. Copy the printed read/zoom commands and
+    retain their filters. A selected outline must belong to one spool and one
+    address family (raw or normalized). A content batch can span spools.
 
     Args:
-        handle: A spool ID. With session=True, may instead be a session ID.
-        addresses: Comma-separated full addresses or full-address ranges.
-        filters: Comma-separated user, agent, messages, tool-calls, or tool-results.
-        tool_name: Exact provider tool name; implies/needs the tool-calls filter.
-        session: Gather saved runs with the exact same session_id. This reports
-            only Spindle captures, never unseen provider history.
-        after: In outline mode, continue after a run:<spool-id> address. With a
-            selection, continue after a fully qualified selected entry address.
-        offset: Character offset applied to every returned entry.
-        limit: Maximum content characters per entry, also subject to page budget.
-        full: Complete content and no character budget (may be large); still at
-            most 200 entries per page. Incompatible with offset/limit.
+        handle: Spool ID, or with session=True a spool/session ID.
+        addresses: Comma-separated addresses or inclusive address..address ranges.
+            Relative paths work only with session=False; session views require
+            run:<spool>/... for every address, endpoint and cursor.
+        filters: Comma-separated user, agent, messages, tool-calls, tool-results;
+            unioned filters narrow the addressed selection before pagination.
+        tool_name: Exact tool name; implies/needs the tool-calls filter.
+        session: Saved records with the same session_id, never unseen history.
+        after: Run address for session browse; selected entry address for
+            content paging or fragmented chronological outlines.
+        offset: Character offset in each content entry; not for outlines.
+        limit: Content characters per entry (default 20,000); not for outlines.
+        full: Bypass content character budgets; still at most 200 entries.
+            Incompatible with offset/limit and outlines.
+        outline: Zoom the selection into bounded previews instead of reading.
+        format: Strictly "text" or "json". JSON without explicit outline=True
+            preserves the original spindle.reap/v1 objects and tree outline.
 
-    Examples:
-        spool_reap("codex-abcd1234")
-        spool_reap("codex-abcd1234", filters="user,agent")
-        spool_reap("codex-abcd1234", filters="tool-calls", tool_name="command_execution")
-        spool_reap("codex-abcd1234", addresses="run:codex-abcd1234/final")
+    Text and JSON obey the configured rendered-character budget. Content
+    continuation (offset) is separate from the next-entry (after) cursor.
     """
-    return await asyncio.to_thread(
+    wire, _ = await asyncio.to_thread(
         _spool_reap_sync,
         handle,
         addresses,
@@ -5979,7 +5977,10 @@ async def spool_reap(
         offset,
         limit,
         full,
+        outline,
+        format,
     )
+    return wire
 
 
 def _spools_sync(include_discovery: bool = False) -> str:
@@ -13444,7 +13445,7 @@ def main():
     reap_parser.add_argument(
         "addresses",
         nargs="*",
-        help="Fully qualified addresses or inclusive <address>..<address> ranges copied from the outline",
+        help="Relative or run:<spool>/... addresses, or inclusive address..address ranges (repeatable)",
     )
     reap_parser.add_argument(
         "--filter",
@@ -13459,7 +13460,13 @@ def main():
         action="store_true",
         help="Gather matching saved runs with the same session_id (captured history only)",
     )
-    reap_parser.add_argument("--after", help="Continue after a run address (outline) or selected entry address")
+    reap_parser.add_argument(
+        "--outline", action="store_true", help="Zoom the selected chronology into at most eight rows"
+    )
+    reap_parser.add_argument(
+        "--json", action="store_true", help="Detailed JSON (legacy v1 unless --outline is explicit)"
+    )
+    reap_parser.add_argument("--after", help="Continue after a run address (session browse) or selected entry address")
     reap_parser.add_argument("--offset", type=int, default=0, help="Character offset within each selected entry")
     reap_parser.add_argument("--limit", type=int, help="Maximum characters from each selected entry")
     reap_parser.add_argument(
@@ -13772,7 +13779,7 @@ def main():
         sys.exit(0)
 
     elif args.command == "reap":
-        result = _spool_reap_sync(
+        result, ok = _spool_reap_sync(
             args.handle,
             addresses=args.addresses,
             filters=args.filters,
@@ -13782,12 +13789,10 @@ def main():
             offset=args.offset,
             limit=args.limit,
             full=args.full,
+            outline=args.outline,
+            format="json" if args.json else "text",
         )
         print(result)
-        try:
-            ok = bool(json.loads(result).get("ok"))
-        except (json.JSONDecodeError, AttributeError):
-            ok = False
         sys.exit(0 if ok else 1)
 
     elif args.command == "unspool":

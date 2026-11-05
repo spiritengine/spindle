@@ -14,6 +14,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
+from .reap_text import render_text
+
 REAP_SCHEMA = "spindle.reap/v1"
 DEFAULT_CONTENT_CHARS = 20_000
 DEFAULT_RESPONSE_CHARS = 50_000
@@ -1062,13 +1064,240 @@ def _render_entry(entry: _Entry, *, offset: int, limit: Optional[int], full: boo
     return rendered
 
 
-def render_response(response: dict[str, Any]) -> str:
+def render_response(response: dict[str, Any], format: str = "json") -> str:
     """The shared wire representation, including JSON escaping in size counts.
 
     Keep ordinary Unicode readable, but escape lone surrogates from provider
     JSON so both CLI stdout and MCP transports can encode this as UTF-8.
     """
+    if format == "text":
+        return render_text(response)
     return json.dumps(response, ensure_ascii=False, indent=2).encode("utf-8", errors="backslashreplace").decode("utf-8")
+
+
+def _canonical_address(address: str, handle: str, session: bool) -> str:
+    if address.startswith("run:"):
+        return address
+    if session:
+        raise ValueError(
+            "session=True requires canonical run:<spool-id>/... addresses, including range endpoints and after"
+        )
+    if not re.fullmatch(r"(?:prompt|final|messages|tool-calls|tool-results|raw|events/\d+(?:/parts/\d+)?)", address):
+        raise ValueError(
+            f"invalid relative address {address!r}; use prompt, final, a collection, or events/N[/parts/M]"
+        )
+    return f"run:{handle}/{address}"
+
+
+def _narrow(entries: list[_Entry], filters: list[str], tool_name: Optional[str]) -> list[_Entry]:
+    if not filters:
+        return entries
+    matches = {entry.address for name in filters for entry in _filter_entries(entries, name, tool_name)}
+    return [entry for entry in entries if entry.address in matches]
+
+
+def _counts(entries: list[_Entry]) -> dict[str, int]:
+    return {
+        kind: sum(entry.kind == kind for entry in entries)
+        for kind in ("message", "tool_call", "tool_result", "raw_event", "final")
+    }
+
+
+def _clues(entries: list[_Entry], *, agent_only: bool = False) -> list[dict[str, Any]]:
+    messages = [entry for entry in entries if entry.kind == "message" and (not agent_only or entry.role == "agent")]
+    fallback = [entry for entry in entries if entry.kind != "message"] if agent_only else entries
+    chosen = ([messages[0], messages[-1]] if len(messages) > 1 else messages) if messages else (fallback or entries)[:1]
+    clues = []
+    for entry in chosen:
+        preview = re.sub(r"[\n\t ]+", " ", entry.content).strip(" ")
+        clues.append(
+            {
+                **{key: value for key in ("kind", "role", "tool_name") if (value := getattr(entry, key)) is not None},
+                "preview": preview[:80],
+                "preview_truncated": len(preview) > 80,
+            }
+        )
+    return clues
+
+
+def _compact_run(run: _Run) -> dict[str, Any]:
+    entries = [entry for entry in run.entries if entry.kind != "final"]
+    final = next((entry for entry in run.entries if entry.kind == "final"), None)
+    return {
+        "address": run.address,
+        "spool_id": run.spool_id,
+        "status": (run.record or {}).get("status", "unknown"),
+        "support": run.support,
+        "support_note": run.support_note,
+        "capture": _capture_facts(run),
+        "issues": [issue.as_dict() for issue in run.issues],
+        "counts": _counts(entries),
+        "clues": _clues(entries + run.raw_entries + ([final] if final else []), agent_only=True),
+        "final": {"address": final.address, "chars": len(final.content)} if final else None,
+    }
+
+
+def _compact_budget_error(handle: str) -> dict[str, Any]:
+    return _error(
+        handle,
+        "outline_exceeds_budget",
+        "outline navigation cannot fit the character budget; narrow the selection or read an exact address",
+    )
+
+
+def _session_outline(
+    runs: list[_Run], scope: dict[str, Any], request: dict[str, Any], format: str, max_chars: int
+) -> dict[str, Any]:
+    start = 0
+    if request.get("after") is not None:
+        try:
+            start = [run.address for run in runs].index(request["after"]) + 1
+        except ValueError:
+            return _error(
+                request["handle"],
+                "invalid_after",
+                "session browse requires a run:<spool> after address in this session",
+            )
+    response = {
+        "schema": REAP_SCHEMA,
+        "ok": True,
+        "mode": "session-outline",
+        "scope": scope,
+        "runs": [],
+        "presentation": {"request": request},
+    }
+
+    def update() -> None:
+        count = len(response["runs"])
+        scope.update(runs_before_page=start, omitted_runs=len(runs) - start - count)
+        _update_page_scope(response)
+        if count and scope["omitted_runs"]:
+            response["run_truncation"] = {"retrieve": {**request, "after": response["runs"][-1]["address"]}}
+        else:
+            response.pop("run_truncation", None)
+
+    update()
+    for run in runs[start : start + 8]:
+        response["runs"].append(_compact_run(run))
+        update()
+        if len(render_response(response, format)) > max_chars:
+            response["runs"].pop()
+            update()
+            if not response["runs"]:
+                return _compact_budget_error(request["handle"])
+            break
+    if len(render_response(response, format)) > max_chars:
+        return _compact_budget_error(request["handle"])
+    return response
+
+
+def _chronological_outline(
+    runs: list[_Run],
+    ordered: list[_Entry],
+    entry_start: int,
+    scope: dict[str, Any],
+    request: dict[str, Any],
+    *,
+    bare: bool,
+    format: str,
+    max_chars: int,
+) -> dict[str, Any]:
+    owners = {entry.address.split("/", 1)[0] for entry in ordered}
+    if len(owners) > 1:
+        return _error(
+            request["handle"],
+            "multiple_spool_outline",
+            "selected outline spans multiple spools; choose one spool to zoom (cross-spool content batches remain available)",
+        )
+    families = {entry.kind == "raw_event" for entry in ordered}
+    if len(families) > 1:
+        return _error(
+            request["handle"],
+            "mixed_outline_families",
+            "choose raw events or normalized entries for one outline; these address families cannot share ranges",
+        )
+    page_runs = [run for run in runs if run.address in owners or len(runs) == 1]
+    remaining = ordered[entry_start:]
+    # Split at holes in the FILTERED underlying sequence. A range plus the
+    # same filters must round-trip to exactly its represented entries.
+    universe = [entry for run in page_runs for entry in (run.raw_entries if families == {True} else run.entries)]
+    universe = _narrow(universe, request["filters"], request["tool_name"])
+    ranks = {entry.address: rank for rank, entry in enumerate(universe)}
+    islands: list[list[_Entry]] = []
+    for entry in remaining:
+        if not islands or ranks[entry.address] != ranks[islands[-1][-1].address] + 1:
+            islands.append([])
+        islands[-1].append(entry)
+    # At most eight islands can appear on this page. Spend remaining rows on
+    # balanced subdivisions, never on spans across unselected gaps.
+    islands = islands[:8]
+    allocation = [1] * len(islands)
+    while sum(allocation) < min(8, sum(map(len, islands))):
+        index = max(
+            (i for i, island in enumerate(islands) if allocation[i] < len(island)),
+            key=lambda i: len(islands[i]) / allocation[i],
+        )
+        allocation[index] += 1
+    groups = []
+    for island, count in zip(islands, allocation):
+        size, extra = divmod(len(island), count)
+        start = 0
+        for i in range(count):
+            part = island[start : start + size + (i < extra)]
+            start += len(part)
+            selector = part[0].address if len(part) == 1 else f"{part[0].address}..{part[-1].address}"
+            read = {key: request[key] for key in ("handle", "session", "filters", "tool_name")}
+            read["addresses"] = [selector]
+            group = {
+                "selector": selector,
+                "first_address": part[0].address,
+                "last_address": part[-1].address,
+                "count": len(part),
+                "counts": _counts(part),
+                "chars": sum(len(entry.content) for entry in part),
+                "clues": _clues(part),
+                "read": read,
+                "zoom": {**read, "outline": True},
+            }
+            if len(part) == 1:
+                group["leaf"] = {
+                    key: value for key in ("kind", "role", "tool_name") if (value := getattr(part[0], key)) is not None
+                }
+            groups.append(group)
+    response = {
+        "schema": REAP_SCHEMA,
+        "ok": True,
+        "mode": "selection-outline",
+        "scope": scope,
+        "runs": [_compact_run(run) for run in page_runs],
+        "groups": [],
+        "selection": {"matched_entries": len(ordered), "entries_before_page": entry_start},
+        "presentation": {"request": request, "bare": bare},
+    }
+
+    def update() -> None:
+        count = sum(group["count"] for group in response["groups"])
+        omitted = len(ordered) - entry_start - count
+        response["selection"].update(returned_entries=count, omitted_entries=omitted)
+        _update_page_scope(response)
+        if count and omitted:
+            response["entry_truncation"] = {"retrieve": {**request, "after": response["groups"][-1]["last_address"]}}
+        else:
+            response.pop("entry_truncation", None)
+
+    update()
+    for group in groups:
+        response["groups"].append(group)
+        update()
+        if len(render_response(response, format)) > max_chars:
+            response["groups"].pop()
+            update()
+            if not response["groups"]:
+                return _compact_budget_error(request["handle"])
+            break
+    if len(render_response(response, format)) > max_chars:
+        return _compact_budget_error(request["handle"])
+    return response
 
 
 def _budget_error(handle: str) -> dict[str, Any]:
@@ -1108,8 +1337,16 @@ def reap_store(
     limit: Optional[int] = None,
     full: bool = False,
     max_chars: int = DEFAULT_RESPONSE_CHARS,
+    outline: bool = False,
+    format: str = "json",
 ) -> dict[str, Any]:
-    """Build an addressable, read-only view of saved spool evidence."""
+    """Resolve and budget evidence once, for either public representation.
+
+    The pure reader defaults to legacy JSON for existing Python consumers;
+    CLI/MCP explicitly choose their text default.
+    """
+    if format not in ("text", "json"):
+        return _error(handle, "invalid_format", "format must be 'text' or 'json'")
     if offset < 0:
         return _error(handle, "invalid_offset", "offset must be zero or greater")
     if limit is not None and limit <= 0:
@@ -1131,12 +1368,50 @@ def reap_store(
     if tool_name is not None and not filter_names:
         filter_names = ["tool-calls"]
 
+    bare = not selectors and not filter_names
+    compact_outline = outline or (format == "text" and bare)
+    if compact_outline and (offset or limit is not None or full):
+        return _error(
+            handle,
+            "outline_content_controls",
+            "outline does not accept offset, limit, or full; omit outline and select an address or filter to read content",
+        )
+    try:
+        selectors = [
+            "..".join(_canonical_address(part, handle, session) for part in selector.split(".."))
+            for selector in selectors
+        ]
+    except ValueError as exc:
+        return _error(handle, "invalid_address", str(exc))
+    if after is not None:
+        try:
+            after = _canonical_address(after, handle, session)
+        except ValueError as exc:
+            return _error(handle, "invalid_after", str(exc))
+    request = {
+        "handle": handle,
+        "session": session,
+        "addresses": selectors,
+        "filters": filter_names,
+        "tool_name": tool_name,
+        "outline": outline,
+        "after": after,
+    }
+
     runs, session_id, resolution_error = _resolve_runs(Path(store), handle, session)
     if resolution_error:
         return resolution_error
     scope = _scope(handle, session, runs, session_id)
+    if format == "text":
+        scope["diagnostics"]["abnormal_status_counts"] = {
+            status: sum((run.record or {}).get("status") == status for run in runs)
+            for status in ("error", "timeout", "cancelled", "abandoned")
+        }
 
-    if not selectors and not filter_names:
+    if compact_outline and bare and session:
+        return _session_outline(runs, scope, request, format, max_chars)
+
+    if bare and not compact_outline:
         if full or offset or limit is not None:
             return _error(
                 handle,
@@ -1216,18 +1491,15 @@ def reap_store(
         selected.extend(items)
     if not selectors:
         selected = [entry for run in runs for entry in run.entries]
+        if compact_outline and bare:
+            selected = [entry for entry in selected if entry.kind != "final"]
 
     # Union the explicit selections first, then narrow that set to entries
     # matching any requested filter. Filters must never add out-of-range items.
     deduplicated = {entry.address: entry for entry in selected}
     deduplicated_overlap = len(selected) - len(deduplicated)
     candidates = list(deduplicated.values())
-    if filter_names:
-        deduplicated = {
-            entry.address: entry
-            for filter_name in filter_names
-            for entry in _filter_entries(candidates, filter_name, tool_name)
-        }
+    deduplicated = {entry.address: entry for entry in _narrow(candidates, filter_names, tool_name)}
     run_order = {run.spool_id: index for index, run in enumerate(runs)}
 
     def source_order(entry: _Entry) -> tuple[int, int, int, int]:
@@ -1247,6 +1519,10 @@ def reap_store(
                 "invalid_after",
                 f"after address {after!r} is not in this selection; repeat the same addresses and filters",
             )
+    if compact_outline:
+        return _chronological_outline(
+            runs, ordered, entry_start, scope, request, bare=bare, format=format, max_chars=max_chars
+        )
     response: dict[str, Any] = {
         "schema": REAP_SCHEMA,
         "ok": True,
@@ -1266,9 +1542,25 @@ def reap_store(
         "entries": [],
         "runs": [],
     }
+    if format == "text":
+        # A singleton result from a collection/filter is still a labelled
+        # collection read. Only a literal leaf selector gets direct content.
+        all_addresses = {entry.address for run in runs for entry in run.all_entries()}
+        response["presentation"] = {
+            "request": {**request, "offset": offset, "limit": limit, "full": full},
+            "exact_leaf": len(selectors) == 1 and selectors[0] in all_addresses,
+        }
+
+    linked_names = (
+        {entry.address: entry.tool_name for run in runs for entry in run.entries if entry.kind == "tool_call"}
+        if format == "text"
+        else {}
+    )
 
     def update_page() -> None:
         owning_ids = dict.fromkeys(_RUN_ADDRESS.fullmatch(entry["address"]).group(1) for entry in response["entries"])
+        if format == "text" and not owning_ids and len(runs) == 1:
+            owning_ids = {runs[0].spool_id: None}
         response["runs"] = [
             {
                 "address": run.address,
@@ -1276,6 +1568,7 @@ def reap_store(
                 "support_note": run.support_note,
                 "capture": _capture_facts(run),
                 "issues": [issue.as_dict() for issue in run.issues],
+                **({"status": (run.record or {}).get("status", "unknown")} if format == "text" else {}),
             }
             for run in (run_by_id[spool_id] for spool_id in owning_ids)
         ]
@@ -1299,6 +1592,7 @@ def reap_store(
                 ),
                 "last_returned_address": last_address,
                 "retrieve": {
+                    **(response["presentation"]["request"] if format == "text" else {}),
                     "after": last_address,
                     "instruction": "repeat the same addresses, filters and content controls with this stable after address",
                 },
@@ -1306,11 +1600,17 @@ def reap_store(
         else:
             response.pop("entry_truncation", None)
 
+    def render_entry(entry: _Entry, content_limit: Optional[int], content_full: bool) -> dict[str, Any]:
+        rendered = _render_entry(entry, offset=offset, limit=content_limit, full=content_full)
+        if not rendered.get("tool_name") and linked_names.get(entry.call_address):
+            rendered["tool_name"] = linked_names[entry.call_address]
+        return rendered
+
     update_page()
     for entry in ordered[entry_start : entry_start + MAX_RETURNED_ENTRIES]:
-        response["entries"].append(_render_entry(entry, offset=offset, limit=limit, full=full))
+        response["entries"].append(render_entry(entry, limit, full))
         update_page()
-        if full or len(render_response(response)) <= max_chars:
+        if full or len(render_response(response, format)) <= max_chars:
             continue
         if len(response["entries"]) > 1:
             response["entries"].pop()
@@ -1326,8 +1626,8 @@ def reap_store(
         fitting = None
         while low <= high:
             count = (low + high) // 2
-            response["entries"][0] = _render_entry(entry, offset=offset, limit=count, full=False)
-            if len(render_response(response)) <= max_chars:
+            response["entries"][0] = render_entry(entry, count, False)
+            if len(render_response(response, format)) <= max_chars:
                 fitting = response["entries"][0]
                 low = count + 1
             else:
@@ -1337,6 +1637,6 @@ def reap_store(
         response["entries"][0] = fitting
         break
 
-    if not full and len(render_response(response)) > max_chars:
+    if not full and len(render_response(response, format)) > max_chars:
         return _budget_error(handle)
     return response
