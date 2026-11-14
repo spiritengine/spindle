@@ -1266,14 +1266,20 @@ def test_authority_lost_latch_is_irreversible_even_after_inode_restore(tmp_path,
 
         return probe
 
-    monkeypatch.setattr("spindle.namespace_owner_process.os.stat", tripwire(real_stat))
-    monkeypatch.setattr("spindle.namespace_owner_process.os.access", tripwire(real_access))
-    monkeypatch.setattr(
-        "spindle.namespace_owner_process.os.fstat",
-        lambda _fd: pytest.fail("latched owner re-read its own lock descriptor"),
-    )
-    with pytest.raises(AuthorityLost):
-        owner._verify_lock()
+    try:
+        # These patch the shared os module. Restore it before pytest resumes
+        # fd capture (pytest 9.2 also calls fstat on its own capture files).
+        with monkeypatch.context() as guarded:
+            guarded.setattr("spindle.namespace_owner_process.os.stat", tripwire(real_stat))
+            guarded.setattr("spindle.namespace_owner_process.os.access", tripwire(real_access))
+            guarded.setattr(
+                "spindle.namespace_owner_process.os.fstat",
+                lambda _fd: pytest.fail("latched owner re-read its own lock descriptor"),
+            )
+            with pytest.raises(AuthorityLost):
+                owner._verify_lock()
+    finally:
+        owner.lock.close()
 
 
 def test_verify_lock_unreadable_pathname_stays_recoverable(tmp_path):

@@ -91,6 +91,15 @@ PROTECTED_KEYS = (
 #: allowlist entry that weakens the rule for everyone else.
 APPLICATOR_MODULE = CONVERGENCE_MODULE_FILE
 
+#: Exact read-side exceptions, not scanner exclusions. Keep the raw findings
+#: visible and require equality so a new field, sibling writer, or stale entry
+#: fails. The behavioural proof below follows this helper through reap_store:
+#: capture item -> fresh dict -> _add_part -> rendered transcript content.
+#: Neither the input item nor the saved spool record is a write destination.
+PROVEN_READ_SIDE_WRITERS = {
+    "reap.py:_codex_result_content": {"error", "exit_code", "result", "status"},
+}
+
 
 def _module_files():
     return sorted(path for path in PRODUCTION_PACKAGE.glob("*.py") if path.name != "_version.py")
@@ -430,8 +439,63 @@ def test_only_the_convergence_applicator_publishes_a_public_terminal():
     """
     found = _scan(_terminal_keys, _module_files())
 
-    assert _outside_the_applicator(found) == {}, _report(found, "Public terminal fields")
+    assert _outside_the_applicator(found) == PROVEN_READ_SIDE_WRITERS, _report(found, "Public terminal fields")
     assert found, _report(found, "Public terminal fields")
+
+
+def test_codex_result_content_is_a_read_side_projection(tmp_path, monkeypatch):
+    """Proof for the exact exception: tool outcomes are text, never spool state."""
+    import copy
+    import json
+    from types import MappingProxyType
+
+    import spindle
+    from spindle.reap import _codex_result_content, reap_store
+
+    # The exempt helper has no calls at all, including persistence calls.
+    # Adding one requires revisiting this proof, even if its field set stays
+    # the same and the production scanner still reports the same exception.
+    tree, _ = _parsed(PRODUCTION_PACKAGE / "reap.py")
+    helper = next(
+        node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "_codex_result_content"
+    )
+    assert not any(isinstance(node, ast.Call) for statement in helper.body for node in ast.walk(statement))
+
+    def no_record_write(*_args, **_kwargs):
+        pytest.fail("read-side projection attempted to publish a spool record")
+
+    monkeypatch.setattr(spindle, "_write_spool", no_record_write)
+    item = {
+        "id": "tool-1",
+        "type": "command_execution",
+        "command": "false",
+        "aggregated_output": "command output",
+        "output": "tool output",
+        "result": {"answer": "tool result"},
+        "error": "tool error",
+        "status": "failed",
+        "exit_code": 7,
+    }
+    before = copy.deepcopy(item)
+    content = _codex_result_content(MappingProxyType(item))
+    assert content == {
+        key: item[key] for key in ("aggregated_output", "output", "result", "error", "status", "exit_code")
+    }
+    assert content is not item
+    assert item == before
+    assert _codex_result_content({"type": "command_execution"}) is None
+
+    record = {"id": "read-side", "harness": "codex", "status": "running", "result": None}
+    record_path = tmp_path / "read-side.json"
+    record_path.write_text(json.dumps(record))
+    (tmp_path / "read-side.stdout").write_text(json.dumps({"type": "item.completed", "item": item}) + "\n")
+    saved = {path.name: path.read_bytes() for path in tmp_path.iterdir() if path.is_file()}
+
+    view = reap_store(tmp_path, "read-side", filters="tool-results")
+    assert len(view["entries"]) == 1
+    assert json.loads(view["entries"][0]["content"]) == content
+    assert {path.name: path.read_bytes() for path in tmp_path.iterdir() if path.is_file()} == saved
+    assert json.loads(record_path.read_text()) == record
 
 
 def test_only_the_convergence_applicator_persists_a_release():
