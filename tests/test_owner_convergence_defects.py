@@ -1155,6 +1155,53 @@ def test_pending_episode_recovers_deterministic_shard_under_lock_before_terminal
     assert obligations_of(record)["failed_shard_preservation"]["progress"] == "complete"
 
 
+def test_launcher_death_between_supervisor_checks_cannot_skip_shard_recovery(episode_store, tmp_path, monkeypatch):
+    """An alive check followed by a dead check must not bypass shard discovery."""
+    spool_id = "launcher-dies-between-checks"
+    source = tmp_path / "source"
+    worktree = source / "worktrees" / spool_id
+    worktree.mkdir(parents=True)
+    launcher = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        episode = localize_identities(causal_episode("reserved"))
+        episode.pop("watchdog", None)  # The launcher is still inside shard creation.
+        episode["revision"] = 1
+        episode["starter"] = spindle._process_fact(launcher.pid)
+        episode_store.write(
+            spool_id,
+            status="pending",
+            episode=episode,
+            owner_generation=GENERATION,
+            created_at="2026-08-01T00:00:00",
+            shard_requested=True,
+            launch_working_dir=str(source),
+            harness="claude-code",
+        )
+        real_reconcile = spindle._reconcile_spool_ownership
+
+        def die_after_live_observation(record):
+            observation = real_reconcile(record)
+            assert observation.state == "active"
+            launcher.kill()
+            launcher.wait(timeout=5)
+            monkeypatch.setattr(spindle, "_reconcile_spool_ownership", real_reconcile)
+            return observation
+
+        monkeypatch.setattr(spindle, "_reconcile_spool_ownership", die_after_live_observation)
+        assert spindle._reconcile_spool_step(spool_id) is True, episode_store.read(spool_id)
+        assert episode_store.read(spool_id)["status"] == "pending"
+        assert spindle._reconcile_spool_step(spool_id) is False
+        record = episode_store.read(spool_id)
+        assert record["status"] == "error"
+        assert record["shard"]["worktree_path"] == str(worktree)
+        assert record["shard_cleanup_preserved"] is True
+        assert obligations_of(record)["failed_shard_preservation"]["progress"] == "complete"
+    finally:
+        if launcher.poll() is None:
+            launcher.kill()
+        launcher.wait(timeout=5)
+
+
 def test_legacy_transcript_ioerror_cannot_skip_terminal_bookkeeping_or_handle_cleanup(
     episode_store, tmp_path, monkeypatch
 ):

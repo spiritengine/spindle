@@ -4699,11 +4699,13 @@ def _reconcile_spool_step(spool_id: str) -> bool:
         return False
     if "owner_episode" in spool:
         episode = spool.get("owner_episode") or {}
-        if (
-            spool.get("status") == "pending"
-            and episode.get("phase") == "reserved"
-            and _reconcile_spool_ownership(spool).state == "terminalizable"
-        ):
+        if spool.get("status") == "pending" and episode.get("phase") == "reserved":
+            if _reconcile_spool_ownership(spool).state != "terminalizable":
+                # The launcher can die between this check and convergence's
+                # fresh liveness check. Defer the whole pass so it cannot
+                # publish a terminal after skipping crash-created shard
+                # discovery (and therefore its preservation obligation).
+                return True
             with _spool_lock(spool_id) as acquired:
                 current = _read_spool(spool_id) if acquired else None
                 if current is not None:
