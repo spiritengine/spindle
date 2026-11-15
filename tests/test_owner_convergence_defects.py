@@ -39,6 +39,7 @@ import sys
 import threading
 import time
 from contextlib import contextmanager
+from datetime import datetime
 
 import pytest
 
@@ -1430,6 +1431,84 @@ def test_shard_discovery_closes_as_none_only_after_the_settle_window(episode_sto
     assert obligations_of(record)["shard_discovery"]["completion"] == {"outcome": "none"}
     assert "shard" not in record and "shard_cleanup_preserved" not in record
     assert spindle._recovery_pass() == []
+
+
+def test_a_look_begun_inside_the_settle_window_cannot_close_the_duty(episode_store, tmp_path, monkeypatch):
+    """The window must have elapsed when the look began, not when it returned.
+
+    A look that starts at 59 s and returns at 60.1 s saw the repository as it
+    was at 59 s; a worktree the child created at 59.5 s would be missed.
+    """
+    import spindle.owner_episode_convergence as convergence
+
+    spool_id = "boundary-crossed-during-look"
+    repo = _shard_source_repo(tmp_path)
+    _dead_launcher_reservation(episode_store, spool_id, repo)
+    clock = {"now": 1_000_000.0}
+    monkeypatch.setattr(convergence, "_wall_epoch", lambda: clock["now"])
+    monkeypatch.setattr(spindle, "SHARD_DISCOVERY_SETTLE_SECONDS", 60)
+    converge(spool_id)
+    opened = obligations_of(episode_store.read(spool_id))["shard_discovery"]["intent"]["opened_at_epoch"]
+    assert opened == 1_000_000.0
+
+    real_discover = spindle._discover_deterministic_shard
+    worktree = repo / "worktrees" / spool_id
+
+    def slow_look(record):
+        answer = real_discover(record)  # sees the repository as it is at 59 s
+        (repo / "worktrees").mkdir(exist_ok=True)
+        _git(repo, "worktree", "add", str(worktree), "-b", f"shard-{spool_id}", "main")  # the child, at 59.5 s
+        clock["now"] = opened + 60.1  # the look returns after the boundary
+        return answer
+
+    clock["now"] = opened + 59
+    with monkeypatch.context() as slow:
+        slow.setattr(spindle, "_discover_deterministic_shard", slow_look)
+        converge(spool_id)
+    assert obligation_progress_of(episode_store.read(spool_id)) == {"shard_discovery": "pending"}, (
+        "a look that began inside the settle window closed the duty as none"
+    )
+
+    converge(spool_id)  # a look that begins after the window sees the worktree
+    record = episode_store.read(spool_id)
+    _assert_found_and_preserved(record, worktree)
+    assert obligations_of(record)["shard_discovery"]["completion"]["outcome"] == "found"
+
+
+def test_settle_window_is_not_shortened_by_a_daylight_saving_jump(episode_store, tmp_path, monkeypatch):
+    """01:59:59 to 03:00:00 local is one elapsed second, not 3,601."""
+    import spindle.owner_episode_convergence as convergence
+
+    spool_id = "dst-spring-forward"
+    repo = _shard_source_repo(tmp_path)
+    _dead_launcher_reservation(episode_store, spool_id, repo)
+    clock = {"epoch": 1_772_953_199.0, "local": datetime(2026, 3, 8, 1, 59, 59)}
+
+    class DstClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            if tz is None:
+                return clock["local"]
+            return datetime.fromtimestamp(clock["epoch"], tz)
+
+    monkeypatch.setattr(convergence, "datetime", DstClock)
+    monkeypatch.setattr(convergence, "_wall_epoch", lambda: clock["epoch"])
+    monkeypatch.setattr(spindle, "SHARD_DISCOVERY_SETTLE_SECONDS", 60)
+    converge(spool_id)
+    published = episode_store.read(spool_id)
+    assert published["completed_at"] == "2026-03-08T01:59:59", "completed_at keeps its local form"
+
+    clock.update(epoch=clock["epoch"] + 1, local=datetime(2026, 3, 8, 3, 0, 0))  # the jump
+    converge(spool_id)
+    assert obligation_progress_of(episode_store.read(spool_id)) == {"shard_discovery": "pending"}, (
+        "one real second across the DST jump was counted as a full settle window"
+    )
+
+    clock.update(epoch=clock["epoch"] + 59, local=datetime(2026, 3, 8, 3, 0, 59))
+    converge(spool_id)
+    record = episode_store.read(spool_id)
+    assert obligations_of(record)["shard_discovery"]["completion"] == {"outcome": "none"}
+    assert record["completed_at"] == published["completed_at"]
 
 
 def test_retention_refuses_while_shard_discovery_is_open(episode_store, tmp_path, monkeypatch):

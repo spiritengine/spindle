@@ -12,6 +12,7 @@ import copy
 import hashlib
 import json
 import os
+import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -785,6 +786,9 @@ def _obligations(captured: CapturedOwnerEpisodeEvidence, projection: TerminalPro
             "owner_generation": generation,
             "source_dir": record.get("launch_working_dir"),
             "reason": "launcher died before recording its requested shard",
+            # The settle window is measured from this epoch stamp, not from the
+            # naive local completed_at, so a DST change cannot shorten it.
+            "opened_at_epoch": _wall_epoch(),
         }
         entries["shard_discovery"] = _entry("shard_discovery", f"{generation}/shard_discovery", intent)
     stdout = captured.output["stdout"]
@@ -976,16 +980,19 @@ def _observe_reserved_shard(captured: CapturedOwnerEpisodeEvidence) -> None:
     captured.observations["shard_discovery"] = state
 
 
-def _shard_discovery_settled(record: dict) -> bool:
-    """Whether the settle window after terminal publication has passed."""
+def _wall_epoch() -> float:
+    """Seconds since the epoch; unaffected by the local UTC offset."""
+    return time.time()
+
+
+def _shard_discovery_settled(entry: dict) -> bool:
+    """Whether the settle window since the duty was opened has passed."""
     import spindle
 
-    try:
-        completed = datetime.fromisoformat(record.get("completed_at"))
-    except (TypeError, ValueError):
+    opened = (entry.get("intent") or {}).get("opened_at_epoch")
+    if type(opened) not in (int, float):
         return False
-    now = datetime.now(timezone.utc) if completed.tzinfo else datetime.now()
-    return (now - completed).total_seconds() >= spindle.SHARD_DISCOVERY_SETTLE_SECONDS
+    return _wall_epoch() - opened >= spindle.SHARD_DISCOVERY_SETTLE_SECONDS
 
 
 def _run_shard_discovery(record: dict) -> None:
@@ -993,8 +1000,9 @@ def _run_shard_discovery(record: dict) -> None:
 
     Closes as found (attaching and preserving the worktree), as recorded (the
     launcher's own late attach got there first), or as none - the last only on
-    a definite empty answer obtained after the settle window. A definite empty
-    answer inside the window leaves the duty pending without an error.
+    a definite empty answer from a look that began after the settle window. A
+    look that began inside the window cannot close the duty, whenever it
+    returns: a worktree created after that look started would be missed.
     """
     import spindle
 
@@ -1004,6 +1012,12 @@ def _run_shard_discovery(record: dict) -> None:
         spindle._preserve_failed_spool_shard(record)
         _mark(record, kind, completion={"outcome": "recorded", "worktree_path": record["shard"].get("worktree_path")})
         return
+    intent = entry.get("intent")
+    if isinstance(intent, dict) and type(intent.get("opened_at_epoch")) not in (int, float):
+        # A duty without a usable stamp starts its window now rather than never.
+        intent["opened_at_epoch"] = _wall_epoch()
+        spindle._write_spool(record["id"], record)
+    may_close_as_none = _shard_discovery_settled(entry)  # decided before the look begins
     state, shard_info = spindle._discover_deterministic_shard(record)
     if state == "found" and shard_info is not None:
         spindle._attach_discovered_shard(record, shard_info)
@@ -1012,7 +1026,7 @@ def _run_shard_discovery(record: dict) -> None:
         return
     if state != "none":
         raise OSError("shard discovery returned no definite answer")
-    if _shard_discovery_settled(record):
+    if may_close_as_none:
         _mark(record, kind, completion={"outcome": "none"})
         return
     if entry.get("error") is not None:
