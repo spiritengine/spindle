@@ -205,3 +205,26 @@ the namespace-safe shared owner primitive.
     actions stay refused. Doctor reports unsettled records as warnings with
     the repair command. They do not make the store unhealthy or block
     launches.
+
+## Crash-created shard discovery
+
+37. Shard discovery duty: a reservation that requested a shard is the
+    write-ahead record of where its worktree can appear. When convergence
+    publishes a `reserved` episode whose launcher is dead and whose record
+    names no shard, it looks once under the capture guards. A worktree found
+    then is attached and published with the ordinary
+    `failed_shard_preservation` duty in the same write. Otherwise the terminal
+    is published at once and carries a pending `shard_discovery` obligation;
+    publication never waits on Git. Discovery answers found, none, or unknown:
+    a timeout or OS error is unknown and never closes the duty, while a missing
+    source directory or a source that is not a Git repository is a definite
+    none. The duty closes as found (attaching and preserving the worktree), as
+    recorded (the launcher's own late attach arrived first), or as none only on
+    a definite none at least `SHARD_DISCOVERY_SETTLE_SECONDS` (60) after
+    `completed_at`. That window is a policy bound covering a killed launcher's
+    still-running child, not ownership evidence; a child that outlives it can
+    leave an unrecorded empty worktree. While the duty is open the record is
+    not retireable and the supervisor keeps replaying it. No caller runs
+    discovery for an owner-episode record. A process older than this duty kind
+    leaves it pending and retains the record; no supervisor capability is
+    added for it.

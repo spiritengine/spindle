@@ -1115,44 +1115,152 @@ def test_indeterminate_namespace_observer_cannot_release_cleanup_proven_episode(
         assert result.refusal_reason == "observer PID namespace does not match the owner episode"
 
 
-def test_pending_episode_recovers_deterministic_shard_under_lock_before_terminalization(
-    episode_store, tmp_path, monkeypatch
-):
-    """The episode fast path cannot discard crash-created shard metadata."""
-    spool_id = "pending-episode-deterministic-shard"
-    source = tmp_path / "source"
-    worktree = source / "worktrees" / spool_id
-    worktree.mkdir(parents=True)
+# --- crash-created shard discovery (finding-20261114-dbuh) --------------------
+#
+# A reserved spool's launcher can die between creating a worktree and recording
+# it. Convergence is the one place that looks for that worktree: once when it
+# publishes the reserved terminal, and afterwards through a durable
+# shard_discovery duty that stays open until the answer is definite and a
+# settle window has passed. No caller runs discovery itself.
+
+
+def _git(repo, *args):
+    subprocess.run(
+        ["git", "-c", "user.name=Spindle Test", "-c", "user.email=spindle@example.invalid", *args],
+        cwd=repo,
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def _shard_source_repo(tmp_path):
+    repo = tmp_path / "source"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    (repo / "README.md").write_text("base\n")
+    _git(repo, "add", "README.md")
+    _git(repo, "commit", "-q", "-m", "base")
+    return repo
+
+
+def _add_skein_named_worktree(repo, spool_id):
+    name = f"{spool_id}-20990101-001"
+    (repo / "worktrees").mkdir(exist_ok=True)
+    _git(repo, "worktree", "add", str(repo / "worktrees" / name), "-b", f"shard-{name}", "main")
+    return repo / "worktrees" / name
+
+
+def _sleeping_launcher():
+    return subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+
+
+def _kill(process):
+    if process.poll() is None:
+        process.kill()
+    process.wait(timeout=5)
+
+
+def _reserve_shard_spool(episode_store, spool_id, source, launcher=None, **fields):
+    """A starter-only reservation that asked for a shard and recorded none."""
     episode = localize_identities(causal_episode("reserved"))
+    episode.pop("watchdog", None)  # The launcher is still inside shard creation.
+    if launcher is not None:
+        episode["revision"] = 1
+        episode["starter"] = spindle._process_fact(launcher.pid)
+    record_fields = {"shard_requested": True, **fields}
     episode_store.write(
         spool_id,
         status="pending",
         episode=episode,
         owner_generation=GENERATION,
         created_at="2026-08-01T00:00:00",
-        shard_requested=True,
         launch_working_dir=str(source),
         harness="claude-code",
+        **record_fields,
     )
-    real_recover = spindle._recover_deterministic_shard
-    lock_observations = []
 
-    def recover_while_locked(record):
-        with spindle._spool_lock(spool_id, blocking=False) as acquired:
-            lock_observations.append(acquired)
-        real_recover(record)
 
-    monkeypatch.setattr(spindle, "_recover_deterministic_shard", recover_while_locked)
+def _dead_launcher_reservation(episode_store, spool_id, source, **fields):
+    launcher = _sleeping_launcher()
+    try:
+        _reserve_shard_spool(episode_store, spool_id, source, launcher, **fields)
+    finally:
+        _kill(launcher)
 
-    assert spindle._reconcile_pending_spool(spool_id) is False
 
-    record = episode_store.read(spool_id)
-    assert lock_observations == [False], "deterministic shard recovery ran without the spool record lock"
+def _git_worktree_list_times_out(monkeypatch):
+    real_run = subprocess.run
+
+    def run(cmd, *args, **kwargs):
+        if list(cmd)[:3] == ["git", "worktree", "list"]:
+            raise subprocess.TimeoutExpired(cmd, 5)
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", run)
+
+
+def _converge_state(spool_id):
+    from spindle.owner_episode_convergence import ObserverIdentity, converge_owner_episode
+
+    return converge_owner_episode(spool_id, ObserverIdentity.for_this_process()).terminal_state
+
+
+def _assert_found_and_preserved(record, worktree):
+    assert record["status"] == "error"
     assert record["shard"]["worktree_path"] == str(worktree)
     assert record["working_dir"] == str(worktree)
     assert record["shard_created_by_spool"] is True
     assert record["shard_cleanup_preserved"] is True
+    assert record["shard"]["startup_failure_preserved"] is True
+
+
+def test_reserved_terminal_discovers_shard_under_the_record_lock(episode_store, tmp_path, monkeypatch):
+    """Discovery and the terminal write share one critical section."""
+    spool_id = "pending-episode-deterministic-shard"
+    source = tmp_path / "source"
+    worktree = source / "worktrees" / spool_id
+    worktree.mkdir(parents=True)
+    _dead_launcher_reservation(episode_store, spool_id, source)
+    real_discover = spindle._discover_deterministic_shard
+    lock_observations = []
+
+    def discover_while_locked(record):
+        with spindle._spool_lock(spool_id, blocking=False) as acquired:
+            lock_observations.append(acquired)
+        return real_discover(record)
+
+    monkeypatch.setattr(spindle, "_discover_deterministic_shard", discover_while_locked)
+
+    assert spindle._reconcile_pending_spool(spool_id) is False
+
+    record = episode_store.read(spool_id)
+    assert lock_observations == [False], "shard discovery ran without the spool record lock"
+    _assert_found_and_preserved(record, worktree)
     assert obligations_of(record)["failed_shard_preservation"]["progress"] == "complete"
+    assert "shard_discovery" not in obligations_of(record), "a shard found at publication owes no discovery"
+
+
+@pytest.mark.parametrize(
+    "entry",
+    ["_check_and_finalize_spool", "_reconcile_pending_spool", "_reconcile_spool_step", "_recovery_pass"],
+)
+def test_every_caller_gets_shard_discovery_from_convergence(episode_store, tmp_path, entry):
+    """unspool/spin_wait, the pending check, the supervisor step and recovery agree."""
+    spool_id = f"caller-{entry.strip('_').replace('_', '-')}"
+    source = tmp_path / "source"
+    worktree = source / "worktrees" / spool_id
+    worktree.mkdir(parents=True)
+    _dead_launcher_reservation(episode_store, spool_id, source)
+
+    if entry == "_recovery_pass":
+        spindle._recovery_pass()
+    else:
+        getattr(spindle, entry)(spool_id)
+
+    record = episode_store.read(spool_id)
+    _assert_found_and_preserved(record, worktree)
+    assert obligation_progress_of(record) == {"failed_shard_preservation": "complete"}
 
 
 def test_launcher_death_between_supervisor_checks_cannot_skip_shard_recovery(episode_store, tmp_path, monkeypatch):
@@ -1161,45 +1269,308 @@ def test_launcher_death_between_supervisor_checks_cannot_skip_shard_recovery(epi
     source = tmp_path / "source"
     worktree = source / "worktrees" / spool_id
     worktree.mkdir(parents=True)
-    launcher = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    launcher = _sleeping_launcher()
     try:
-        episode = localize_identities(causal_episode("reserved"))
-        episode.pop("watchdog", None)  # The launcher is still inside shard creation.
-        episode["revision"] = 1
-        episode["starter"] = spindle._process_fact(launcher.pid)
-        episode_store.write(
-            spool_id,
-            status="pending",
-            episode=episode,
-            owner_generation=GENERATION,
-            created_at="2026-08-01T00:00:00",
-            shard_requested=True,
-            launch_working_dir=str(source),
-            harness="claude-code",
-        )
-        real_reconcile = spindle._reconcile_spool_ownership
+        _reserve_shard_spool(episode_store, spool_id, source, launcher)
+        real_pending = spindle._reconcile_pending_spool
+        observed = []
 
-        def die_after_live_observation(record):
-            observation = real_reconcile(record)
-            assert observation.state == "active"
-            launcher.kill()
-            launcher.wait(timeout=5)
-            monkeypatch.setattr(spindle, "_reconcile_spool_ownership", real_reconcile)
-            return observation
+        def die_after_live_observation(target):
+            # The step's own convergence pass has just seen the launcher alive.
+            observed.append(episode_store.read(spool_id)["status"])
+            _kill(launcher)
+            return real_pending(target)
 
-        monkeypatch.setattr(spindle, "_reconcile_spool_ownership", die_after_live_observation)
-        assert spindle._reconcile_spool_step(spool_id) is True, episode_store.read(spool_id)
-        assert episode_store.read(spool_id)["status"] == "pending"
-        assert spindle._reconcile_spool_step(spool_id) is False
+        monkeypatch.setattr(spindle, "_reconcile_pending_spool", die_after_live_observation)
+        assert spindle._reconcile_spool_step(spool_id) is False, episode_store.read(spool_id)
+        assert observed == ["pending"], "the launcher was not observed alive before it died"
         record = episode_store.read(spool_id)
-        assert record["status"] == "error"
-        assert record["shard"]["worktree_path"] == str(worktree)
-        assert record["shard_cleanup_preserved"] is True
+        _assert_found_and_preserved(record, worktree)
         assert obligations_of(record)["failed_shard_preservation"]["progress"] == "complete"
     finally:
-        if launcher.poll() is None:
-            launcher.kill()
-        launcher.wait(timeout=5)
+        _kill(launcher)
+
+
+def test_live_launcher_reservation_is_left_alone(episode_store, tmp_path):
+    """A live launcher records its own shard; nothing is attached or published."""
+    spool_id = "launcher-still-alive"
+    source = tmp_path / "source"
+    (source / "worktrees" / spool_id).mkdir(parents=True)
+    launcher = _sleeping_launcher()
+    try:
+        _reserve_shard_spool(episode_store, spool_id, source, launcher)
+        before = episode_store.read(spool_id)
+        assert spindle._reconcile_spool_step(spool_id) is True
+        assert spindle._check_and_finalize_spool(spool_id) is False
+        assert episode_store.read(spool_id) == before
+    finally:
+        _kill(launcher)
+
+
+def test_worktree_and_launcher_death_between_caller_lock_and_convergence_is_found(episode_store, tmp_path, monkeypatch):
+    """The pending check's lock release leaves no window: convergence looks itself."""
+    import spindle.owner_episode_convergence as convergence
+
+    spool_id = "worktree-appears-before-convergence"
+    source = tmp_path / "source"
+    source.mkdir()
+    worktree = source / "worktrees" / spool_id
+    launcher = _sleeping_launcher()
+    try:
+        _reserve_shard_spool(episode_store, spool_id, source, launcher)
+        real_converge = convergence.converge_owner_episode
+
+        def create_then_die(target, observer):
+            worktree.mkdir(parents=True)
+            _kill(launcher)
+            return real_converge(target, observer)
+
+        monkeypatch.setattr(convergence, "converge_owner_episode", create_then_die)
+        assert spindle._reconcile_pending_spool(spool_id) is False
+        _assert_found_and_preserved(episode_store.read(spool_id), worktree)
+    finally:
+        _kill(launcher)
+
+
+def test_discovery_timeout_publishes_at_once_and_a_later_look_attaches_the_shard(episode_store, tmp_path, monkeypatch):
+    """A failed look is not an empty one: the terminal carries the open question."""
+    spool_id = "discovery-timeout"
+    repo = _shard_source_repo(tmp_path)
+    worktree = _add_skein_named_worktree(repo, spool_id)
+    _dead_launcher_reservation(episode_store, spool_id, repo)
+
+    with monkeypatch.context() as slow_git:
+        _git_worktree_list_times_out(slow_git)
+        assert spindle._reconcile_spool_step(spool_id) is False, "publication waited on discovery"
+        published = episode_store.read(spool_id)
+        assert published["status"] == "error"
+        assert published["terminal_origin"] == "stale_dead_reservation"
+        assert "shard" not in published
+        duty = obligations_of(published)["shard_discovery"]
+        assert duty["progress"] == "pending"
+        assert duty["idempotency_key"] == f"{GENERATION}/shard_discovery"
+        assert duty["intent"]["source_dir"] == str(repo)
+        assert duty["error"] == "OSError: shard discovery returned no definite answer"
+        assert spindle._recovery_pass() == [spool_id], "an open discovery duty must keep a monitor"
+
+    # The settle window having passed does not excuse a look that never succeeded.
+    monkeypatch.setattr(spindle, "SHARD_DISCOVERY_SETTLE_SECONDS", 0)
+    with monkeypatch.context() as slow_git:
+        _git_worktree_list_times_out(slow_git)
+        spindle._reconcile_spool_step(spool_id)
+        assert obligation_progress_of(episode_store.read(spool_id))["shard_discovery"] == "pending"
+
+    spindle._reconcile_spool_step(spool_id)
+    record = episode_store.read(spool_id)
+    _assert_found_and_preserved(record, worktree)
+    assert record["shard"]["branch_name"] == f"shard-{worktree.name}"
+    duty = obligations_of(record)["shard_discovery"]
+    assert duty["progress"] == "complete"
+    assert duty["completion"] == {"outcome": "found", "worktree_path": str(worktree)}
+    assert duty["error"] is None
+    assert immutable_terminal(record) == immutable_terminal(published)
+
+
+def immutable_terminal(record):
+    return {name: record.get(name) for name in ("status", "error", "error_kind", "completed_at", "terminal_origin")}
+
+
+@pytest.mark.parametrize(
+    "replay",
+    ["_reconcile_spool_step", "_check_and_finalize_spool", "_recovery_pass"],
+)
+def test_worktree_created_after_the_terminal_is_attached_inside_the_settle_window(episode_store, tmp_path, replay):
+    """A killed launcher's child can finish `git worktree add` after publication."""
+    spool_id = f"late-child-{replay.strip('_').replace('_', '-')}"
+    repo = _shard_source_repo(tmp_path)
+    _dead_launcher_reservation(episode_store, spool_id, repo)
+
+    assert spindle._reconcile_spool_step(spool_id) is False
+    published = episode_store.read(spool_id)
+    assert published["status"] == "error"
+    duty = obligations_of(published)["shard_discovery"]
+    assert (duty["progress"], duty["error"]) == ("pending", None), "an empty look inside the window is not an error"
+
+    # Looking again inside the window neither closes nor rewrites the record.
+    spindle._reconcile_spool_step(spool_id)
+    assert episode_store.read(spool_id) == published
+
+    (repo / "worktrees").mkdir()
+    worktree = repo / "worktrees" / spool_id
+    _git(repo, "worktree", "add", str(worktree), "-b", f"shard-{spool_id}", "main")
+
+    if replay == "_recovery_pass":
+        spindle._recovery_pass()
+    else:
+        getattr(spindle, replay)(spool_id)
+
+    record = episode_store.read(spool_id)
+    _assert_found_and_preserved(record, worktree)
+    assert obligations_of(record)["shard_discovery"]["completion"] == {
+        "outcome": "found",
+        "worktree_path": str(worktree),
+    }
+    assert immutable_terminal(record) == immutable_terminal(published)
+    assert spindle._check_and_finalize_spool(spool_id) is True
+
+
+def test_shard_discovery_closes_as_none_only_after_the_settle_window(episode_store, tmp_path, monkeypatch):
+    spool_id = "no-worktree-ever"
+    repo = _shard_source_repo(tmp_path)
+    _dead_launcher_reservation(episode_store, spool_id, repo)
+
+    monkeypatch.setattr(spindle, "SHARD_DISCOVERY_SETTLE_SECONDS", 3600)
+    assert _converge_state(spool_id) == "terminal_with_obligations_pending"
+    assert obligation_progress_of(episode_store.read(spool_id)) == {"shard_discovery": "pending"}
+    assert spindle._recovery_pass() == [spool_id]
+
+    monkeypatch.setattr(spindle, "SHARD_DISCOVERY_SETTLE_SECONDS", 0)
+    assert _converge_state(spool_id) == "fully_converged"
+    record = episode_store.read(spool_id)
+    assert obligations_of(record)["shard_discovery"]["completion"] == {"outcome": "none"}
+    assert "shard" not in record and "shard_cleanup_preserved" not in record
+    assert spindle._recovery_pass() == []
+
+
+def test_retention_refuses_while_shard_discovery_is_open(episode_store, tmp_path, monkeypatch):
+    """The record is the only pointer a late worktree can be attached to."""
+    monkeypatch.setattr(spindle, "SPOOL_RETENTION_HOURS", 24)  # retention is opt-in
+    spool_id = "retention-open-discovery"
+    repo = _shard_source_repo(tmp_path)
+    _dead_launcher_reservation(episode_store, spool_id, repo)
+    monkeypatch.setattr(spindle, "SHARD_DISCOVERY_SETTLE_SECONDS", 3600)
+    converge(spool_id)
+    assert obligation_progress_of(episode_store.read(spool_id)) == {"shard_discovery": "pending"}
+
+    spindle._cleanup_old_spools()
+    assert episode_store.spool_path(spool_id).exists(), "retention retired a record with shard discovery still open"
+
+    # Closing the duty lifts this guard. (Whether the sweep then retires a
+    # reserved-origin terminal is decided by the retirement unit, not by it.)
+    from spindle.owner_episode_convergence import discoverable_duties_outstanding
+
+    assert discoverable_duties_outstanding(spool_id, episode_store.read(spool_id)) is True
+    monkeypatch.setattr(spindle, "SHARD_DISCOVERY_SETTLE_SECONDS", 0)
+    converge(spool_id)
+    assert discoverable_duties_outstanding(spool_id, episode_store.read(spool_id)) is False
+
+
+def test_live_launcher_late_attach_closes_shard_discovery_as_recorded(episode_store, tmp_path, monkeypatch):
+    """The launcher's own late attach to a terminal record settles the question."""
+    spool_id = "late-launcher-attach"
+    source = tmp_path / "source"
+    source.mkdir()
+    _dead_launcher_reservation(episode_store, spool_id, source)
+    monkeypatch.setattr(spindle, "SHARD_DISCOVERY_SETTLE_SECONDS", 3600)
+    converge(spool_id)
+    worktree = tmp_path / "elsewhere" / "named-by-the-launcher"
+    worktree.mkdir(parents=True)
+    spindle._publish_created_shard(
+        spool_id,
+        str(source),
+        "main",
+        {"worktree_path": str(worktree), "branch_name": "shard-x", "shard_id": worktree.name},
+    )
+
+    assert _converge_state(spool_id) == "fully_converged"
+    record = episode_store.read(spool_id)
+    assert record["shard"]["worktree_path"] == str(worktree)
+    assert record["shard_cleanup_preserved"] is True
+    assert obligations_of(record)["shard_discovery"]["completion"] == {
+        "outcome": "recorded",
+        "worktree_path": str(worktree),
+    }
+
+
+def test_reservation_without_a_shard_request_owes_no_discovery(episode_store, tmp_path):
+    spool_id = "no-shard-requested"
+    source = tmp_path / "source"
+    (source / "worktrees" / spool_id).mkdir(parents=True)
+    _dead_launcher_reservation(episode_store, spool_id, source, shard_requested=False)
+
+    assert _converge_state(spool_id) == "fully_converged"
+    record = episode_store.read(spool_id)
+    assert record["status"] == "error"
+    assert "shard" not in record
+    assert obligations_of(record) == {}
+
+
+def test_discovery_distinguishes_a_definite_none_from_a_failed_look(tmp_path, monkeypatch):
+    spool_id = "discover-states"
+    repo = _shard_source_repo(tmp_path)
+    record = {"id": spool_id, "launch_working_dir": str(repo), "shard_requested": True}
+
+    assert spindle._discover_deterministic_shard(record) == ("none", None)
+    assert spindle._discover_deterministic_shard({**record, "launch_working_dir": str(tmp_path / "gone")}) == (
+        "none",
+        None,
+    ), "a missing source directory can hold no worktree"
+    plain = tmp_path / "not-a-repo"
+    plain.mkdir()
+    assert spindle._discover_deterministic_shard({**record, "launch_working_dir": str(plain)}) == (
+        "none",
+        None,
+    ), "a source that is not a Git repository can register no worktree"
+
+    real_run = subprocess.run
+    for failure in (subprocess.TimeoutExpired(["git"], 5), FileNotFoundError("git"), PermissionError("git")):
+        with monkeypatch.context() as broken:
+
+            def run(cmd, *args, _failure=failure, **kwargs):
+                if list(cmd)[:3] == ["git", "worktree", "list"]:
+                    raise _failure
+                return real_run(cmd, *args, **kwargs)
+
+            broken.setattr(subprocess, "run", run)
+            assert spindle._discover_deterministic_shard(record) == ("unknown", None), failure
+
+    with monkeypatch.context() as broken:
+        broken.setattr(
+            subprocess,
+            "run",
+            lambda cmd, *args, **kwargs: subprocess.CompletedProcess(cmd, 128, "", "fatal: index file corrupt"),
+        )
+        assert spindle._discover_deterministic_shard(record) == ("unknown", None)
+
+    worktree = _add_skein_named_worktree(repo, spool_id)
+    _add_skein_named_worktree(repo, f"{spool_id}-sibling")
+    state, shard = spindle._discover_deterministic_shard(record)
+    assert state == "found"
+    assert shard == {
+        "worktree_path": str(worktree),
+        "branch_name": f"shard-{worktree.name}",
+        "shard_id": worktree.name,
+    }
+    assert record == {"id": spool_id, "launch_working_dir": str(repo), "shard_requested": True}
+
+
+def test_an_obligation_kind_this_process_does_not_know_stays_owed(episode_store, tmp_path, monkeypatch):
+    """Mixed versions: a supervisor older than a duty kind must leave it pending.
+
+    This is how a pre-shard_discovery process treats that duty. It cannot
+    discharge it, and it must not close it or retire the record that states it.
+    """
+    monkeypatch.setattr(spindle, "SPOOL_RETENTION_HOURS", 24)
+    spool_id = "unknown-duty-kind"
+    source = tmp_path / "source"
+    source.mkdir()
+    _dead_launcher_reservation(episode_store, spool_id, source, shard_requested=False)
+    converge(spool_id)
+    record = episode_store.read(spool_id)
+    foreign = {
+        "kind": "duty_from_a_newer_spindle",
+        "idempotency_key": f"{GENERATION}/duty_from_a_newer_spindle",
+        "intent": {"owner_generation": GENERATION},
+        "progress": "pending",
+        "completion": None,
+        "error": None,
+    }
+    record["owner_convergence"]["obligations"]["duty_from_a_newer_spindle"] = foreign
+    spindle._write_spool(spool_id, record)
+
+    assert _converge_state(spool_id) == "terminal_with_obligations_pending"
+    spindle._cleanup_old_spools()
+    assert episode_store.read(spool_id)["owner_convergence"]["obligations"]["duty_from_a_newer_spindle"] == foreign
 
 
 def test_legacy_transcript_ioerror_cannot_skip_terminal_bookkeeping_or_handle_cleanup(

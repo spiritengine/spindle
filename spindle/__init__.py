@@ -443,6 +443,14 @@ PENDING_SPAWN_TIMEOUT = float(os.environ.get("SPINDLE_PENDING_SPAWN_TIMEOUT", "6
 # that setup window, but only for a bounded interval so a long-lived service
 # cannot leave a pending spool wedged after an internal exception.
 PENDING_LAUNCH_TIMEOUT = float(os.environ.get("SPINDLE_PENDING_LAUNCH_TIMEOUT", "120"))
+# A launcher killed during shard creation can leave a child (`skein shard
+# spawn`, `git worktree add`) that creates the worktree after the reservation
+# was published as terminal. The terminal's shard_discovery duty keeps looking
+# for this long after publication before it may close as "none". This is a
+# policy bound on a best-effort duty, not ownership evidence: the terminal is
+# already public and capacity already released. The default matches the two
+# 30-second budgets _spawn_shard grants its subprocesses.
+SHARD_DISCOVERY_SETTLE_SECONDS = float(os.environ.get("SPINDLE_SHARD_DISCOVERY_SETTLE", "60"))
 
 # Poll interval for monitoring detached processes
 MONITOR_POLL_INTERVAL = float(os.environ.get("SPINDLE_MONITOR_POLL_INTERVAL", "2"))
@@ -4359,81 +4367,104 @@ def _check_and_finalize_spool(spool_id: str) -> bool:
     return result.terminal_state in {"terminal_with_obligations_pending", "fully_converged"}
 
 
-def _recover_deterministic_shard(current: dict) -> None:
-    """Attach a plain-git or SKEIN-named shard from a minimal reservation."""
-    if current.get("shard") or not current.get("shard_requested"):
-        return
-    source = current.get("launch_working_dir")
-    if not source:
-        return
-    worktree = Path(source) / "worktrees" / current["id"]
+def _discover_deterministic_shard(record: dict) -> Tuple[str, Optional[Dict[str, str]]]:
+    """Look for the worktree a reservation's launcher may have created.
+
+    Returns ``("found", shard_info)``, ``("none", None)`` or ``("unknown",
+    None)``. Only a definite answer is "found" or "none"; a Git timeout or OS
+    error is "unknown", so a caller can never mistake a failed look for an
+    empty one. A missing source directory and a source that is not a Git
+    repository are definite: no worktree can be registered there. The record
+    is not modified, and no spool lock is taken.
+    """
+    spool_id = record.get("id")
+    source = record.get("launch_working_dir")
+    if not spool_id or not source or not Path(source).is_dir():
+        return "none", None
+    worktree = Path(source) / "worktrees" / spool_id
     if worktree.exists():
-        shard_info = {
+        return "found", {
             "worktree_path": str(worktree),
-            "branch_name": f"shard-{current['id']}",
-            "shard_id": current["id"],
+            "branch_name": f"shard-{spool_id}",
+            "shard_id": spool_id,
         }
-    else:
-        # SKEIN names a shard `{agent}-{YYYYMMDD}-{seq}` even though Spindle
-        # supplies the spool id as `--agent`. Query Git directly so recovery
-        # does not depend on SKEIN's server or SQLite metadata surviving the
-        # launcher. Exact agent and branch matching avoids adopting another
-        # spool's worktree; max() selects the newest zero-padded sequence if a
-        # previous crashed attempt with the same id also remains.
-        try:
-            result = subprocess.run(
-                ["git", "worktree", "list", "--porcelain"],
-                cwd=source,
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-            return
-        if result.returncode != 0:
-            return
+    # SKEIN names a shard `{agent}-{YYYYMMDD}-{seq}` even though Spindle
+    # supplies the spool id as `--agent`. Query Git directly so recovery
+    # does not depend on SKEIN's server or SQLite metadata surviving the
+    # launcher. Exact agent and branch matching avoids adopting another
+    # spool's worktree; max() selects the newest zero-padded sequence if a
+    # previous crashed attempt with the same id also remains.
+    try:
+        result = subprocess.run(
+            ["git", "worktree", "list", "--porcelain"],
+            cwd=source,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return "unknown", None
+    if result.returncode != 0:
+        if "not a git repository" in (result.stderr or "").lower():
+            return "none", None
+        return "unknown", None
 
-        candidates = []
-        candidate_path = None
-        candidate_branch = None
-        for line in [*result.stdout.splitlines(), ""]:
-            if line.startswith("worktree "):
-                if candidate_path is not None:
-                    candidates.append((candidate_path, candidate_branch))
-                candidate_path = Path(line.split(" ", 1)[1])
-                candidate_branch = None
-            elif line.startswith("branch "):
-                candidate_branch = line.split(" ", 1)[1].removeprefix("refs/heads/")
-            elif not line and candidate_path is not None:
+    candidates = []
+    candidate_path = None
+    candidate_branch = None
+    for line in [*result.stdout.splitlines(), ""]:
+        if line.startswith("worktree "):
+            if candidate_path is not None:
                 candidates.append((candidate_path, candidate_branch))
-                candidate_path = None
-                candidate_branch = None
+            candidate_path = Path(line.split(" ", 1)[1])
+            candidate_branch = None
+        elif line.startswith("branch "):
+            candidate_branch = line.split(" ", 1)[1].removeprefix("refs/heads/")
+        elif not line and candidate_path is not None:
+            candidates.append((candidate_path, candidate_branch))
+            candidate_path = None
+            candidate_branch = None
 
-        name_pattern = re.compile(rf"^{re.escape(current['id'])}-\d{{8}}-\d{{3}}$")
-        matching = [
-            (path, branch)
-            for path, branch in candidates
-            if name_pattern.fullmatch(path.name) and branch == f"shard-{path.name}" and path.exists()
-        ]
-        if not matching:
-            return
-        worktree, branch_name = max(matching, key=lambda item: item[0].name)
-        shard_info = {
-            "worktree_path": str(worktree),
-            "branch_name": branch_name,
-            "shard_id": worktree.name,
-        }
+    name_pattern = re.compile(rf"^{re.escape(spool_id)}-\d{{8}}-\d{{3}}$")
+    matching = [
+        (path, branch)
+        for path, branch in candidates
+        if name_pattern.fullmatch(path.name) and branch == f"shard-{path.name}" and path.exists()
+    ]
+    if not matching:
+        return "none", None
+    worktree, branch_name = max(matching, key=lambda item: item[0].name)
+    return "found", {
+        "worktree_path": str(worktree),
+        "branch_name": branch_name,
+        "shard_id": worktree.name,
+    }
 
-    if not worktree.exists():
-        return
-    current.update(
+
+def _attach_discovered_shard(record: dict, shard_info: Dict[str, str]) -> None:
+    """Record a discovered crash-created worktree on *record* (caller writes)."""
+    record.update(
         {
-            "working_dir": str(worktree),
+            "working_dir": shard_info["worktree_path"],
             "shard": shard_info,
             "shard_created_by_spool": True,
-            "shard_source_dir": source,
+            "shard_source_dir": record.get("launch_working_dir"),
         }
     )
+
+
+def _recover_deterministic_shard(current: dict) -> None:
+    """Attach a discovered shard to a legacy (pre-episode) stale reservation.
+
+    Owner-episode records never come here: convergence runs discovery itself
+    when it publishes a reserved terminal and keeps a shard_discovery duty on
+    the record until the answer is definite.
+    """
+    if current.get("shard") or not current.get("shard_requested"):
+        return
+    state, shard_info = _discover_deterministic_shard(current)
+    if state == "found" and shard_info is not None:
+        _attach_discovered_shard(current, shard_info)
 
 
 def _reconcile_pending_spool(spool_id: str) -> bool:
@@ -4445,12 +4476,9 @@ def _reconcile_pending_spool(spool_id: str) -> bool:
         current = _read_spool(spool_id)
         if not current or current.get("status") != "pending":
             return False
-        if "owner_episode" in current:
-            before = dict(current)
-            _recover_deterministic_shard(current)
-            if current != before:
-                _write_spool(spool_id, current)
-            episode_record = True
+        # An owner-episode reservation is published by convergence, which also
+        # owns crash-created shard discovery for it.
+        episode_record = "owner_episode" in current
         if not episode_record:
             if current.get("pid"):
                 return True
@@ -4698,21 +4726,6 @@ def _reconcile_spool_step(spool_id: str) -> bool:
     if not spool:
         return False
     if "owner_episode" in spool:
-        episode = spool.get("owner_episode") or {}
-        if spool.get("status") == "pending" and episode.get("phase") == "reserved":
-            if _reconcile_spool_ownership(spool).state != "terminalizable":
-                # The launcher can die between this check and convergence's
-                # fresh liveness check. Defer the whole pass so it cannot
-                # publish a terminal after skipping crash-created shard
-                # discovery (and therefore its preservation obligation).
-                return True
-            with _spool_lock(spool_id) as acquired:
-                current = _read_spool(spool_id) if acquired else None
-                if current is not None:
-                    before = dict(current)
-                    _recover_deterministic_shard(current)
-                    if current != before:
-                        _write_spool(spool_id, current)
         from .owner_episode_convergence import ObserverIdentity, converge_owner_episode
 
         convergence = converge_owner_episode(spool_id, ObserverIdentity.for_this_process())

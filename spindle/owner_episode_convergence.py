@@ -777,6 +777,16 @@ def _obligations(captured: CapturedOwnerEpisodeEvidence, projection: TerminalPro
         entries["failed_shard_preservation"] = _entry(
             "failed_shard_preservation", f"{generation}/preserve_failed_shard", intent
         )
+    if captured.observations.get("shard_discovery") in {"none", "unknown"}:
+        # The launcher died holding a shard request and no worktree is recorded.
+        # A child it started can still create one, and a failed look is not an
+        # empty one, so the question stays open on the terminal record.
+        intent = {
+            "owner_generation": generation,
+            "source_dir": record.get("launch_working_dir"),
+            "reason": "launcher died before recording its requested shard",
+        }
+        entries["shard_discovery"] = _entry("shard_discovery", f"{generation}/shard_discovery", intent)
     stdout = captured.output["stdout"]
     if projection.terminal_origin in {"natural_success", "natural_failure"} and stdout:
         digest = _digest(stdout)
@@ -937,6 +947,78 @@ def discoverable_duties_outstanding(spool_id: str, record: dict | None) -> bool:
         return False
     discovery = _status_only_has_explicit_duties(spool_id, record)
     return True if isinstance(discovery, MailboxUnavailable) else discovery
+
+
+def _observe_reserved_shard(captured: CapturedOwnerEpisodeEvidence) -> None:
+    """Look once for a crash-created shard before a reserved terminal is built.
+
+    The caller holds the capture guards and has just observed the launcher
+    dead, so nothing else can record the shard. A worktree found now is
+    attached to the captured record and published with the ordinary
+    failed_shard_preservation duty in the same atomic write. Any other answer
+    is recorded as an observation; _obligations turns it into a durable
+    shard_discovery duty. Publication never waits on this look.
+    """
+    import spindle
+
+    record = captured.record
+    if (captured.episode or {}).get("phase") != "reserved":
+        return
+    if not record.get("shard_requested") or record.get("shard"):
+        return
+    try:
+        state, shard_info = spindle._discover_deterministic_shard(record)
+    except Exception as exc:
+        _raise_if_crash(exc)
+        state, shard_info = "unknown", None
+    if state == "found" and shard_info is not None:
+        spindle._attach_discovered_shard(record, shard_info)
+    captured.observations["shard_discovery"] = state
+
+
+def _shard_discovery_settled(record: dict) -> bool:
+    """Whether the settle window after terminal publication has passed."""
+    import spindle
+
+    try:
+        completed = datetime.fromisoformat(record.get("completed_at"))
+    except (TypeError, ValueError):
+        return False
+    now = datetime.now(timezone.utc) if completed.tzinfo else datetime.now()
+    return (now - completed).total_seconds() >= spindle.SHARD_DISCOVERY_SETTLE_SECONDS
+
+
+def _run_shard_discovery(record: dict) -> None:
+    """Advance the shard_discovery duty by one look; raise when the look failed.
+
+    Closes as found (attaching and preserving the worktree), as recorded (the
+    launcher's own late attach got there first), or as none - the last only on
+    a definite empty answer obtained after the settle window. A definite empty
+    answer inside the window leaves the duty pending without an error.
+    """
+    import spindle
+
+    kind = "shard_discovery"
+    entry = record[CONVERGENCE_KEY]["obligations"][kind]
+    if record.get("shard"):
+        spindle._preserve_failed_spool_shard(record)
+        _mark(record, kind, completion={"outcome": "recorded", "worktree_path": record["shard"].get("worktree_path")})
+        return
+    state, shard_info = spindle._discover_deterministic_shard(record)
+    if state == "found" and shard_info is not None:
+        spindle._attach_discovered_shard(record, shard_info)
+        spindle._preserve_failed_spool_shard(record)
+        _mark(record, kind, completion={"outcome": "found", "worktree_path": shard_info["worktree_path"]})
+        return
+    if state != "none":
+        raise OSError("shard discovery returned no definite answer")
+    if _shard_discovery_settled(record):
+        _mark(record, kind, completion={"outcome": "none"})
+        return
+    if entry.get("error") is not None:
+        # The look succeeded; only the settle window keeps the duty open.
+        entry.update(error=None)
+        spindle._write_spool(record["id"], record)
 
 
 def _apply_projection(record: dict, projection: TerminalProjection, captured: CapturedOwnerEpisodeEvidence) -> dict:
@@ -1172,6 +1254,8 @@ def _run_obligations(spool_id: str, record: dict) -> dict:
                         "shard_cleanup_preserved": bool(record.get("shard_cleanup_preserved")),
                     },
                 )
+            elif kind == "shard_discovery":
+                _run_shard_discovery(record)
             elif kind == "natural_transcript":
                 intent = entry["intent"]
                 source = Path(intent["source_path"])
@@ -1876,6 +1960,7 @@ def converge_owner_episode(spool_id: str, observer: ObserverIdentity) -> Converg
 
                 record = captured.record
                 if not has_published_terminal(record):
+                    _observe_reserved_shard(captured)
                     projection = _projection(captured)
                     record = _apply_projection(record, projection, captured)
                     spindle._write_spool(spool_id, record)
