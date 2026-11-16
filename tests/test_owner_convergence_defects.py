@@ -1433,6 +1433,37 @@ def test_shard_discovery_closes_as_none_only_after_the_settle_window(episode_sto
     assert spindle._recovery_pass() == []
 
 
+def test_a_legacy_shard_discovery_duty_starts_its_settle_window_on_first_replay(episode_store, tmp_path, monkeypatch):
+    import spindle.owner_episode_convergence as convergence
+
+    spool_id = "legacy-shard-discovery-without-opened-at"
+    repo = _shard_source_repo(tmp_path)
+    _dead_launcher_reservation(episode_store, spool_id, repo)
+    clock = {"now": 900_000.0}
+    monkeypatch.setattr(convergence, "_wall_epoch", lambda: clock["now"])
+    monkeypatch.setattr(spindle, "SHARD_DISCOVERY_SETTLE_SECONDS", 60)
+    converge(spool_id)
+
+    legacy = episode_store.read(spool_id)
+    obligations_of(legacy)["shard_discovery"]["intent"].pop("opened_at_epoch")
+    spindle._write_spool(spool_id, legacy)
+
+    clock["now"] = 1_000_000.0
+    converge(spool_id)
+    first_replay = episode_store.read(spool_id)
+    duty = obligations_of(first_replay)["shard_discovery"]
+    assert duty["intent"]["opened_at_epoch"] == 1_000_000.0
+    assert duty["progress"] == "pending"
+
+    clock["now"] += 59
+    converge(spool_id)
+    assert obligation_progress_of(episode_store.read(spool_id)) == {"shard_discovery": "pending"}
+
+    clock["now"] += 1
+    converge(spool_id)
+    assert obligations_of(episode_store.read(spool_id))["shard_discovery"]["completion"] == {"outcome": "none"}
+
+
 def test_a_look_begun_inside_the_settle_window_cannot_close_the_duty(episode_store, tmp_path, monkeypatch):
     """The window must have elapsed when the look began, not when it returned.
 
