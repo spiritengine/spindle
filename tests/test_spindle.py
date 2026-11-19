@@ -10852,9 +10852,10 @@ class TestCodexSandboxEnforcement:
 class TestCodexInstallCache:
     def test_detects_in_place_upgrade_and_downgrade(self, tmp_path):
         binary = tmp_path / "codex"
-        for version in ("0.154.0", "0.170.0", "0.154.0"):
+        for timestamp, version in enumerate(("0.154.0", "0.170.0", "0.154.0"), start=1_700_000_000):
             binary.write_text(f"#!/bin/sh\necho codex-cli {version}\n")
             binary.chmod(0o755)
+            os.utime(binary, (timestamp, timestamp))
             with patch("spindle.subprocess.run", wraps=subprocess.run) as run:
                 assert spindle._codex_cli_version(str(binary)) == version
                 assert spindle._codex_cli_version(str(binary)) == version
@@ -10896,14 +10897,17 @@ class TestCodexInstallCache:
         assert version.call_count == sandbox.call_count == 2
 
     @pytest.mark.parametrize(
-        "failure",
+        "failure,diagnostics",
         [
-            subprocess.TimeoutExpired("codex", 10),
-            subprocess.CompletedProcess([], 1, "codex-cli 0.154.0"),
-            subprocess.CompletedProcess([], 0, "no version reported"),
+            (subprocess.TimeoutExpired("codex", 10), ["timed out"]),
+            (
+                subprocess.CompletedProcess([], 1, "codex-cli 0.154.0", "launcher error"),
+                ["exit 1", "codex-cli 0.154.0", "launcher error"],
+            ),
+            (subprocess.CompletedProcess([], 0, "no version reported"), ["exit 0", "no version reported"]),
         ],
     )
-    def test_failed_version_probe_is_retried(self, tmp_path, failure):
+    def test_failed_version_probe_is_logged_and_retried(self, tmp_path, caplog, failure, diagnostics):
         binary = tmp_path / "codex"
         binary.touch()
         success = subprocess.CompletedProcess([], 0, "codex-cli 0.170.0")
@@ -10912,6 +10916,11 @@ class TestCodexInstallCache:
             assert spindle._codex_cli_version(str(binary)) == "0.170.0"
             assert spindle._codex_cli_version(str(binary)) == "0.170.0"
         assert run.call_count == 2
+        warnings = [record.getMessage() for record in caplog.records if record.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert str(binary) in warnings[0]
+        for detail in diagnostics:
+            assert detail in warnings[0]
 
 
 class TestCodexSandboxEnforcesProbe:

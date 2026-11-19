@@ -8549,6 +8549,13 @@ def _codex_cli_version(binary: Optional[str], process_env: Optional[Dict[str, st
             if identity is not None:
                 _CODEX_VERSION_CACHE[binary] = (identity, version)
             return version
+        logger.warning(
+            "spindle: codex --version returned no usable version for %s (exit %d, stdout=%r, stderr=%r)",
+            binary,
+            proc.returncode,
+            (proc.stdout or "")[:256],
+            (proc.stderr or "")[:256],
+        )
     except Exception as exc:
         logger.warning("spindle: codex --version failed for %s: %s", binary, exc)
     return None
@@ -10915,14 +10922,11 @@ def _kimi_spin_sync(
     except ValueError as exc:
         return f"Error: {exc}"
 
-    # Resolve model aliases (default to K3 if no model specified) and decide
-    # whether to run kimi-cli in thinking mode. Validate the resolved model against the
-    # kimi config BEFORE reserving a slot or creating a shard: an unregistered model makes
-    # kimi-cli silently fall back to an empty LLM and emit only "LLM not set".
+    # Default to K3.1 Pro. Check local registration before reserving a slot or creating
+    # a shard because kimi-cli silently falls back to an empty LLM for an unknown model.
     resolved_model = KIMI_MODEL_ALIASES.get(model, model) if model else KIMI_DEFAULT_MODEL
-    # Thinking is enabled when the caller picked a thinking alias, OR when the
-    # resolved model is thinking-only (K3 and k2.7-code reject requests with
-    # thinking disabled, regardless of whether reached via alias or full name).
+    # K3.1 Pro, K3 and K2.7 Code require thinking, including both highspeed variants.
+    # Check the resolved ID so defaults, aliases and full IDs all get --thinking.
     enable_thinking = (bool(model) and model in KIMI_THINKING_ALIASES) or (resolved_model in KIMI_THINKING_REQUIRED)
     model_error = _kimi_validate_model(resolved_model)
     if model_error:

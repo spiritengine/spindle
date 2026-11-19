@@ -294,9 +294,10 @@ Exit 1 before inference: app-server client initialization failed with read-only
 filesystem. Other new Codex names were not probed after this shared failure.
 All new Codex targets rely on supplied documentation/account catalog evidence;
 the research finding also records an earlier successful 6.2 Astra spool.
-The service unit PATH selects the same 0.170.0 binary as the shell, but this
-sandbox cannot reach the user systemd bus or see the live service process.
-Launch-time service version remains unverified; Terra 6.1 requires >=0.159.0.
+Both reviewers verified that the service resolves and launches Codex 0.170.0,
+which meets Terra 6.1's minimum of 0.159.0. Spools that recorded 0.154.0 after
+the in-place upgrade inherited a stale version lookup. Commit `b5e02ab` fixes
+the cache that produced those records.
 
 ```bash
 timeout 50 gemini -p 'Reply exactly MODEL_OK. Do not use tools.' \
@@ -322,8 +323,7 @@ documentation/live catalog evidence; command tests verify required thinking.
 Gemini: whether Hydrogen should become the default after CLI smoke validation,
 and whether `pro` should ever track an element model. Neither moved.
 
-Codex: confirm launch-time service binary/version for Terra 6.1 and entitlement
-for the new default. Confirm product/account-specific 5.5/5.5 Pro retirement
+Codex: confirm entitlement for the new default. Confirm product/account-specific 5.5/5.5 Pro retirement
 before removing either pin. No ambiguous `6.1` or undocumented tier IDs added.
 
 Profile discovery now advertises existing `model_aliases` as `models` (empty
@@ -418,10 +418,14 @@ Full-suite result: **5 failed, 3066 passed in 813.56 seconds (13m33s)**,
 exit 1. **Zero deselected, zero skipped**, including namespace tests. All
 model-refresh behavior tests passed. This is not a clean full-suite pass.
 
-The four real-Codex failures reproduce on untouched base e23ccc7. Three
-containment tests report the app-server socket-directory error documented below;
-the fourth, `TestCodexSandboxEnforcesProbe::test_real_codex_binary_enforces`,
-reports a false enforcement probe and “ran no known CLI shape.”
+The four real-Codex failures came from running the suite inside a Codex sandbox.
+The outer sandbox mounts `/tmp/codex-daemon-1000` read-only with mode `000`,
+so the nested Codex 0.170.0 rejects its socket directory. In independent review,
+all four tests passed on both `e23ccc7` and `b5e02ab` with the CONTRIBUTING.md
+bwrap command run outside a Codex session. A second reviewer exercised live
+read-only and research spools through the service and verified that both
+enforced their configured write boundaries. SKEIN records the evidence in
+`finding-20261119-5hyz`.
 
 The fifth failure was
 `test_stateless_cancel_disconnect_releases_waiter[yield-True]`: MCP's
@@ -429,8 +433,7 @@ The fifth failure was
 closed memory stream, violating the test's no-error-log assertion. This test
 passed alone on both base and changed worktree. No cancellation, stream, or
 process-containment code was changed here. The full-run failure remains recorded;
-it is not erased by the successful reruns. No independent review was started:
-the coordinator will assign one after this shard is delivered. No merge or push.
+it is not erased by the successful reruns.
 
 Baseline diagnosis used an untouched archive of
 `e23ccc7e85c7da149056f1a7829cefbfe725d5f7`:
@@ -448,10 +451,9 @@ timeout 240 bwrap --ro-bind / / --bind /tmp /tmp \
   > /tmp/spindle-refresh-base-codex.log 2>&1
 ```
 
-Result: 3 failed, 68 deselected in 26.34 seconds. All three installed-Codex
-sandbox tests fail identically on the untouched base: Codex 0.170.0 reports
-“app-server socket directory must be a user-owned directory with mode 0700.”
-These tests do not make model calls. No containment code changed in this refresh.
+Inside the outer Codex sandbox, 3 failed and 68 were deselected in 26.34
+seconds on the base. The nested CLI reported “app-server socket directory must
+be a user-owned directory with mode 0700.”
 
 ```bash
 timeout 90 bwrap --ro-bind / / --bind /tmp /tmp \
@@ -492,13 +494,13 @@ timeout 120 bwrap --ro-bind / / --bind /tmp /tmp \
   > /tmp/spindle-refresh-base-codex-enforces.log 2>&1
 ```
 
-Result: 1 failed in 14.48 seconds, no deselections; same enforcement-probe
-failure as the changed worktree.
+Inside the same outer Codex sandbox, the enforcement probe failed on the base
+in 14.48 seconds, with zero deselections.
 
 Collection-only diagnostic used the same full-suite bwrap invocation with
 `timeout 120` and pytest arguments
 `tests/ --collect-only -p no:cacheprovider -q`, redirected to
 `/tmp/spindle-refresh-collected.log`: 3071 tests collected in 34.92 seconds.
 
-`git diff --check` passed. No independent review, merge or push was performed.
+`git diff --check` passed during the implementation run.
 Worktree: `/home/patrick/projects/spindle/worktrees/codex-0464ae91-20261119-001`.

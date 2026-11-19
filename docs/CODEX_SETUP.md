@@ -253,11 +253,11 @@ A freshly fetched old-client cache therefore cannot establish retirement or
 current availability. The previous claim that 6 Sol/Luna were API-only is
 superseded by the current-client catalog, not by new successful inference probes.
 
-Check the binary and version recorded on each spool (`codex_bin`,
-`codex_version`), not just shell `codex --version`. Existing service spools
-recorded 0.154.0 while the shell resolved 0.170.0 at the same path. The service
-unit's PATH also selects that path; its live process environment was inaccessible
-in the implementation sandbox. No CLI upgrade or service change was made.
+Reviewers verified on November 19 that the service resolves and launches Codex
+0.170.0. After the in-place upgrade, the long-running service still recorded
+0.154.0 in `codex_version` because it cached the version by `codex_bin` path.
+Since `b5e02ab`, Spindle probes the version again when the launcher or its npm
+package manifest changes.
 
 Sources: [OpenAI model docs](https://developers.openai.com/api/docs/models),
 [deprecations](https://developers.openai.com/api/docs/deprecations), and the
