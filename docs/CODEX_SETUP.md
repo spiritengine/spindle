@@ -219,25 +219,50 @@ Specify model via the `model` parameter:
 spin(
     prompt="Your task",
     harness="codex",
-    model="sol",  # Alias for gpt-5.6-sol, the default
+    model="sol",  # Alias for gpt-6.2-sol, the default
     working_dir="/path/to/project",
 )
 ```
 
-Available models (account catalog checked 2026-09-25 on codex 0.154.0):
-- `gpt-6-astra` — frontier tier; aliases `astra`, `6`, `6-astra`
-- `gpt-reserve` — fast/affordable agentic coding tier; alias `reserve`. Hidden from the
-  TUI model picker but served on ChatGPT-account auth
-- `gpt-5.6-sol` (default) — flagship tier; `5.6`, `sol`, and `codex` normalize to it.
-  The catalog now labels the 5.6 tiers "Older"; the default stays here deliberately
-- `gpt-5.6` — official umbrella model; preserved for API-key or unknown authentication,
-  but mapped to `gpt-5.6-sol` when `codex login status` reports ChatGPT authentication
-  because that route rejects the umbrella ID on this installation
-- `gpt-5.6-terra` / `gpt-5.6-luna` — explicit faster tiers; aliases `terra` and `luna`
-- `gpt-5.5` — prior default; retired 2026-10-14, so a pin to it now fails
-- `gpt-6-sol` / `gpt-6-luna` — on the public API docs but API-only here; 400 on
-  ChatGPT-account auth. Aliases `6-sol` / `6-luna` pass them through for API-key installs
-- `gpt-5.3-codex` and other `-codex` ids — API-only; 400 on ChatGPT-account auth
+Available models (provider docs and account catalog checked 2026-11-19):
+- `gpt-6.2-sol` (default) — `sol`, `codex`, `6.2-sol`.
+- `gpt-6.2-astra` — `astra`, `6.2`, `6.2-astra`.
+- `gpt-6.1-terra` — `terra`, `6.1-terra`; requires Codex >=0.159.0.
+- `gpt-6.1-sol` — `6.1-sol`; no ambiguous `6.1` shortcut.
+- `gpt-6-luna` — `luna`, `6-luna`.
+- Generation pins remain: `6` / `6-astra` → `gpt-6-astra`, `6-sol` →
+  `gpt-6-sol`, `5.6` / `5.6-sol` → `gpt-5.6-sol`, and `5.6-terra` /
+  `5.6-luna` → their corresponding 5.6 tiers.
+- `reserve` → `gpt-reserve`, a hidden fast/affordable coding tier.
+- Explicit `gpt-5.6` still maps to `gpt-5.6-sol` on ChatGPT auth and passes
+  through unchanged on API-key or unknown auth. It does not track the new default.
+- `5.5` / `5.5-pro` are retained: the September claim of October retirement
+  was not reconfirmed by the current public deprecation page.
+- `5.3-codex`, `5.4-nano`, and `5.1` remain until their announced shutdown on
+  April 1, 2027. Other existing pins remain without confirmed retirement.
+
+Removed shortcuts: `5.1-codex-max`, `5.1-codex-mini`, and `codex-mini` (targets
+shut down July 23, 2026); `4.1-nano` (target shut down October 23, 2026).
+Unknown strings still pass through; removing an alias is not a provider-ID blocklist.
+
+The authenticated model catalog is **client-version dependent**. On November 19,
+`client_version=0.170.0` returned 6.2 Astra/Sol, 6.1 Sol/Terra, Reserve, all three
+6 tiers, and all three 5.6 tiers. The same credentials with `0.154.0` returned
+only Reserve, 6 Astra and 5.6 tiers (excluding internal entries from both lists).
+A freshly fetched old-client cache therefore cannot establish retirement or
+current availability. The previous claim that 6 Sol/Luna were API-only is
+superseded by the current-client catalog, not by new successful inference probes.
+
+Reviewers verified on November 19 that the service resolves and launches Codex
+0.170.0. After the in-place upgrade, the long-running service still recorded
+0.154.0 in `codex_version` because it cached the version by `codex_bin` path.
+Since `b5e02ab`, Spindle probes the version again when the launcher or its npm
+package manifest changes.
+
+Sources: [OpenAI model docs](https://developers.openai.com/api/docs/models),
+[deprecations](https://developers.openai.com/api/docs/deprecations), and the
+account catalog at `https://chatgpt.com/backend-api/codex/models?client_version=0.170.0`.
+See [refresh evidence and probe limits](MODEL_REFRESH_2026_11_19.md).
 
 Spindle cannot infer every account's model entitlements. Unknown full model IDs pass through
 to Codex, and a structured `turn.failed` response is recorded as a spool error. API-key-backed

@@ -25,7 +25,7 @@ Python helpers remain detached. See the [MCP contract and recovery instructions]
 completion = spin(
     prompt="Write a function to parse CSV files",
     working_dir="/path/to/project",
-    model="gpt-5.6",  # Optional; ChatGPT auth normalizes this to the default Sol tier
+    model="gpt-5.6",  # Optional; ChatGPT auth normalizes this explicit pin to gpt-5.6-sol
     harness="codex",  # Use Codex instead of Claude Code
     permission="full",  # Mapped to sandbox policy
     timeout=300,  # Optional, seconds
@@ -122,7 +122,7 @@ Codex spools include a `harness` field set to "codex" to distinguish them from C
   "status": "running",
   "prompt": "Write a CSV parser",
   "working_dir": "/path/to/project",
-  "model": "gpt-5.6-sol",
+  "model": "gpt-6.2-sol",
   "sandbox": "workspace-write",
   "tags": ["codex", "csv"],
   "session_id": null,
@@ -175,7 +175,7 @@ result2 = next_completion["result"]
 | Shard support | `shard`, `careful+shard` (bwrap-contained on Linux) | `shard`, `careful+shard` (worktree at `workspace-write`, bwrap-wrapped on Linux) |
 | SKEIN integration | In a SKEIN project, shards spawn through `skein shard spawn` and shard agents get SKEIN orientation unless `skeinless=True` | Same |
 | Permission modes | careful, readonly, full, shard | Mapped to sandbox policies (read-only, workspace-write, danger-full-access) |
-| Model selection | sonnet, opus, haiku | gpt-5.6-sol default; ChatGPT auth maps gpt-5.6 to Sol |
+| Model selection | sonnet, opus, haiku | gpt-6.2-sol default; ChatGPT auth maps explicit gpt-5.6 to gpt-5.6-sol |
 | Session resume | `--resume` flag | `codex exec resume` command |
 
 ## Future Enhancements

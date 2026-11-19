@@ -337,7 +337,7 @@ spin("Summarize this file", model="haiku", working_dir="/project")
 # Complex work to opus
 spin("Design the new architecture", model="opus", working_dir="/project")
 
-# Frontier reasoning: "fable" is the CLI's rolling alias (Fable 5.1 as of 2026-09)
+# Frontier reasoning: "fable" is the CLI's rolling alias (provider-dependent)
 spin("Untangle the scheduler race", model="fable", working_dir="/project")
 
 # Pin a generation instead of riding the rolling alias
@@ -568,19 +568,19 @@ Spindle supports multiple AI agent harnesses, allowing you to choose the best to
 **Codex CLI** - OpenAI models via `codex` CLI
 - Good for quick edits, simple tasks, prototyping
 - Requires ChatGPT Plus/Pro/Enterprise
-- Models include `"astra"` (`gpt-6-astra`), `"sol"` (default), `"terra"`, `"luna"`, `"reserve"` (`gpt-reserve`, fast/affordable coding tier), or any full model name
+- Models include `"astra"` (`gpt-6.2-astra`), `"sol"` (`gpt-6.2-sol`, default), `"terra"` (`gpt-6.1-terra`, Codex >=0.159.0), `"luna"` (`gpt-6-luna`), `"reserve"` (`gpt-reserve`, fast/affordable coding tier), or any full model name
 - Use `harness="codex"`
 
 **Gemini CLI** - Google's Gemini models via `gemini` CLI
 - Full agent with tool use, file access, multi-step reasoning
 - Generous free tier (1000 req/day with Google account)
-- Models: `"flash"`/`"video"` (3.8 Flash), `"pro"` (3.1 Pro Preview, default), `"flash-lite"` (3.5 Flash-Lite), or any full model name
+- Models: `"carbon"`, `"neon"`, `"hydrogen"`, `"argon"` (Gemini 4; also `4-` aliases), `"flash"`/`"video"` (3.8 Flash), `"pro"` (3.1 Pro Preview, default), `"flash-lite"` (3.5 Flash-Lite), or any full model name
 - Native video: put `@clip.mp4` in the prompt and set `working_dir` to its directory. Verified with Gemini CLI 0.39.1; local files are limited to 20 MiB. See [video setup and limits](docs/GEMINI_VIDEO.md).
 - Use `harness="gemini"`
 
 **Kimi CLI** - Moonshot AI's Kimi models via `kimi-cli`
 - Thinking mode for complex reasoning
-- Models: `"k3"`/`"latest"`/`"thinking"` (K3, always thinking; default), `"k2.7-code"`, `"k2.6"`, or any full model name
+- Models: `"k3.1"`/`"k3.1-pro"`/`"latest"`/`"thinking"` (K3.1 Pro, always thinking; default), `"highspeed"`/`"k3.1-pro-highspeed"` (K3.1 Pro Highspeed, always thinking), `"k3"`, `"k2.7-code"`, `"k2.6"`, or any full model name
 - Kimi headless mode auto-approves its tool calls; it has no classifier-vetted
   or genuinely "careful" mode. Spindle therefore wraps every Kimi process
   except `full` without shard intent in its own bwrap filesystem boundary. The
@@ -597,6 +597,14 @@ Spindle supports multiple AI agent harnesses, allowing you to choose the best to
   contained; `full` without a shard explicitly runs uncontained. Shard launches
   require an absolute `KIMI_SHARE_DIR` when that override is used.
 - Use `harness="kimi"`
+
+Model catalog checked 2026-11-19. Claude rolling aliases and its `sonnet`
+default remain delegated to the CLI; direct Anthropic currently resolves Fable
+5.2 and Opus/Sonnet/Haiku 5.5, but other providers and overrides can differ.
+Older version pins remain available except confirmed retired Codex shortcuts.
+Gemini's default stays at 3.1 Pro Preview pending validation of a replacement.
+See the [model refresh evidence and decisions](docs/MODEL_REFRESH_2026_11_19.md)
+and [Codex account/version notes](docs/CODEX_SETUP.md#model-selection).
 
 ### Basic Usage
 
@@ -750,7 +758,7 @@ abandonment.
 - `harness` (optional): "claude-code" (default), "codex", "gemini", "kimi", or a lodged profile name (see [Profiles](#profiles))
 - `working_dir` (required): Project directory for every harness
 - `permission` (optional): "readonly" (alias "manual"), "careful" (default, = auto), "full", "shard", "careful+shard", "research", "research+shard", "auto", "auto+shard" (readonly/manual cannot be combined with shard intent; `auto` variants are Claude-only; other names map to harness-specific enforcement, and Kimi accepts them for compatibility but has no "careful" approval mode)
-- `model` (optional): Model to use ("sonnet", "opus", "fable", "haiku" rolling aliases or pinned "fable-5.1", "opus-5.5", "sonnet-5", "opus-5" for Claude; "astra", "sol", "terra", "luna", "reserve" for Codex; "flash", "pro", "video" for Gemini; "k3", "latest", "thinking", "k2.7-code", "k2.6" for Kimi)
+- `model` (optional): Model to use ("sonnet", "opus", "fable", "haiku" rolling aliases or pinned "fable-5.2", "opus-5.5", "sonnet-5.5", "haiku-5.5" for Claude; "astra", "sol", "terra", "luna", "reserve" for Codex; "carbon", "neon", "hydrogen", "argon", "flash", "pro", "video" for Gemini; "k3.1", "highspeed", "k3", "latest", "thinking", "k2.7-code", "k2.6" for Kimi)
 - `timeout` (optional): Auto-kill after N seconds
 - `wait` (default True): Block for the result; False returns an ID immediately
 - `wait_timeout` (optional): Stop waiting after N seconds without killing the spool; omitted or `0` means no deadline

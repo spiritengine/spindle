@@ -1,6 +1,12 @@
 # Gemini video in Spindle
 
-Research and implementation plan, 2026-09-13.
+Research and implementation plan, 2026-09-13. Findings below are historical.
+
+Current-use note, 2026-11-19: `astra` now selects `gpt-6.2-astra`; `6-astra`
+preserves the original model. Gemini's `video` alias still selects 3.8 Flash,
+and the default remains 3.1 Pro Preview. New Gemini 4 element aliases have
+catalog evidence, but no new video validation; Hydrogen remains a candidate
+default. See [model refresh evidence](MODEL_REFRESH_2026_11_19.md).
 
 Astra was already present in commit 039c8eb: `harness="codex", model="astra"`
 selects `gpt-6-astra`. Its discovery and command-construction tests pass.
