@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+### Model refresh — 2026-11-19
+
+- Added Claude `fable-5.2`, `sonnet-5.5`, and `haiku-5.5` pins. Rolling aliases
+  remain CLI-owned; the default remains `sonnet`. All earlier pins remain.
+- Added Codex `6.2`, `6.2-astra`, `6.2-sol`, `6.1-sol`, and `6.1-terra`.
+  `astra` moves to 6.2 Astra; `sol`/`codex` and the default to 6.2 Sol;
+  `terra` to 6.1 Terra (Codex >=0.159.0); `luna` to 6 Luna. Older pins remain.
+  Removed confirmed retired `5.1-codex-max`, `5.1-codex-mini`, `codex-mini`,
+  and `4.1-nano`. Retained `5.5`/`5.5-pro`: the September retirement claim
+  below was not reconfirmed. Documented version-dependent account catalogs.
+- Added Gemini `carbon`, `neon`, `hydrogen`, `argon` and their `4-` aliases.
+  Default and Pro aliases stay on 3.1 Pro Preview; Flash/video stay on 3.8.
+- Added Kimi `k3.1`, `k3.1-pro`, `k3.1-pro-highspeed`. Default, `latest`, and
+  `thinking` move to K3.1 Pro; `highspeed` moves to K3.1 Pro Highspeed.
+  Both IDs force `--thinking`, including full-ID selections. Older pins remain.
+- Profile discovery now exposes existing `model_aliases` as `models`; no
+  external profile files changed. Tests check command/spool/discovery agreement.
+- Sources and probe limitations are recorded in
+  [the refresh report](docs/MODEL_REFRESH_2026_11_19.md). This sweep does not
+  claim live inference for every new ID.
+
+### Previous sweep — 2026-09-25
+
 Model catalog sweep (2026-09-25). Every alias below was checked against the
 provider's live model list and, for new ids, exercised with a one-line request.
 

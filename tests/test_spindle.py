@@ -605,9 +605,25 @@ def _allowed_tools_of(cmd):
     return cmd[cmd.index("--allowedTools") + 1]
 
 
-def test_claude_opus_5_alias_reaches_cli(tmp_path):
-    cmd = _spin_claude_cmd(tmp_path, "careful", model="opus-5")
-    assert cmd[cmd.index("--model") + 1] == "claude-opus-5"
+@pytest.mark.parametrize(
+    "model,expected",
+    [
+        ("fable-5.2", "claude-fable-5-2"),
+        ("sonnet-5.5", "claude-sonnet-5-5"),
+        ("haiku-5.5", "claude-haiku-5-5"),
+        ("opus-5", "claude-opus-5"),
+        ("fable-5.1", "claude-fable-5-1"),
+        ("sonnet-5", "claude-sonnet-5"),
+        *[(alias, alias) for alias in ("haiku", "sonnet", "opus", "fable")],
+    ],
+)
+def test_claude_alias_reaches_cli_and_spool(tmp_path, model, expected):
+    cmd = _spin_claude_cmd(tmp_path, "careful", model=model)
+    assert cmd[cmd.index("--model") + 1] == expected
+    spool = json.loads(next(tmp_path.glob("*.json")).read_text())
+    # Claude preserves the requested alias for respin; discovery resolves it.
+    assert spool["model"] == model
+    assert _get_harnesses()["claude-code"]["models"][spool["model"]] == expected
 
 
 class TestClaudePermissionMode:
@@ -4140,6 +4156,13 @@ class TestGeminiHarness:
             ("video", "gemini-3.8-flash"),
             ("flash", "gemini-3.8-flash"),
             ("2.5-pro", "gemini-2.5-pro"),
+            ("3.1-pro", "gemini-3.1-pro-preview"),
+            ("flash-lite", "gemini-3.5-flash-lite"),
+            *[
+                (alias, f"gemini-4-{element}")
+                for element in ("carbon", "neon", "hydrogen", "argon")
+                for alias in (element, f"4-{element}", f"gemini-4-{element}")
+            ],
             ("gemini-future-model", "gemini-future-model"),
         ],
     )
@@ -4170,6 +4193,8 @@ class TestGeminiHarness:
         assert spool["model"] == expected
         if model is None:
             assert _get_harnesses()["gemini"]["default_model"] == expected
+        elif model in GEMINI_MODEL_ALIASES:
+            assert _get_harnesses()["gemini"]["models"][model] == expected
 
     def test_gemini_spin_requires_working_dir(self, tmp_path):
         """Gemini spin should require working_dir."""
@@ -4527,24 +4552,24 @@ class TestKimiHarness:
 
     def test_kimi_model_aliases(self):
         """Aliases should resolve only to models the managed provider actually serves."""
-        assert KIMI_MODEL_ALIASES["thinking"] == "moonshot-ai/kimi-k3"
+        assert KIMI_MODEL_ALIASES["thinking"] == "moonshot-ai/kimi-k3.1-pro"
         assert KIMI_MODEL_ALIASES["k3"] == "moonshot-ai/kimi-k3"
         assert KIMI_MODEL_ALIASES["k2.6"] == "moonshot-ai/kimi-k2.6"
         # kimi-k2.5 left the managed catalog (2026-09-25 sweep); the alias must not
         # resolve to a model _kimi_validate_model would refuse.
         assert "k2.5" not in KIMI_MODEL_ALIASES
         assert "moonshot-ai/kimi-k2.5" not in KIMI_MODEL_ALIASES.values()
-        assert KIMI_MODEL_ALIASES["latest"] == "moonshot-ai/kimi-k3"
+        assert KIMI_MODEL_ALIASES["latest"] == "moonshot-ai/kimi-k3.1-pro"
         # The retired standalone thinking/turbo models must not reappear as alias targets.
         assert "moonshot-ai/kimi-k2-thinking" not in KIMI_MODEL_ALIASES.values()
         assert "moonshot-ai/kimi-k2-turbo-preview" not in KIMI_MODEL_ALIASES.values()
         # Default model must be a real, registerable model (regression: was kimi-k2-thinking).
-        assert KIMI_DEFAULT_MODEL == "moonshot-ai/kimi-k3"
+        assert KIMI_DEFAULT_MODEL == "moonshot-ai/kimi-k3.1-pro"
         # k2.7-code (2026-06-12): coding-specialized aliases resolve to the served model.
         assert KIMI_MODEL_ALIASES["k2.7-code"] == "moonshot-ai/kimi-k2.7-code"
         assert KIMI_MODEL_ALIASES["k2.7"] == "moonshot-ai/kimi-k2.7-code"
         assert KIMI_MODEL_ALIASES["code"] == "moonshot-ai/kimi-k2.7-code"
-        assert KIMI_MODEL_ALIASES["highspeed"] == "moonshot-ai/kimi-k2.7-code-highspeed"
+        assert KIMI_MODEL_ALIASES["highspeed"] == "moonshot-ai/kimi-k3.1-pro-highspeed"
 
     def test_kimi_k2_7_code_forces_thinking_via_alias(self, tmp_path):
         """k2.7-code is thinking-only; selecting it by alias must add --thinking."""
@@ -4596,7 +4621,7 @@ class TestKimiHarness:
         assert "--thinking" in captured_cmd
 
     def test_kimi_spin_resolves_alias(self, tmp_path):
-        """The 'thinking' alias resolves to K3 and enables thinking mode."""
+        """The 'thinking' alias resolves to K3.1 Pro and enables thinking mode."""
         captured_cmd = []
 
         def fake_spawn(spool_id, cmd, cwd, env=None):
@@ -4616,7 +4641,7 @@ class TestKimiHarness:
                         env=None,
                     )
 
-        assert "moonshot-ai/kimi-k3" in captured_cmd
+        assert "moonshot-ai/kimi-k3.1-pro" in captured_cmd
         assert "--thinking" in captured_cmd
 
     def test_kimi_spin_full_model_no_thinking_flag(self, tmp_path):
@@ -4643,55 +4668,60 @@ class TestKimiHarness:
         assert "moonshot-ai/kimi-k2.6" in captured_cmd
         assert "--thinking" not in captured_cmd
 
-    def test_kimi_spin_default_model(self, tmp_path):
-        """No model specified defaults to K3 with its required thinking mode."""
+    @pytest.mark.parametrize(
+        "model,expected",
+        [
+            (None, "moonshot-ai/kimi-k3.1-pro"),
+            *[
+                (alias, "moonshot-ai/kimi-k3.1-pro")
+                for alias in ("latest", "thinking", "k3.1", "k3.1-pro", "moonshot-ai/kimi-k3.1-pro")
+            ],
+            *[
+                (alias, "moonshot-ai/kimi-k3.1-pro-highspeed")
+                for alias in ("highspeed", "k3.1-pro-highspeed", "moonshot-ai/kimi-k3.1-pro-highspeed")
+            ],
+            *[(alias, "moonshot-ai/kimi-k3") for alias in ("k3", "moonshot-ai/kimi-k3")],
+            *[(alias, "moonshot-ai/kimi-k2.7-code") for alias in ("k2.7", "k2.7-code", "code")],
+            ("k2.7-code-highspeed", "moonshot-ai/kimi-k2.7-code-highspeed"),
+        ],
+    )
+    def test_kimi_forces_thinking_for_every_selection_path(self, tmp_path, model, expected):
+        """Always-thinking models agree across the command, spool and discovery."""
         captured_cmd = []
 
         def fake_spawn(spool_id, cmd, cwd, env=None):
             captured_cmd.extend(cmd)
             return 12345
 
-        with patch("spindle.SPINDLE_DIR", tmp_path):
-            with patch("spindle._spawn_detached", side_effect=fake_spawn):
-                with patch("spindle._count_running", return_value=0):
-                    _kimi_spin_sync(
-                        prompt="Test",
-                        working_dir=str(tmp_path),
-                        model=None,
-                        system_prompt=None,
-                        timeout=None,
-                        tags=None,
-                        env=None,
-                    )
+        with (
+            patch("spindle.SPINDLE_DIR", tmp_path),
+            patch("spindle._spawn_detached", side_effect=fake_spawn),
+            patch("spindle._count_running", return_value=0),
+            patch("spindle._kimi_registered_models", return_value={expected}),
+        ):
+            spool_id = _kimi_spin_sync("Test", str(tmp_path), model, None, None, None, None)
 
-        m_idx = captured_cmd.index("-m")
-        assert captured_cmd[m_idx + 1] == "moonshot-ai/kimi-k3"
+        assert captured_cmd[captured_cmd.index("-m") + 1] == expected
         assert "--thinking" in captured_cmd
+        spool = json.loads((tmp_path / f"{spool_id}.json").read_text())
+        assert spool["model"] == expected
+        discovery = _get_harnesses()["kimi"]
+        if model is None:
+            assert discovery["default_model"] == expected
+        elif model in KIMI_MODEL_ALIASES:
+            assert discovery["models"][model] == expected
 
-    @pytest.mark.parametrize("model", ["k3", "latest", "moonshot-ai/kimi-k3"])
-    def test_kimi_k3_forces_thinking_for_every_selection_path(self, tmp_path, model):
-        """K3 is always-thinking whether selected by alias or full model name."""
-        captured_cmd = []
-
-        def fake_spawn(spool_id, cmd, cwd, env=None):
-            captured_cmd.extend(cmd)
-            return 12345
-
-        with patch("spindle.SPINDLE_DIR", tmp_path):
-            with patch("spindle._spawn_detached", side_effect=fake_spawn):
-                with patch("spindle._count_running", return_value=0):
-                    _kimi_spin_sync(
-                        prompt="Test",
-                        working_dir=str(tmp_path),
-                        model=model,
-                        system_prompt=None,
-                        timeout=None,
-                        tags=None,
-                        env=None,
-                    )
-
-        assert "moonshot-ai/kimi-k3" in captured_cmd
-        assert "--thinking" in captured_cmd
+    @pytest.mark.parametrize("model", [None, "k3.1", "k3.1-pro-highspeed", "moonshot-ai/kimi-k3.1-pro"])
+    def test_new_kimi_models_require_local_registration(self, tmp_path, model):
+        with (
+            patch("spindle.SPINDLE_DIR", tmp_path),
+            patch("spindle._kimi_registered_models", return_value={"moonshot-ai/kimi-k3"}),
+            patch("spindle._spawn_detached") as spawn,
+        ):
+            result = _kimi_spin_sync("Test", str(tmp_path), model, None, None, None, None)
+        assert "not registered" in result
+        spawn.assert_not_called()
+        assert list(tmp_path.glob("kimi-*.json")) == []
 
     def test_kimi_spin_rejects_unregistered_model(self, tmp_path):
         """An unregistered model is rejected up front with a clear error instead of
@@ -6141,6 +6171,8 @@ class TestSpinHarnesses:
         "model, expected",
         [
             ("fable", True),
+            ("fable-5.2", True),
+            ("claude-fable-5-2", True),
             ("fable-5.1", True),
             ("fable-5", True),
             ("claude-fable-5-1", True),
@@ -6173,10 +6205,10 @@ class TestSpinHarnesses:
         result = _get_harnesses()
         assert result["claude-code"]["default_model"] == "sonnet"
 
-    def test_codex_advertises_astra_without_changing_default(self):
+    def test_codex_advertises_current_astra_and_sol_default(self):
         result = _get_harnesses()["codex"]
-        assert result["models"]["astra"] == "gpt-6-astra"
-        assert result["default_model"] == "gpt-5.6-sol"
+        assert result["models"]["astra"] == "gpt-6.2-astra"
+        assert result["default_model"] == "gpt-6.2-sol"
 
     def test_codex_advertises_2026_09_catalog_additions(self):
         """gpt-reserve and the GPT-6 tier spellings resolve to the catalog ids."""
@@ -6184,9 +6216,21 @@ class TestSpinHarnesses:
         assert models["reserve"] == "gpt-reserve"
         assert models["6"] == "gpt-6-astra"
         assert models["6-astra"] == "gpt-6-astra"
-        # API-only on ChatGPT-account auth (400), kept so they pass through cleanly.
+        # Generation pins remain selectable in the current-client catalog.
         assert models["6-sol"] == "gpt-6-sol"
         assert models["6-luna"] == "gpt-6-luna"
+
+    def test_codex_removes_only_confirmed_retired_aliases(self):
+        models = _get_harnesses()["codex"]["models"]
+        for alias in ("5.1-codex-max", "5.1-codex-mini", "codex-mini", "4.1-nano"):
+            assert alias not in models
+        for target in ("gpt-5.1-codex-max", "gpt-5.1-codex-mini", "gpt-4.1-nano"):
+            assert target not in models.values()
+        for alias in ("5.5", "5.5-pro", "5.3-codex", "5.4-nano", "5.1"):
+            assert models[alias] == f"gpt-{alias}"
+        for invented in ("6.1", "6.1-astra", "6.2-terra", "6.1-luna", "6.2-luna"):
+            assert invented not in models
+        assert models == spindle.CODEX_MODEL_ALIASES
 
     def test_unknown_harness_returns_error(self):
         """spin() should return error JSON for unknown harness names."""
@@ -8846,15 +8890,31 @@ class TestCodexSandboxEnforcement:
     @pytest.mark.parametrize(
         "requested,expected",
         [
-            (None, "gpt-5.6-sol"),
+            (None, "gpt-6.2-sol"),
             ("gpt-5.6", "gpt-5.6-sol"),
             ("5.6", "gpt-5.6-sol"),
-            ("sol", "gpt-5.6-sol"),
+            ("sol", "gpt-6.2-sol"),
+            ("codex", "gpt-6.2-sol"),
+            ("6.2-sol", "gpt-6.2-sol"),
+            ("astra", "gpt-6.2-astra"),
+            ("6.2", "gpt-6.2-astra"),
+            ("6.2-astra", "gpt-6.2-astra"),
+            ("6.1-sol", "gpt-6.1-sol"),
+            ("terra", "gpt-6.1-terra"),
+            ("6.1-terra", "gpt-6.1-terra"),
+            ("luna", "gpt-6-luna"),
+            ("6", "gpt-6-astra"),
+            ("6-astra", "gpt-6-astra"),
+            ("6-sol", "gpt-6-sol"),
+            ("6-luna", "gpt-6-luna"),
+            ("5.6-sol", "gpt-5.6-sol"),
+            ("5.6-terra", "gpt-5.6-terra"),
+            ("5.6-luna", "gpt-5.6-luna"),
             ("gpt-5.6-terra", "gpt-5.6-terra"),
             ("gpt-5.6-luna", "gpt-5.6-luna"),
         ],
     )
-    def test_gpt_56_family_spelling_normalizes_to_concrete_tier(self, tmp_path, requested, expected):
+    def test_codex_aliases_and_default_reach_command_and_spool(self, tmp_path, requested, expected):
         with self._captured_codex_spin(tmp_path) as captured_cmd:
             with patch("spindle.threading.Thread"):
                 _codex_spin_sync("do work", str(tmp_path), requested, "read-only", None, None, None)
@@ -8864,15 +8924,11 @@ class TestCodexSandboxEnforcement:
         spool = json.loads(next(tmp_path.glob("codex-*.json")).read_text())
         assert spool["model"] == expected
 
-    def test_astra_alias_normalizes_to_supported_codex_model(self, tmp_path):
-        with self._captured_codex_spin(tmp_path) as captured_cmd:
-            with patch("spindle.threading.Thread"):
-                _codex_spin_sync("do work", str(tmp_path), "astra", "read-only", None, None, None)
-
-        cmd = captured_cmd[0]
-        assert cmd[cmd.index("--model") + 1] == "gpt-6-astra"
-        spool = json.loads(next(tmp_path.glob("codex-*.json")).read_text())
-        assert spool["model"] == "gpt-6-astra"
+        discovery = _get_harnesses()["codex"]
+        if requested is None:
+            assert discovery["default_model"] == expected
+        elif requested in spindle.CODEX_MODEL_ALIASES:
+            assert discovery["models"][requested] == expected
 
     @pytest.mark.parametrize("auth_mode", ["api", "unknown"])
     def test_explicit_gpt_56_is_preserved_outside_chatgpt_auth(self, tmp_path, auth_mode):
@@ -12896,6 +12952,7 @@ class TestProfiles:
         assert entry["type"] == "profile"
         assert entry["base_harness"] == "claude-code"
         assert entry["default_model"] == "big"
+        assert entry["models"] == {}
         assert entry["description"] == "alt endpoint"
         assert entry["source"].endswith("alt/profile.json")
 
@@ -13062,8 +13119,12 @@ class TestProfiles:
 
         with patch("spindle._spawn_detached", side_effect=fake_spawn):
             with patch("spindle._count_running", return_value=0):
-                asyncio.run(self._spin()("x", harness="alt", model="fast", working_dir=str(tmp_path)))
+                spool_id = asyncio.run(self._spin()("x", harness="alt", model="fast", working_dir=str(tmp_path)))
         assert captured["cmd"][captured["cmd"].index("--model") + 1] == "small-model"
+
+        assert _read_spool(spool_id)["model"] == "small-model"
+        assert _get_harnesses()["alt"]["models"] == {"fast": "small-model"}
+        assert _get_harnesses()["alt"]["default_model"] == "big"
 
     def test_spin_appends_extra_args(self, profiles_root, tmp_path):
         _make_profile(profiles_root, "alt", {"extra_args": ["--verbose"]})

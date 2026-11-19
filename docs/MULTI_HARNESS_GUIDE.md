@@ -36,7 +36,7 @@ Spindle abstracts the underlying AI agent implementation through a "harness" lay
 ### Claude Code (Default)
 
 **CLI:** `claude` (Anthropic's Claude Code CLI)
-**Models:** Claude Fable, Opus, Sonnet, Haiku (Fable 5.1, Opus 5.5, Sonnet 5, Haiku 4.5 as of 2026-09-25)
+**Models:** Claude Fable, Opus, Sonnet, Haiku (Fable 5.2, Opus/Sonnet/Haiku 5.5 on direct Anthropic as of 2026-11-19; provider overrides can differ)
 **Strengths:** Complex reasoning, architecture design, code review
 
 The Claude Code harness is Spindle's default and most capable option. It excels at:
@@ -57,7 +57,7 @@ spin("Refactor auth to use dependency injection", working_dir="/project")
 ### Codex CLI
 
 **CLI:** `codex` (OpenAI's Codex CLI)
-**Models:** GPT-6 Astra (`astra`), GPT-5.6 Sol/Terra/Luna (`sol` is the default), GPT-Reserve (`reserve`); see [CODEX_SETUP.md](CODEX_SETUP.md) for what the ChatGPT-account route serves
+**Models:** GPT-6.2 Astra/Sol (`astra`/`sol`; Sol is the default), GPT-6.1 Terra (`terra`, requires Codex >=0.159.0), GPT-6 Luna (`luna`), GPT-Reserve (`reserve`); see [CODEX_SETUP.md](CODEX_SETUP.md) for what the ChatGPT-account route serves
 **Strengths:** Speed, quick edits, prototyping
 
 The Codex harness prioritizes speed over depth. Ideal for:
@@ -74,7 +74,8 @@ spin(prompt="Add error handling to process_data()", harness="codex", working_dir
 **Important:** `working_dir` is required for Codex, as for every harness.
 
 **Claude model aliases:**
-- `"haiku"` / `"sonnet"` / `"opus"` / `"fable"` → passed through as the CLI's rolling "latest of this tier" alias (`fable` is Fable 5.1, `opus` is Opus 5.5 as of 2026-09-25)
+- `"haiku"` / `"sonnet"` / `"opus"` / `"fable"` → passed through as the CLI's rolling "latest of this tier" alias (provider-dependent; never pinned by Spindle)
+- `"fable-5.2"` → `claude-fable-5-2`, `"sonnet-5.5"` → `claude-sonnet-5-5`, `"haiku-5.5"` → `claude-haiku-5-5`
 - `"fable-5.1"` → `claude-fable-5-1`, `"opus-5.5"` → `claude-opus-5-5`, `"sonnet-5"` → `claude-sonnet-5`, `"haiku-4.5"` → `claude-haiku-4-5`
 - `"fable-5"`, `"opus-5"`, `"opus-4.8"`, `"opus-4.7"`, `"opus-4.6"`, `"sonnet-4.6"` → the corresponding legacy ids (still served)
 - No model specified → `sonnet`
@@ -83,7 +84,7 @@ spin(prompt="Add error handling to process_data()", harness="codex", working_dir
 ### Gemini CLI
 
 **CLI:** `gemini` (Google's Gemini CLI)
-**Models:** Gemini 3.8 Flash, 3.1 Pro Preview (default), 3.5 Flash-Lite, and explicit older aliases
+**Models:** Gemini 4 Carbon/Neon/Hydrogen/Argon, 3.8 Flash, 3.1 Pro Preview (default), 3.5 Flash-Lite, and explicit older aliases
 **Strengths:** Generous free tier, good for quick tasks
 
 The Gemini harness uses Google's Gemini CLI in headless mode. It's a full agent with tool use, file access, and multi-step reasoning. Auth is handled by the CLI (Google account login or API key).
@@ -94,6 +95,10 @@ spin(prompt="Summarize this codebase", harness="gemini", working_dir="/path/to/p
 ```
 
 **Model aliases:**
+- `"carbon"` / `"4-carbon"` → `gemini-4-carbon`
+- `"neon"` / `"4-neon"` → `gemini-4-neon`
+- `"hydrogen"` / `"4-hydrogen"` → `gemini-4-hydrogen`
+- `"argon"` / `"4-argon"` → `gemini-4-argon`
 - `"flash"` / `"video"` / `"3.8-flash"` → `gemini-3.8-flash`
 - `"pro"` / `"3-pro"` → `gemini-3.1-pro-preview` (3 Pro Preview has shut down)
 - `"3.1-pro"` → `gemini-3.1-pro-preview`
@@ -111,7 +116,7 @@ See [video setup, trust, and limits](GEMINI_VIDEO.md).
 ### Kimi CLI
 
 **CLI:** `kimi-cli` (Moonshot AI's Kimi Code CLI)
-**Models:** Kimi K3, K2.7 Code, K2.6
+**Models:** Kimi K3.1 Pro/Pro Highspeed, K3, K2.7 Code, K2.6
 **Strengths:** Reasoning, multimodal support
 
 The Kimi harness uses Moonshot AI's Kimi Code CLI in headless mode. Full agent with tool use, file access, and multi-step reasoning. Auth via Kimi/Moonshot API credentials configured in `~/.kimi/config.toml`.
@@ -142,18 +147,26 @@ spin(prompt="Analyze this bug and suggest a fix", harness="kimi", working_dir="/
 
 **Model aliases:**
 - `"k3"` → `moonshot-ai/kimi-k3` with required thinking mode
-- `"thinking"` → `moonshot-ai/kimi-k3` with required thinking mode
+- `"k3.1"` / `"k3.1-pro"` / `"thinking"` → `moonshot-ai/kimi-k3.1-pro` with required thinking mode
+- `"highspeed"` / `"k3.1-pro-highspeed"` → `moonshot-ai/kimi-k3.1-pro-highspeed` with required thinking mode
 - `"k2.6"` → `moonshot-ai/kimi-k2.6`
-- `"k2.7-code"` / `"code"` → `moonshot-ai/kimi-k2.7-code` with required thinking mode; `"highspeed"` → the highspeed variant
-- `"latest"` → `moonshot-ai/kimi-k3` with required thinking mode (latest stable)
-- No model specified → `moonshot-ai/kimi-k3` with required thinking mode (default)
+- `"k2.7-code"` / `"k2.7"` / `"code"` → `moonshot-ai/kimi-k2.7-code` with required thinking mode; `"k2.7-code-highspeed"` → the K2.7 highspeed variant
+- `"latest"` → `moonshot-ai/kimi-k3.1-pro` with required thinking mode (latest stable)
+- No model specified → `moonshot-ai/kimi-k3.1-pro` with required thinking mode (default)
 - Any other string passes through to the CLI as-is
 
-The standalone `kimi-k2-thinking` / `kimi-k2-thinking-turbo` / `kimi-k2-turbo-preview` models the managed provider used to ship are gone. Thinking is now a model capability enabled with kimi-cli's `--thinking` flag. Spindle enables it automatically for always-thinking K3 and K2.7 Code models, regardless of whether they are selected by alias or full model name.
+The standalone `kimi-k2-thinking` / `kimi-k2-thinking-turbo` / `kimi-k2-turbo-preview` models the managed provider used to ship are gone. Thinking is now a model capability enabled with kimi-cli's `--thinking` flag. Spindle enables it automatically for always-thinking K3.1 Pro/Pro Highspeed, K3 and K2.7 Code models, regardless of whether they are selected by alias or full model name.
 
 Every alias target must be registered under `[models.…]` in `~/.kimi/config.toml`. A model that isn't registered makes kimi-cli silently fall back to an empty LLM and emit only `LLM not set`; spindle validates the resolved model up front and returns a clear error (with the list of available models) instead. Upgrade kimi-cli and use interactive `/model` to refresh managed models if a newer one is missing.
 
 **Important:** Kimi requires `working_dir` to be specified. Session continuity uses explicit UUID session IDs generated upfront. Auth via `kimi-cli login` or direct API key configuration in `~/.kimi/config.toml`.
+
+Catalog checked 2026-11-19. Gemini Hydrogen remains a default candidate;
+`pro`, `3-pro`, and `3.1-pro` stay explicitly on 3.1 Pro Preview. K2.6/K2.7
+remain selectable for eligible accounts, with no confirmed retirement.
+Profile discovery includes each profile's `model_aliases` as `models`; profiles
+without aliases advertise an empty object. This does not modify lodged profiles.
+See [refresh evidence, retained pins, and open decisions](MODEL_REFRESH_2026_11_19.md).
 
 ## Unified API
 
@@ -240,7 +253,7 @@ Session continuity is harness-aware - Spindle remembers which harness was used a
 | Metric | Claude Code | Codex CLI | Gemini CLI | Kimi CLI |
 |--------|-------------|-----------|------------|----------|
 | Code understanding | Excellent | Good | Good | Good |
-| Reasoning depth | Deep | Moderate | Good (3.1 Pro) | Excellent (K3) |
+| Reasoning depth | Deep | Moderate | Good (3.1 Pro) | Excellent (K3.1 Pro) |
 | Best for | Complex tasks | Quick edits | Fast general work | Fast reasoning tasks |
 | Cost per task | Higher | Lower | Free tier available | Varies by plan |
 
