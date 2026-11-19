@@ -8467,7 +8467,7 @@ async def spool_info(spool_id: str) -> str:
 # resolved binary once and a restrictive-tier launch is REFUSED when the probe says the
 # sandbox is not enforcing (see _codex_spin_sync / _codex_respin_sync). The version is still
 # recorded per spool, for provenance only — it no longer gates anything.
-_CODEX_VERSION_CACHE: Dict[str, Optional[str]] = {}
+_CODEX_VERSION_CACHE: Dict[str, tuple[tuple, str]] = {}
 
 # Cached enforcement-probe results, keyed by binary and Codex config context so a reinstall,
 # upgrade, CODEX_HOME/HOME change, or config edit re-probes. The probe is a local no-model exec.
@@ -8510,17 +8510,30 @@ def _resolve_codex_binary(process_env: Optional[Dict[str, str]] = None) -> Optio
     return shutil.which("codex", path=path)
 
 
-def _codex_cli_version(binary: Optional[str], process_env: Optional[Dict[str, str]] = None) -> Optional[str]:
-    """Version of a codex binary (e.g. "0.125.0"), or None if it can't be determined.
+def _codex_install_identity(binary: str) -> Optional[tuple]:
+    """Identify the installed CLI without starting it or reading package contents."""
+    try:
+        entry = Path(os.path.realpath(binary, strict=True))
+        stamp = _record_stamp(entry.stat())
+        # npm's bin/codex.js can stay identical across native CLI upgrades.
+        # Its package.json pins the matching platform package version.
+        package = None
+        if entry.parts[-4:] == ("@openai", "codex", "bin", "codex.js"):
+            package = _record_stamp((entry.parent.parent / "package.json").stat())
+        return (entry, stamp, package)
+    except OSError:
+        return None
 
-    Cached per path: this shells out, and spin is on the hot path.
-    """
+
+def _codex_cli_version(binary: Optional[str], process_env: Optional[Dict[str, str]] = None) -> Optional[str]:
+    """Return the CLI's reported version, caching successful probes for an identified install."""
     if not binary:
         return None
-    if binary in _CODEX_VERSION_CACHE:
-        return _CODEX_VERSION_CACHE[binary]
+    identity = _codex_install_identity(binary)
+    cached = _CODEX_VERSION_CACHE.get(binary)
+    if cached is not None and cached[0] == identity:
+        return cached[1]
 
-    version = None
     try:
         proc = subprocess.run(
             [binary, "--version"],
@@ -8531,14 +8544,14 @@ def _codex_cli_version(binary: Optional[str], process_env: Optional[Dict[str, st
         )
         # e.g. "codex-cli 0.125.0"
         match = re.search(r"codex-cli\s+(\S+)", proc.stdout or "")
-        if match:
+        if proc.returncode == 0 and match:
             version = match.group(1)
+            if identity is not None:
+                _CODEX_VERSION_CACHE[binary] = (identity, version)
+            return version
     except Exception as exc:
         logger.warning("spindle: codex --version failed for %s: %s", binary, exc)
-        version = None
-
-    _CODEX_VERSION_CACHE[binary] = version
-    return version
+    return None
 
 
 def _codex_auth_mode(binary: Optional[str], process_env: Optional[Dict[str, str]] = None) -> str:
@@ -8573,13 +8586,11 @@ def _codex_auth_mode(binary: Optional[str], process_env: Optional[Dict[str, str]
     return mode
 
 
-def _codex_sandbox_probe_key(codex_bin: str, process_env: Optional[Dict[str, str]] = None) -> tuple:
+def _codex_sandbox_probe_key(codex_bin: str, process_env: Optional[Dict[str, str]] = None) -> Optional[tuple]:
     """Cache key that changes with the binary or its effective Codex config."""
-    try:
-        mtime = os.path.getmtime(codex_bin)
-    except OSError as exc:
-        logger.debug("spindle: codex sandbox probe-key mtime unavailable for %s: %s", codex_bin, exc)
-        mtime = None
+    identity = _codex_install_identity(codex_bin)
+    if identity is None:
+        return None
     effective_env = process_env or os.environ
     home = effective_env.get("HOME", str(Path.home()))
     codex_home = effective_env.get("CODEX_HOME") or str(Path(home) / ".codex")
@@ -8589,7 +8600,7 @@ def _codex_sandbox_probe_key(codex_bin: str, process_env: Optional[Dict[str, str
         config_signature = (config_stat.st_mtime_ns, config_stat.st_size)
     except OSError:
         config_signature = None
-    return (codex_bin, _codex_cli_version(codex_bin, process_env), mtime, codex_home, config_signature)
+    return (codex_bin, identity, codex_home, config_signature)
 
 
 def _codex_sandbox_probe_argvs(codex_bin: str, shell_cmd: str, config_args: Optional[list] = None) -> list:
@@ -8820,17 +8831,19 @@ def _codex_sandbox_enforces(
         return False
 
     key = _codex_sandbox_probe_key(codex_bin, process_env)
-    if research:
-        key = (key, _CODEX_RESEARCH_PROFILE_PREFIX)
-    cached = _CODEX_SANDBOX_ENFORCES_CACHE.get(key)
-    if cached is not None:
-        return cached
+    if key is not None:
+        if research:
+            key = (key, _CODEX_RESEARCH_PROFILE_PREFIX)
+        cached = _CODEX_SANDBOX_ENFORCES_CACHE.get(key)
+        if cached is not None:
+            return cached
 
     if research:
         result = _codex_sandbox_probe(codex_bin, process_env, research=True)
     else:
         result = _codex_sandbox_probe(codex_bin, process_env)
-    _CODEX_SANDBOX_ENFORCES_CACHE[key] = result
+    if key is not None:
+        _CODEX_SANDBOX_ENFORCES_CACHE[key] = result
     return result
 
 

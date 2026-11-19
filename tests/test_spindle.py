@@ -10849,6 +10849,71 @@ class TestCodexSandboxEnforcement:
         assert retry_spool["permission"] == "research"
 
 
+class TestCodexInstallCache:
+    def test_detects_in_place_upgrade_and_downgrade(self, tmp_path):
+        binary = tmp_path / "codex"
+        for version in ("0.154.0", "0.170.0", "0.154.0"):
+            binary.write_text(f"#!/bin/sh\necho codex-cli {version}\n")
+            binary.chmod(0o755)
+            with patch("spindle.subprocess.run", wraps=subprocess.run) as run:
+                assert spindle._codex_cli_version(str(binary)) == version
+                assert spindle._codex_cli_version(str(binary)) == version
+            run.assert_called_once()
+
+    @pytest.mark.parametrize("research", [False, True])
+    def test_npm_manifest_replacement_invalidates_version_and_sandbox(self, tmp_path, research):
+        package = tmp_path / "lib/node_modules/@openai/codex"
+        entry = package / "bin/codex.js"
+        entry.parent.mkdir(parents=True)
+        entry.touch()
+        binary = tmp_path / "bin/codex"
+        binary.parent.mkdir()
+        binary.symlink_to(entry)
+        manifest = package / "package.json"
+        manifest.write_text('{"version":"0.154.0"}')
+
+        def version_probe(*args, **kwargs):
+            version = json.loads(manifest.read_text())["version"]
+            return subprocess.CompletedProcess(args, 0, f"codex-cli {version}")
+
+        with (
+            patch("spindle.subprocess.run", side_effect=version_probe) as version,
+            patch("spindle._codex_sandbox_probe", side_effect=[True, False]) as sandbox,
+        ):
+            for _ in range(2):
+                assert spindle._codex_cli_version(str(binary)) == "0.154.0"
+                assert spindle._codex_sandbox_enforces(str(binary), research=research) is True
+
+            # Keep the launcher, symlink, manifest size and mtime unchanged.
+            replacement = package / "next.json"
+            replacement.write_text('{"version":"0.170.0"}')
+            timestamp = manifest.stat().st_mtime_ns
+            os.utime(replacement, ns=(timestamp, timestamp))
+            replacement.replace(manifest)
+
+            assert spindle._codex_cli_version(str(binary)) == "0.170.0"
+            assert spindle._codex_sandbox_enforces(str(binary), research=research) is False
+        assert version.call_count == sandbox.call_count == 2
+
+    @pytest.mark.parametrize(
+        "failure",
+        [
+            subprocess.TimeoutExpired("codex", 10),
+            subprocess.CompletedProcess([], 1, "codex-cli 0.154.0"),
+            subprocess.CompletedProcess([], 0, "no version reported"),
+        ],
+    )
+    def test_failed_version_probe_is_retried(self, tmp_path, failure):
+        binary = tmp_path / "codex"
+        binary.touch()
+        success = subprocess.CompletedProcess([], 0, "codex-cli 0.170.0")
+        with patch("spindle.subprocess.run", side_effect=[failure, success]) as run:
+            assert spindle._codex_cli_version(str(binary)) is None
+            assert spindle._codex_cli_version(str(binary)) == "0.170.0"
+            assert spindle._codex_cli_version(str(binary)) == "0.170.0"
+        assert run.call_count == 2
+
+
 class TestCodexSandboxEnforcesProbe:
     """The behavioral sandbox probe (_codex_sandbox_enforces) and the fail-closed refusal.
 

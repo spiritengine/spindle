@@ -12,6 +12,10 @@
   Removed confirmed retired `5.1-codex-max`, `5.1-codex-mini`, `codex-mini`,
   and `4.1-nano`. Retained `5.5`/`5.5-pro`: the September retirement claim
   below was not reconfirmed. Documented version-dependent account catalogs.
+- A running Spindle service refreshes the Codex version recorded on spools and
+  rechecks sandbox enforcement after an in-place CLI upgrade or downgrade.
+  Both caches track the resolved launcher and the npm manifest for the Codex
+  JavaScript entry point. A failed version lookup is retried on the next call.
 - Added Gemini `carbon`, `neon`, `hydrogen`, `argon` and their `4-` aliases.
   Default and Pro aliases stay on 3.1 Pro Preview; Flash/video stay on 3.8.
 - Added Kimi `k3.1`, `k3.1-pro`, `k3.1-pro-highspeed`. Default, `latest`, and
